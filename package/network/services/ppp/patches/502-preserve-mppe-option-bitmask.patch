@@ -1,0 +1,204 @@
+From fc475ac85cc1510a4995559e69f44f42d9705dc0 Mon Sep 17 00:00:00 2001
+From: Semih Baskan <strst.gs@gmail.com>
+Date: Tue, 13 Oct 2026 11:17:10 +0300
+Subject: [PATCH] pppd: Fix require-mppe enabling only 40-bit MPPE
+
+The require-mppe and +mppe options are o_bool options with the value
+MPPE_OPT_40 | MPPE_OPT_128, stored in ccp_wantoptions[0].mppe. That
+field is an unsigned char bit mask, but process_option() stores o_bool
+values through a bool pointer:
+
+	*(bool *)(opt->addr) = v;
+
+Up to 2.4.9 pppd.h had "typedef unsigned char bool", so this stored 3.
+Since 2.5.0 (commit ba7f7e053daa) pppd.h includes <stdbool.h>, so the 3
+becomes 1 on assignment and the mask is left with MPPE_OPT_40 only.
+
+So require-mppe requests and accepts 40-bit MPPE only, although pppd(8)
+says it enables both 40-bit and 128-bit encryption:
+
+- Two peers that both use require-mppe settle on 40-bit.
+- A require-mppe peer cannot connect to one using require-mppe-128;
+  the link is closed with "MPPE required but peer negotiation failed".
+- "require-mppe nomppe-40" clears the only bit that is left, so MPPE is
+  no longer required. Against a peer that does not ask for MPPE the
+  link comes up unencrypted.
+
+Point require-mppe and +mppe at an otherwise unused bool and copy the
+value into ccp_wantoptions[0].mppe with OPT_A2COPY. For that, make
+OPT_A2COPY and OPT_A2CLR store through a u_char pointer, as OPT_A2OR and
+OPT_A2CLRB already do. All other users of these two flags store 0 or 1,
+and a u_char store writes the same single byte as the bool store did, so
+they behave as before.
+
+The other o_bool options with a value above 1 are not affected. They
+store into a real bool or into a throwaway field, and change their bit
+mask through addr2 with OPT_A2OR or OPT_A2CLRB.
+
+Add testsuite/mppe_test.py and list it in EXTRA_DIST. It checks the
+negotiated strength for require-mppe on both sides, +mppe against
+require-mppe-128, require-mppe with nomppe-128 and require-mppe-40, and
+that "require-mppe nomppe-40" refuses a peer without MPPE. Without this
+change the test fails on the first case (40-bit), and the last case on
+its own fails with the link up and only Deflate negotiated.
+
+Upstream-Status: Submitted [https://github.com/ppp-project/ppp/pull/646]
+
+Signed-off-by: Semih Baskan <strst.gs@gmail.com>
+---
+ Makefile.am            |  1 +
+ pppd/ccp.c             | 11 ++++---
+ pppd/options.c         |  4 +--
+ pppd/options.h         |  2 +-
+ testsuite/mppe_test.py | 67 ++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 78 insertions(+), 7 deletions(-)
+ create mode 100755 testsuite/mppe_test.py
+
+diff --git a/Makefile.am b/Makefile.am
+index 6ec62a0..464638b 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -59,6 +59,7 @@ EXTRA_DIST= \
+     testsuite/auth-pap_test.py \
+     testsuite/data-transfer_test.py \
+     testsuite/link-up_test.py \
++    testsuite/mppe_test.py \
+     testsuite/mtu-negotiation_test.py \
+     testsuite/ping_test.py
+ 
+diff --git a/pppd/ccp.c b/pppd/ccp.c
+index 3387833..6b03a77 100644
+--- a/pppd/ccp.c
++++ b/pppd/ccp.c
+@@ -68,6 +68,7 @@ static char deflate_value[8];
+  */
+ #ifdef PPP_WITH_MPPE
+ bool refuse_mppe_stateful = 1;		/* Allow stateful mode? */
++static bool require_mppe;
+ #endif
+ 
+ static struct option ccp_option_list[] = {
+@@ -111,12 +112,14 @@ static struct option ccp_option_list[] = {
+ 
+ #ifdef PPP_WITH_MPPE
+     /* MPPE options are symmetrical ... we only set wantoptions here */
+-    { "require-mppe", o_bool, &ccp_wantoptions[0].mppe,
++    { "require-mppe", o_bool, &require_mppe,
+       "require MPPE encryption",
+-      OPT_PRIO | MPPE_OPT_40 | MPPE_OPT_128 },
+-    { "+mppe", o_bool, &ccp_wantoptions[0].mppe,
++      OPT_PRIO | OPT_A2COPY | MPPE_OPT_40 | MPPE_OPT_128,
++      &ccp_wantoptions[0].mppe },
++    { "+mppe", o_bool, &require_mppe,
+       "require MPPE encryption",
+-      OPT_ALIAS | OPT_PRIO | MPPE_OPT_40 | MPPE_OPT_128 },
++      OPT_ALIAS | OPT_PRIO | OPT_A2COPY | MPPE_OPT_40 | MPPE_OPT_128,
++      &ccp_wantoptions[0].mppe },
+     { "nomppe", o_bool, &ccp_wantoptions[0].mppe,
+       "don't allow MPPE encryption", OPT_PRIO },
+     { "-mppe", o_bool, &ccp_wantoptions[0].mppe,
+diff --git a/pppd/options.c b/pppd/options.c
+index fec65ed..09aa046 100644
+--- a/pppd/options.c
++++ b/pppd/options.c
+@@ -897,9 +897,9 @@ process_option(struct option *opt, char *cmd, char **argv)
+ 	v = opt->flags & OPT_VALUE;
+ 	*(bool *)(opt->addr) = v;
+ 	if (opt->addr2 && (opt->flags & OPT_A2COPY))
+-	    *(bool *)(opt->addr2) = v;
++	    *(u_char *)(opt->addr2) = v;
+ 	else if (opt->addr2 && (opt->flags & OPT_A2CLR))
+-	    *(bool *)(opt->addr2) = 0;
++	    *(u_char *)(opt->addr2) = 0;
+ 	else if (opt->addr2 && (opt->flags & OPT_A2CLRB))
+ 	    *(u_char *)(opt->addr2) &= ~v;
+ 	else if (opt->addr2 && (opt->flags & OPT_A2OR))
+diff --git a/pppd/options.h b/pppd/options.h
+index 4ed0892..bb5f870 100644
+--- a/pppd/options.h
++++ b/pppd/options.h
+@@ -80,7 +80,7 @@ typedef struct option option_t;
+ #define OPT_ALIAS	0x200000 /* option is alias for previous option */
+ #define OPT_A2COPY	0x400000 /* addr2 -> second location to rcv value */
+ #define OPT_ENABLE	0x800000 /* use *addr2 as enable for option */
+-#define OPT_A2CLR	0x1000000 /* clear *(bool *)addr2 */
++#define OPT_A2CLR	0x1000000 /* clear *(u_char *)addr2 */
+ #define OPT_PRIVFIX	0x2000000 /* user can't override if set by root */
+ #define OPT_INITONLY	0x4000000 /* option can only be set in init phase */
+ #define OPT_DEVEQUIV	0x8000000 /* equiv to device name */
+diff --git a/testsuite/mppe_test.py b/testsuite/mppe_test.py
+new file mode 100755
+index 0000000..158dbcd
+--- /dev/null
++++ b/testsuite/mppe_test.py
+@@ -0,0 +1,67 @@
++#!/usr/bin/env python3
++# MPPE strength negotiation: require-mppe must allow both 40-bit and
++# 128-bit encryption (so two require-mppe peers settle on 128-bit and a
++# require-mppe peer can talk to a 128-bit-only one), require-mppe-40 still
++# limits the link to 40-bit, and "require-mppe nomppe-40" must not let the
++# link come up without MPPE.
++
++import os
++import subprocess
++
++from pppfns import (
++    IS_LINUX, PPPD, PPPD_PEER, PppPair, require_link_env, sudo_prefix,
++    test_fail, test_skipped,
++)
++
++require_link_env()
++
++for binary in {PPPD, PPPD_PEER}:
++    with open(binary, 'rb') as f:
++        if b'require-mppe' not in f.read():
++            test_skipped(f'{binary} is built without MPPE support')
++if IS_LINUX:
++    subprocess.run(sudo_prefix() + ['modprobe', 'ppp_mppe'],
++                   capture_output=True)
++    if not os.path.exists('/sys/module/ppp_mppe'):
++        test_skipped('no kernel MPPE support (ppp_mppe)')
++
++# MPPE keys come from MS-CHAP, so b authenticates a with MS-CHAPv2.
++server_kwargs = dict(noauth=False, chap_secrets='cli\tsrv\t"s3cret"\t*\n')
++server_options = ['auth', 'require-mschap-v2', 'name', 'srv']
++client_options = ['user', 'cli', 'remotename', 'srv', 'password', 's3cret']
++
++CCP_UP = r'\S.* compression enabled'
++
++
++def pair(name, a_mppe, b_mppe):
++    return PppPair(a_options=client_options + a_mppe,
++                   b_options=server_options + b_mppe, b_kwargs=server_kwargs,
++                   name=name)
++
++
++def check(name, a_mppe, b_mppe, expect):
++    print(f'{" ".join(a_mppe)} vs {" ".join(b_mppe)}:')
++    with pair(name, a_mppe, b_mppe) as p:
++        p.up()
++        for peer in (p.a, p.b):
++            got = peer.wait_for_text(CCP_UP).group(0)
++            print(f'  {peer.name}: {got}')
++            if got != f'MPPE {expect} stateless compression enabled':
++                test_fail(f'pppd {peer.name}: expected MPPE {expect}, '
++                          f'got "{got}"')
++        p.down()
++
++
++check('both', ['require-mppe'], ['require-mppe'], '128-bit')
++check('plus-128', ['+mppe'], ['require-mppe-128'], '128-bit')
++check('no128', ['require-mppe', 'nomppe-128'], ['require-mppe'], '40-bit')
++check('only40', ['require-mppe-40'], ['require-mppe-40'], '40-bit')
++
++print('require-mppe nomppe-40 vs no MPPE options:')
++with pair('refuse', ['require-mppe', 'nomppe-40'], []) as p:
++    p.start()
++    got = p.a.wait_for_text(CCP_UP + '|MPPE required but peer '
++                            'negotiation failed').group(0)
++    print(f'  a: {got}')
++    if 'MPPE required' not in got:
++        test_fail(f'pppd a: link came up without MPPE ("{got}")')
+-- 
+2.43.0
+
