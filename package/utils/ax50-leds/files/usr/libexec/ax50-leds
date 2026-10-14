@@ -3,14 +3,14 @@
 
 import * as fs from 'fs';
 import * as uci from 'uci';
-import { display_state, runtime_allowed } from '/usr/share/ucode/wps-led.uc';
+import { display_state, runtime_allowed } from '/usr/share/ax50-leds/wps.uc';
 
 const led = 'blue:power';
 const led_path = `/sys/class/leds/${led}/`;
-const state_path = '/var/run/wps-led.json';
-const valid_path = '/var/run/wps-led.valid';
-const lock_path = '/var/run/wps-led.lock';
-let diag_attempted = false;
+const state_path = '/var/run/ax50-leds.json';
+const valid_path = '/var/run/ax50-leds.valid';
+const lock_path = '/var/run/ax50-leds.lock';
+let admitted = false;
 
 function config_state()
 {
@@ -78,7 +78,8 @@ function locked(fn)
 	// CLOEXEC prevents a user LED trigger's background child retaining the lock.
 	let lock = fs.open(lock_path, 'ae');
 	if (!lock || !lock.lock('x'))
-		die('Unable to lock WPS LED policy\n');
+		die('Unable to lock AX50 LED policy\n');
+	admitted = true;
 	let result;
 	try { result = fn(read_state()); }
 	catch (e) { lock.close(); die(e); }
@@ -88,17 +89,16 @@ function locked(fn)
 
 function run_diag(phase)
 {
-	diag_attempted = true;
 	return system([ '/bin/sh', '-c',
-		'LED_RUNTIME_LOCKED=1; export LED_RUNTIME_LOCKED; . /etc/diag.sh; set_led_state "$1"',
-		'led-runtime', phase ]);
+		'. /etc/diag.sh; set_led_state "$1"',
+		'ax50-leds', phase ]);
 }
 
 function run_led(action, args)
 {
 	return system([ '/bin/sh', '-c',
-		'LED_RUNTIME_LOCKED=1; export LED_RUNTIME_LOCKED; exec /etc/init.d/led "$@"',
-		'led-runtime', action, ...(args ?? []) ]);
+		'. /lib/functions.sh; . /lib/functions/led-service.sh; led_apply "$@"',
+		'ax50-leds', action, ...(args ?? []) ]);
 }
 
 function attr(name, value)
@@ -474,24 +474,22 @@ let board = trim(fs.readfile('/tmp/sysinfo/board_name') ?? '');
 let compatible = split(fs.readfile('/proc/device-tree/compatible') ?? '', '\x00');
 let command = ARGV[0], args = slice(ARGV, 1);
 if (board != 'tplink,archer-ax50-v1' && index(compatible, 'tplink,archer-ax50-v1') < 0) {
-	if (command == 'diag') exit(run_diag(args[0]));
-	if (command == 'led') exit(run_led(args[0], slice(args, 1)));
-	exit(0);
+	exit(65);
 }
 
 try {
 	let rc = command == 'watch' ? watch() : command == 'watch-internet' ? watch_internet() : policy_command(command, args);
-	// The generic diagnostic hook falls back only if this helper could not
-	// execute the operation. Keep handled failures inside the locking seam.
-	exit(command == 'diag' && diag_attempted && rc ? 64 : rc);
+	// Admitted operations retain ownership even after a partial failure.
+	// Generic callers must never repeat them outside the policy lock.
+	exit((command == 'diag' || command == 'led') && rc ? 64 : rc);
 }
 catch (e) {
-	warn(`led-runtime: ${e}\n`);
+	warn(`ax50-leds: ${e}\n`);
 	if (command == 'watch-internet') {
 		try { locked(release_internet); } catch (e) { }
 	}
 	if (command == 'watch') {
 		try { update_display({ mode: 'normal' }); } catch (e) { }
 	}
-	exit(command == 'diag' && diag_attempted ? 64 : 1);
+	exit(command == 'diag' || command == 'led' ? (admitted ? 64 : 65) : 1);
 }

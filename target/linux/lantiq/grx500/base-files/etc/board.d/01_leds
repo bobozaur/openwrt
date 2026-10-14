@@ -8,8 +8,12 @@ case "$(board_name)" in
 tplink,archer-ax50-v1)
 	# Wi-Fi also joins br-lan; this indicator follows the wired LAN ports.
 	_ucidef_set_led_trigger "lan" "LAN" "blue:lan" "network"
-	_ucidef_set_led_trigger "wan" "Internet reachable" "blue:internet" "internet"
-	_ucidef_set_led_trigger "wan_error" "Internet unavailable" "orange:internet" "internet"
+	if [ -x /usr/libexec/led-policy ]; then
+		_ucidef_set_led_trigger "wan" "Internet reachable" "blue:internet" "internet"
+		_ucidef_set_led_trigger "wan_error" "Internet unavailable" "orange:internet" "internet"
+	else
+		ucidef_set_led_netdev "wan" "WAN" "blue:internet" "wan"
+	fi
 	ucidef_set_led_usbport "usb" "USB" "blue:usb" "usb3-port1" "usb4-port1"
 	ucidef_set_led_wlan "wlan2g" "Wi-Fi 2.4 GHz" "blue:wlan-2g" "wave-0000:01:00.0-0-radio"
 	ucidef_set_led_wlan "wlan5g" "Wi-Fi 5 GHz" "blue:wlan-5g" "wave-0000:01:00.0-1-radio"

@@ -56,16 +56,13 @@ set_state() {
 	local ret
 
 	[ -n "$boot" -o -n "$failsafe" -o -n "$running" -o -n "$upgrade" ] || return 0
-	if [ "$LED_RUNTIME_LOCKED" != 1 ] && [ -x /usr/libexec/led-runtime ]; then
-		if /usr/libexec/led-runtime diag "$1"; then
-			return 0
-		else
-			ret=$?
-		fi
-		# The helper attempted this operation under its lock. Repeating it
-		# outside the lock could overwrite a newly applied runtime pattern.
-		[ "$ret" = 64 ] && return 1
+	if led_policy diag "$1"; then
+		return 0
+	else
+		ret=$?
 	fi
-	# Early boot or a missing runtime dependency must not suppress diagnostics.
-	set_led_state "$1"
+	case "$ret" in
+		65) set_led_state "$1" ;;
+		*) return 1 ;;
+	esac
 }

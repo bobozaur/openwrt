@@ -85,7 +85,7 @@ define Device/tplink_archer-ax50-v1
 	uboot-envtools ubi-utils ax50-caldata kmod-grx500-eth kmod-wave wave600-firmware wave-scripts wpad-mbedtls ucode-mod-uci kmod-usb3 \
 	kmod-usb-dwc3-grx500 kmod-usb-ledtrig-usbport block-mount hfsfsck kmod-usb-storage kmod-fs-ext4 \
 	kmod-usb-net-rndis kmod-usb-net-cdc-ether kmod-usb-net-cdc-ncm kmod-bonding \
-	kmod-nf-nathelper-pptp pingcheck
+	kmod-nf-nathelper-pptp ax50-leds
   IMAGES := sysupgrade.bin
   IMAGE/sysupgrade.bin := grx500-sysupgrade | append-metadata
 endef

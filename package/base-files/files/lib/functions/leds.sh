@@ -130,3 +130,24 @@ status_led_blink_failsafe() {
 status_led_blink_preinit_regular() {
 	led_timer $status_led 200 200
 }
+
+# Optional display owner API: diag PHASE or led ACTION [SYSFS].
+# 0 means handled, 64 means handled but failed, 65 means unavailable. Once
+# ownership is admitted, failures must not fall back to an unlocked write.
+# An owner invokes set_led_state() or led_apply() for the raw operation,
+# never the delegating entrypoint. Absence leaves ordinary LED behavior intact.
+led_policy() {
+	[ -x /usr/libexec/led-policy ] || return 65
+	local ret
+	if /usr/libexec/led-policy "$@"; then
+		return 0
+	else
+		ret=$?
+	fi
+	# A missing interpreter is unavailable too; admitted operation failures
+	# are normalized by the owner to 64.
+	case "$ret" in
+		126|127) return 65 ;;
+		*) return "$ret" ;;
+	esac
+}
