@@ -79,7 +79,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  /*
   * ccp_reqci - processed a received configure-request.
   * Returns CONFACK, CONFNAK or CONFREJ and the packet modified
-@@ -1168,7 +1202,6 @@ ccp_reqci(fsm *f, u_char *p, int *lenp,
+@@ -1184,7 +1218,6 @@ ccp_reqci(fsm *f, u_char *p, int *lenp,
  		MPPE_OPTS_TO_CI(ho->mppe, &p[2]);
  		if (newret == CONFACK) {
  		    u_char opt_buf[CILEN_MPPE + MPPE_MAX_KEY_LEN];
@@ -87,7 +87,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  		    BCOPY(p, opt_buf, CILEN_MPPE);
  		    mppe_get_send_key(&opt_buf[CILEN_MPPE], MPPE_MAX_KEY_LEN);
-@@ -1180,16 +1213,7 @@ ccp_reqci(fsm *f, u_char *p, int *lenp,
+@@ -1196,16 +1229,7 @@ ccp_reqci(fsm *f, u_char *p, int *lenp,
  			newret = CONFREJ;
  			break;
  		    }
@@ -105,7 +105,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		}
  
  		/*
-@@ -1342,6 +1366,12 @@ ccp_reqci(fsm *f, u_char *p, int *lenp,
+@@ -1358,6 +1382,12 @@ ccp_reqci(fsm *f, u_char *p, int *lenp,
  	    *lenp = retp - p0;
      }
  #ifdef PPP_WITH_MPPE
