@@ -1,35 +1,23 @@
-Subject: [PATCH] reconcile protocol-owned dynamic interfaces with parent updates
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: reconcile parent-owned dynamic interface sets
 
-DHCP transition options describe a desired set, not append-only interfaces.
-Let protocol notifications replace only their exact parent's children, fence
-old callbacks across setups, and retire children on parent loss or teardown.
-Keep legacy add_dynamic callers compatible and protect static/foreign names.
+Publish dynamic children as the desired set of one exact parent, using the
+setup-generation token from the preceding change. An omitted child field
+leaves that set alone; an empty array retires it. Prepare all names and
+configurations before mutation, reject static or foreign-owned names, and
+retain legacy add_dynamic callers.
 
---- a/interface.h
-+++ b/interface.h
-@@ -127,6 +127,11 @@
- 	bool renew;
- 	bool remove_pending;
- 
-+	/* Dynamic interfaces published by this exact parent interface. */
-+	struct interface *dynamic_parent;
-+	struct list_head dynamic_list;
-+	struct list_head dynamic_children;
-+
- 	unsigned int carrier_loss_delay;
- 	struct uloop_timeout carrier_loss_timer;
- 
-@@ -192,6 +197,7 @@
- 
- bool interface_add(struct interface *iface, struct blob_attr *config);
- bool interface_add_alias(struct interface *iface, struct blob_attr *config);
-+void interface_remove_dynamic_children(struct interface *parent);
- 
- void interface_set_proto_state(struct interface *iface, struct interface_proto_state *state);
- 
+Own children through the native interface/vlist lifecycle. Retire them on
+parent link loss, teardown or destruction; detach parent pointers before
+callbacks can observe a dying owner. A rejected child set must not suppress
+a valid parent lease, and redefined children cancel pending old removal.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
 --- a/interface.c
 +++ b/interface.c
-@@ -354,7 +354,8 @@
+@@ -354,7 +354,8 @@ __interface_set_down(struct interface *i
  	case IFS_SETUP:
  		uloop_timeout_cancel(&iface->carrier_loss_timer);
  		iface->state = IFS_TEARDOWN;
@@ -39,7 +27,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  			__set_config_state(iface, IFC_REMOVE);
  
  		if (state == IFS_UP)
-@@ -402,7 +403,8 @@
+@@ -402,7 +403,8 @@ interface_check_state(struct interface *
  		if (!iface->enabled || !link_state) {
  			uloop_timeout_cancel(&iface->carrier_loss_timer);
  			iface->state = IFS_TEARDOWN;
@@ -49,7 +37,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  				__set_config_state(iface, IFC_REMOVE);
  
  			interface_proto_event(iface->proto, PROTO_CMD_TEARDOWN, false);
-@@ -766,9 +768,39 @@
+@@ -766,9 +768,39 @@ interface_cleanup_state(struct interface
  }
  
  static void
@@ -89,7 +77,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  
  	uloop_timeout_cancel(&iface->remove_timer);
  	uloop_timeout_cancel(&iface->carrier_loss_timer);
-@@ -938,7 +970,11 @@
+@@ -938,7 +970,11 @@ interface_alloc(const char *name, struct
  	bool force_link = false;
  
  	iface = calloc_a(sizeof(*iface), &iface_name, strlen(name) + 1);
@@ -101,7 +89,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  	INIT_LIST_HEAD(&iface->errors);
  	INIT_LIST_HEAD(&iface->users);
  	INIT_LIST_HEAD(&iface->hotplug_list);
-@@ -1077,7 +1113,6 @@
+@@ -1077,7 +1113,6 @@ static bool __interface_add(struct inter
  {
  	struct blob_attr *tb[IFACE_ATTR_MAX];
  	struct blob_attr *cur;
@@ -109,7 +97,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  
  	blobmsg_parse_attr(iface_attrs, IFACE_ATTR_MAX, tb, config);
  
-@@ -1095,25 +1130,9 @@
+@@ -1095,26 +1130,10 @@ static bool __interface_add(struct inter
  			iface->device = blobmsg_data(cur);
  	}
  
@@ -123,7 +111,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  	iface->config = config;
  	iface->tags = tb[IFACE_ATTR_TAGS];
  	vlist_add(&interfaces, &iface->node, iface->name);
--
+ 
 -	if (name) {
 -		iface = vlist_find(&interfaces, name, iface, node);
 -		free(name);
@@ -132,10 +120,11 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
 -		if (iface)
 -			iface->node.version = -1;
 -	}
- 
+-
  	return true;
  }
-@@ -1531,7 +1550,8 @@
+ 
+@@ -1531,7 +1550,8 @@ static void
  interface_change_config(struct interface *if_old, struct interface *if_new)
  {
  	struct blob_attr *old_config = if_old->config;
@@ -145,7 +134,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  
  	/*
  	 * The interface is being redefined: cancel a pending deferred removal,
-@@ -1539,6 +1559,10 @@
+@@ -1539,6 +1559,10 @@ interface_change_config(struct interface
  	 */
  	if (if_old->config_state == IFC_REMOVE)
  		__set_config_state(if_old, IFC_NORMAL);
@@ -156,7 +145,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  
  #define FIELD_CHANGED_STR(field)					\
  		((!!if_old->field != !!if_new->field) ||		\
-@@ -1672,12 +1696,19 @@
+@@ -1672,12 +1696,19 @@ interface_update(struct vlist_tree *tree
  
  	if (node_old && node_new) {
  		D(INTERFACE, "Update interface '%s'", if_new->name);
@@ -176,44 +165,31 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  		interface_event(if_new, IFEV_CREATE);
  		proto_init_interface(if_new, if_new->config);
  		interface_claim_device(if_new);
---- a/proto-ext.h
-+++ b/proto-ext.h
-@@ -44,6 +44,7 @@
- 	bool restart_pending;
+--- a/interface.h
++++ b/interface.h
+@@ -127,6 +127,11 @@ struct interface {
+ 	bool renew;
+ 	bool remove_pending;
  
- 	int last_error;
-+	char token[80];
++	/* Dynamic interfaces published by this exact parent interface. */
++	struct interface *dynamic_parent;
++	struct list_head dynamic_list;
++	struct list_head dynamic_children;
++
+ 	unsigned int carrier_loss_delay;
+ 	struct uloop_timeout carrier_loss_timer;
  
- 	struct list_head deps;
- };
+@@ -192,6 +197,7 @@ void interface_free(struct interface *if
+ 
+ bool interface_add(struct interface *iface, struct blob_attr *config);
+ bool interface_add_alias(struct interface *iface, struct blob_attr *config);
++void interface_remove_dynamic_children(struct interface *parent);
+ 
+ void interface_set_proto_state(struct interface *iface, struct interface_proto_state *state);
+ 
 --- a/proto-ext.c
 +++ b/proto-ext.c
-@@ -17,6 +17,7 @@
- #include <stdlib.h>
- #include <stdio.h>
- #include <signal.h>
-+#include <time.h>
- 
- #include <arpa/inet.h>
- #include <netinet/in.h>
-@@ -24,6 +25,8 @@
- #include "proto-ext.h"
- #include "system.h"
- #include "handler.h"
-+
-+#define PROTO_TOKEN_ENV "NETIFD_PROTO_TOKEN="
- 
- static void
- proto_ext_check_dependencies(struct proto_ext_state *state)
-@@ -183,6 +186,7 @@
- 		uloop_timeout_cancel(&state->teardown_timeout);
- 		uloop_timeout_cancel(&state->checkup_timeout);
- 		state->sm = S_IDLE;
-+		state->token[0] = 0;
- 		state->proto.proto_event(&state->proto, IFPEV_DOWN);
- 		break;
- 	}
-@@ -228,6 +232,7 @@
+@@ -232,6 +232,7 @@ proto_ext_free(struct interface_proto_st
  	struct proto_ext_state *state;
  
  	state = container_of(proto, struct proto_ext_state, proto);
@@ -221,23 +197,22 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  	uloop_timeout_cancel(&state->teardown_timeout);
  	uloop_timeout_cancel(&state->checkup_timeout);
  	proto_ext_clear_host_dep(state);
-@@ -316,6 +321,8 @@
+@@ -320,6 +321,7 @@ enum {
  	NOTIFY_DNS_SEARCH,
  	NOTIFY_NEIGHBORS,
  	NOTIFY_NEIGHBORS6,
 +	NOTIFY_CHILDREN,
-+	NOTIFY_TOKEN,
+ 	NOTIFY_TOKEN,
  	__NOTIFY_LAST
  };
- 
-@@ -339,7 +346,114 @@
+@@ -344,9 +346,115 @@ static const struct blobmsg_policy notif
  	[NOTIFY_DNS_SEARCH] = { .name = "dns_search", .type = BLOBMSG_TYPE_ARRAY },
  	[NOTIFY_NEIGHBORS]= {.name = "neighbor", .type = BLOBMSG_TYPE_ARRAY},
  	[NOTIFY_NEIGHBORS6]= {.name = "neighbor6", .type = BLOBMSG_TYPE_ARRAY},
 +	[NOTIFY_CHILDREN] = { .name = "dynamic-children", .type = BLOBMSG_TYPE_UNSPEC },
-+	[NOTIFY_TOKEN] = { .name = "proto-token", .type = BLOBMSG_TYPE_UNSPEC },
+ 	[NOTIFY_TOKEN] = { .name = "proto-token", .type = BLOBMSG_TYPE_UNSPEC },
  };
-+
+ 
 +static void
 +proto_ext_free_children(struct interface **children, int n)
 +{
@@ -342,10 +317,11 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
 +	}
 +	return 0;
 +}
- 
++
  static int
  proto_ext_update_link(struct proto_ext_state *state, struct blob_attr *data, struct blob_attr **tb)
-@@ -361,6 +475,7 @@
+ {
+@@ -367,6 +475,7 @@ proto_ext_update_link(struct proto_ext_s
  
  	up = blobmsg_get_bool(tb[NOTIFY_LINK_UP]);
  	if (!up) {
@@ -353,32 +329,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  		state->proto.proto_event(&state->proto, IFPEV_LINK_LOST);
  		return 0;
  	}
-@@ -464,7 +579,9 @@
- proto_ext_run_command(struct proto_ext_state *state, struct blob_attr **tb)
- {
- 	static char *argv[64];
--	static char *env[32];
-+	static char *env[33];
-+	char token_env[sizeof(PROTO_TOKEN_ENV) + sizeof(state->token)];
-+	int i;
- 
- 	if (state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
- 		return UBUS_STATUS_PERMISSION_DENIED;
-@@ -475,8 +592,12 @@
- 	if (!fill_string_list(tb[NOTIFY_COMMAND], argv, ARRAY_SIZE(argv)))
- 		goto error;
- 
--	if (!fill_string_list(tb[NOTIFY_ENV], env, ARRAY_SIZE(env)))
-+	if (!fill_string_list(tb[NOTIFY_ENV], env, ARRAY_SIZE(env) - 1))
- 		goto error;
-+	for (i = 0; env[i]; i++);
-+	snprintf(token_env, sizeof(token_env), PROTO_TOKEN_ENV "%s", state->token);
-+	env[i++] = token_env;
-+	env[i] = NULL;
- 
- 	state->proto_task_killed = false;
- 	netifd_start_process((const char **) argv, (char **) env, &state->proto_task);
-@@ -624,16 +745,35 @@
+@@ -636,6 +745,8 @@ proto_ext_notify(struct interface_proto_
  {
  	struct proto_ext_state *state;
  	struct blob_attr *tb[__NOTIFY_LAST];
@@ -387,13 +338,10 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  
  	state = container_of(proto, struct proto_ext_state, proto);
  
- 	blobmsg_parse_attr(notify_attr, __NOTIFY_LAST, tb, attr);
- 	if (!tb[NOTIFY_ACTION])
- 		return UBUS_STATUS_INVALID_ARGUMENT;
-+	if (tb[NOTIFY_TOKEN] &&
-+	    (blobmsg_type(tb[NOTIFY_TOKEN]) != BLOBMSG_TYPE_STRING ||
-+	     !state->token[0] || strcmp(blobmsg_get_string(tb[NOTIFY_TOKEN]), state->token)))
-+		return UBUS_STATUS_PERMISSION_DENIED;
+@@ -646,10 +757,23 @@ proto_ext_notify(struct interface_proto_
+ 	    (blobmsg_type(tb[NOTIFY_TOKEN]) != BLOBMSG_TYPE_STRING ||
+ 	     !state->token[0] || strcmp(blobmsg_get_string(tb[NOTIFY_TOKEN]), state->token)))
+ 		return UBUS_STATUS_PERMISSION_DENIED;
 +	if (tb[NOTIFY_CHILDREN]) {
 +		if (!tb[NOTIFY_TOKEN] || state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
 +			return UBUS_STATUS_PERMISSION_DENIED;
@@ -415,30 +363,7 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  	case 1:
  		return proto_ext_run_command(state, tb);
  	case 2:
-@@ -723,7 +863,10 @@
- {
- 	struct interface_proto_state *proto = &state->proto;
- 	static char error_buf[32];
--	char *envp[2];
-+	static unsigned long long sequence;
-+	char token_env[sizeof(PROTO_TOKEN_ENV) + sizeof(state->token)];
-+	char *envp[3];
-+	struct timespec now = {};
- 	const char *action;
- 	char *config;
- 	int ret, j = 0;
-@@ -734,6 +877,10 @@
- 			action = "setup";
- 			state->last_error = -1;
- 			proto_ext_clear_host_dep(state);
-+			/* Fence callbacks from earlier setups and daemon instances. */
-+			clock_gettime(CLOCK_MONOTONIC, &now);
-+			snprintf(state->token, sizeof(state->token), "%ld:%lld:%ld:%llu",
-+				 (long)getpid(), (long long)now.tv_sec, now.tv_nsec, ++sequence);
- 			state->sm = S_SETUP;
- 			break;
- 
-@@ -776,6 +923,7 @@
+@@ -799,6 +923,7 @@ proto_ext_run(struct proto_ext_state *st
  		state->restart_pending = false;
  		action = "restart";
  	} else {
@@ -446,33 +371,14 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
  		switch (state->sm) {
  		case S_SETUP:
  			if (state->script_task.uloop.pending) {
-@@ -816,6 +964,8 @@
- 		goto error;
- 	}
- 
-+	snprintf(token_env, sizeof(token_env), PROTO_TOKEN_ENV "%s", state->token);
-+	envp[j++] = token_env;
- 	envp[j] = NULL;
- 
- 	ret = start_cb(state, action, config, envp);
-@@ -832,8 +982,10 @@
- 	 * came up does not reach the proto handler, so a stuck S_SETUP would
- 	 * block every future setup attempt
- 	 */
--	if (cmd == PROTO_CMD_SETUP)
-+	if (cmd == PROTO_CMD_SETUP) {
- 		state->sm = S_IDLE;
-+		state->token[0] = 0;
-+	}
- 
- 	return ret;
- }
 --- a/scripts/netifd-proto.sh
 +++ b/scripts/netifd-proto.sh
-@@ -112,6 +112,15 @@
+@@ -112,6 +112,17 @@ proto_close_data() {
  	proto_close_nested
  }
  
++# Link-up desired set for this exact parent: omit to keep, empty to retire.
++# Requires the current setup token; static and foreign names are not replaceable.
 +proto_add_dynamic_children() {
 +	proto_close_nested
 +	json_add_array "dynamic-children"
@@ -484,12 +390,4 @@ Keep legacy add_dynamic callers compatible and protect static/foreign names.
 +
  proto_add_dns_server() {
  	local address="$1"
- 
-@@ -327,6 +336,7 @@
- 	local interface="$1"
- 	local options="$2"
- 	json_add_string "interface" "$interface"
-+	[ -n "$NETIFD_PROTO_TOKEN" ] && json_add_string "proto-token" "$NETIFD_PROTO_TOKEN"
- 	ubus $options call network.interface notify_proto "$(json_dump)"
- }
  

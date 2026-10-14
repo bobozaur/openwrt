@@ -1,6 +1,20 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: preserve bridge-owned intra-BSS forwarding
+
+Some AP drivers send all bridged intra-BSS traffic through Linux instead
+of using an internal shortcut. Accept that explicit driver capability and
+include it in the bridge hairpin decision independently of multicast
+conversion or proxy-ARP policy. Isolation continues to take precedence.
+
+Generic wireless/AP metadata does not identify this forwarding owner. Keep
+the property capability-based rather than selecting a chipset in netifd.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
 --- a/device.h
 +++ b/device.h
-@@ -321,6 +321,8 @@
+@@ -321,6 +321,8 @@ struct device {
  	bool default_config;
  	bool wireless;
  	bool wireless_ap;
@@ -9,20 +23,9 @@
  	bool wireless_proxyarp;
  	bool wireless_isolate;
  	bool bpdu_filter;
---- a/ucode.c
-+++ b/ucode.c
-@@ -102,6 +102,8 @@
- 		dev->wireless = bval;
- 	if (prop_get_bool(data, "wireless_isolate", &bval))
- 		dev->wireless_isolate = bval;
-+	if (prop_get_bool(data, "wireless_bridge_forwarding", &bval))
-+		dev->wireless_bridge_forwarding = bval;
- 	if (prop_get_bool(data, "wireless_proxyarp", &bval))
- 		dev->wireless_proxyarp = bval;
- 	if (prop_get_bool(data, "wireless_ap", &bval)) {
 --- a/system-linux.c
 +++ b/system-linux.c
-@@ -976,7 +976,10 @@
+@@ -976,7 +976,10 @@ system_bridge_set_wireless(struct device
  	         !bridge->settings.multicast_to_unicast)
  		mcast_to_ucast = false;
  
@@ -34,3 +37,14 @@
  	if (dev->wireless_isolate)
  		hairpin = false;
  
+--- a/ucode.c
++++ b/ucode.c
+@@ -102,6 +102,8 @@ uc_netifd_device_set(uc_vm_t *vm, size_t
+ 		dev->wireless = bval;
+ 	if (prop_get_bool(data, "wireless_isolate", &bval))
+ 		dev->wireless_isolate = bval;
++	if (prop_get_bool(data, "wireless_bridge_forwarding", &bval))
++		dev->wireless_bridge_forwarding = bval;
+ 	if (prop_get_bool(data, "wireless_proxyarp", &bval))
+ 		dev->wireless_proxyarp = bval;
+ 	if (prop_get_bool(data, "wireless_ap", &bval)) {

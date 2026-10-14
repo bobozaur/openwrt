@@ -1,12 +1,19 @@
-Subject: [PATCH] netifd: let protocols own the logical MTU option
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: let protocols own their logical MTU option
 
-A tunnel protocol can use mtu for its own L3 device while retaining other
-legacy per-interface device attributes. Filter only that option when the
-protocol declares no-device-mtu; explicit device sections keep ownership.
+A protocol can use mtu for its own L3 device without changing the physical
+underlay MTU. The no-device-mtu capability filters only that legacy device
+attribute; keep other legacy attributes and explicit device-section owners.
+
+Neither no-device nor no-device-config expresses this narrower ownership.
+Expose the same capability to shell and ucode protocol handlers.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- a/interface.c
 +++ b/interface.c
-@@ -705,6 +705,10 @@
+@@ -705,6 +705,10 @@ interface_alias_cb(struct interface_user
  static void
  interface_set_device_config(struct interface *iface, struct device *dev)
  {
@@ -17,7 +24,7 @@ protocol declares no-device-mtu; explicit device sections keep ownership.
  	if (!dev || !dev->default_config)
  		return;
  
-@@ -712,9 +716,26 @@
+@@ -712,9 +716,26 @@ interface_set_device_config(struct inter
  	    (!dev->iface_config || dev->config_iface != iface))
  		return;
  
@@ -47,7 +54,7 @@ protocol declares no-device-mtu; explicit device sections keep ownership.
  static void
 --- a/proto-shell.c
 +++ b/proto-shell.c
-@@ -116,6 +116,10 @@
+@@ -116,6 +116,10 @@ proto_shell_add_handler(const char *scri
  	if (tmp && json_object_get_boolean(tmp))
  		handler->proto.flags |= PROTO_FLAG_NODEV_CONFIG;
  
@@ -60,7 +67,7 @@ protocol declares no-device-mtu; explicit device sections keep ownership.
  		handler->proto.flags |= PROTO_FLAG_NO_TASK;
 --- a/proto-ucode.c
 +++ b/proto-ucode.c
-@@ -213,6 +213,10 @@
+@@ -213,6 +213,10 @@ uc_netifd_add_proto_fn(uc_vm_t *vm, size
  	if (ucv_is_truish(flag_val))
  		proto->flags |= PROTO_FLAG_NODEV_CONFIG;
  
@@ -73,7 +80,7 @@ protocol declares no-device-mtu; explicit device sections keep ownership.
  		proto->flags |= PROTO_FLAG_NO_TASK;
 --- a/proto.h
 +++ b/proto.h
-@@ -45,6 +45,8 @@
+@@ -45,6 +45,8 @@ enum {
  	PROTO_FLAG_NO_TASK = (1 << 7),
  	PROTO_FLAG_NODEV_CONFIG = (1 << 8),
  	PROTO_FLAG_RESTART_AVAILABLE = (1 << 9),
@@ -84,7 +91,7 @@ protocol declares no-device-mtu; explicit device sections keep ownership.
  struct interface_proto_state {
 --- a/scripts/netifd-proto.sh
 +++ b/scripts/netifd-proto.sh
-@@ -457,6 +457,7 @@
+@@ -457,6 +457,7 @@ init_proto() {
  			add_protocol() {
  				no_device=0
  				no_device_config=0
@@ -92,7 +99,7 @@ protocol declares no-device-mtu; explicit device sections keep ownership.
  				no_proto_task=0
  				available=0
  				renew_handler=0
-@@ -473,6 +474,7 @@
+@@ -473,6 +474,7 @@ init_proto() {
  				json_close_array
  				json_add_boolean no-device "$no_device"
  				json_add_boolean no-device-config "$no_device_config"

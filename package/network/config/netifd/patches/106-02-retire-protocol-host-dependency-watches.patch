@@ -1,0 +1,30 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: let protocols retire their host dependency watches
+
+After successfully applying a complete live configuration, a protocol can
+retire its previous dependency watches and publish its current endpoints.
+Require the current setup token and reject retired teardown/abort owners.
+
+This retires only the protocol's watches. It does not delete netifd's shared
+underlay host-route cache or change another protocol's route lifetime.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/proto-ext.c
++++ b/proto-ext.c
+@@ -788,6 +788,14 @@ proto_ext_notify(struct interface_proto_
+ 		return proto_ext_add_host_dependency(state, tb);
+ 	case 7:
+ 		return proto_ext_setup_failed(state);
++	case 8:
++		/* A successful in-place update republishes its complete dependency
++		 * set. Retire old watches only once the protocol is ready to do so.
++		 */
++		if (!tb[NOTIFY_TOKEN] || state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
++			return UBUS_STATUS_PERMISSION_DENIED;
++		proto_ext_clear_host_dep(state);
++		return 0;
+ 	default:
+ 		return UBUS_STATUS_INVALID_ARGUMENT;
+ 	}

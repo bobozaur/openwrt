@@ -1,24 +1,21 @@
-Subject: [PATCH] netifd: allow protocols to accept live configuration updates
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: accept opt-in live protocol configuration updates
 
-Let an up ucode protocol opt into compatible configuration changes with a
-pure config_update callback. Accepted configurations use the existing renew
-queue and instance; other interface changes retain the full reload path.
-Allow the protocol to retire old dependency watches after successful apply.
+Let an up, idle ucode protocol compare its old and new serialized configs
+with a pure config_update callback. Accept only explicit true, copy desired
+state and use the existing renew queue; incompatible interface or device
+changes still use normal teardown/setup.
 
---- a/proto.h
-+++ b/proto.h
-@@ -59,6 +59,8 @@
- 	/* filled in by the protocol handler */
- 	int (*notify)(struct interface_proto_state *, struct blob_attr *data);
- 	int (*cb)(struct interface_proto_state *, enum interface_proto_cmd cmd, bool force);
-+	/* Accept a configuration update without tearing down the live instance. */
-+	bool (*config_update)(struct interface_proto_state *, struct blob_attr *config);
- 	void (*free)(struct interface_proto_state *);
- };
- 
+Admission schedules renewal; it is not proof that asynchronous apply
+succeeded. The protocol retains responsibility for error reporting and its
+normal resulting address, route and link publication.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
 --- a/interface.c
 +++ b/interface.c
-@@ -1572,6 +1572,7 @@
+@@ -1572,6 +1572,7 @@ interface_change_config(struct interface
  {
  	struct blob_attr *old_config = if_old->config;
  	bool reload = if_old->config_state == IFC_REMOVE;
@@ -26,7 +23,7 @@ Allow the protocol to retire old dependency watches after successful apply.
  	bool reload_ip = false, update_prefix_delegation = false;
  
  	/*
-@@ -1607,7 +1608,7 @@
+@@ -1607,7 +1608,7 @@ interface_change_config(struct interface
  		  if_old->name);
  	else if (!uci_blob_check_equal(if_old->config, if_new->config,
  				       if_old->proto_handler->config_params))
@@ -35,7 +32,7 @@ Allow the protocol to retire old dependency watches after successful apply.
  
  #define UPDATE(field, __var) ({						\
  		bool __changed = (if_old->field != if_new->field);	\
-@@ -1676,7 +1677,12 @@
+@@ -1676,7 +1677,12 @@ interface_change_config(struct interface
  		reload = if_old->main_dev.dev != old_dev;
  	}
  
@@ -51,7 +48,7 @@ Allow the protocol to retire old dependency watches after successful apply.
  		interface_clear_errors(if_old);
 --- a/proto-ucode.c
 +++ b/proto-ucode.c
-@@ -116,6 +116,56 @@
+@@ -116,6 +116,56 @@ proto_ucode_handler(struct interface_pro
  	return proto_ext_run(state, cmd, force, proto_ucode_start);
  }
  
@@ -108,7 +105,7 @@ Allow the protocol to retire old dependency watches after successful apply.
  static struct interface_proto_state *
  proto_ucode_attach(const struct proto_handler *h, struct interface *iface,
  		   struct blob_attr *attr)
-@@ -133,6 +183,7 @@
+@@ -133,6 +183,7 @@ proto_ucode_attach(const struct proto_ha
  	}
  
  	state->proto.cb = proto_ucode_handler;
@@ -116,7 +113,7 @@ Allow the protocol to retire old dependency watches after successful apply.
  
  	return &state->proto;
  }
-@@ -182,7 +233,7 @@
+@@ -182,7 +233,7 @@ uc_netifd_add_proto_fn(uc_vm_t *vm, size
  		return NULL;
  
  	res = ucv_resource_create_ex(vm, "netifd.proto_handler",
@@ -125,7 +122,7 @@ Allow the protocol to retire old dependency watches after successful apply.
  				     sizeof(*handler) + strlen(name) + 1 +
  				     strlen(script_path) + 1);
  	if (!res)
-@@ -204,6 +255,9 @@
+@@ -204,6 +255,9 @@ uc_netifd_add_proto_fn(uc_vm_t *vm, size
  	if (ucv_is_callable(config_val)) {
  		ucv_resource_value_set(res, 0, ucv_get(config_val));
  	}
@@ -135,20 +132,14 @@ Allow the protocol to retire old dependency watches after successful apply.
  
  	flag_val = ucv_object_get(obj, "no-device", NULL);
  	if (ucv_is_truish(flag_val))
---- a/proto-ext.c
-+++ b/proto-ext.c
-@@ -788,6 +788,14 @@
- 		return proto_ext_add_host_dependency(state, tb);
- 	case 7:
- 		return proto_ext_setup_failed(state);
-+	case 8:
-+		/* A successful in-place update republishes its complete dependency
-+		 * set. Retire old watches only once the protocol is ready to do so.
-+		 */
-+		if (!tb[NOTIFY_TOKEN] || state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
-+			return UBUS_STATUS_PERMISSION_DENIED;
-+		proto_ext_clear_host_dep(state);
-+		return 0;
- 	default:
- 		return UBUS_STATUS_INVALID_ARGUMENT;
- 	}
+--- a/proto.h
++++ b/proto.h
+@@ -59,6 +59,8 @@ struct interface_proto_state {
+ 	/* filled in by the protocol handler */
+ 	int (*notify)(struct interface_proto_state *, struct blob_attr *data);
+ 	int (*cb)(struct interface_proto_state *, enum interface_proto_cmd cmd, bool force);
++	/* Accept a configuration update without tearing down the live instance. */
++	bool (*config_update)(struct interface_proto_state *, struct blob_attr *config);
+ 	void (*free)(struct interface_proto_state *);
+ };
+ 
