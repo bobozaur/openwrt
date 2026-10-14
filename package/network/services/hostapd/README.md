@@ -1,63 +1,3 @@
-# Native AP/STA channel metadata
-
-Negotiated channel definitions retain the center-channel index returned by
-`ieee80211_freq_to_chan()` on every supported band, including 2.4 GHz. The
-frequency-info fallback uses the same native conversion for HT20/40, with
-center frequency equal to the primary frequency plus ten MHz per secondary
-channel offset, as in `hostapd_set_freq_params()`. Both representations now
-agree with hostapd's actual channel-switch callback.
-
-The exact channel/beaconing permission checks remain active. This metadata
-correction does not relax channel geometry or regulatory checks, change the
-80/160/320 MHz mapping, or alter security and scan timing.
-
-Pausing an AP requests native peer disconnection while station keys still exist,
-then retires hostapd station state before stopping the driver. Peers establish
-fresh associations when the AP resumes; a paused AP does not retain station
-records whose driver keys and peer identifiers have been removed. Native PMF
-handling remains responsible for protected management frames.
-
-# Connection scan watchdog recovery
-
-An nl80211 watchdog abort remains an incomplete scan: its cached BSS entries
-cannot drive network selection. When the matching native aborted completion
-confirms that watchdog request, an enabled, still-connecting owner schedules a
-fresh scan through the normal one-second retry path. The real completion also
-establishes scan-event support for the existing learned-event timeout; neither
-the initial nor learned timeout budget is changed.
-
-Explicit `ABORT_SCAN`, manual or external scans, special scan handlers, and
-removed, disabled or disconnected owners do not gain this retry. `DISCONNECT`
-continues to cancel pending scans and request abortion of an active scan. A
-retry is observable at the normal INFO level as `CTRL-EVENT-SCAN-FAILED` with
-`retry=1 reason=watchdog`; `ret` contains the platform's negative `ETIMEDOUT`.
-Driver provenance is cleared on new scan attempts, failed abortion, explicit
-cancellation, completion and interface/link retirement.
-
-# Supplicant WPS credential events
-
-The `wps_credentials` ubus event retains `ifname`, `ssid`, `encryption` and
-`key`. Its `processed` flag is true only after the supplicant has accepted the
-native network profile, applied its security adjustments, and completed any
-requested configuration-file write. Accepted events also contain `network_id`
-and the native configuration strings `proto`, `key_mgmt` and `pairwise`.
-
-With `wps_cred_processing=1`, credentials are handed to an external handler and
-`processed` is false; native profile fields are absent. An event does not imply
-that credentials have been committed to UCI or that association has completed.
-Consumers must preserve the accepted security policy and their own configuration
-ownership when implementing persistence.
-
-# EAP peer identity with mbedTLS
-
-The mbedTLS backend delegates an explicitly configured certificate-name policy
-or `hash://server/sha256/` leaf pin to its existing EAP certificate verifier. This
-allows suffix and alternative-name policies without substituting a single TLS
-hostname. Missing peer-identity policy still retains mbedTLS's refusal to verify
-an unspecified hostname. The native policy is unchanged: name constraints keep
-normal certificate-chain checks; a configured leaf pin uses the existing pin
-branch and does not additionally apply the separate name constraints.
-
 # UBUS methods - hostapd
 
 ## bss_mgmt_enable
@@ -477,3 +417,34 @@ Start WPS Push Button Configuration.
 
 ### example
 `ubus call hostapd.wl5-fb wps_start`
+
+
+# UBUS events - wpa_supplicant
+
+## wps_credentials
+Notify consumers of received WPS credentials and whether the supplicant accepted
+its native network profile. This event does not acknowledge association or UCI
+persistence.
+
+### payload
+
+| Name | Type | Presence | Description |
+|---|---|---|---|
+| ifname | string | always | supplicant interface name |
+| ssid | string | always | received SSID |
+| encryption | string | always | received authentication summary: `psk`, `psk2` or `none`; use the native profile fields below for its accepted security policy |
+| key | string | always | received network key; may be empty for open credentials |
+| processed | bool | always | whether the native network profile was accepted |
+| network_id | integer | processed only | accepted native network identifier |
+| wps_run | integer | processed only | WPS run associated with that network |
+| ieee80211w | integer | processed only | effective native profile PMF policy |
+| proto, key_mgmt, pairwise | string | processed only, when available | serialized native profile fields after security adjustments |
+
+With `processed=true`, native profile acceptance and security adjustments have
+completed. If native configuration-file writing is enabled and compiled in,
+that write has also succeeded. Consumers must preserve the accepted profile's
+security policy when implementing persistence.
+
+With `wps_cred_processing=1`, credentials are handed to an external handler:
+`processed=false` and the native profile fields are absent. This is an external
+processing notification, not a rejection status.
