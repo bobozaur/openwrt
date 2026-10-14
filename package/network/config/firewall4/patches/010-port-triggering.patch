@@ -1,5 +1,15 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] fw4: own timed IPv4 port triggers and mapping reservations
 
+Publish timed owner maps and per-device/protocol port reservations in the
+existing fw4 transaction. Hold the native fw4 lock across competing UPnP
+allocation and keep triggered flows outside offload. An active lease can
+only be refreshed by its owner; reload withdraws its owners atomically.
+
+Upstream-Status: Pending
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/root/etc/hotplug.d/iface/20-firewall
 +++ b/root/etc/hotplug.d/iface/20-firewall
 @@ -6,7 +6,14 @@
@@ -67,33 +77,15 @@ Subject: [PATCH] fw4: own timed IPv4 port triggers and mapping reservations
  {% if (fw4.check_flowtable()): %}
  delete flowtable inet fw4 ft
  {% endif %}
-@@ -135,7 +144,11 @@
- 		type filter hook forward priority filter; policy {{ fw4.forward_policy(true) }};
- 
- {% if (length(flowtable_devices) > 0): %}
-+{%  if (length(fw4.port_triggers())): %}
-+		jump flow_offload
-+{%  else %}
- 		meta l4proto { tcp, udp } flow offload @ft;
-+{%  endif %}
- {% endif %}
- {% fw4.includes('chain-prepend', 'forward') %}
- 		ct state vmap { established : accept, related : accept{% if (fw4.default_option("drop_invalid")): %}, invalid : drop{% endif %} } comment "!fw4: Handle forwarded flows"
-@@ -151,6 +164,13 @@
- {% endif %}
- 	}
- 
-+{% if (length(flowtable_devices) && length(fw4.port_triggers())): %}
-+	chain flow_offload {
+@@ -158,6 +167,7 @@
+ 		meta nfproto ipv4 udp dport { 67, 68 } counter return comment "!fw4: Keep DHCPv4 destination in slow path"
+ 		meta nfproto ipv6 udp sport { 546, 547 } counter return comment "!fw4: Keep DHCPv6 source in slow path"
+ 		meta nfproto ipv6 udp dport { 546, 547 } counter return comment "!fw4: Keep DHCPv6 destination in slow path"
 +{%+ include('port-trigger.uc', { fw4, mode: 'offload' }) %}
-+		meta l4proto { tcp, udp } flow offload @ft;
-+	}
-+
-+{% endif %}
- 	chain output {
- 		type filter hook output priority filter; policy {{ fw4.output_policy(true) }};
- 
-@@ -324,6 +344,11 @@
+ 		meta l4proto { tcp, udp } flow offload @ft;
+ {% fw4.includes('chain-append', 'flow_offload') %}
+ 	}
+@@ -336,6 +346,11 @@
  {%  if (zone.dflags.dnat): %}
  	chain dstnat_{{ zone.name }} {
  {%   fw4.includes('chain-prepend', `dstnat_${zone.name}`) %}
@@ -105,7 +97,7 @@ Subject: [PATCH] fw4: own timed IPv4 port triggers and mapping reservations
  {%   for (let redirect in fw4.redirects(`dstnat_${zone.name}`)): %}
  		{%+ include("redirect.uc", { fw4, zone, redirect }) %}
  {%   endfor %}
-@@ -432,6 +457,7 @@
+@@ -444,6 +459,7 @@
  {%  endif %}
  {% endfor %}
  {% fw4.includes('chain-append', 'mangle_postrouting') %}
