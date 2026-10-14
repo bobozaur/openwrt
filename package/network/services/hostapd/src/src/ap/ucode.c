@@ -994,6 +994,7 @@ out:
 
 	for (i = 0; i < iface->num_bss; i++) {
 		struct hostapd_data *hapd = iface->bss[i];
+		int ret;
 
 		ret = hostapd_set_freq(hapd, conf->hw_mode, iface->freq,
 				 conf->channel,
