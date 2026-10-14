@@ -10,6 +10,7 @@ import * as netifd from 'wifi.netifd';
 import * as rtnl from 'rtnl';
 import * as fs from 'fs';
 import * as libubus from 'ubus';
+import { macaddr_sync, macaddr_sync_entry } from '/usr/share/hostap/common.uc';
 
 const wave = require('wifi.wave');
 
@@ -25,14 +26,33 @@ function reset_phy(phy) {
 		phy, config: '', prev_config: `/var/run/hostapd-${phy}.conf`
 	});
 	let sta = !global.ubus.list('wpa_supplicant') ||
-		global.ubus.call('wpa_supplicant', 'config_set', { phy, config: [] });
+		global.ubus.call('wpa_supplicant', 'config_set', { phy, config: [], defer: true });
 	return !!ap && !!sta;
+}
+
+// A STA-only radio still has a persistent firmware AP master. Its address
+// belongs to a separate netifd group until both role configurations retire.
+// Mixed mode is covered by hostapd's actual AP-address mirror instead.
+function master_macaddr_sync(group, phy, address) {
+	let list = {};
+	if (address)
+		list[group + '/master'] = macaddr_sync_entry(phy, -1, address, { static: true });
+	let result = macaddr_sync(global.ubus, 'network.wireless', group, list);
+	let error = libubus.error();
+	return !error && type(result) == 'object' &&
+		type(result.refused) == 'array' && !length(result.refused);
 }
 
 function reset(data) {
 	let sta = reset_phy(data?.sta_phy);
 	let ap = reset_phy(data?.ap_phy);
-	return ap && sta;
+	if (!ap || !sta)
+		return false;
+	return !data?.macaddr_group || master_macaddr_sync(data.macaddr_group);
+}
+
+function setup_failed(data, reason) {
+	return fail(reset(data) ? reason : 'WAVE_TEARDOWN_FAILED');
 }
 
 function iw(args) {
@@ -126,7 +146,9 @@ function setup(data) {
 	    (data.data?.ap_phy != radio.ap.phy && !reset_phy(radio.ap.phy)) ||
 	    (data.data?.sta_phy != radio.sta.phy && !reset_phy(radio.sta.phy)))
 		return fail('WAVE_TEARDOWN_FAILED');
-	netifd.set_data({ wave: true, phy: data.phy, ap_phy: radio.ap.phy, sta_phy: radio.sta.phy });
+	let owner = { wave: true, phy: data.phy, ap_phy: radio.ap.phy, sta_phy: radio.sta.phy,
+		macaddr_group: modes.sta && !mixed ? `wave/${radio.sta.phy}` : null };
+	netifd.set_data(owner);
 	configure_radio(radio.ap.phy, config);
 	let ap_data = { ...data, phy: radio.ap.phy, config: { ...config },
 		station_phy: mixed ? radio.sta.phy : null, channel_follow: !!mixed };
@@ -150,11 +172,14 @@ function setup(data) {
 		validate('iface', v.config);
 		for (let _, sta in v.stas)
 			validate('station', sta.config);
-		iface.prepare(v.config, phy, config.num_global_macaddr, config.macaddr_base);
+		iface.prepare(v.config);
 		// Reuse the factory address on the protected firmware master. Make
 		// this explicit so hostapd's allocator does not reserve it twice.
-		if (primary && mode == 'ap')
+		if (primary && mode == 'ap') {
+			if (v.config.default_macaddr)
+				v.config.macaddr = config.macaddr_base;
 			delete v.config.default_macaddr;
+		}
 		if (!v.config.default_macaddr) {
 			let address = lc(v.config.macaddr);
 			if (assigned[address])
@@ -182,22 +207,19 @@ function setup(data) {
 	}
 
 	if (modes.sta) {
+		if (owner.macaddr_group &&
+		    !master_macaddr_sync(owner.macaddr_group, sta_data.phy, master_mac))
+			return setup_failed(owner, 'WAVE_MAC_RESERVATION_FAILED');
 		if (!supplicant.setup(supplicant_data, sta_data))
-			return fail('WAVE_SUPPLICANT_FAILED');
-		// The AP wiphy owns the persistent firmware master. Reserve its
-		// address in the station allocator, which only sees the STA wiphy.
-		global.ubus.call('wpa_supplicant', 'phy_set_macaddr_list', {
-			phy: sta_data.phy, radio: config.radio, macaddr: [ master_mac ],
-		});
-		if (libubus.error())
-			return fail('WAVE_MAC_RESERVATION_FAILED');
+			return setup_failed(owner, 'WAVE_SUPPLICANT_FAILED');
 	}
+	// Native hostapd publishes every actual AP BSSID into the station scope
+	// before channel-follow callbacks can resume the deferred station.
 	if (modes.ap && !hostapd.setup(ap_data))
-		return fail('WAVE_HOSTAPD_FAILED');
-	if (modes.sta) {
-		if (!supplicant.start(sta_data))
-			return fail('WAVE_SUPPLICANT_FAILED');
-	}
+		return setup_failed(owner, 'WAVE_HOSTAPD_FAILED');
+	if (modes.sta && !supplicant.start(sta_data))
+		return setup_failed(owner, 'WAVE_SUPPLICANT_FAILED');
+
 	netifd.set_up();
 	return 0;
 }

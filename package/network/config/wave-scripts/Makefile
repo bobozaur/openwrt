@@ -3,7 +3,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wave-scripts
-PKG_RELEASE:=7
+PKG_RELEASE:=8
 PKG_LICENSE:=GPL-2.0-only
 
 include $(INCLUDE_DIR)/package.mk
@@ -12,7 +12,8 @@ define Package/wave-scripts
   SECTION:=utils
   CATEGORY:=Network
   TITLE:=WAVE radio configuration support
-  DEPENDS:=+wifi-scripts +iw +kmod-wave +@WIFI_SCRIPTS_UCODE
+  DEPENDS:=+wifi-scripts +iw +kmod-wave +hostapd-common +@WIFI_SCRIPTS_UCODE
+  EXTRA_DEPENDS:=hostapd-common (>=2026.08.07~831364bf-r29)
   PKGARCH:=all
 endef
 
