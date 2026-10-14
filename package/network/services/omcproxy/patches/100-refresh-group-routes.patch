@@ -1,12 +1,18 @@
-Subject: [PATCH] omcproxy: refresh group routes and retain configured downlinks
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] omcproxy: invalidate cached routes for a changed group
 
-Invalidate only cached sources of the changed group on the upstream MRIB.
-Initialize scope before synchronous group replay and remove only downlinks
-absent from the replacement configuration.
+A membership or source-filter change updates downstream group state, but
+previously cached upstream source routes still contain the old output set.
+Expire only that group's cached sources after updating the client, using
+the upstream MRIB and its native exact-group flush operation. Unrelated
+groups and multicast interface ownership remain unchanged.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- a/src/proxy.c
 +++ b/src/proxy.c
-@@ -92,8 +92,12 @@
+@@ -92,8 +92,12 @@ static void proxy_trigger(struct querier
  		bool include, const struct in6_addr *sources, size_t len)
  {
  	struct proxy_downlink *iface = container_of(user, struct proxy_downlink, iface);
@@ -20,25 +26,3 @@ absent from the replacement configuration.
  }
  
  // Remove proxy with given name
-@@ -158,7 +162,7 @@
- 		struct querier_user_iface *iface = container_of(user, struct querier_user_iface, user);
- 
- 		size_t i;
--		for (i = 0; i < downlinks_cnt && downlinks[i] == iface->iface->ifindex; ++i);
-+		for (i = 0; i < downlinks_cnt && downlinks[i] != iface->iface->ifindex; ++i);
- 		if (i == downlinks_cnt)
- 			proxy_remove_downlink(container_of(iface, struct proxy_downlink, iface));
- 	}
-@@ -187,10 +191,10 @@
- 		if (mrib_attach_user(&downlink->mrib, downlinks[i], NULL))
- 			goto downlink_err2;
- 
-+		/* Attaching can immediately announce existing group state. */
-+		downlink->flags = proxy->flags;
- 		if (querier_attach(&downlink->iface, &proxy->querier, downlinks[i], proxy_trigger))
- 			goto downlink_err1;
--
--		downlink->flags = proxy->flags;
- 		continue;
- 
- downlink_err1:
