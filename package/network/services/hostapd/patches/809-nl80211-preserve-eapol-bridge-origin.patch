@@ -1,3 +1,14 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: retain EAPOL bridge origin
+
+A bridge-bound EAPOL socket must retain the originating interface so the
+existing native receiver selects its actual BSS. Request PACKET_ORIGDEV
+without adding another authentication or bridge forwarding policy.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 --- a/src/drivers/driver_nl80211.c
 +++ b/src/drivers/driver_nl80211.c
 @@ -9514,6 +9514,7 @@

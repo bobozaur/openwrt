@@ -1,13 +1,14 @@
-Subject: [PATCH] hostapd: keep extended NSS capability checks in host byte order
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] hostapd: check VHT capabilities in host byte order
 
-The hardware VHT capability word and its masks are in host byte order.
-Converting the word before checking the mask makes the short-GI-160 bit
-look like extended NSS support on big-endian systems. This clears the
-advertised 160 MHz capability, omits its center-frequency segment from
-VHT Operation, and incorrectly selects extended-NSS HT operation fields.
+OpenWrt's inherited extended-NSS patch checks host VHT capability words.
+Those words and their masks are in host byte order. Converting a word
+before masking confuses short-GI-160 with extended NSS on big-endian hosts
+and incorrectly changes the advertised width and operation fields.
 
-Check host words directly, and convert masks when modifying little-endian
-capability fields. Cover HT Operation, VHT Operation and VHT Capabilities.
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/src/ap/ieee802_11_ht.c
 +++ b/src/ap/ieee802_11_ht.c

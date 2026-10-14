@@ -1,12 +1,14 @@
-Subject: [PATCH] AP: publish the configured Multi-AP role to userspace-MLME drivers
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] AP: publish the configured Multi-AP role to userspace MLME drivers
 
-Drivers which leave AP association responses to hostapd still need the configured
-BSS role before a station associates. Reuse the existing Multi-AP IE encoder in
-the AP association-response template for WPA_DRIVER_FLAGS_AP_MLME drivers.
+Userspace-MLME drivers need the configured local BSS role before station
+creation. Reuse the native Multi-AP association-response template encoder;
+an explicit empty template clears a previous role without changing the
+ordinary association-response producer.
 
-Allocate the template even when it is empty so a role-disable update sends an
-explicit NL80211_ATTR_IE_ASSOC_RESP clear. Device-SME templates and the actual
-per-station association-response conditions and contents remain unchanged.
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/src/ap/ap_drv_ops.c
 +++ b/src/ap/ap_drv_ops.c

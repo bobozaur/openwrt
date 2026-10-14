@@ -1,11 +1,14 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] mbedtls: delegate configured EAP peer identity verification
 
-mbedTLS 3.6.7 distinguishes an unspecified TLS hostname from an explicit
-request to use another peer-verification policy. EAP already verifies its
-configured leaf-certificate pin or domain and certificate-subject constraints
-in the native callback. Select that callback without replacing its policy
-with one SNI hostname. Preserve its pin/name policy, chain handling, and
-refusal of a missing peer identity policy.
+OpenWrt's mbedTLS EAP verifier already owns configured certificate-name constraints
+and leaf-certificate pins. Select that verifier without replacing its policy
+with one SNI hostname, while retaining chain validation, existing pin policy
+and refusal of an unspecified peer identity.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/src/crypto/tls_mbedtls.c
 +++ b/src/crypto/tls_mbedtls.c

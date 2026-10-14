@@ -1,3 +1,14 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] ucode: publish native shared-channel state changes
+
+Paired AP and station consumers need native AP state and completed channel
+changes, rather than inferring them from a configuration request. Notify the
+existing ucode owner after those native state transitions.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 --- a/src/ap/hostapd.c
 +++ b/src/ap/hostapd.c
 @@ -4405,6 +4405,7 @@

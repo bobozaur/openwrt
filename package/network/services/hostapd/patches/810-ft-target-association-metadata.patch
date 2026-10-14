@@ -1,13 +1,182 @@
-Subject: [PATCH] SME: rebuild target-dependent association metadata for FT
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] SME: refresh FT target association and security metadata
 
-FT over the DS bypasses the authentication setup that builds association
-metadata. Reusing those IEs advertises the previous AP operating class and
-capabilities after a cross-band transition. Reuse the existing auxiliary IE
-builders against the selected target. Supply the target RSNXE to the existing
-FT response owner before PTK/MIC construction so its cryptographic decision
-and the transmitted metadata agree. Ordinary over-air authentication retains
-its current target cache and the original FT key/state owners.
+FT over DS bypasses the normal authentication setup and can retain association
+metadata and AP security IEs from the old BSS. Reuse native metadata builders
+for the selected target, pass its RSNXE to the existing FT owner, and refresh
+target security IEs before reassociation validation. Keep the original FT
+cryptographic checks, strict RSNE comparison and key-installation lifetime.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/src/rsn_supp/wpa.h
++++ b/src/rsn_supp/wpa.h
+@@ -573,7 +573,8 @@
+ const u8 * wpa_sm_get_ft_md(struct wpa_sm *sm);
+ int wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
+ 			    int ft_action, const u8 *target_ap,
+-			    const u8 *ric_ies, size_t ric_ies_len);
++			    const u8 *ric_ies, size_t ric_ies_len,
++			    const u8 *target_rsnxe);
+ int wpa_ft_is_completed(struct wpa_sm *sm);
+ void wpa_reset_ft_completed(struct wpa_sm *sm);
+ int wpa_ft_validate_reassoc_resp(struct wpa_sm *sm, const u8 *ies,
+@@ -610,7 +611,9 @@
+ 
+ static inline int
+ wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
+-			int ft_action, const u8 *target_ap)
++			int ft_action, const u8 *target_ap,
++			const u8 *ric_ies, size_t ric_ies_len,
++			const u8 *target_rsnxe)
+ {
+ 	return 0;
+ }
+--- a/src/rsn_supp/wpa_ft.c
++++ b/src/rsn_supp/wpa_ft.c
+@@ -583,7 +583,8 @@
+ 
+ int wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
+ 			    int ft_action, const u8 *target_ap,
+-			    const u8 *ric_ies, size_t ric_ies_len)
++			    const u8 *ric_ies, size_t ric_ies_len,
++			    const u8 *target_rsnxe)
+ {
+ 	u8 *ft_ies;
+ 	size_t ft_ies_len;
+@@ -592,6 +593,11 @@
+ 	u8 ptk_name[WPA_PMK_NAME_LEN];
+ 	int ret = -1, res;
+ 	const u8 *bssid;
++	/* Over-DS still has the current AP's beacon cache. Select the target's
++	 * capabilities before deriving PTK and the reassociation MIC, without
++	 * replacing the associated AP cache or changing FT validation.
++	 */
++	const u8 *ap_rsnxe = ft_action ? target_rsnxe : sm->ap_rsnxe;
+ 	const u8 *kck;
+ 	size_t kck_len, kdk_len;
+ 
+@@ -708,7 +714,7 @@
+ 
+ 	if (sm->force_kdk_derivation ||
+ 	    (sm->secure_ltf &&
+-	     ieee802_11_rsnx_capab(sm->ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF)))
++	     ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF)))
+ 		kdk_len = WPA_KDK_MAX_LEN;
+ 	else
+ 		kdk_len = 0;
+@@ -726,7 +732,7 @@
+ 
+ #ifdef CONFIG_PASN
+ 	if (sm->secure_ltf &&
+-	    ieee802_11_rsnx_capab(sm->ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF) &&
++	    ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF) &&
+ 	    wpa_ltf_keyseed(&sm->ptk, sm->key_mgmt, sm->pairwise_cipher)) {
+ 		wpa_printf(MSG_DEBUG, "FT: Failed to derive LTF keyseed");
+ 		goto fail;
+@@ -745,7 +751,7 @@
+ 				    kck, kck_len, bssid,
+ 				    ric_ies, ric_ies_len,
+ 				    parse.mdie ? parse.mdie - 2 : NULL,
+-				    !sm->ap_rsnxe);
++				    !ap_rsnxe);
+ 	if (ft_ies) {
+ 		wpa_sm_update_ft_ies(sm, sm->mobility_domain,
+ 				     ft_ies, ft_ies_len);
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -4738,16 +4738,25 @@
+ 		return -1;
+ 	}
+ 
++	/*
++	 * FT over DS skips the SME authentication path that normally selects
++	 * the target AP's security IEs. Refresh them before validating the FT
++	 * Reassociation Response, rather than comparing it with the old AP.
++	 */
+ 	if (ft_completed &&
+-	    (wpa_s->drv_flags & WPA_DRIVER_FLAGS_BSS_SELECTION)) {
++	    (wpa_s->drv_flags & (WPA_DRIVER_FLAGS_BSS_SELECTION |
++				WPA_DRIVER_FLAGS_SME))) {
+ 		wpa_msg(wpa_s, MSG_INFO, "Attempt to roam to " MACSTR,
+ 			MAC2STR(bssid));
+-		if (!wpa_supplicant_update_current_bss(wpa_s, bssid)) {
++		if (!wpa_supplicant_update_current_bss(wpa_s, bssid) ||
++		    !wpa_bss_get_ie(wpa_s->current_bss, WLAN_EID_RSN) ||
++		    wpa_supplicant_assoc_update_ie(wpa_s) < 0) {
+ 			wpa_printf(MSG_ERROR,
+-				   "Can't find target AP's information!");
+-			return 0;
+-		}
+-		wpa_supplicant_assoc_update_ie(wpa_s);
++				   "Could not update FT target AP security information");
++			wpa_supplicant_deauthenticate(wpa_s,
++						      WLAN_REASON_INVALID_IE);
++			return -1;
++		}
+ 	}
+ 
+ 	if (data && wpa_supplicant_event_associnfo(wpa_s, data) < 0)
+@@ -5524,15 +5533,28 @@
+ wpa_supplicant_event_ft_response(struct wpa_supplicant *wpa_s,
+ 				 union wpa_event_data *data)
+ {
++	const u8 *target_rsnxe = NULL;
++	struct wpa_bss *target;
++
+ 	if (data == NULL)
+ 		return;
++
++	if (data->ft_ies.ft_action) {
++		target = wpa_bss_get_bssid(wpa_s, data->ft_ies.target_ap);
++		if (!target) {
++			wpa_printf(MSG_INFO, "FT: No target BSS for over-DS response");
++			return;
++		}
++		target_rsnxe = wpa_bss_get_rsnxe(wpa_s, target,
++					      wpa_s->current_ssid, false);
++	}
+ 
+ 	if (wpa_ft_process_response(wpa_s->wpa, data->ft_ies.ies,
+ 				    data->ft_ies.ies_len,
+ 				    data->ft_ies.ft_action,
+ 				    data->ft_ies.target_ap,
+ 				    data->ft_ies.ric_ies,
+-				    data->ft_ies.ric_ies_len) < 0) {
++				    data->ft_ies.ric_ies_len, target_rsnxe) < 0) {
+ 		/* TODO: prevent MLME/driver from trying to associate? */
+ 	}
+ }
+@@ -5582,6 +5604,8 @@
+ {
+ 	const u8 *sta_addr, *target_ap_addr;
+ 	u16 status;
++	struct wpa_bss *target;
++	const u8 *target_rsnxe;
+ 
+ 	wpa_hexdump(MSG_MSGDUMP, "FT: RX Action", data, len);
+ 	if (is_multicast_ether_addr(da)) {
+@@ -5616,9 +5640,17 @@
+ 		return;
+ 	}
+ 
++	target = wpa_bss_get_bssid(wpa_s, target_ap_addr);
++	if (!target) {
++		wpa_printf(MSG_INFO, "FT: No target BSS for over-DS response");
++		return;
++	}
++	target_rsnxe = wpa_bss_get_rsnxe(wpa_s, target,
++					  wpa_s->current_ssid, false);
++
+ 	if (wpa_ft_process_response(wpa_s->wpa, data + 1 + 2 * ETH_ALEN + 2,
+ 				    len - (1 + 2 * ETH_ALEN + 2), 1,
+-				    target_ap_addr, NULL, 0) < 0)
++				    target_ap_addr, NULL, 0, target_rsnxe) < 0)
+ 		return;
+ 
+ #ifdef CONFIG_SME
 --- a/wpa_supplicant/sme.c
 +++ b/wpa_supplicant/sme.c
 @@ -1194,6 +1194,174 @@
@@ -406,137 +575,3 @@ its current target cache and the original FT key/state owners.
  
  	os_memset(&params, 0, sizeof(params));
  
---- a/wpa_supplicant/events.c
-+++ b/wpa_supplicant/events.c
-@@ -5524,15 +5524,28 @@
- wpa_supplicant_event_ft_response(struct wpa_supplicant *wpa_s,
- 				 union wpa_event_data *data)
- {
-+	const u8 *target_rsnxe = NULL;
-+	struct wpa_bss *target;
-+
- 	if (data == NULL)
- 		return;
-+
-+	if (data->ft_ies.ft_action) {
-+		target = wpa_bss_get_bssid(wpa_s, data->ft_ies.target_ap);
-+		if (!target) {
-+			wpa_printf(MSG_INFO, "FT: No target BSS for over-DS response");
-+			return;
-+		}
-+		target_rsnxe = wpa_bss_get_rsnxe(wpa_s, target,
-+					      wpa_s->current_ssid, false);
-+	}
- 
- 	if (wpa_ft_process_response(wpa_s->wpa, data->ft_ies.ies,
- 				    data->ft_ies.ies_len,
- 				    data->ft_ies.ft_action,
- 				    data->ft_ies.target_ap,
- 				    data->ft_ies.ric_ies,
--				    data->ft_ies.ric_ies_len) < 0) {
-+				    data->ft_ies.ric_ies_len, target_rsnxe) < 0) {
- 		/* TODO: prevent MLME/driver from trying to associate? */
- 	}
- }
-@@ -5582,6 +5595,8 @@
- {
- 	const u8 *sta_addr, *target_ap_addr;
- 	u16 status;
-+	struct wpa_bss *target;
-+	const u8 *target_rsnxe;
- 
- 	wpa_hexdump(MSG_MSGDUMP, "FT: RX Action", data, len);
- 	if (is_multicast_ether_addr(da)) {
-@@ -5616,9 +5631,17 @@
- 		return;
- 	}
- 
-+	target = wpa_bss_get_bssid(wpa_s, target_ap_addr);
-+	if (!target) {
-+		wpa_printf(MSG_INFO, "FT: No target BSS for over-DS response");
-+		return;
-+	}
-+	target_rsnxe = wpa_bss_get_rsnxe(wpa_s, target,
-+					  wpa_s->current_ssid, false);
-+
- 	if (wpa_ft_process_response(wpa_s->wpa, data + 1 + 2 * ETH_ALEN + 2,
- 				    len - (1 + 2 * ETH_ALEN + 2), 1,
--				    target_ap_addr, NULL, 0) < 0)
-+				    target_ap_addr, NULL, 0, target_rsnxe) < 0)
- 		return;
- 
- #ifdef CONFIG_SME
---- a/src/rsn_supp/wpa_ft.c
-+++ b/src/rsn_supp/wpa_ft.c
-@@ -583,7 +583,8 @@
- 
- int wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
- 			    int ft_action, const u8 *target_ap,
--			    const u8 *ric_ies, size_t ric_ies_len)
-+			    const u8 *ric_ies, size_t ric_ies_len,
-+			    const u8 *target_rsnxe)
- {
- 	u8 *ft_ies;
- 	size_t ft_ies_len;
-@@ -592,6 +593,11 @@
- 	u8 ptk_name[WPA_PMK_NAME_LEN];
- 	int ret = -1, res;
- 	const u8 *bssid;
-+	/* Over-DS still has the current AP's beacon cache. Select the target's
-+	 * capabilities before deriving PTK and the reassociation MIC, without
-+	 * replacing the associated AP cache or changing FT validation.
-+	 */
-+	const u8 *ap_rsnxe = ft_action ? target_rsnxe : sm->ap_rsnxe;
- 	const u8 *kck;
- 	size_t kck_len, kdk_len;
- 
-@@ -708,7 +714,7 @@
- 
- 	if (sm->force_kdk_derivation ||
- 	    (sm->secure_ltf &&
--	     ieee802_11_rsnx_capab(sm->ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF)))
-+	     ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF)))
- 		kdk_len = WPA_KDK_MAX_LEN;
- 	else
- 		kdk_len = 0;
-@@ -726,7 +732,7 @@
- 
- #ifdef CONFIG_PASN
- 	if (sm->secure_ltf &&
--	    ieee802_11_rsnx_capab(sm->ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF) &&
-+	    ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF) &&
- 	    wpa_ltf_keyseed(&sm->ptk, sm->key_mgmt, sm->pairwise_cipher)) {
- 		wpa_printf(MSG_DEBUG, "FT: Failed to derive LTF keyseed");
- 		goto fail;
-@@ -745,7 +751,7 @@
- 				    kck, kck_len, bssid,
- 				    ric_ies, ric_ies_len,
- 				    parse.mdie ? parse.mdie - 2 : NULL,
--				    !sm->ap_rsnxe);
-+				    !ap_rsnxe);
- 	if (ft_ies) {
- 		wpa_sm_update_ft_ies(sm, sm->mobility_domain,
- 				     ft_ies, ft_ies_len);
---- a/src/rsn_supp/wpa.h
-+++ b/src/rsn_supp/wpa.h
-@@ -573,7 +573,8 @@
- const u8 * wpa_sm_get_ft_md(struct wpa_sm *sm);
- int wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
- 			    int ft_action, const u8 *target_ap,
--			    const u8 *ric_ies, size_t ric_ies_len);
-+			    const u8 *ric_ies, size_t ric_ies_len,
-+			    const u8 *target_rsnxe);
- int wpa_ft_is_completed(struct wpa_sm *sm);
- void wpa_reset_ft_completed(struct wpa_sm *sm);
- int wpa_ft_validate_reassoc_resp(struct wpa_sm *sm, const u8 *ies,
-@@ -610,7 +611,9 @@
- 
- static inline int
- wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
--			int ft_action, const u8 *target_ap)
-+			int ft_action, const u8 *target_ap,
-+			const u8 *ric_ies, size_t ric_ies_len,
-+			const u8 *target_rsnxe)
- {
- 	return 0;
- }

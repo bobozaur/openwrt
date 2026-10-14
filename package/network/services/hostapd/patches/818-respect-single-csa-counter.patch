@@ -1,3 +1,14 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] AP: respect the driver single CSA counter capability
+
+A driver advertising one CSA counter cannot apply a second independent
+countdown. Honor its existing capability when preparing a channel switch
+while preserving normal countdown behavior on other drivers.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 --- a/src/ap/hostapd.c
 +++ b/src/ap/hostapd.c
 @@ -4747,6 +4747,7 @@

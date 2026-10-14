@@ -1,3 +1,15 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] ucode: publish inline AP WPS settings through their native owner
+
+An inline AP configuration has no standalone configuration-file owner to
+accept received WPS settings. Return the exact BSS and validated settings to
+its existing ucode owner, and report protocol success only after that owner
+accepts publication. Preserve standalone and external credential processing.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 --- a/src/ap/wps_hostapd.c
 +++ b/src/ap/wps_hostapd.c
 @@ -571,34 +571,9 @@

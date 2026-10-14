@@ -1,4 +1,13 @@
-Subject: [PATCH] nl80211: observe absent peers with userspace AP SME
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: report unsolicited peer removal to userspace AP SME
+
+Kernel peer removal can precede the userspace AP state transition. Deliver the
+existing removal indication to that owner so stale stations and keys retire,
+without changing ordinary authentication admission.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/src/drivers/driver_nl80211_event.c
 +++ b/src/drivers/driver_nl80211_event.c

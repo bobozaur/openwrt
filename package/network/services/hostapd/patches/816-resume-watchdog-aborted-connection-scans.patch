@@ -1,11 +1,14 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] nl80211: resume connection scans after a watchdog abort
 
-A real aborted completion can arrive after the scan watchdog cancels an
-otherwise valid background scan. Keep discarding those partial results,
-but distinguish this failure from explicit cancellation and continue the
-owned connection scan through the existing scheduler. Learn completion
-support only from that matching native event; retain the existing timeout
-budgets and manual, external, disabled and disconnected behavior.
+A matching native aborted completion after the watchdog remains an incomplete
+scan, but a live connecting owner still needs its ordinary retry. Preserve
+explicit cancellation, manual/external scans, removed owners and original
+timeout budgets; do not select networks from aborted cached results.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/src/drivers/driver.h
 +++ b/src/drivers/driver.h

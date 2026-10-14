@@ -1,14 +1,13 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] ucode: use native channel centers for HT20 and HT40
 
-The negotiated channel producer already converts center_freq1 through
-ieee80211_freq_to_chan(), but discarded that index on 2.4 GHz. The native
-hostapd channel-switch callback retains it, causing the unchanged channel
-to fail an exact AP/STA transition comparison.
+Keep the center-channel index from ieee80211_freq_to_chan on every band.
+Use the same native HT20/40 center-frequency conversion for fallback metadata
+so paired AP/STA comparisons match completed channel-switch notifications.
 
-Keep the converted index on every supported band. For the frequency-info
-fallback, derive HT20/40 centers using hostapd's existing primary-plus-
-secondary-offset geometry and the same native converter. Wider channel
-mapping and channel permission checks remain unchanged.
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/wpa_supplicant/ucode.c
 +++ b/wpa_supplicant/ucode.c

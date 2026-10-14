@@ -419,6 +419,34 @@ Start WPS Push Button Configuration.
 `ubus call hostapd.wl5-fb wps_start`
 
 
+# UBUS methods - wpa_supplicant
+
+The following methods use the per-interface object `wpa_supplicant.<ifname>`.
+An optional `section` string fences the request against a replacement UCI
+interface; a mismatch returns Not Found. HTTP callers remain subject to the
+transport's read/write ACLs.
+
+## wps_start
+Start native push-button enrollment. Optional `multi_ap` overrides the
+interface's configured backhaul-station intent. Supplying `section` additionally
+requires a complete persistent client configuration assigned to one radio.
+Success acknowledges the native start command, not association or credential
+persistence.
+
+## wps_status
+Return current native connection `state`, bounded enrollment-result `phase` and
+`persistent` eligibility. Phases include `idle`, `active`, `connecting`, `waiting`,
+`saved`, `unconfirmed`, `conflict`, `cancelled`, `expired` and
+`unrepresentable credential`. `saved` confirms durable credential publication;
+`unconfirmed` retains an ambiguous publication outcome. This result is separate
+from current connection state and survives the resulting configuration reload.
+
+## wps_cancel
+Cancel an unfinished native handshake or withdraw pending credential persistence.
+For an established non-WPS profile, cancellation preserves the connection and
+a terminal saved result. Closing a UI status view does not invoke cancellation.
+
+
 # UBUS events - wpa_supplicant
 
 ## wps_credentials

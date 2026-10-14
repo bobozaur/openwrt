@@ -1,3 +1,15 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] WPS: expose the native registrar result lifetime
+
+Clients displaying enrollment need the native registrar and external-settings
+result, not a second session owner. Publish bounded result state and its age
+from the existing registrar lifecycle while retaining native completion,
+timeout and cancellation ownership.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
 --- a/src/ap/hostapd.h
 +++ b/src/ap/hostapd.h
