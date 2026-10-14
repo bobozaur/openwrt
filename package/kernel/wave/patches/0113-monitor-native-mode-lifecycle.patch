@@ -1,0 +1,149 @@
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -907,6 +907,7 @@
+ 
+   void                   *calibr_buffer;  /* Calibration Extension related */
+   uint32                 calibr_dma_addr;
++  uint32                 calibr_buffer_size;
+ 
+   uint8                  fw_log_is_supported;    /* FW Logger Extension related */
+   uint8                  fw_log_is_supported_ex;
+@@ -5774,29 +5775,48 @@
+ static void
+ _mtlk_mmb_cleanup_calibration_cache(mtlk_hw_t *hw)
+ {
++  if (!hw->calibr_buffer)
++    return;
++
+   mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+                             hw->calibr_dma_addr,
+-                            hw->chi_area.sCalibr.sData.u32BufferRequestedSize,
++                            hw->calibr_buffer_size,
+                             MTLK_DATA_BIDIRECTIONAL);
+   mtlk_osal_mem_free(hw->calibr_buffer);
+   hw->calibr_dma_addr = 0;
+   hw->calibr_buffer = NULL;
+-}
+-
+-static void _mtlk_mmb_set_calibration_buffers (mtlk_hw_t *hw)
+-{
+-
+-  memset(hw->calibr_buffer, 0, hw->chi_area.sCalibr.sData.u32BufferRequestedSize);
+-
+-  hw->calibr_dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
++  hw->calibr_buffer_size = 0;
++}
++
++static int _mtlk_mmb_set_calibration_buffers (mtlk_hw_t *hw)
++{
++  struct device *dev = mtlk_ccr_get_dev_ctx(hw->ccr);
++
++  memset(hw->calibr_buffer, 0, hw->calibr_buffer_size);
++  hw->calibr_dma_addr = mtlk_osal_map_to_phys_addr(dev,
+                                                    hw->calibr_buffer,
+-                                                   hw->chi_area.sCalibr.sData.u32BufferRequestedSize,
++                                                   hw->calibr_buffer_size,
+                                                    MTLK_DATA_BIDIRECTIONAL);
+-  MTLK_ASSERT(0 != hw->calibr_dma_addr);
++  if (dma_mapping_error(dev, hw->calibr_dma_addr))
++    goto failed;
++  /* The native HDK request uses zero to mean no host calibration cache. */
++  if (!hw->calibr_dma_addr) {
++    mtlk_osal_unmap_phys_addr(dev, hw->calibr_dma_addr,
++                              hw->calibr_buffer_size,
++                              MTLK_DATA_BIDIRECTIONAL);
++    goto failed;
++  }
+ 
+   ILOG0_DPD("Calibration buffer: dma_addr 0x%08X, virt_addr 0x%p, size %d",
+-            hw->calibr_dma_addr, hw->calibr_buffer, hw->chi_area.sCalibr.sData.u32BufferRequestedSize);
+-
++            hw->calibr_dma_addr, hw->calibr_buffer, hw->calibr_buffer_size);
++  return MTLK_ERR_OK;
++
++failed:
++  mtlk_osal_mem_free(hw->calibr_buffer);
++  hw->calibr_buffer = NULL;
++  hw->calibr_dma_addr = 0;
++  hw->calibr_buffer_size = 0;
++  return MTLK_ERR_NO_RESOURCES;
+ }
+ 
+ #define __CCR_IO_MASK__         ((1u << 24) - 1) /* 16M - accessible from the host */
+@@ -5828,8 +5848,8 @@
+                                               MTLK_MEM_TAG_EXTENSION);
+ 
+   if (hw->calibr_buffer) {
+-    _mtlk_mmb_set_calibration_buffers(hw);
+-    return MTLK_ERR_OK;
++    hw->calibr_buffer_size = hw->chi_area.sCalibr.sData.u32BufferRequestedSize;
++    return _mtlk_mmb_set_calibration_buffers(hw);
+   }
+   else {
+     WLOG_D("Can't allocate Calibration buffer of %d bytes",
+@@ -10749,6 +10769,7 @@
+ _wave_hw_mmb_restore (mtlk_hw_t *hw)
+ {
+   int res = MTLK_ERR_OK;
++  bool fresh_monitor;
+ 
+   MTLK_ASSERT(hw != NULL);
+   /* MTLK_ASSERT(hw->vap_manager != NULL); */
+@@ -10756,6 +10777,13 @@
+ 
+   if (READ_ONCE(hw->quiescing))
+     return MTLK_ERR_NOT_READY;
++
++  /* A monitor transition uses a complete fresh firmware/RX lifetime.
++   * Its completed PCI/IRQ/DMA/CPU fence owns the old cache before unmap.
++   * Ordinary fault recovery retains its native calibration-cache policy. */
++  fresh_monitor = smp_load_acquire(&hw->monitor_fenced);
++  if (fresh_monitor)
++    _mtlk_mmb_cleanup_calibration_cache(hw);
+ 
+   /* Reset FW and chip */
+   _mtlk_mmb_reset_all_events(hw);
+@@ -10906,6 +10934,12 @@
+   if (res != MTLK_ERR_OK) {
+     ELOG_D("MMB_Restore _mtlk_mmb_prealloc_rx_mgmt_buffers failed(%d)", res);
+     return res;
++  }
++
++  if (fresh_monitor) {
++    res = _mtlk_mmb_init_calibration_cache(hw);
++    if (res != MTLK_ERR_OK)
++      return res;
+   }
+ 
+   if (hw->chi_area.sMipsControl.sData.u32DescriptorLocation) {
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -5371,11 +5371,20 @@
+   mtlk_txmm_msg_t   man_msg;
+   mtlk_txmm_data_t *man_entry;
+   wave_int          band;
++  uint32            calibration_dma;
+   int res = MTLK_ERR_OK;
+ 
+   band = radio->wave_band;
+   ILOG0_DDD("band=%u, offline_algo_mask=0x%08x, online_algo_mask=0x%08x",
+             band, offline_mask, online_mask);
++
++  /* A fresh monitor firmware lifetime may replace the native cache.
++   * Publish the current mapped owner, never the previous DMA address. */
++  res = mtlk_hw_get_prop(radio->hw_api,
++                         MTLK_HW_CALIB_BUF_DMA_ADDR,
++                         &calibration_dma, sizeof(calibration_dma));
++  if (res != MTLK_ERR_OK)
++    goto end;
+ 
+   /* prepare msg for the FW */
+   if (!(man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, txmm, &res)))
+@@ -5391,6 +5400,7 @@
+ 
+   /* copy everything from our saved copy */
+   *req = *current_hdkconfig; /* struct copy */
++  req->calibrationBufferBaseAddress = HOST_TO_MAC32(calibration_dma);
+ 
+   /* change the things that can dynamically change */
+   req->hdkConf.band = band;

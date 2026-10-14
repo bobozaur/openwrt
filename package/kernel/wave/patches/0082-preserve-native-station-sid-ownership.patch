@@ -1,0 +1,187 @@
+Subject: [PATCH] wave: retain exact SID ownership through native station failures
+
+Prepare reservation and release replies before changing firmware ownership.
+Fence uncertain command results, withdraw a released SID before requesting its
+replacement, and propagate release failure into interface teardown's existing
+terminal fence. A failed replacement must not reuse the old peer's released SID.
+
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -1115,35 +1115,55 @@
+ {
+   mtlk_core_t *nic = HANDLE_T_PTR(mtlk_core_t, hcore);
+   mtlk_clpb_t *clpb = *(mtlk_clpb_t **) data;
+-  int res = MTLK_ERR_OK;
++  int res, *reply;
+   IEEE_ADDR *addr;
+   uint32 addr_size;
+-  uint16 sid;
++  uint16 *sid;
+ 
+   MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
+ 
+   addr = mtlk_clpb_enum_get_next(clpb, &addr_size);
+-  MTLK_CLPB_TRY(addr, addr_size)
+-    if (mtlk_vap_is_ap(nic->vap_handle) && !mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
+-      ILOG1_D("CID-%04x: HOSTAPD STA database is not synced", mtlk_vap_get_oid(nic->vap_handle));
+-      MTLK_CLPB_EXIT(MTLK_ERR_NOT_READY);
+-    }
+-
+-    /* Check that station is not connected */
+-    if (_core_cfg_check_sid_connected(nic, addr)) {
+-      MTLK_CLPB_EXIT(MTLK_ERR_ALREADY_EXISTS);
+-    }
+-
+-    res = core_cfg_internal_request_sid(nic, addr, &sid);
+-
+-  MTLK_CLPB_FINALLY(res)
+-    return mtlk_clpb_push_res_data(clpb, res, &sid, sizeof(sid));
+-  MTLK_CLPB_END
++  if (!addr || addr_size != sizeof(*addr))
++    return MTLK_ERR_PARAMS;
++
++  /* Reserve both reply records before firmware can allocate the SID. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++  sid = mtlk_osal_mem_alloc(sizeof(*sid), MTLK_MEM_TAG_CLPB);
++  if (!sid)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, sid, sizeof(*sid));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(sid);
++    return res;
++  }
++  *sid = DB_UNKNOWN_SID;
++
++  if (mtlk_vap_is_ap(nic->vap_handle) &&
++      !mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
++    *reply = MTLK_ERR_NOT_READY;
++  } else if (_core_cfg_check_sid_connected(nic, addr)) {
++    *reply = MTLK_ERR_ALREADY_EXISTS;
++  } else {
++    *reply = core_cfg_internal_request_sid(nic, addr, sid);
++    /* Lost command acknowledgement cannot permit a new SID admission. */
++    if (*reply != MTLK_ERR_OK && *reply != MTLK_ERR_NO_MEM &&
++        *reply != MTLK_ERR_MAC)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(nic->vap_handle));
++  }
++
++  return MTLK_ERR_OK;
+ }
+ 
+ int __MTLK_IFUNC core_cfg_remove_sid (mtlk_handle_t hcore, const void *data, uint32 data_size)
+ {
+-  int res;
++  int res, *reply;
+ 
+   uint16 *sid;
+   uint32 sid_size;
+@@ -1154,15 +1174,27 @@
+   MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
+ 
+   sid = mtlk_clpb_enum_get_next(clpb, &sid_size);
+-  MTLK_CLPB_TRY(sid, sid_size)
+-    if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
+-      ILOG1_D("CID-%04x: HOSTAPD STA database is not synced", mtlk_vap_get_oid(nic->vap_handle));
+-      MTLK_CLPB_EXIT(MTLK_ERR_NOT_READY);
+-    }
+-    res = core_remove_sid(nic, *sid);
+-  MTLK_CLPB_FINALLY(res)
+-    return mtlk_clpb_push_res(clpb, res);
+-  MTLK_CLPB_END
++  if (!sid || sid_size != sizeof(*sid))
++    return MTLK_ERR_PARAMS;
++
++  /* Never lose a successful release to a later clipboard allocation. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++  if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
++    *reply = MTLK_ERR_NOT_READY;
++  } else {
++    *reply = core_remove_sid(nic, *sid);
++    if (*reply != MTLK_ERR_OK && *reply != MTLK_ERR_NO_MEM &&
++        *reply != MTLK_ERR_MAC)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(nic->vap_handle));
++  }
++  return MTLK_ERR_OK;
+ }
+ 
+ int core_cfg_ap_disconnect_all (mtlk_handle_t hcore, const void* data, uint32 data_size)
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -895,35 +895,30 @@
+ {
+   struct wv_vif_priv *wv_iface_inf = (struct wv_vif_priv *)vif->drv_priv;
+   mtlk_df_user_t *df_user = wv_iface_inf->df_user;
+-  int ret = 0;
++  int ret;
++
++  if (wv_iface_inf->is_set_sid &&
++      ether_addr_equal(wv_iface_inf->peer_ap_addr, sta->addr))
++    return MTLK_ERR_OK;
+ 
+   if (wv_iface_inf->is_set_sid) {
+-    if(mtlk_osal_compare_eth_addresses(wv_iface_inf->peer_ap_addr, sta->addr) != 0) {
+-      ILOG2_V("change vif_sid");
+-      ret = wv_release_sid(df_user, wv_iface_inf->vif_sid);
+-      if (ret) {
+-        ELOG_V("wv_release_sid failed");
+-        return  ret;
+-      }
+-      ret = wv_request_sid(df_user, &wv_iface_inf->vif_sid, sta->addr);
+-      if (ret) {
+-        ELOG_V("wv_request_sid failed");
+-        return ret;
+-      }
+-      mtlk_osal_copy_eth_addresses(wv_iface_inf->peer_ap_addr, sta->addr);
+-    }
+-  } else {
+-    ILOG2_V("new vif_sid");
+-    ret = wv_request_sid(df_user, &wv_iface_inf->vif_sid, sta->addr);
++    ret = wv_release_sid(df_user, wv_iface_inf->vif_sid);
+     if (ret) {
+-      ELOG_V("wv_request_sid failed");
++      ELOG_V("wv_release_sid failed");
+       return ret;
+     }
+-    mtlk_osal_copy_eth_addresses(wv_iface_inf->peer_ap_addr, sta->addr);
+-    wv_iface_inf->is_set_sid = TRUE;
+-  }
+-
+-  return ret;
++    /* A failed replacement must not leave a released SID reusable. */
++    wv_iface_inf->is_set_sid = FALSE;
++  }
++
++  ret = wv_request_sid(df_user, &wv_iface_inf->vif_sid, sta->addr);
++  if (ret) {
++    ELOG_V("wv_request_sid failed");
++    return ret;
++  }
++  ether_addr_copy(wv_iface_inf->peer_ap_addr, sta->addr);
++  wv_iface_inf->is_set_sid = TRUE;
++  return MTLK_ERR_OK;
+ }
+ 
+ uint8* __MTLK_IFUNC
+@@ -1172,7 +1167,7 @@
+   if (priv->mac80211_no_queue)
+     ndev->priv_flags |= IFF_NO_QUEUE;
+   if (res == MTLK_ERR_OK && priv->is_set_sid)
+-    wv_release_sid(priv->df_user, priv->vif_sid);
++    res = wv_release_sid(priv->df_user, priv->vif_sid);
+ 
+   cfg.vap_handle = vap;
+   if (res == MTLK_ERR_OK) {

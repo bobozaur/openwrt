@@ -1,0 +1,17 @@
+--- a/ubus.c
++++ b/ubus.c
+@@ -826,6 +826,14 @@
+ 	struct device *dev;
+ 	void *a, *inactive;
+ 
++	static const char * const states[] = {
++		[IFS_DOWN] = "down", [IFS_SETUP] = "setup",
++		[IFS_UP] = "up", [IFS_TEARDOWN] = "teardown",
++	};
++
++	/* Pending only describes setup. Expose the authoritative protocol state
++	 * so shared-service owners can await teardown instead of inferring it. */
++	blobmsg_add_string(&b, "state", states[iface->state]);
+ 	blobmsg_add_u8(&b, "up", iface->state == IFS_UP);
+ 	blobmsg_add_u8(&b, "pending", iface->state == IFS_SETUP);
+ 	blobmsg_add_u8(&b, "available", iface->available);

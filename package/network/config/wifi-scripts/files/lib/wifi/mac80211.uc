@@ -53,7 +53,7 @@ function radio_exists(path, macaddr, phy, radio) {
 
 for (let phy_name, phy in board.wlan) {
 	let info = phy.info;
-	if (!info || !length(info.bands))
+	if (phy.skip_defaults || !info || !length(info.bands))
 		continue;
 
 	let radios = length(info.radios) > 0 ? info.radios : [{ bands: info.bands }];

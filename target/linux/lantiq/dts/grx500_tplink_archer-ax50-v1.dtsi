@@ -1,0 +1,158 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include "grx500.dtsi"
+#include <dt-bindings/input/input.h>
+
+/ {
+	compatible = "tplink,archer-ax50-v1", "lantiq,grx500";
+	model = "TP-Link Archer AX50 v1";
+
+	chosen { stdout-path = "serial0:115200n8"; };
+	aliases {
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
+	};
+
+	memory@20000000 {
+		device_type = "memory";
+		reg = <0x20000000 0x10000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		boot-monitor@20000000 {
+			reg = <0x20000000 0x20000>;
+			no-map;
+		};
+	};
+
+	keys {
+		compatible = "gpio-keys-polled";
+		poll-interval = <100>;
+		button-reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+		};
+		button-wps {
+			label = "wps";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&gpio0 8 GPIO_ACTIVE_LOW>;
+		};
+		button-led {
+			label = "lights_toggle";
+			linux,code = <KEY_LIGHTS_TOGGLE>;
+			gpios = <&gpio1 4 (GPIO_ACTIVE_LOW | GPIO_PULL_DISABLE)>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+		led_power: led-power {
+			label = "blue:power";
+			gpios = <&gpio0 21 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+		};
+		led-lan {
+			label = "blue:lan";
+			gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
+		};
+		led-usb {
+			label = "blue:usb";
+			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+		};
+		led-internet-orange {
+			label = "orange:internet";
+			gpios = <&gpio0 6 GPIO_ACTIVE_HIGH>;
+		};
+		led-internet-blue {
+			label = "blue:internet";
+			gpios = <&gpio0 7 GPIO_ACTIVE_HIGH>;
+		};
+		led-wlan2g {
+			label = "blue:wlan-2g";
+			gpios = <&gpio0 1 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "wave-0000:01:00.0-0-radio";
+		};
+		led-wlan5g {
+			label = "blue:wlan-5g";
+			gpios = <&gpio0 4 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "wave-0000:01:00.0-1-radio";
+		};
+	};
+};
+
+&asc0 { status = "okay"; };
+
+&gpio1 {
+	lantiq,bbspi-en = <0>;
+};
+
+&nand {
+	status = "okay";
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		partition@0 {
+			label = "uboot";
+			reg = <0x0 0x100000>;
+			read-only;
+		};
+		partition@100000 {
+			label = "ubootconfigA";
+			reg = <0x100000 0x40000>;
+		};
+		partition@140000 {
+			label = "ubootconfigB";
+			reg = <0x140000 0x40000>;
+		};
+		partition@180000 {
+			label = "gphyfirmware";
+			reg = <0x180000 0x40000>;
+			read-only;
+		};
+		partition@1c0000 {
+			label = "calibration";
+			reg = <0x1c0000 0x100000>;
+			read-only;
+		};
+		partition@2c0000 {
+			label = "system_sw";
+			reg = <0x2c0000 0x7c00000>;
+		};
+		partition@7ec0000 {
+			label = "res";
+			reg = <0x7ec0000 0x140000>;
+			read-only;
+		};
+	};
+};
+
+&pcie {
+	status = "okay";
+	main-reset-gpios = <&gpio1 11 (GPIO_ACTIVE_LOW | GPIO_PULL_DISABLE)>;
+	aux-reset-gpios = <&gpio1 29 (GPIO_ACTIVE_LOW | GPIO_PULL_DISABLE)>;
+};
+
+&usb0 {
+	status = "okay";
+	vbus-gpios = <&gpio0 14 GPIO_ACTIVE_LOW>;
+};
+
+&usb1 {
+	status = "okay";
+	vbus-gpios = <&gpio0 2 GPIO_ACTIVE_HIGH>;
+};
+
+&ethernet {
+	status = "okay";
+};
+
+&lan5 { label = "lan1"; };
+&lan4 { label = "lan2"; };
+&lan3 { label = "lan3"; };
+&lan2 { label = "lan4"; };

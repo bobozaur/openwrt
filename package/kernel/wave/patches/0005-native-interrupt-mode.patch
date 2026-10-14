@@ -1,0 +1,53 @@
+--- a/wireless/driver/linux/mtlk_mmb_drv.c
++++ b/wireless/driver/linux/mtlk_mmb_drv.c
+@@ -1149,8 +1149,6 @@
+              return MTLK_ERR_UNKNOWN;
+   }
+ 
+-  mtlk_hw_mmb_set_msi_intr_mode(obj->hw_api->hw, obj->irq_mode);
+-
+   for (i = 0; i < obj->nof_irqs; i++) {
+     MTLK_ASSERT(obj->irq_out[i]);
+ 
+@@ -1322,6 +1320,11 @@
+     pci_clear_master(obj->pdev);
+     return MTLK_ERR_NOT_READY;
+   }
++  /* Program the device output after PCI INTx is enabled, with its source
++   * still masked and firmware CPUs held in reset. IRQ handlers already own
++   * the line. This preserves the retained driver's PCI/device ordering. */
++  mtlk_hw_mmb_set_msi_intr_mode(obj->hw_api->hw, obj->irq_mode);
++  mtlk_ccr_print_irq_regs(&obj->ccr);
+   return MTLK_ERR_OK;
+ }
+ 
+--- a/wireless/driver/shared/mtlk_ccr_pcieg6.c
++++ b/wireless/driver/shared/mtlk_ccr_pcieg6.c
+@@ -1807,7 +1807,7 @@
+     /* Legacy IRQ mode */
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_MSI_ENABLE, PCIE_MSI_DISABLED);
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_LEGACY_INT_ENA, PCIE_LEGACY_INT_ENABLED);
+-    _CCR_RMW_REG_FIELD_(ccr_mem, 0, REG_PCIE_REGBLOCK_MSI_CAPABILITY,
++    _CCR_RMW_REG_FIELD_(ccr_mem, 0, PCIE_CFG_REGS_MSI_CAPABILITY,
+                                               MSI_CAPABILITY_REGISTER_CTRL_MSI_ENABLE,
+                                               MSI_CAPABILITY_REGISTER_CTRL_MSI_DISABLED);
+   } else {
+@@ -1815,7 +1815,7 @@
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_MSI_ENABLE, PCIE_MSI_ENABLED);
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_LEGACY_INT_ENA, PCIE_LEGACY_INT_DISABLED);
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_MSI_INTR_MODE, irq_mode);
+-    _CCR_RMW_REG_FIELD_(ccr_mem, 0, REG_PCIE_REGBLOCK_MSI_CAPABILITY,
++    _CCR_RMW_REG_FIELD_(ccr_mem, 0, PCIE_CFG_REGS_MSI_CAPABILITY,
+                                               MSI_CAPABILITY_REGISTER_CTRL_MSI_ENABLE,
+                                               MSI_CAPABILITY_REGISTER_CTRL_MSI_ENABLED);
+   }
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -4099,6 +4099,7 @@
+   mtlk_ccr_disable_interrupts(hw->ccr, MTLK_IRQ_ALL);
+   mtlk_ccr_clear_interrupts_if_pending(hw->ccr, (uint32) -1);
+   mtlk_ccr_switch_to_iram_boot(hw->ccr);
++  mtlk_ccr_print_irq_regs(hw->ccr);
+   hw->perform_isr_action = isr_action_init;
+   MTLK_HW_INIT_EVT_RESET(hw);
+   mtlk_ccr_enable_interrupts(hw->ccr, MTLK_IRQ_ALL);

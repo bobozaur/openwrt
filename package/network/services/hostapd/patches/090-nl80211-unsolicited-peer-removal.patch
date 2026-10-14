@@ -1,0 +1,25 @@
+Subject: [PATCH] nl80211: observe absent peers with userspace AP SME
+
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -2500,6 +2500,20 @@
+ 		return;
+ 	}
+ 
++	if (is_ap_interface(drv->nlmode) && !bss->valid_links) {
++		struct hostap_sta_driver_data sta_data = { 0 };
++
++		/* A userspace-SME driver can lose a peer independently, e.g. when
++		 * firmware revokes its keys by removing the station. However,
++		 * hostapd also removes/re-adds stations during authentication.
++		 * Ignore delayed events for a peer that has already been re-added,
++		 * and do not interpret an unrelated query failure as absence.
++		 */
++		if (nl80211_get_link_signal(bss, addr, &sta_data) == -ENOENT)
++			drv_event_disassoc(bss->ctx, addr);
++		return;
++	}
++
+ 	if (drv->nlmode != NL80211_IFTYPE_ADHOC)
+ 		return;
+ 

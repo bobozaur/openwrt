@@ -1,0 +1,619 @@
+--- a/src/ndp.c
++++ b/src/ndp.c
+@@ -28,18 +28,315 @@
+ 
+ #include <linux/filter.h>
+ #include <linux/neighbour.h>
++#include <net/if.h>
++#include <netlink/errno.h>
+ 
+ #include "dhcpv6.h"
+ #include "odhcpd.h"
+ 
+ 
+ static void ndp_netevent_cb(unsigned long event, struct netevent_handler_info *info);
+-static void setup_route(struct in6_addr *addr, struct interface *iface, bool add);
+-static void setup_addr_for_relaying(struct in6_addr *addr, struct interface *iface, bool add);
+ static void handle_solicit(void *addr, void *data, size_t len,
+ 		struct interface *iface, void *dest);
+ 
+ static struct netevent_handler ndp_netevent_handler = { .cb = ndp_netevent_cb, };
++
++/* Runtime ownership survives configuration reloads, which clear iface->ndp
++ * before setup is called. Never infer ownership from a kernel proxy flag or
++ * route metric: either may also belong to an administrator. */
++struct ndp_runtime {
++	struct list_head head;
++	struct interface *iface;
++	int ifindex;
++	bool learn_routes;
++};
++
++enum ndp_source_reason {
++	NDP_SOURCE_ADDR = 1,
++	NDP_SOURCE_NEIGH = 2,
++};
++
++struct ndp_source {
++	struct list_head head;
++	struct ndp_runtime *runtime;
++	struct in6_addr addr;
++	unsigned int reasons;
++};
++
++struct ndp_allocation {
++	struct list_head head;
++	struct in6_addr addr;
++	int ifindex;
++	uint32_t metric;
++	bool proxy;
++	bool wanted;
++};
++
++static LIST_HEAD(ndp_runtimes);
++static LIST_HEAD(ndp_sources);
++static LIST_HEAD(ndp_allocations);
++static void ndp_reconcile(void);
++static void ndp_retry_cb(struct uloop_timeout *timeout);
++static void ndp_update_cb(struct uloop_timeout *timeout);
++static struct uloop_timeout ndp_retry = { .cb = ndp_retry_cb };
++static struct uloop_timeout ndp_update = { .cb = ndp_update_cb };
++static unsigned int ndp_retry_delay = 250;
++static bool ndp_retry_needed;
++static bool ndp_stopping;
++
++static void ndp_schedule_retry(void)
++{
++	if (!ndp_stopping && !ndp_retry.pending) {
++		uloop_timeout_set(&ndp_retry, ndp_retry_delay);
++		ndp_retry_delay = min(ndp_retry_delay * 2, 30000U);
++	}
++}
++
++static void ndp_retry_cb(_o_unused struct uloop_timeout *timeout)
++{
++	ndp_reconcile();
++}
++
++static void ndp_update_cb(_o_unused struct uloop_timeout *timeout)
++{
++	ndp_reconcile();
++}
++
++static struct ndp_runtime *ndp_runtime_find(struct interface *iface)
++{
++	struct ndp_runtime *runtime;
++
++	list_for_each_entry(runtime, &ndp_runtimes, head)
++		if (runtime->iface == iface)
++			return runtime;
++
++	return NULL;
++}
++
++static void ndp_want(const struct in6_addr *addr, int ifindex, bool proxy, bool create)
++{
++	struct ndp_allocation *allocation;
++	int ret;
++
++	list_for_each_entry(allocation, &ndp_allocations, head) {
++		if (allocation->ifindex == ifindex && allocation->proxy == proxy &&
++		    allocation->metric == (proxy ? 0 : 1024) &&
++		    !memcmp(&allocation->addr, addr, sizeof(*addr))) {
++			allocation->wanted = true;
++			return;
++		}
++	}
++
++	if (!create)
++		return;
++
++	/* Linux proxy-neighbour creation does not implement NLM_F_EXCL.
++	 * Preserve entries already present; this does not arbitrate another
++	 * writer concurrently creating the identical key. */
++	if (proxy) {
++		ret = netlink_get_interface_proxy_neigh(ifindex, addr);
++		if (ret) {
++			if (ret < 0)
++				ndp_retry_needed = true;
++			return;
++		}
++	}
++
++	allocation = calloc(1, sizeof(*allocation));
++	if (!allocation) {
++		ndp_retry_needed = true;
++		return;
++	}
++
++	ret = proxy ? netlink_setup_proxy_neigh(addr, ifindex, true) :
++		netlink_setup_route_owned(addr, 128, ifindex, NULL, 1024, true);
++	if (ret) {
++		if (ret != -NLE_EXIST)
++			ndp_retry_needed = true;
++		free(allocation);
++		return;
++	}
++
++	allocation->addr = *addr;
++	allocation->ifindex = ifindex;
++	allocation->metric = proxy ? 0 : 1024;
++	allocation->proxy = proxy;
++	allocation->wanted = true;
++	list_add_tail(&allocation->head, &ndp_allocations);
++}
++
++static void ndp_mark_demand(bool create)
++{
++	struct ndp_source *source;
++	struct ndp_runtime *target;
++
++	list_for_each_entry(source, &ndp_sources, head) {
++		if ((source->reasons & NDP_SOURCE_NEIGH) && source->runtime->learn_routes)
++			ndp_want(&source->addr, source->runtime->ifindex, false, create);
++
++		list_for_each_entry(target, &ndp_runtimes, head)
++			if (target->ifindex != source->runtime->ifindex)
++				ndp_want(&source->addr, target->ifindex, true, create);
++	}
++}
++
++static bool ndp_release(struct ndp_allocation *allocation)
++{
++	char ifname[IF_NAMESIZE];
++	int ret = 0;
++
++	if (if_indextoname(allocation->ifindex, ifname))
++		ret = allocation->proxy ?
++			netlink_setup_proxy_neigh(&allocation->addr, allocation->ifindex, false) :
++			netlink_setup_route_owned(&allocation->addr, 128,
++				allocation->ifindex, NULL, allocation->metric, false);
++	if (ret && ret != -NLE_OBJ_NOTFOUND) {
++		error("Failed to withdraw owned NDP %s on interface %d: %d",
++		      allocation->proxy ? "proxy" : "route", allocation->ifindex, ret);
++		return false;
++	}
++
++	list_del(&allocation->head);
++	free(allocation);
++	return true;
++}
++
++static void ndp_reconcile(void)
++{
++	struct ndp_allocation *allocation, *next;
++
++	uloop_timeout_cancel(&ndp_update);
++	ndp_retry_needed = false;
++
++	list_for_each_entry(allocation, &ndp_allocations, head)
++		allocation->wanted = false;
++	ndp_mark_demand(false);
++
++	/* Retire old routes before creating replacements, including when an
++	 * address moves between interfaces. Keep failed withdrawals for retry. */
++	list_for_each_entry_safe(allocation, next, &ndp_allocations, head) {
++		if (allocation->wanted)
++			continue;
++
++		if (!ndp_release(allocation))
++			ndp_retry_needed = true;
++	}
++
++	ndp_mark_demand(true);
++	if (ndp_retry_needed) {
++		ndp_schedule_retry();
++	} else {
++		uloop_timeout_cancel(&ndp_retry);
++		ndp_retry_delay = 250;
++	}
++}
++
++static bool ndp_observe(struct ndp_runtime *runtime, const struct in6_addr *addr,
++		unsigned int reason, bool add)
++{
++	struct ndp_source *source, *found = NULL;
++
++	if (IN6_IS_ADDR_UNSPECIFIED(addr) || IN6_IS_ADDR_LINKLOCAL(addr) ||
++	    IN6_IS_ADDR_LOOPBACK(addr) || IN6_IS_ADDR_MULTICAST(addr))
++		return false;
++
++	list_for_each_entry(source, &ndp_sources, head)
++		if (source->runtime == runtime && !memcmp(&source->addr, addr, sizeof(*addr))) {
++			found = source;
++			break;
++		}
++
++	if (!found && add) {
++		found = calloc(1, sizeof(*found));
++		if (!found)
++			return false;
++		found->addr = *addr;
++		found->runtime = runtime;
++		list_add_tail(&found->head, &ndp_sources);
++	}
++	if (!found || (!!(found->reasons & reason) == add))
++		return false;
++
++	if (add)
++		found->reasons |= reason;
++	else
++		found->reasons &= ~reason;
++
++	if (!found->reasons) {
++		list_del(&found->head);
++		free(found);
++	}
++	return true;
++}
++
++static void ndp_retire(struct ndp_runtime *runtime)
++{
++	struct ndp_source *source, *next;
++
++	list_for_each_entry_safe(source, next, &ndp_sources, head)
++		if (source->runtime == runtime) {
++			list_del(&source->head);
++			free(source);
++		}
++	list_del(&runtime->head);
++	free(runtime);
++	ndp_reconcile();
++}
++
++static int ndp_activate(struct interface *iface)
++{
++	struct ndp_runtime *runtime = ndp_runtime_find(iface);
++	struct ndp_source *source, *next;
++	struct odhcpd_ipaddr *addrs = NULL;
++	ssize_t count = netlink_get_interface_addrs(iface->ifindex, true, &addrs);
++	time_t now = odhcpd_time();
++
++	if (count < 0)
++		return -1;
++	if (!runtime) {
++		runtime = calloc(1, sizeof(*runtime));
++		if (!runtime) {
++			free(addrs);
++			return -1;
++		}
++		runtime->iface = iface;
++		runtime->ifindex = iface->ifindex;
++		list_add_tail(&runtime->head, &ndp_runtimes);
++	}
++	runtime->learn_routes = iface->learn_routes;
++
++	/* Refresh local-address reasons without losing learned-neighbour reasons. */
++	list_for_each_entry_safe(source, next, &ndp_sources, head)
++		if (source->runtime == runtime)
++			ndp_observe(runtime, &source->addr, NDP_SOURCE_ADDR, false);
++	for (ssize_t i = 0; i < count; i++)
++		if (addrs[i].valid_lt > (uint32_t)now)
++			ndp_observe(runtime, &addrs[i].addr.in6, NDP_SOURCE_ADDR, true);
++	free(addrs);
++
++	ndp_reconcile();
++	return 0;
++}
++
++static void ndp_shutdown(void)
++{
++	struct ndp_runtime *runtime, *next;
++	struct ndp_source *source, *next_source;
++
++	/* Registered after netlink_init(), so the request socket is still live. */
++	ndp_stopping = true;
++	uloop_timeout_cancel(&ndp_update);
++	uloop_timeout_cancel(&ndp_retry);
++	list_for_each_entry_safe(source, next_source, &ndp_sources, head) {
++		list_del(&source->head);
++		free(source);
++	}
++	list_for_each_entry_safe(runtime, next, &ndp_runtimes, head) {
++		list_del(&runtime->head);
++		free(runtime);
++	}
++	ndp_reconcile();
++}
+ 
+ /* Initialize NDP-proxy */
+ int ndp_init(void)
+@@ -50,6 +347,9 @@
+ 		error("Failed to add ndp netevent handler");
+ 		ret = -1;
+ 	}
++
++	if (!ret)
++		atexit(ndp_shutdown);
+ 
+ 	return ret;
+ }
+@@ -80,11 +380,20 @@
+ 		.filter = (struct sock_filter *)bpf,
+ 	};
+ 
++	struct ndp_runtime *runtime;
+ 	int ret = 0, procfd;
+ 	bool dump_neigh = false;
+ 	char procbuf[64];
+ 
+ 	enable = enable && (iface->ndp == MODE_RELAY);
++
++	/* This must precede opening procfs: the old netdev may already be gone. */
++	runtime = ndp_runtime_find(iface);
++	if (runtime && (!enable || runtime->ifindex != iface->ifindex)) {
++		ndp_retire(runtime);
++		runtime = NULL;
++	}
++	dump_neigh = !runtime;
+ 
+ 	snprintf(procbuf, sizeof(procbuf), "/proc/sys/net/ipv6/conf/%s/proxy_ndp", iface->ifname);
+ 	procfd = open(procbuf, O_WRONLY);
+@@ -107,7 +416,6 @@
+ 		if (!enable)
+ 			if (write(procfd, "0\n", 2) < 0) {}
+ 
+-		dump_neigh = true;
+ 	}
+ 
+ 	if (enable) {
+@@ -235,19 +543,22 @@
+ 		iface->ndp_event.handle_dgram = handle_solicit;
+ 		odhcpd_register(&iface->ndp_event);
+ 
+-		/* If we already were enabled dump is unnecessary, if not do dump */
+-		if (!dump_neigh)
++		if (ndp_activate(iface)) {
++			ret = -1;
++			goto out;
++		}
++		if (dump_neigh)
+ 			netlink_dump_neigh_table(false);
+-		else
+-			dump_neigh = false;
+-	}
+-
+-	if (dump_neigh)
+-		netlink_dump_neigh_table(true);
++	}
+ 
+  out:
+ 	if (ret < 0) {
++		runtime = ndp_runtime_find(iface);
++		if (runtime)
++			ndp_retire(runtime);
++
+ 		if (iface->ndp_event.uloop.fd >= 0) {
++			uloop_fd_delete(&iface->ndp_event.uloop);
+ 			close(iface->ndp_event.uloop.fd);
+ 			iface->ndp_event.uloop.fd = -1;
+ 		}
+@@ -267,46 +578,52 @@
+ static void ndp_netevent_cb(unsigned long event, struct netevent_handler_info *info)
+ {
+ 	struct interface *iface = info->iface;
++	struct ndp_runtime *runtime;
++	unsigned int reason;
++	const struct in6_addr *addr;
+ 	bool add = true;
+ 
+-	if (!iface || iface->ndp == MODE_DISABLED)
++	if (!iface)
++		return;
++	if (event == NETEV_IFINDEX_CHANGE) {
++		ndp_setup_interface(iface, iface->ifindex > 0 && (iface->ifflags & IFF_RUNNING));
++		return;
++	}
++	if (iface->ndp != MODE_RELAY)
++		return;
++	runtime = ndp_runtime_find(iface);
++	if (!runtime || runtime->ifindex != iface->ifindex)
+ 		return;
+ 
+ 	switch (event) {
+ 	case NETEV_ADDR6_DEL:
+ 		add = false;
+-		netlink_dump_neigh_table(false);
+ 		_o_fallthrough;
+ 	case NETEV_ADDR6_ADD:
+-		setup_addr_for_relaying(&info->addr.in6, iface, add);
++		addr = &info->addr.in6;
++		reason = NDP_SOURCE_ADDR;
+ 		break;
+ 	case NETEV_NEIGH6_DEL:
+ 		add = false;
+ 		_o_fallthrough;
+ 	case NETEV_NEIGH6_ADD:
+-		if (info->neigh.flags & NTF_PROXY) {
+-			if (add) {
+-				netlink_setup_proxy_neigh(&info->neigh.dst.in6, iface->ifindex, false);
+-				setup_route(&info->neigh.dst.in6, iface, false);
+-				netlink_dump_neigh_table(false);
+-			}
+-			break;
+-		}
+-
+-		if (add &&
+-		    !(info->neigh.state &
+-		      (NUD_REACHABLE|NUD_STALE|NUD_DELAY|NUD_PROBE|NUD_PERMANENT|NUD_NOARP)))
+-			break;
+-
+-		setup_addr_for_relaying(&info->neigh.dst.in6, iface, add);
+-		setup_route(&info->neigh.dst.in6, iface, add);
+-
+-		if (!add)
+-			netlink_dump_neigh_table(false);
++		/* A proxy is output state, not a learned host or an ownership receipt. */
++		if (info->neigh.flags & NTF_PROXY)
++			return;
++		if (add && !(info->neigh.state &
++		    (NUD_REACHABLE | NUD_STALE | NUD_DELAY | NUD_PROBE | NUD_PERMANENT | NUD_NOARP)))
++			return;
++		addr = &info->neigh.dst.in6;
++		reason = NDP_SOURCE_NEIGH;
+ 		break;
+ 	default:
+-		break;
+-	}
++		return;
++	}
++
++	if (ndp_observe(runtime, addr, reason, add) && !ndp_update.pending)
++		uloop_timeout_set(&ndp_update, 0);
++	if (!add)
++		netlink_dump_neigh_table(false);
+ }
+ 
+ /* Send an ICMP-ECHO. This is less for actually pinging but for the
+@@ -317,17 +634,33 @@
+ 	struct sockaddr_in6 dest = { .sin6_family = AF_INET6, .sin6_addr = *addr , };
+ 	struct icmp6_hdr echo = { .icmp6_type = ICMP6_ECHO_REQUEST };
+ 	struct iovec iov = { .iov_base = &echo, .iov_len = sizeof(echo) };
++	struct ndp_allocation *allocation;
+ 	char ipbuf[INET6_ADDRSTRLEN];
++	int ret;
+ 
+ 	inet_ntop(AF_INET6, addr, ipbuf, sizeof(ipbuf));
+ 	debug("Pinging for %s on %s", ipbuf, iface->name);
+ 
+-	netlink_setup_route(addr, 128, iface->ifindex, NULL, 128, true);
+-
+-	/* Use link-local address as source for RFC 4861 compliance and macOS compatibility */
++	allocation = calloc(1, sizeof(*allocation));
++	if (!allocation)
++		return;
++	ret = netlink_setup_route_owned(addr, 128, iface->ifindex, NULL, 128, true);
++	if (ret) {
++		free(allocation);
++		if (ret != -NLE_EXIST)
++			return;
++	} else {
++		allocation->addr = *addr;
++		allocation->ifindex = iface->ifindex;
++		allocation->metric = 128;
++		list_add_tail(&allocation->head, &ndp_allocations);
++	}
++
++	/* Use link-local address as source for RFC 4861 compliance and macOS compatibility. */
+ 	odhcpd_try_send_with_src(iface->ndp_ping_fd, &dest, &iov, 1, iface);
+ 
+-	netlink_setup_route(addr, 128, iface->ifindex, NULL, 128, false);
++	if (!ret && !ndp_release(allocation))
++		ndp_schedule_retry();
+ }
+ 
+ /* Send a Neighbor Advertisement. */
+@@ -422,38 +755,3 @@
+ 	}
+ }
+ 
+-/* Use rtnetlink to modify kernel routes */
+-static void setup_route(struct in6_addr *addr, struct interface *iface, bool add)
+-{
+-	char ipbuf[INET6_ADDRSTRLEN];
+-
+-	inet_ntop(AF_INET6, addr, ipbuf, sizeof(ipbuf));
+-	debug("%s about %s%s on %s",
+-	      (add) ? "Learning" : "Forgetting",
+-	      iface->learn_routes ? "proxy routing for " : "",
+-	      ipbuf, iface->name);
+-
+-	if (iface->learn_routes)
+-		netlink_setup_route(addr, 128, iface->ifindex, NULL, 1024, add);
+-}
+-
+-static void setup_addr_for_relaying(struct in6_addr *addr, struct interface *iface, bool add)
+-{
+-	struct interface *c;
+-	char ipbuf[INET6_ADDRSTRLEN];
+-
+-	inet_ntop(AF_INET6, addr, ipbuf, sizeof(ipbuf));
+-
+-	avl_for_each_element(&interfaces, c, avl) {
+-		if (iface == c || c->ndp != MODE_RELAY)
+-			continue;
+-
+-		if (netlink_setup_proxy_neigh(addr, c->ifindex, add)) {
+-			if (add)
+-				error("Failed to add proxy neighbour entry %s on %s",
+-				      ipbuf, c->name);
+-		} else
+-			debug("%s proxy neighbour entry %s on %s",
+-			      add ? "Added" : "Deleted", ipbuf, c->name);
+-	}
+-}
+--- a/src/netlink.c
++++ b/src/netlink.c
+@@ -1010,6 +1010,7 @@
+ 	if (ctxt.ret < 0)
+ 		goto free;
+ 
++	ctxt.ret = 0;
+ 	while (ctxt.pending)
+ 		nl_recvmsgs(rtnl_socket, cb);
+ 
+@@ -1022,9 +1023,9 @@
+ }
+ 
+ 
+-int netlink_setup_route(const struct in6_addr *addr, const int prefixlen,
++static int setup_route(const struct in6_addr *addr, const int prefixlen,
+ 		const int ifindex, const struct in6_addr *gw,
+-		const uint32_t metric, const bool add)
++		const uint32_t metric, const bool add, const bool exclusive)
+ {
+ 	struct nl_msg *msg;
+ 	struct rtmsg rtm = {
+@@ -1032,14 +1033,14 @@
+ 		.rtm_dst_len = prefixlen,
+ 		.rtm_src_len = 0,
+ 		.rtm_table = RT_TABLE_MAIN,
+-		.rtm_protocol = (add ? RTPROT_STATIC : RTPROT_UNSPEC),
++		.rtm_protocol = (add || exclusive ? RTPROT_STATIC : RTPROT_UNSPEC),
+ 		.rtm_scope = (add ? (gw ? RT_SCOPE_UNIVERSE : RT_SCOPE_LINK) : RT_SCOPE_NOWHERE),
+ 		.rtm_type = (add ? RTN_UNICAST : RTN_UNSPEC),
+ 	};
+ 	int ret = 0;
+ 
+ 	msg = nlmsg_alloc_simple(add ? RTM_NEWROUTE : RTM_DELROUTE,
+-					add ? NLM_F_CREATE | NLM_F_REPLACE : 0);
++					add ? NLM_F_CREATE | (exclusive ? NLM_F_EXCL : NLM_F_REPLACE) : 0);
+ 	if (!msg)
+ 		return -1;
+ 
+@@ -1059,6 +1060,23 @@
+ 		return ret;
+ 
+ 	return nl_wait_for_ack(rtnl_socket);
++}
++
++
++
++int netlink_setup_route(const struct in6_addr *addr, const int prefixlen,
++		const int ifindex, const struct in6_addr *gw,
++		const uint32_t metric, const bool add)
++{
++	return setup_route(addr, prefixlen, ifindex, gw, metric, add, false);
++}
++
++/* Callers may withdraw only routes for which exclusive creation succeeded. */
++int netlink_setup_route_owned(const struct in6_addr *addr, const int prefixlen,
++		const int ifindex, const struct in6_addr *gw,
++		const uint32_t metric, const bool add)
++{
++	return setup_route(addr, prefixlen, ifindex, gw, metric, add, true);
+ }
+ 
+ 
+--- a/src/odhcpd.h
++++ b/src/odhcpd.h
+@@ -637,6 +637,9 @@
+ int netlink_setup_route(const struct in6_addr *addr, const int prefixlen,
+ 			const int ifindex, const struct in6_addr *gw,
+ 			const uint32_t metric, const bool add);
++int netlink_setup_route_owned(const struct in6_addr *addr, const int prefixlen,
++		const int ifindex, const struct in6_addr *gw,
++		const uint32_t metric, const bool add);
+ int netlink_setup_proxy_neigh(const struct in6_addr *addr,
+ 			      const int ifindex, const bool add);
+ int netlink_setup_addr(struct odhcpd_ipaddr *oaddr,

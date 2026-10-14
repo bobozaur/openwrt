@@ -1,0 +1,31 @@
+From: AX50 OpenWrt bring-up <noreply@example.invalid>
+Subject: [PATCH] wave: keep the exclusive monitor out of software iftypes
+
+The monitor consumes the native firmware master and requires exclusive
+ownership of both physical radios.  It is not an unrestricted software
+interface, so advertise it only in interface_modes.
+
+OpenWrt uses software monitor support to distinguish mac80211 from full-MAC
+devices.  Setting that bit made it skip reuse of WAVE's persistent AP master
+and attempt to create a second AP with the same name, breaking ordinary AP
+startup on the monitor-capable radio.
+
+The supported single monitor remains admitted by cfg80211 interface_modes;
+single interface types do not belong in iface_combinations.  The existing
+whole-card claim still rejects AP, station, scan and CAC coexistence.  Keep
+the AP combinations and genuinely software AP-VLAN type unchanged.
+
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -2891,8 +2891,10 @@
+   wiphy->interface_modes = BIT(NL80211_IFTYPE_AP);
+   if (radio_id == 0 && wave_hw_monitor_supported(HANDLE_T_PTR(mtlk_hw_t, hw_handle))) {
+     wiphy->interface_modes |= BIT(NL80211_IFTYPE_MONITOR);
+-    wiphy->software_iftypes |= BIT(NL80211_IFTYPE_MONITOR);
++    /* This receiver owns the firmware master and both radios exclusively.
++     * It is a hardware mode, not an unrestricted software interface. Keep
++     * full-MAC master reuse and the existing AP combinations intact. */
+   }
+ #if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
+   wiphy->interface_modes |= BIT(NL80211_IFTYPE_AP_VLAN);
+   wiphy->software_iftypes |= BIT(NL80211_IFTYPE_AP_VLAN);

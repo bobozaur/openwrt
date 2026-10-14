@@ -1,0 +1,56 @@
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -10908,11 +10908,11 @@
+   unsigned int i;
+ 
+   /* Firmware is given a local RD index. Verify it against the DMA owner;
+-   * retained firmware may return completions in a different pool order. */
++   * Ethernet decapsulation can move the payload within the allocation. */
+   if (index < bdr->nof_bds) {
+     entry = _mtlk_basic_bdr_get_mirror_bd(bdr, index, struct mtlk_hw_bss_ind_mirror);
+     if (entry->dma_addr && address >= entry->dma_addr &&
+-        address - entry->dma_addr < 16)
++        address - entry->dma_addr < entry->size)
+       return entry;
+   }
+   for (i = 0; i < bdr->nof_bds; i++) {
+@@ -10920,7 +10920,7 @@
+       continue;
+     entry = _mtlk_basic_bdr_get_mirror_bd(bdr, i, struct mtlk_hw_bss_ind_mirror);
+     if (entry->dma_addr && address >= entry->dma_addr &&
+-        address - entry->dma_addr < 16)
++        address - entry->dma_addr < entry->size)
+       return entry;
+   }
+   return NULL;
+@@ -10996,15 +10996,26 @@
+   }
+ 
+   owner = wave_mgmt_rx_owner(hw, hostpayload, HD_BD_INDEX_GET(pHD));
+-  if (!owner)
++  if (!owner) {
++    ELOG_DD("BSS RX has no owned mapping: index=%u address=0x%08x",
++             HD_BD_INDEX_GET(pHD), hostpayload);
+     goto critical_error;
+-  lead = hostpayload - owner->dma_addr + offset;
+-  if (lead >= 16 || size > BSS_MGMT_FRAME_SIZE || lead > owner->size ||
+-      size > owner->size - lead)
++  }
++  lead = hostpayload - owner->dma_addr;
++  if (offset > owner->size - lead)
+     goto critical_error;
++  lead += offset;
++  if (size > BSS_MGMT_FRAME_SIZE || size > owner->size - lead) {
++    ELOG_DDD("BSS RX exceeds owned mapping: lead=%u length=%u allocation=%u",
++             lead, size, owner->size);
++    goto critical_error;
++  }
+   is_eapol = ((type == (IEEE80211_FTYPE_DATA >> 2)) &&
+               (frame_type == FRAME_TYPE_EAPOL ||
+                (frame_type == FRAME_TYPE_ETHERNET && hw->bss_mgmt.rx_eapol.data_size)));
++  if (is_eapol && lead >= RX_MGMT_ALIGN_SIZE)
++    ILOG0_DDDD("BSS RX EAPOL mapping: index=%u lead=%u length=%u allocation=%u",
++                HD_BD_INDEX_GET(pHD), lead, size, owner->size);
+   total_size = lead + size;
+   if (!is_eapol) {
+     if (is_gen5) {

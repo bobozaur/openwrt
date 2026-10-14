@@ -1,0 +1,52 @@
+Subject: [PATCH] AP: publish the configured Multi-AP role to userspace-MLME drivers
+
+Drivers which leave AP association responses to hostapd still need the configured
+BSS role before a station associates. Reuse the existing Multi-AP IE encoder in
+the AP association-response template for WPA_DRIVER_FLAGS_AP_MLME drivers.
+
+Allocate the template even when it is empty so a role-disable update sends an
+explicit NL80211_ATTR_IE_ASSOC_RESP clear. Device-SME templates and the actual
+per-station association-response conditions and contents remain unchanged.
+
+--- a/src/ap/ap_drv_ops.c
++++ b/src/ap/ap_drv_ops.c
+@@ -84,6 +84,18 @@
+ 	if (add_buf_data(&assocresp, buf, pos - buf) < 0 ||
+ 	    add_buf_data(&proberesp, buf, pos - buf) < 0)
+ 		goto fail;
++
++	if (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_AP_MLME) {
++		/*
++		 * Publish the configured BSS role for drivers using hostapd's
++		 * per-station association responses. Keep an explicit empty
++		 * template when the role is disabled so updates clear old IEs.
++		 */
++		pos = hostapd_eid_multi_ap(hapd, buf, sizeof(buf));
++		if (wpabuf_resize(&assocresp, pos - buf) != 0)
++			goto fail;
++		wpabuf_put_data(assocresp, buf, pos - buf);
++	}
+ #endif /* NEED_AP_MLME */
+ 
+ 	pos = buf;
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -99,7 +99,7 @@
+ #endif /* CONFIG_IEEE8021X_AUTH */
+ 
+ 
+-static u8 * hostapd_eid_multi_ap(struct hostapd_data *hapd, u8 *eid, size_t len)
++u8 * hostapd_eid_multi_ap(struct hostapd_data *hapd, u8 *eid, size_t len)
+ {
+ 	struct multi_ap_params multi_ap = { 0 };
+ 
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -64,6 +64,7 @@
+ void hostapd_2040_coex_action(struct hostapd_data *hapd,
+ 			      const struct ieee80211_mgmt *mgmt, size_t len);
+ #ifdef NEED_AP_MLME
++u8 * hostapd_eid_multi_ap(struct hostapd_data *hapd, u8 *eid, size_t len);
+ int ieee802_11_get_mib(struct hostapd_data *hapd, char *buf, size_t buflen);
+ int ieee802_11_get_mib_sta(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   char *buf, size_t buflen);

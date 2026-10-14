@@ -1,0 +1,257 @@
+Subject: [PATCH] nl80211: resume connection scans after a watchdog abort
+
+A real aborted completion can arrive after the scan watchdog cancels an
+otherwise valid background scan. Keep discarding those partial results,
+but distinguish this failure from explicit cancellation and continue the
+owned connection scan through the existing scheduler. Learn completion
+support only from that matching native event; retain the existing timeout
+budgets and manual, external, disabled and disconnected behavior.
+
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -7284,6 +7284,8 @@
+ 	/**
+ 	 * struct scan_info - Optional data for EVENT_SCAN_RESULTS events
+ 	 * @aborted: Whether the scan was aborted
++	 * @aborted_by_timeout: A matching native completion confirms an abort
++	 *	requested by the driver scan watchdog, rather than an explicit cancel
+ 	 * @freqs: Scanned frequencies in MHz (%NULL = all channels scanned)
+ 	 * @num_freqs: Number of entries in freqs array
+ 	 * @ssids: Scanned SSIDs (%NULL or zero-length SSID indicates wildcard
+@@ -7302,6 +7304,7 @@
+ 	 */
+ 	struct scan_info {
+ 		int aborted;
++		int aborted_by_timeout;
+ 		const int *freqs;
+ 		size_t num_freqs;
+ 		struct wpa_driver_scan_ssid ssids[WPAS_MAX_SCAN_SSIDS];
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -125,6 +125,8 @@
+ 	u8 rand_addr[ETH_ALEN];
+ 
+ 	unsigned int start_iface_up:1;
++	/* Current normal scan only; never survives explicit cancellation. */
++	unsigned int scan_timeout_abort:1;
+ };
+ 
+ struct drv_nl80211_if_info {
+--- a/src/drivers/driver_nl80211_scan.c
++++ b/src/drivers/driver_nl80211_scan.c
+@@ -164,7 +164,7 @@
+ #endif /* CONFIG_DRIVER_NL80211_QCA */
+ 
+ 	for (bss = drv->first_bss; bss; bss = bss->next) {
+-		if (bss->scan_link)
++		if (bss->scan_link && bss->ctx == timeout_ctx)
+ 			break;
+ 	}
+ 
+@@ -173,11 +173,19 @@
+ 		return;
+ 	}
+ 
++	/* Record intent before submitting; only the matching completion may
++	 * report it as a watchdog abort or establish event support. */
++	bss->scan_timeout_abort = !bss->in_deinit &&
++		!drv->vendor_scan_cookie && !drv->scan_for_auth &&
++		drv->last_scan_cmd == NL80211_CMD_TRIGGER_SCAN &&
++		(drv->scan_state == SCAN_REQUESTED ||
++		 drv->scan_state == SCAN_STARTED);
+ 	if (!drv->vendor_scan_cookie &&
+ 	    nl80211_abort_scan(bss) == 0) {
+ 		bss->scan_link = NULL;
+ 		return;
+ 	}
++	bss->scan_timeout_abort = 0;
+ 
+ 	wpa_printf(MSG_DEBUG, "nl80211: Failed to abort scan");
+ 
+@@ -373,6 +381,7 @@
+ 	int ret = -1, timeout;
+ 	struct nl_msg *msg = NULL;
+ 
++	bss->scan_timeout_abort = 0;
+ 	wpa_dbg(bss->ctx, MSG_DEBUG, "nl80211: scan request");
+ 	drv->scan_for_auth = 0;
+ 
+@@ -573,6 +582,7 @@
+ 	struct nl_msg *msg;
+ 	size_t i;
+ 
++	bss->scan_timeout_abort = 0;
+ 	wpa_dbg(drv->ctx, MSG_DEBUG, "nl80211: sched_scan request");
+ 
+ #ifdef ANDROID
+@@ -1133,6 +1143,11 @@
+ 	struct i802_bss *bss = priv;
+ #ifdef CONFIG_DRIVER_NL80211_QCA
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
++#endif /* CONFIG_DRIVER_NL80211_QCA */
++
++	/* Public cancellation supersedes a pending watchdog request. */
++	bss->scan_timeout_abort = 0;
++#ifdef CONFIG_DRIVER_NL80211_QCA
+ 
+ 	/*
+ 	 * If scan_cookie is zero, a normal scan through kernel (cfg80211)
+@@ -1190,6 +1205,7 @@
+ 	int ret = -1;
+ 	u64 cookie = 0;
+ 
++	bss->scan_timeout_abort = 0;
+ 	wpa_dbg(drv->ctx, MSG_DEBUG, "nl80211: vendor scan request");
+ 	drv->scan_for_auth = 0;
+ 
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -2208,7 +2208,8 @@
+ 
+ 
+ static void send_scan_event(struct i802_bss *bss, int aborted,
+-			    struct nlattr *tb[], int external_scan)
++			    struct nlattr *tb[], int external_scan,
++			    int aborted_by_timeout)
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	union wpa_event_data event;
+@@ -2232,6 +2233,7 @@
+ 	os_memset(&event, 0, sizeof(event));
+ 	info = &event.scan_info;
+ 	info->aborted = aborted;
++	info->aborted_by_timeout = aborted_by_timeout;
+ 	info->external_scan = external_scan;
+ 	info->nl_scan_event = 1;
+ 
+@@ -4868,6 +4870,7 @@
+ {
+ 	struct wpa_driver_nl80211_data *drv = bss->drv;
+ 	int external_scan_event = 0;
++	int watchdog_abort = 0;
+ 	struct nlattr *frame = tb[NL80211_ATTR_FRAME];
+ 
+ 	wpa_printf(MSG_DEBUG, "nl80211: Drv Event %d (%s) received for %s",
+@@ -4919,6 +4922,7 @@
+ 		wpa_supplicant_event(bss->ctx, EVENT_SCAN_STARTED, NULL);
+ 		break;
+ 	case NL80211_CMD_START_SCHED_SCAN:
++		bss->scan_timeout_abort = 0;
+ 		wpa_dbg(bss->ctx, MSG_DEBUG, "nl80211: Sched scan started");
+ 		drv->scan_state = SCHED_SCAN_STARTED;
+ 		break;
+@@ -4940,13 +4944,14 @@
+ 		} else {
+ 			external_scan_event = 1;
+ 		}
+-		send_scan_event(bss, 0, tb, external_scan_event);
++		bss->scan_timeout_abort = 0;
++		send_scan_event(bss, 0, tb, external_scan_event, 0);
+ 		break;
+ 	case NL80211_CMD_SCHED_SCAN_RESULTS:
+ 		wpa_dbg(bss->ctx, MSG_DEBUG,
+ 			"nl80211: New sched scan results available");
+ 		drv->scan_state = SCHED_SCAN_RESULTS;
+-		send_scan_event(bss, 0, tb, 0);
++		send_scan_event(bss, 0, tb, 0, 0);
+ 		break;
+ 	case NL80211_CMD_SCAN_ABORTED:
+ 		wpa_dbg(bss->ctx, MSG_DEBUG, "nl80211: Scan aborted");
+@@ -4957,13 +4962,18 @@
+ 			 * Need to indicate that scan results are available in
+ 			 * order not to make wpa_supplicant stop its scanning.
+ 			 */
++			watchdog_abort = bss->scan_timeout_abort;
++			if (watchdog_abort)
++				drv->scan_complete_events = 1;
+ 			eloop_cancel_timeout(wpa_driver_nl80211_scan_timeout,
+ 					     drv, bss->ctx);
+ 			drv->last_scan_cmd = 0;
+ 		} else {
+ 			external_scan_event = 1;
+ 		}
+-		send_scan_event(bss, 1, tb, external_scan_event);
++		bss->scan_timeout_abort = 0;
++		send_scan_event(bss, 1, tb, external_scan_event,
++				watchdog_abort);
+ 		break;
+ 	case NL80211_CMD_AUTHENTICATE:
+ 	case NL80211_CMD_ASSOCIATE:
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -3729,6 +3729,7 @@
+ 		   bss->ifname, drv->disabled_11b_rates);
+ 
+ 	bss->in_deinit = 1;
++	bss->scan_timeout_abort = 0;
+ 	if (drv->data_tx_status)
+ 		eloop_unregister_read_sock(drv->eapol_tx_sock);
+ 	if (drv->eapol_tx_sock >= 0)
+@@ -9913,6 +9914,7 @@
+ 	wpa_printf(MSG_DEBUG, "nl80211: %s(type=%d ifname=%s) ifindex=%d added_if=%d",
+ 		   __func__, type, ifname, ifindex, bss->added_if);
+ 
++	bss->scan_timeout_abort = 0;
+ 	eloop_cancel_timeout(wpa_driver_nl80211_scan_timeout, drv, bss->ctx);
+ 
+ 	if (ifindex > 0 && (bss->added_if || bss->ifindex != ifindex))
+@@ -9944,6 +9946,7 @@
+ 	}
+ 
+ 	bss->in_deinit = 1;
++	bss->scan_timeout_abort = 0;
+ 	if (bss != drv->first_bss) {
+ 		struct i802_bss *tbss;
+ 
+@@ -10530,6 +10533,7 @@
+ 	/* First remove the link locally */
+ 	os_memset(link->addr, 0, ETH_ALEN);
+ 
++	bss->scan_timeout_abort = 0;
+ 	eloop_cancel_timeout(wpa_driver_nl80211_scan_timeout, drv, bss->ctx);
+ 	/* Clear the active links and set the flink */
+ 	nl80211_update_active_links(bss, link_id);
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -2518,6 +2518,7 @@
+ 	int ap = 0;
+ 	bool trigger_6ghz_scan;
+ 	bool short_ssid_match_found = false;
++	bool retry_watchdog_scan = false;
+ #ifndef CONFIG_NO_RANDOM_POOL
+ 	size_t i, num;
+ #endif /* CONFIG_NO_RANDOM_POOL */
+@@ -2656,6 +2657,21 @@
+ 	if (data && data->scan_info.aborted) {
+ 		wpa_dbg(wpa_s, MSG_DEBUG,
+ 			"Scan was aborted - do not use the incomplete scan results to trigger new operations");
++		/* A watchdog abort is a failed connection scan, not an operator
++		 * cancellation. Retire its radio work before scheduling a fresh
++		 * scan; partial results must never drive network selection. */
++		retry_watchdog_scan = data->scan_info.aborted_by_timeout &&
++			data->scan_info.nl_scan_event && own_request &&
++			wpa_s->own_scan_running && wpa_s->scan_work &&
++			wpa_s->scan_work->started &&
++			wpa_s->last_scan_req != MANUAL_SCAN_REQ &&
++			wpa_s->scan_req == NORMAL_SCAN_REQ &&
++			wpa_s->wpa_state == WPA_SCANNING &&
++			wpa_s->conf->ap_scan == 1 &&
++			!wpa_s->disconnected && !wpa_s->interface_removed &&
++			!wpa_s->beacon_rep_data.token &&
++			!wpa_s->scan_res_fail_handler &&
++			wpa_supplicant_enabled_networks(wpa_s);
+ 		goto scan_work_done;
+ 	}
+ 
+@@ -2739,6 +2755,11 @@
+ 		struct wpa_radio_work *work = wpa_s->scan_work;
+ 		wpa_s->scan_work = NULL;
+ 		radio_work_done(work);
++	}
++	if (retry_watchdog_scan) {
++		wpa_msg(wpa_s, MSG_INFO, WPA_EVENT_SCAN_FAILED
++			"ret=%d retry=1 reason=watchdog", -ETIMEDOUT);
++		wpa_supplicant_req_new_scan(wpa_s, 1, 0);
+ 	}
+ 	return ret;
+ }

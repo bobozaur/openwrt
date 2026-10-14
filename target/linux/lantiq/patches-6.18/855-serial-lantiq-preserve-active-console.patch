@@ -1,0 +1,129 @@
+Subject: [PATCH] serial: lantiq: retain console TX after tty shutdown
+
+The kernel console continues using polling output after the last tty closes.
+Keep its baud generator and TX FIFO running while retiring tty IRQ/RX ownership.
+Balance the tty CCF clock reference independently of the console setup reference,
+including startup failures. Legacy direct gates stay on for an active console.
+
+--- a/drivers/tty/serial/lantiq.c
++++ b/drivers/tty/serial/lantiq.c
+@@ -323,6 +323,36 @@
+ {
+ }
+ 
++static void lqasc_release_tty_clock(struct uart_port *port)
++{
++	struct ltq_uart_port *ltq_port = to_ltq_uart_port(port);
++
++	/* Legacy clock gates have no reference count for the console owner. */
++	if (!IS_ERR(ltq_port->clk) &&
++	    (IS_ENABLED(CONFIG_COMMON_CLK) || !uart_console_registered(port)))
++		clk_disable_unprepare(ltq_port->clk);
++}
++
++static void lqasc_hw_shutdown(struct uart_port *port)
++{
++	struct ltq_uart_port *ltq_port = to_ltq_uart_port(port);
++	bool console = uart_console_registered(port);
++	unsigned long flags;
++
++	spin_lock_irqsave(&ltq_port->lock, flags);
++	__raw_writel(0, port->membase + LTQ_ASC_IRNREN);
++	lqasc_stop_rx(port);
++	asc_update_bits(ASCRXFCON_RXFEN, ASCRXFCON_RXFFLU,
++		port->membase + LTQ_ASC_RXFCON);
++	/* The registered console keeps polling TX after the last tty closes. */
++	if (!console) {
++		__raw_writel(0, port->membase + LTQ_ASC_CON);
++		asc_update_bits(ASCTXFCON_TXFEN, ASCTXFCON_TXFFLU,
++			port->membase + LTQ_ASC_TXFCON);
++	}
++	spin_unlock_irqrestore(&ltq_port->lock, flags);
++}
++
+ static int
+ lqasc_startup(struct uart_port *port)
+ {
+@@ -330,8 +360,11 @@
+ 	int retval;
+ 	unsigned long flags;
+ 
+-	if (!IS_ERR(ltq_port->clk))
+-		clk_prepare_enable(ltq_port->clk);
++	if (!IS_ERR(ltq_port->clk)) {
++		retval = clk_prepare_enable(ltq_port->clk);
++		if (retval)
++			return retval;
++	}
+ 	port->uartclk = clk_get_rate(ltq_port->freqclk);
+ 
+ 	spin_lock_irqsave(&ltq_port->lock, flags);
+@@ -357,8 +390,11 @@
+ 	spin_unlock_irqrestore(&ltq_port->lock, flags);
+ 
+ 	retval = ltq_port->soc->request_irq(port);
+-	if (retval)
++	if (retval) {
++		lqasc_hw_shutdown(port);
++		lqasc_release_tty_clock(port);
+ 		return retval;
++	}
+ 
+ 	__raw_writel(ASC_IRNREN_RX | ASC_IRNREN_ERR | ASC_IRNREN_TX,
+ 		port->membase + LTQ_ASC_IRNREN);
+@@ -369,19 +405,11 @@
+ lqasc_shutdown(struct uart_port *port)
+ {
+ 	struct ltq_uart_port *ltq_port = to_ltq_uart_port(port);
+-	unsigned long flags;
+-
++
++	lqasc_hw_shutdown(port);
+ 	ltq_port->soc->free_irq(port);
+-
+-	spin_lock_irqsave(&ltq_port->lock, flags);
+-	__raw_writel(0, port->membase + LTQ_ASC_CON);
+-	asc_update_bits(ASCRXFCON_RXFEN, ASCRXFCON_RXFFLU,
+-		port->membase + LTQ_ASC_RXFCON);
+-	asc_update_bits(ASCTXFCON_TXFEN, ASCTXFCON_TXFFLU,
+-		port->membase + LTQ_ASC_TXFCON);
+-	spin_unlock_irqrestore(&ltq_port->lock, flags);
+-	if (!IS_ERR(ltq_port->clk))
+-		clk_disable_unprepare(ltq_port->clk);
++	/* With CCF, console setup owns a separate clock reference. */
++	lqasc_release_tty_clock(port);
+ }
+ 
+ static void
+@@ -622,6 +650,7 @@
+ 	int bits = 8;
+ 	int parity = 'n';
+ 	int flow = 'n';
++	int ret;
+ 
+ 	if (co->index >= MAXPORTS)
+ 		return -ENODEV;
+@@ -632,14 +661,20 @@
+ 
+ 	port = &ltq_port->port;
+ 
+-	if (!IS_ERR(ltq_port->clk))
+-		clk_prepare_enable(ltq_port->clk);
++	if (!IS_ERR(ltq_port->clk)) {
++		ret = clk_prepare_enable(ltq_port->clk);
++		if (ret)
++			return ret;
++	}
+ 
+ 	port->uartclk = clk_get_rate(ltq_port->freqclk);
+ 
+ 	if (options)
+ 		uart_parse_options(options, &baud, &parity, &bits, &flow);
+-	return uart_set_options(port, co, baud, parity, bits, flow);
++	ret = uart_set_options(port, co, baud, parity, bits, flow);
++	if (ret && !IS_ERR(ltq_port->clk))
++		clk_disable_unprepare(ltq_port->clk);
++	return ret;
+ }
+ 
+ static struct console lqasc_console = {

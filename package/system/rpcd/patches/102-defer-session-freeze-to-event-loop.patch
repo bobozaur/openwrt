@@ -1,0 +1,78 @@
+Subject: [PATCH] Freeze sessions from the event-loop reload boundary
+
+The raw HUP/USR1 signal handler serialized sessions using allocator-backed
+global RPC state. A reload could interrupt a request using that same session
+tree or blob buffer, causing reentrancy, corruption or a stuck allocator.
+
+Use native uloop signal watchers to request loop exit, then freeze sessions
+after the active callback has completed. HUP still executes the same daemon
+and thaws its native sessions; USR1 retains its existing freeze-and-exit policy.
+
+--- a/main.c
++++ b/main.c
+@@ -33,15 +33,16 @@
+ 
+ static struct ubus_context *ctx;
+ static bool respawn = false;
++static bool freeze_sessions = false;
+ 
+ int rpc_exec_timeout = RPC_EXEC_DEFAULT_TIMEOUT;
+ 
+ static void
+-handle_signal(int sig)
++handle_signal(struct uloop_signal *signal)
+ {
+-	rpc_session_freeze();
+-	uloop_cancelled = true;
+-	respawn = (sig == SIGHUP);
++	freeze_sessions = true;
++	respawn = (signal->signo == SIGHUP);
++	uloop_end();
+ }
+ 
+ static void
+@@ -68,10 +69,14 @@
+ 
+ int main(int argc, char **argv)
+ {
++	struct uloop_signal signals[] = {
++		{ .cb = handle_signal, .signo = SIGHUP },
++		{ .cb = handle_signal, .signo = SIGUSR1 },
++	};
+ 	struct stat s;
+ 	const char *hangup;
+ 	const char *ubus_socket = NULL;
+-	int ch;
++	int ch, i;
+ 
+ 	while ((ch = getopt(argc, argv, "s:t:")) != -1) {
+ 		switch (ch) {
+@@ -101,10 +106,15 @@
+ 	umask(0077);
+ 
+ 	signal(SIGPIPE, SIG_IGN);
+-	signal(SIGHUP,  handle_signal);
+-	signal(SIGUSR1, handle_signal);
+ 
+ 	uloop_init();
++	for (i = 0; i < ARRAY_SIZE(signals); i++) {
++		if (uloop_signal_add(&signals[i])) {
++			fprintf(stderr, "Failed to register reload signal\n");
++			uloop_done();
++			return -1;
++		}
++	}
+ 
+ 	ctx = ubus_connect(ubus_socket);
+ 	if (!ctx) {
+@@ -127,6 +137,10 @@
+ 		rpc_session_thaw();
+ 
+ 	uloop_run();
++	/* Session serialization uses the same state and blob buffer as RPCs.
++	 * Finish the current callback before taking the reload snapshot. */
++	if (freeze_sessions)
++		rpc_session_freeze();
+ 	ubus_free(ctx);
+ 	uloop_done();
+ 

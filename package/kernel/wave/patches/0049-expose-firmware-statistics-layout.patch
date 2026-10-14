@@ -1,0 +1,127 @@
+Subject: [PATCH] expose the firmware statistics layout beside the raw data
+
+The statistics layout is supplied by firmware. Export its parsed metadata
+so readers can decode the existing raw endpoint without guessing offsets.
+Publish both files only after table validation succeeds, and remove both
+before freeing the immutable layout. The binary endpoint is unchanged.
+
+--- a/wireless/driver/shared/hw_mmb.h
++++ b/wireless/driver/shared/hw_mmb.h
+@@ -483,6 +483,10 @@
+ int __MTLK_IFUNC
+ mtlk_hw_mhi_get_stats (mtlk_hw_t *hw);
+ 
++struct seq_file;
++int __MTLK_IFUNC
++mtlk_hw_seq_write_mhi_stats_layout(mtlk_hw_t *hw, struct seq_file *s);
++
+ int __MTLK_IFUNC
+ mtlk_hw_mhi_copy_stats (mtlk_hw_t *hw, uint8 *buff, uint32 *size);
+ 
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -6102,6 +6102,37 @@
+ }
+ 
+ int __MTLK_IFUNC
++mtlk_hw_seq_write_mhi_stats_layout(mtlk_hw_t *hw, struct seq_file *s)
++{
++    const hw_mhi_stats_t *stats = &hw->hw_mhi_stats;
++    const StatsEntryDecoded_t *entry;
++    unsigned i, subtype = 0, last_type = ~0U;
++
++    /* Published only after parsing succeeds. The layout is immutable and
++     * proc removal drains readers before freeing it, so no data lock is
++     * needed. The binary data itself remains in firmware little-endian order. */
++    mtlk_aux_seq_printf(s, "data_bytes %u\nentry_count %u\nbyte_order little\n",
++                        stats->db_size, stats->tab_size);
++    mtlk_aux_seq_printf(s, "type subtype offset unit_size dimensions dim1 dim2 next_index_offset stride\n");
++    for (i = 0; i < stats->tab_size; i++) {
++        entry = &stats->table[i];
++        /* Firmware does not fill entry->subtype. The parser validates the
++         * start of each contiguous type against the firmware type table. */
++        if (entry->type != last_type) {
++            last_type = entry->type;
++            subtype = 0;
++        }
++        mtlk_aux_seq_printf(s, "%u %u %u %u %u %u %u %u %u\n",
++                            (unsigned)entry->type, subtype++, (unsigned)entry->offset,
++                            (unsigned)entry->unitSize, (unsigned)entry->numOfDimensions,
++                            (unsigned)entry->dimension1, (unsigned)entry->dimension2,
++                            (unsigned)entry->nextIdxOffset,
++                            (unsigned)(entry->nextIdxOffset ? entry->nextIdxOffset : entry->unitSize));
++    }
++    return MTLK_ERR_OK;
++}
++
++int __MTLK_IFUNC
+ mtlk_hw_mhi_copy_stats (mtlk_hw_t *hw, uint8 *buff, uint32 *size)
+ {
+     hw_mhi_stats_t          *mhi_stats;
+@@ -6391,6 +6422,9 @@
+ 
+     /* Get Statistics Table */
+     res = _mtlk_hw_mhi_get_table(hw);
++    if (MTLK_ERR_OK != res)
++        goto finish;
++
+     for (i = 0; i < hw->radio_descr->num_radios; i++) {
+         res = mtlk_df_ui_mhi_stats_create(mtlk_df_get_user(mtlk_vap_manager_get_master_df(wave_radio_descr_vap_manager_get(hw->radio_descr, i))), db_size);
+         if (MTLK_ERR_OK != res) {
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -7720,6 +7720,7 @@
+ /*------ MHI_STATISTICS ------*/
+ 
+ #define PROC_MHI_STATS "mhi_stats"
++#define PROC_MHI_STATS_LAYOUT "mhi_stats_layout"
+ 
+ static int
+ _mtlk_df_ui_mhi_stats_show(mtlk_seq_entry_t *s, void *data)
+@@ -7747,15 +7748,32 @@
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+ 
++static int
++_mtlk_df_ui_mhi_stats_layout_show(mtlk_seq_entry_t *s, void *data)
++{
++  mtlk_df_t *df = mtlk_df_proc_seq_entry_get_df(s);
++  mtlk_hw_t *hw = mtlk_vap_get_hw(mtlk_df_get_vap_handle(df));
++
++  return _mtlk_df_mtlk_to_linux_error_code(mtlk_hw_seq_write_mhi_stats_layout(hw, s));
++}
++
+ static int mtlk_df_ui_reg_mhi_stats_read(mtlk_df_user_t* df_user, unsigned size)
+ {
+-  /* only for master vap */
+-  if (mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df))) {
+-    return mtlk_df_proc_node_add_seq_entry_size(PROC_MHI_STATS,
+-             df_user->slow_ctx->proc_df_node, df_user->df, _mtlk_df_ui_mhi_stats_show, size);
+-  } else {
++  int res;
++
++  if (!mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df)))
+     return MTLK_ERR_OK;
+-  }
++
++  res = mtlk_df_proc_node_add_seq_entry_size(PROC_MHI_STATS,
++          df_user->slow_ctx->proc_df_node, df_user->df, _mtlk_df_ui_mhi_stats_show, size);
++  if (res != MTLK_ERR_OK)
++    return res;
++
++  res = mtlk_df_proc_node_add_seq_entry_size(PROC_MHI_STATS_LAYOUT,
++          df_user->slow_ctx->proc_df_node, df_user->df, _mtlk_df_ui_mhi_stats_layout_show, 0);
++  if (res != MTLK_ERR_OK)
++    mtlk_df_proc_node_remove_entry(PROC_MHI_STATS, df_user->slow_ctx->proc_df_node);
++  return res;
+ }
+ 
+ static int
+@@ -7773,6 +7791,7 @@
+ {
+   /* only for master vap */
+   if (mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df))) {
++    mtlk_df_proc_node_remove_entry(PROC_MHI_STATS_LAYOUT, df_user->slow_ctx->proc_df_node);
+     mtlk_df_proc_node_remove_entry(PROC_MHI_STATS, df_user->slow_ctx->proc_df_node);
+   }
+ }

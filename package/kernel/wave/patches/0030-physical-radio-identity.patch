@@ -1,0 +1,144 @@
+Subject: [PATCH] expose physical radio and master identity for role wiphys
+
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -1889,6 +1889,55 @@
+ /**
+   FIXCFG80211: description
+ */
++/* AP and STA wiphys share a physical radio, but are distinct nl80211
++ * objects. Publish their hardware identity before registration so discovery
++ * does not depend on enumeration order, interface names or active roles.
++ */
++static wave_radio_t *wave_wiphy_radio(struct wiphy *wiphy)
++{
++  if (wiphy->interface_modes & BIT(NL80211_IFTYPE_STATION))
++    return wv_ieee80211_hw_radio_get(wiphy_to_ieee80211_hw(wiphy));
++  return wv_cfg80211_wave_radio_get(wiphy_priv(wiphy));
++}
++
++static ssize_t wave_radio_id_show(struct device *dev,
++                                  struct device_attribute *attr, char *buf)
++{
++  return sysfs_emit(buf, "%u\n", wave_radio_id_get(wave_wiphy_radio(container_of(dev, struct wiphy, dev))));
++}
++static DEVICE_ATTR_RO(wave_radio_id);
++
++static ssize_t wave_role_show(struct device *dev,
++                              struct device_attribute *attr, char *buf)
++{
++  struct wiphy *wiphy = container_of(dev, struct wiphy, dev);
++
++  return sysfs_emit(buf, "%s\n",
++    wiphy->interface_modes & BIT(NL80211_IFTYPE_STATION) ? "sta" : "ap");
++}
++static DEVICE_ATTR_RO(wave_role);
++
++static ssize_t wave_master_ifindex_show(struct device *dev,
++                                        struct device_attribute *attr, char *buf)
++{
++  return sysfs_emit(buf, "%u\n",
++    wave_radio_master_ifindex_get(wave_wiphy_radio(container_of(dev, struct wiphy, dev))));
++}
++static DEVICE_ATTR_RO(wave_master_ifindex);
++
++static struct attribute *wave_wiphy_attrs[] = {
++  &dev_attr_wave_radio_id.attr,
++  &dev_attr_wave_role.attr,
++  &dev_attr_wave_master_ifindex.attr,
++  NULL,
++};
++ATTRIBUTE_GROUPS(wave_wiphy);
++
++void wv_cfg80211_sysfs_init(struct wiphy *wiphy)
++{
++  wiphy->dev.groups = wave_wiphy_groups;
++}
++
+ int __MTLK_IFUNC
+ wv_cfg80211_init (
+   wv_cfg80211_t *cfg80211,
+@@ -1930,6 +1979,7 @@
+   set_wiphy_dev(wiphy, dev);
+ 
+   wiphy->interface_modes = BIT(NL80211_IFTYPE_AP);
++  wv_cfg80211_sysfs_init(wiphy);
+ 
+   hw_get_fw_version(hw_handle, wiphy->fw_version, sizeof(wiphy->fw_version));
+ 
+--- a/wireless/driver/linux/cfg80211.h
++++ b/wireless/driver/linux/cfg80211.h
+@@ -25,6 +25,8 @@
+ #define WV_SUPP_NUM_STS 3 /* a possible default to fall back on */
+ 
+ typedef struct _wv_cfg80211_t wv_cfg80211_t;
++
++void wv_cfg80211_sysfs_init(struct wiphy *wiphy);
+ typedef struct _wave_radio_t wave_radio_t;
+ 
+ wave_radio_t * __MTLK_IFUNC wv_cfg80211_wave_radio_get (wv_cfg80211_t *cfg80211);
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -2132,6 +2132,7 @@
+   hw->chanctx_data_size = 0; /* relevant for multichannel HW */
+ 
+   hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
++  wv_cfg80211_sysfs_init(hw->wiphy);
+ 
+   hw->wiphy->mgmt_stypes = wv_mgmt_stypes;
+ 
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -231,6 +231,7 @@
+   BOOL                  is_interfdet_enabled; /* Interference Detection */
+   BOOL                  init_done;
+   bool                  control_ready;
++  unsigned int          master_ifindex;
+   bool                  watchdog_started, watchdog_replied;
+   unsigned long         watchdog_started_at, watchdog_last_reply;
+   BOOL                  sta_vifs_exist;
+@@ -610,6 +611,7 @@
+     wave_radio_t *radio = &radio_descr->radio[i];
+     struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
+     wiphy_lock(wiphy);
++    WRITE_ONCE(radio->master_ifindex, 0);
+     smp_store_release(&radio->control_ready, false);
+     wiphy_unlock(wiphy);
+   }
+@@ -652,8 +654,11 @@
+     rtnl_lock();
+     wiphy_lock(wiphy);
+     res = wave_df_register_netdev_locked(mtlk_df_get_user(wave_radio_df_get(radio)));
+-    if (!res)
++    if (!res) {
++      WRITE_ONCE(radio->master_ifindex,
++        mtlk_df_user_get_ndev(mtlk_df_get_user(wave_radio_df_get(radio)))->ifindex);
+       smp_store_release(&radio->control_ready, true);
++    }
+     wiphy_unlock(wiphy);
+     rtnl_unlock();
+     if (res) {
+@@ -964,6 +969,13 @@
+ }
+ 
+ /*** Context accessors ***/
++
++/* Copy only the published index: sysfs must not follow a master netdev
++ * pointer while teardown is unregistering and freeing that interface. */
++unsigned int wave_radio_master_ifindex_get(wave_radio_t *radio)
++{
++  return READ_ONCE(radio->master_ifindex);
++}
+ 
+ bool wave_radio_control_ready_get(wave_radio_t *radio)
+ {
+--- a/wireless/driver/linux/wave_radio.h
++++ b/wireless/driver/linux/wave_radio.h
+@@ -125,6 +125,7 @@
+ }
+ 
+ wave_radio_descr_t* wave_radio_create(wave_int radio_num, mtlk_hw_api_t *hw_api, mtlk_work_mode_e work_mode);
++unsigned int wave_radio_master_ifindex_get(wave_radio_t *radio);
+ bool wave_radio_control_ready_get(wave_radio_t *radio);
+ void wave_radio_watchdog_start(wave_radio_t *radio);
+ void wave_radio_watchdog_reply(wave_radio_t *radio);

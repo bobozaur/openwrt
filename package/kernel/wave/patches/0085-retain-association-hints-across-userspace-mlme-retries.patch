@@ -1,0 +1,70 @@
+Subject: [PATCH] wave: retain association hints across userspace MLME retries
+
+Several received requests for one peer can be queued before hostapd's
+NEW_STATION completes. Consuming the single latest per-MAC hint slot makes
+a later valid retry fail after the first reader, even though the received
+metadata remains fresh. Keep a bounded, non-destructive snapshot instead.
+
+Preserve the existing expiry after 30 seconds, same-peer replacement and BSS cleanup.
+Reading does not refresh expiry. Current nl80211 parameters and the current
+local Multi-AP role still own negotiation and four-address admission; this
+cache is neither a station/key owner nor an association-request cookie.
+
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -9944,7 +9944,7 @@
+   spin_unlock_irqrestore(&df_user->assoc_lock, flags);
+ }
+ 
+-bool wave_df_assoc_take(mtlk_df_user_t *df_user, const u8 *mac,
++bool wave_df_assoc_get(mtlk_df_user_t *df_user, const u8 *mac,
+                        struct wave_assoc_metadata *metadata)
+ {
+   unsigned long flags;
+@@ -9955,8 +9955,11 @@
+   for (i = 0; i < ARRAY_SIZE(df_user->assoc_metadata); i++) {
+     struct wave_assoc_metadata *entry = &df_user->assoc_metadata[i];
+     if (ether_addr_equal(entry->mac, mac) && time_before(jiffies, entry->expires)) {
++      /* RX and userspace MLME are asynchronous: several association
++       * requests may share the latest per-peer hints before NEW_STATION
++       * completes. Reading must not consume or extend this bounded cache.
++       */
+       *metadata = *entry;
+-      memset(entry, 0, sizeof(*entry));
+       found = true;
+       break;
+     }
+--- a/wireless/driver/linux/mtlk_df_user_priv.h
++++ b/wireless/driver/linux/mtlk_df_user_priv.h
+@@ -712,12 +712,12 @@
+   bool pbac;
+   unsigned long expires;
+ };
+-/* Pending receive metadata belongs to the association request, independently
+- * of an installed peer. Peer/key removal preserves it; add consumes it once,
+- * and BSS stop clears all pending requests. Entries expire after 30 seconds. */
++/* Latest received hints are independent of the installed peer/key owner.
++ * Lookups and peer removal preserve the snapshot without refreshing expiry.
++ * A new request replaces it; BSS stop clears it. Entries expire after 30 seconds. */
+ void wave_df_assoc_record(mtlk_df_user_t *df_user,
+                           const struct wave_assoc_metadata *metadata);
+-bool wave_df_assoc_take(mtlk_df_user_t *df_user, const u8 *mac,
++bool wave_df_assoc_get(mtlk_df_user_t *df_user, const u8 *mac,
+                        struct wave_assoc_metadata *metadata);
+ void wave_df_assoc_clear(mtlk_df_user_t *df_user);
+ /* Accepted AP setup Association Response IEs own the local BSS role. A peer
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2563,7 +2563,11 @@
+   /* This AP does not advertise pre-association station creation. */
+   if (!params->aid || params->aid > IEEE80211_MAX_AID)
+     return MTLK_ERR_PARAMS;
+-  if (!wave_df_assoc_take(df_user, mac, &metadata))
++  /* Hostapd may remove/re-add a peer for queued association retries.
++   * Current nl80211 parameters own negotiation; received radio/vendor hints
++   * remain available until replacement, expiry or BSS lifecycle cleanup.
++   */
++  if (!wave_df_assoc_get(df_user, mac, &metadata))
+     return MTLK_ERR_NOT_READY;
+   info->bss_coex_20_40 = metadata.coexistence;
+   info->vendor = metadata.vendor;

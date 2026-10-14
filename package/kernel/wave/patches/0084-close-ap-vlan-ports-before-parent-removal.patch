@@ -1,0 +1,29 @@
+Subject: [PATCH] wave: close AP VLAN dependents before parent deletion
+
+Mirror mac80211's ndo_stop ordering: RTNL protects the dependent interface
+list while dev_close() sends notifications without the wiphy mutex held.
+The later cfg80211 deletion callback can then unregister down children
+without recursively taking the wiphy mutex in NETDEV_GOING_DOWN.
+Retain child objects; existing BSS/station owners still retire bindings.
+
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -2211,8 +2211,18 @@
+ {
+   mtlk_hw_t *hw;
+   mtlk_df_user_t* df_user =  mtlk_df_user_from_ndev(ndev);
++  struct wave_ap_vlan *vlan, *next;
+ 
+   MTLK_CHECK_DF_USER(df_user);
++
++  /* Like mac80211, close dependent ports from ndo_stop under RTNL, before
++   * the parent's locked cfg80211 deletion callback. Their close notifiers
++   * acquire the wiphy mutex; unregistering an UP child there would recurse.
++   * Close only the ports; existing BSS/STA owners retire their bindings.
++   */
++  ASSERT_RTNL();
++  list_for_each_entry_safe(vlan, next, &df_user->ap_vlans, node)
++    dev_close(vlan->wdev.netdev);
+ 
+   ILOG0_SS("%s, %s: stop the interface", current->comm, mtlk_df_user_get_name(df_user));
+   wave_df_tx_queue_stop(df_user);

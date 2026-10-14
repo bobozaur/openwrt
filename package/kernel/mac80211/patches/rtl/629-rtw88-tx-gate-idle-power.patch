@@ -1,0 +1,119 @@
+Subject: [PATCH] wifi: rtw88: retain idle-power reports with 8822b TX gates
+
+Capture the native five-report idle-power sample alongside the existing
+qualified gates. Preserve the report latch and gain, reject another latch
+owner, and restore after cancellation or a failed readback. Raw reports
+have no hardware freshness indication.
+
+---
+
+--- a/drivers/net/wireless/realtek/rtw88/debug.c
++++ b/drivers/net/wireless/realtek/rtw88/debug.c
+@@ -251,6 +251,11 @@
+  */
+ #define RTW8822B_DBG_HEADER 0x8f8
+ #define RTW8822B_DBG_CLOCK 0x198c
++#define RTW8822B_IDLE_POWER_CTRL 0x9e4
++#define RTW8822B_IDLE_POWER_REPORT 0xff0
++#define RTW8822B_IDLE_POWER_FREEZE BIT(30)
++#define RTW8822B_IDLE_POWER_IDLE 0x02000402
++#define RTW8822B_IDLE_POWER_SAMPLES 5
+ 
+ static int rtw_debugfs_tx_gate_open(struct inode *inode, struct file *file)
+ {
+@@ -261,8 +266,9 @@
+ 	};
+ 	struct rtw_dev *rtwdev = inode->i_private;
+ 	struct rtw_debugfs_tx_buffer *snapshot;
+-	u32 values[ARRAY_SIZE(registers)], original[3], restored[3];
+-	u32 output[2], stop;
++	u32 values[ARRAY_SIZE(registers)], original[4], restored[4];
++	u32 output[2], stop, idle_power[RTW8822B_IDLE_POWER_SAMPLES];
++	bool idle_power_frozen = false;
+ 	u64 started, finished;
+ 	char *text;
+ 	unsigned int i, used = 0;
+@@ -299,11 +305,14 @@
+ 	original[0] = rtw_read32(rtwdev, RTW8822B_DBG_HEADER);
+ 	original[1] = rtw_read32(rtwdev, REG_DBGSEL);
+ 	original[2] = rtw_read32(rtwdev, RTW8822B_DBG_CLOCK);
++	original[3] = rtw_read32(rtwdev, RTW8822B_IDLE_POWER_CTRL);
+ 	/* Firmware 30.20 leaves CCA selected after completed IQK. Borrow that
+ 	 * state only in this driver's uninterrupted, power-save-free firmware
+-	 * lifetime. A matching tuple alone never establishes ownership.
++	 * lifetime. The idle-power latch must retain its known PHY-table state;
++	 * bus helpers cannot report a failed read. A tuple alone is not ownership.
+ 	 */
+ 	if ((original[0] & GENMASK(27, 20)) ||
++	    original[3] != RTW8822B_IDLE_POWER_IDLE ||
+ 	    !((original[1] == 0x130 && !(original[2] & GENMASK(2, 0))) ||
+ 	      (original[1] == 0 && (original[2] & GENMASK(2, 0)) == 7 &&
+ 	       test_bit(RTW_FLAG_TX_GATE_IQK_DONE, rtwdev->flags)))) {
+@@ -347,13 +356,48 @@
+ 		}
+ 		output[i] = rtw_read32(rtwdev, REG_DBGRPT);
+ 	}
++
++	/* The 8822B idle-power report updates every 5 us while idle. Match the
++	 * native five-report reader without pausing DIG or changing its gain.
++	 * There is no ready bit: retain raw reports, not a freshness verdict.
++	 */
++	for (i = 0; i < ARRAY_SIZE(idle_power); i++) {
++		if (signal_pending(current)) {
++			ret = -ERESTARTSYS;
++			goto restore;
++		}
++		if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags) ||
++		    !test_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags)) {
++			ret = -ENODEV;
++			goto restore;
++		}
++		rtw_write32(rtwdev, RTW8822B_IDLE_POWER_CTRL,
++			    original[3] | RTW8822B_IDLE_POWER_FREEZE);
++		idle_power_frozen = true;
++		if (rtw_read32(rtwdev, RTW8822B_IDLE_POWER_CTRL) !=
++		    (original[3] | RTW8822B_IDLE_POWER_FREEZE)) {
++			ret = -EIO;
++			goto restore;
++		}
++		idle_power[i] = rtw_read32(rtwdev, RTW8822B_IDLE_POWER_REPORT);
++		rtw_write32(rtwdev, RTW8822B_IDLE_POWER_CTRL, original[3]);
++		if (rtw_read32(rtwdev, RTW8822B_IDLE_POWER_CTRL) != original[3]) {
++			ret = -EIO;
++			goto restore;
++		}
++		idle_power_frozen = false;
++		udelay(5);
++	}
+ restore:
++	if (idle_power_frozen)
++		rtw_write32(rtwdev, RTW8822B_IDLE_POWER_CTRL, original[3]);
+ 	rtw_write32(rtwdev, REG_DBGSEL, original[1]);
+ 	rtw_write32(rtwdev, RTW8822B_DBG_CLOCK, original[2]);
+ 	/* The header is never modified; preserve and verify its whole value. */
+ 	restored[0] = rtw_read32(rtwdev, RTW8822B_DBG_HEADER);
+ 	restored[1] = rtw_read32(rtwdev, REG_DBGSEL);
+ 	restored[2] = rtw_read32(rtwdev, RTW8822B_DBG_CLOCK);
++	restored[3] = rtw_read32(rtwdev, RTW8822B_IDLE_POWER_CTRL);
+ 	if (memcmp(original, restored, sizeof(original)))
+ 		ret = -EIO;
+ 	if (!test_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags))
+@@ -375,11 +419,14 @@
+ 	used += scnprintf(text + used, 2048 - used,
+ 			  "045c 1 %08x\ncca %08x\nedcca %08x\n",
+ 			  stop, output[0], output[1]);
++	used += scnprintf(text + used, 2048 - used, "idle_power");
++	for (i = 0; i < ARRAY_SIZE(idle_power); i++)
++		used += scnprintf(text + used, 2048 - used, " %08x", idle_power[i]);
+ 	used += scnprintf(text + used, 2048 - used,
+-			  "original %08x %08x %08x\n"
+-			  "restored %08x %08x %08x\nend\n",
+-			  original[0], original[1], original[2],
+-			  restored[0], restored[1], restored[2]);
++			  "\noriginal %08x %08x %08x %08x\n"
++			  "restored %08x %08x %08x %08x\nend\n",
++			  original[0], original[1], original[2], original[3],
++			  restored[0], restored[1], restored[2], restored[3]);
+ 	snapshot->size = used;
+ 	file->private_data = snapshot;
+ 	return 0;

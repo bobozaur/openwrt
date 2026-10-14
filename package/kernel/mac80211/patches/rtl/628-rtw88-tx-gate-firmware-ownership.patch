@@ -1,0 +1,326 @@
+Subject: [PATCH] wifi: rtw88: qualify 8822b debug mux against firmware lifetime
+
+The 8822B IQK firmware leaves its CCA selector and clock enabled.
+A matching register tuple alone does not exclude firmware power-
+save consumers. Track an uninterrupted, supported normal firmware
+lifetime and current IQK completion, refusing sampling after
+unsupported commands or transitions. Preserve ordinary
+calibration, power policy and full mux restoration.
+
+---
+
+--- a/drivers/net/wireless/realtek/rtw88/debug.c
++++ b/drivers/net/wireless/realtek/rtw88/debug.c
+@@ -245,7 +245,8 @@
+ };
+ 
+ /* 8822B OFDM debug output: header zero, selectors 0 (CCA) and 0x209
+- * (EDCCA). The inactive table state uses selector 0x130, clock bits zero.
++ * (EDCCA). The table state is 0x130/clock 0; completed IQK leaves 0/clock 7.
++ * Both need firmware-lifetime exclusion of autonomous power-save owners.
+  * These are sequential samples, not busy-time counters or TX verdicts.
+  */
+ #define RTW8822B_DBG_HEADER 0x8f8
+@@ -287,7 +288,9 @@
+ 	if (test_bit(RTW_FLAG_RESTARTING, rtwdev->flags) ||
+ 	    test_bit(RTW_FLAG_RESTART_TRIGGERING, rtwdev->flags) ||
+ 	    test_bit(RTW_FLAG_LEISURE_PS, rtwdev->flags) ||
+-	    test_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags)) {
++	    test_bit(RTW_FLAG_LEISURE_PS_DEEP, rtwdev->flags) ||
++	    test_bit(RTW_FLAG_SCANNING, rtwdev->flags) ||
++	    !test_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags)) {
+ 		ret = -EBUSY;
+ 		goto unlock;
+ 	}
+@@ -296,8 +299,14 @@
+ 	original[0] = rtw_read32(rtwdev, RTW8822B_DBG_HEADER);
+ 	original[1] = rtw_read32(rtwdev, REG_DBGSEL);
+ 	original[2] = rtw_read32(rtwdev, RTW8822B_DBG_CLOCK);
+-	if ((original[0] & GENMASK(25, 22)) || original[1] != 0x130 ||
+-	    (original[2] & GENMASK(2, 0))) {
++	/* Firmware 30.20 leaves CCA selected after completed IQK. Borrow that
++	 * state only in this driver's uninterrupted, power-save-free firmware
++	 * lifetime. A matching tuple alone never establishes ownership.
++	 */
++	if ((original[0] & GENMASK(27, 20)) ||
++	    !((original[1] == 0x130 && !(original[2] & GENMASK(2, 0))) ||
++	      (original[1] == 0 && (original[2] & GENMASK(2, 0)) == 7 &&
++	       test_bit(RTW_FLAG_TX_GATE_IQK_DONE, rtwdev->flags)))) {
+ 		ret = -EBUSY;
+ 		goto unlock;
+ 	}
+@@ -307,7 +316,8 @@
+ 			ret = -ERESTARTSYS;
+ 			goto unlock;
+ 		}
+-		if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags)) {
++		if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags) ||
++		    !test_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags)) {
+ 			ret = -ENODEV;
+ 			goto unlock;
+ 		}
+@@ -322,7 +332,8 @@
+ 			ret = -ERESTARTSYS;
+ 			goto restore;
+ 		}
+-		if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags)) {
++		if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags) ||
++		    !test_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags)) {
+ 			ret = -ENODEV;
+ 			goto restore;
+ 		}
+@@ -345,6 +356,8 @@
+ 	restored[2] = rtw_read32(rtwdev, RTW8822B_DBG_CLOCK);
+ 	if (memcmp(original, restored, sizeof(original)))
+ 		ret = -EIO;
++	if (!test_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags))
++		ret = -ENODEV;
+ 	finished = ktime_get_ns();
+ unlock:
+ 	mutex_unlock(&rtwdev->mutex);
+@@ -639,6 +652,7 @@
+ 	if (ret)
+ 		return ret;
+ 
++	rtw_tx_gate_invalidate(rtwdev);
+ 	switch (len) {
+ 	case 1:
+ 		rtw_dbg(rtwdev, RTW_DBG_DEBUGFS,
+@@ -718,6 +732,7 @@
+ 	}
+ 
+ 	mutex_lock(&rtwdev->mutex);
++	rtw_tx_gate_invalidate(rtwdev);
+ 	rtw_write_rf(rtwdev, path, addr, mask, val);
+ 	mutex_unlock(&rtwdev->mutex);
+ 	rtw_dbg(rtwdev, RTW_DBG_DEBUGFS,
+--- a/drivers/net/wireless/realtek/rtw88/fw.c
++++ b/drivers/net/wireless/realtek/rtw88/fw.c
+@@ -406,6 +406,9 @@
+ 
+ 	lockdep_assert_held(&rtwdev->mutex);
+ 
++	if ((h2c->w0 & 0xff) != H2C_CMD_DEFAULT_PORT)
++		rtw_tx_gate_invalidate(rtwdev);
++
+ 	box = rtwdev->h2c.last_box_num;
+ 	switch (box) {
+ 	case 0:
+@@ -434,6 +437,7 @@
+ 				       false, rtwdev, REG_HMETFR);
+ 
+ 	if (ret) {
++		rtw_tx_gate_invalidate(rtwdev);
+ 		rtw_err(rtwdev, "failed to send h2c command\n");
+ 		rtw_fw_dump_dbg_info(rtwdev);
+ 		return;
+@@ -462,6 +466,15 @@
+ 
+ 	lockdep_assert_held(&rtwdev->mutex);
+ 
++	/* LPS/P2P/inactive-PS and TDMA can own the firmware debug mux.
++	 * Default-port selection is not a power transition. Even a failed or
++	 * disabling command cannot requalify an already active firmware owner.
++	 */
++	if (((h2c[0] & 0xe0) == 0x20 && h2c[0] != H2C_CMD_DEFAULT_PORT) ||
++	    (h2c[0] == H2C_CMD_COEX_TDMA_TYPE &&
++	     memchr_inv(h2c + 1, 0, 5)))
++		rtw_tx_gate_invalidate(rtwdev);
++
+ 	box = rtwdev->h2c.last_box_num;
+ 	switch (box) {
+ 	case 0:
+@@ -490,6 +503,7 @@
+ 				       false, rtwdev, REG_HMETFR);
+ 
+ 	if (ret) {
++		rtw_tx_gate_invalidate(rtwdev);
+ 		rtw_err(rtwdev, "failed to send h2c command\n");
+ 		return;
+ 	}
+@@ -503,6 +517,7 @@
+ 
+ void rtw_fw_h2c_cmd_dbg(struct rtw_dev *rtwdev, u8 *h2c)
+ {
++	rtw_tx_gate_invalidate(rtwdev);
+ 	rtw_fw_send_h2c_command(rtwdev, h2c);
+ }
+ 
+@@ -511,11 +526,21 @@
+ 	int ret;
+ 
+ 	lockdep_assert_held(&rtwdev->mutex);
++
++	/* Other offloads, including P2P and channel switching, have no qualified
++	 * exclusion contract with tx_gate. This does not change their policy.
++	 */
++	if (get_unaligned_le16(h2c_pkt + 2) != H2C_PKT_GENERAL_INFO &&
++	    get_unaligned_le16(h2c_pkt + 2) != H2C_PKT_PHYDM_INFO &&
++	    get_unaligned_le16(h2c_pkt + 2) != H2C_PKT_IQK)
++		rtw_tx_gate_invalidate(rtwdev);
+ 
+ 	FW_OFFLOAD_H2C_SET_SEQ_NUM(h2c_pkt, rtwdev->h2c.seq);
+ 	ret = rtw_hci_write_data_h2c(rtwdev, h2c_pkt, H2C_PKT_SIZE);
+-	if (ret)
++	if (ret) {
++		rtw_tx_gate_invalidate(rtwdev);
+ 		rtw_err(rtwdev, "failed to send h2c packet\n");
++	}
+ 	rtwdev->h2c.seq++;
+ }
+ 
+--- a/drivers/net/wireless/realtek/rtw88/mac.c
++++ b/drivers/net/wireless/realtek/rtw88/mac.c
+@@ -379,6 +379,8 @@
+ {
+ 	int ret = 0;
+ 
++	rtw_tx_gate_invalidate(rtwdev);
++
+ 	ret = rtw_mac_pre_system_cfg(rtwdev);
+ 	if (ret)
+ 		goto err;
+@@ -411,6 +413,7 @@
+ 
+ void rtw_mac_power_off(struct rtw_dev *rtwdev)
+ {
++	rtw_tx_gate_invalidate(rtwdev);
+ 	rtw_mac_power_switch(rtwdev, false);
+ }
+ 
+@@ -439,6 +442,9 @@
+ 
+ static void wlan_cpu_enable(struct rtw_dev *rtwdev, bool enable)
+ {
++	if (!enable)
++		rtw_tx_gate_invalidate(rtwdev);
++
+ 	if (enable) {
+ 		/* cpu io interface enable */
+ 		rtw_write8_set(rtwdev, REG_RSV_CTRL + 1, BIT_WLMCU_IOIF);
+@@ -981,6 +987,7 @@
+ static
+ int _rtw_download_firmware(struct rtw_dev *rtwdev, struct rtw_fw_state *fw)
+ {
++	rtw_tx_gate_invalidate(rtwdev);
+ 	if (rtw_chip_wcpu_8051(rtwdev))
+ 		return __rtw_download_firmware_legacy(rtwdev, fw);
+ 
+@@ -994,6 +1001,15 @@
+ 	ret = _rtw_download_firmware(rtwdev, fw);
+ 	if (ret)
+ 		return ret;
++
++	/* Only this normal firmware's IQK and power-save mux contract is known.
++	 * Successful download resets the firmware CPU and its power-save state.
++	 */
++	if (IS_ENABLED(CPTCFG_RTW88_DEBUGFS) &&
++	    rtwdev->chip->id == RTW_CHIP_TYPE_8822B && fw == &rtwdev->fw &&
++	    fw->type == RTW_NORMAL_FW && fw->version == 30 &&
++	    fw->sub_version == 20 && !fw->sub_index && fw->h2c_version == 14)
++		set_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags);
+ 
+ 	if (rtw_hci_type(rtwdev) == RTW_HCI_TYPE_PCIE &&
+ 	    rtwdev->chip->id == RTW_CHIP_TYPE_8821C)
+--- a/drivers/net/wireless/realtek/rtw88/main.c
++++ b/drivers/net/wireless/realtek/rtw88/main.c
+@@ -636,6 +636,7 @@
+ 
+ void rtw_fw_recovery(struct rtw_dev *rtwdev)
+ {
++	rtw_tx_gate_invalidate(rtwdev);
+ 	if (!test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags) &&
+ 	    !test_bit(RTW_FLAG_RESTARTING, rtwdev->flags))
+ 		ieee80211_queue_work(rtwdev->hw, &rtwdev->fw_recovery_work);
+@@ -1559,6 +1560,7 @@
+ 
+ void rtw_power_off(struct rtw_dev *rtwdev)
+ {
++	rtw_tx_gate_invalidate(rtwdev);
+ 	rtw_hci_stop(rtwdev);
+ 	rtw_coex_power_off_setting(rtwdev);
+ 	rtw_mac_power_off(rtwdev);
+@@ -1569,6 +1571,7 @@
+ {
+ 	struct rtw_coex *coex = &rtwdev->coex;
+ 
++	rtw_tx_gate_invalidate(rtwdev);
+ 	clear_bit(RTW_FLAG_RUNNING, rtwdev->flags);
+ 	clear_bit(RTW_FLAG_FW_RUNNING, rtwdev->flags);
+ 
+--- a/drivers/net/wireless/realtek/rtw88/main.h
++++ b/drivers/net/wireless/realtek/rtw88/main.h
+@@ -379,6 +379,8 @@
+ 	RTW_FLAG_RESTART_TRIGGERING,
+ 	RTW_FLAG_FORCE_LOWEST_RATE,
+ 	RTW_FLAG_UNREGISTERING,
++	RTW_FLAG_TX_GATE_FW_READY,
++	RTW_FLAG_TX_GATE_IQK_DONE,
+ 
+ 	NUM_OF_RTW_FLAGS,
+ };
+@@ -2154,6 +2156,18 @@
+ 	return !!rtwdev->sta_cnt;
+ }
+ 
++/* Diagnostic eligibility belongs to one uninterrupted firmware lifetime.
++ * A completed later IQK must never undo a power transition or an IQK timeout.
++ */
++static inline void rtw_tx_gate_invalidate(struct rtw_dev *rtwdev)
++{
++	if (!IS_ENABLED(CPTCFG_RTW88_DEBUGFS))
++		return;
++
++	clear_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags);
++	clear_bit(RTW_FLAG_TX_GATE_IQK_DONE, rtwdev->flags);
++}
++
+ static inline struct ieee80211_txq *rtwtxq_to_txq(struct rtw_txq *rtwtxq)
+ {
+ 	void *p = rtwtxq;
+--- a/drivers/net/wireless/realtek/rtw88/ps.c
++++ b/drivers/net/wireless/realtek/rtw88/ps.c
+@@ -70,6 +70,8 @@
+ {
+ 	u8 request, confirm, polling;
+ 	int ret;
++
++	rtw_tx_gate_invalidate(rtwdev);
+ 
+ 	request = rtw_read8(rtwdev, rtwdev->hci.rpwm_addr);
+ 	confirm = rtw_read8(rtwdev, rtwdev->hci.cpwm_addr);
+--- a/drivers/net/wireless/realtek/rtw88/rtw8822b.c
++++ b/drivers/net/wireless/realtek/rtw88/rtw8822b.c
+@@ -1075,7 +1075,20 @@
+ 	struct rtw_iqk_para para = {.clear = 0, .segment_iqk = 0};
+ 	u32 rf_reg, iqk_fail_mask;
+ 	int counter;
+-	bool reload;
++	bool reload, qualify;
++
++	qualify = IS_ENABLED(CPTCFG_RTW88_DEBUGFS) &&
++		  test_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags);
++	if (IS_ENABLED(CPTCFG_RTW88_DEBUGFS))
++		clear_bit(RTW_FLAG_TX_GATE_IQK_DONE, rtwdev->flags);
++	if (qualify) {
++		/* Reject stale completion before submitting this IQK. A prior
++		 * timeout poisons FW_READY until an actual firmware reset.
++		 */
++		rf_reg = rtw_read_rf(rtwdev, RF_PATH_A, RF_DTXLOK, RFREG_MASK);
++		if (rf_reg == 0xabcde || rf_reg == INV_RF_DATA)
++			rtw_tx_gate_invalidate(rtwdev);
++	}
+ 
+ 	rtw_fw_do_iqk(rtwdev, &para);
+ 
+@@ -1085,6 +1098,10 @@
+ 			break;
+ 		msleep(20);
+ 	}
++	if (counter == 300)
++		rtw_tx_gate_invalidate(rtwdev);
++	else if (qualify && test_bit(RTW_FLAG_TX_GATE_FW_READY, rtwdev->flags))
++		set_bit(RTW_FLAG_TX_GATE_IQK_DONE, rtwdev->flags);
+ 	rtw_write_rf(rtwdev, RF_PATH_A, RF_DTXLOK, RFREG_MASK, 0x0);
+ 
+ 	reload = !!rtw_read32_mask(rtwdev, REG_IQKFAILMSK, BIT(16));

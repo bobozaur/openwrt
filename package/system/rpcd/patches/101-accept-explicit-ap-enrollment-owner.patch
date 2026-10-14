@@ -1,0 +1,91 @@
+--- a/uci.c
++++ b/uci.c
+@@ -1328,7 +1328,7 @@
+  * emulate it with separate get/set/commit calls. */
+ enum {
+ 	WPS_SECTION, WPS_DEVICE, WPS_EXPECTED, WPS_EXPECTED_DEVICE,
+-	WPS_VALUES, WPS_SESSION, __WPS_MAX,
++	WPS_VALUES, WPS_MODE, WPS_SESSION, __WPS_MAX,
+ };
+ 
+ static const struct blobmsg_policy rpc_wps_policy[__WPS_MAX] = {
+@@ -1337,6 +1337,7 @@
+ 	[WPS_EXPECTED] = { .name = "expected", .type = BLOBMSG_TYPE_TABLE },
+ 	[WPS_EXPECTED_DEVICE] = { .name = "expected_device", .type = BLOBMSG_TYPE_TABLE },
+ 	[WPS_VALUES] = { .name = "values", .type = BLOBMSG_TYPE_TABLE },
++	[WPS_MODE] = { .name = "mode", .type = BLOBMSG_TYPE_STRING },
+ 	[WPS_SESSION] = { .name = "ubus_rpc_session", .type = BLOBMSG_TYPE_STRING },
+ };
+ 
+@@ -1494,15 +1495,19 @@
+ 	return false;
+ }
+ 
+-static bool rpc_wps_values(struct blob_attr *values)
+-{
+-	struct blob_attr *a, *ssid, *enc, *key, *pmf;
++static bool rpc_wps_values(struct blob_attr *values, bool ap)
++{
++	struct blob_attr *a, *ssid, *enc, *key, *pmf, *wps_state;
+ 	const char *encryption, *secret;
+ 	int rem, i;
+ 	ssid = rpc_wps_field(values, "ssid");
+ 	enc = rpc_wps_field(values, "encryption");
+ 	key = rpc_wps_field(values, "key");
+ 	pmf = rpc_wps_field(values, "ieee80211w");
++	wps_state = rpc_wps_field(values, "wps_state");
++	if (ap && (!rpc_wps_string(wps_state) ||
++		   strcmp(blobmsg_get_string(wps_state), "2")))
++		return false;
+ 	if (!rpc_wps_string(ssid) || strlen(blobmsg_get_string(ssid)) < 1 ||
+ 	    strlen(blobmsg_get_string(ssid)) > 32 || !rpc_wps_string(enc) ||
+ 	    !rpc_wps_string(pmf))
+@@ -1530,6 +1535,9 @@
+ 		if (!strcmp(name, "sae_password")) {
+ 			if (blobmsg_type(a) != BLOBMSG_TYPE_UNSPEC)
+ 				return false;
++		} else if (!strcmp(name, "wps_state")) {
++			if (!ap)
++				return false;
+ 		} else if (strcmp(name, "ssid") && strcmp(name, "encryption") &&
+ 			   strcmp(name, "key") && strcmp(name, "ieee80211w")) {
+ 			return false;
+@@ -1546,7 +1554,7 @@
+ 	struct uci_package *p = NULL;
+ 	struct uci_section *s, *device;
+ 	struct uci_element *e, *tmp;
+-	const char *status = "conflict";
++	const char *status = "conflict", *mode = "sta";
+ 	int rv = UBUS_STATUS_UNKNOWN_ERROR, rem, err;
+ 	bool saved = false;
+ 
+@@ -1555,9 +1563,19 @@
+ 	 * of session delta/rollback semantics through the HTTP RPC interface. */
+ 	if (tb[WPS_SESSION])
+ 		return UBUS_STATUS_PERMISSION_DENIED;
++	/* STA callers keep their original default. AP enrollment must explicitly
++	 * request its mode; the committed section and full snapshots must agree.
++	 */
++	if (tb[WPS_MODE]) {
++		if (!rpc_wps_string(tb[WPS_MODE]))
++			return UBUS_STATUS_INVALID_ARGUMENT;
++		mode = blobmsg_get_string(tb[WPS_MODE]);
++		if (strcmp(mode, "sta") && strcmp(mode, "ap"))
++			return UBUS_STATUS_INVALID_ARGUMENT;
++	}
+ 	if (!rpc_wps_string(tb[WPS_SECTION]) || !rpc_wps_string(tb[WPS_DEVICE]) ||
+ 	    !tb[WPS_EXPECTED] || !tb[WPS_EXPECTED_DEVICE] || !tb[WPS_VALUES] ||
+-	    !rpc_wps_values(tb[WPS_VALUES]))
++	    !rpc_wps_values(tb[WPS_VALUES], !strcmp(mode, "ap")))
+ 		return UBUS_STATUS_INVALID_ARGUMENT;
+ 	if (apply_sid[0]) {
+ 		status = "busy";
+@@ -1594,7 +1612,7 @@
+ 	if (!s || strcmp(s->type, "wifi-iface") || !device ||
+ 	    strcmp(device->type, "wifi-device") ||
+ 	    !uci_lookup_option_string(c, s, "mode") ||
+-	    strcmp(uci_lookup_option_string(c, s, "mode"), "sta") ||
++	    strcmp(uci_lookup_option_string(c, s, "mode"), mode) ||
+ 	    !rpc_wps_device(c, s, device->e.name) ||
+ 	    !rpc_wps_section(c, device, tb[WPS_EXPECTED_DEVICE], NULL))
+ 		goto reply;

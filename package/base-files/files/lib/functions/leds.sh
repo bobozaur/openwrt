@@ -59,18 +59,18 @@ led_set_attr() {
 }
 
 led_timer() {
-	led_set_attr $1 "trigger" "timer"
-	led_set_attr $1 "delay_on" "$2"
+	led_set_attr $1 "trigger" "timer" &&
+	led_set_attr $1 "delay_on" "$2" &&
 	led_set_attr $1 "delay_off" "$3"
 }
 
 led_on() {
-	led_set_attr $1 "trigger" "none"
+	led_set_attr $1 "trigger" "none" &&
 	led_set_attr $1 "brightness" 255
 }
 
 led_off() {
-	led_set_attr $1 "trigger" "none"
+	led_set_attr $1 "trigger" "none" &&
 	led_set_attr $1 "brightness" 0
 }
 
@@ -81,13 +81,16 @@ status_led_restore_trigger() {
 	[ -n "$ledpath" ] && \
 		trigger=$(cat "$ledpath/linux,default-trigger" 2>/dev/null)
 
-	[ -n "$trigger" ] && \
+	if [ -n "$trigger" ]; then
 		led_set_attr "$(get_dt_led $1)" "trigger" "$trigger"
+	fi
 }
 
 status_led_set_timer() {
-	led_timer $status_led "$1" "$2"
-	[ -n "$status_led2" ] && led_timer $status_led2 "$1" "$2"
+	led_timer $status_led "$1" "$2" || return $?
+	if [ -n "$status_led2" ]; then
+		led_timer $status_led2 "$1" "$2"
+	fi
 }
 
 status_led_set_heartbeat() {
@@ -95,13 +98,17 @@ status_led_set_heartbeat() {
 }
 
 status_led_on() {
-	led_on $status_led
-	[ -n "$status_led2" ] && led_on $status_led2
+	led_on $status_led || return $?
+	if [ -n "$status_led2" ]; then
+		led_on $status_led2
+	fi
 }
 
 status_led_off() {
-	led_off $status_led
-	[ -n "$status_led2" ] && led_off $status_led2
+	led_off $status_led || return $?
+	if [ -n "$status_led2" ]; then
+		led_off $status_led2
+	fi
 }
 
 status_led_blink_slow() {

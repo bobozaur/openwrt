@@ -1,0 +1,26 @@
+Subject: [PATCH] fw4: honor nftables includes in the flow offload chain
+
+Allow the standard chain include mechanism to select traffic that must stay
+on the regular packet path. A forward-chain include runs after the jump to
+flow_offload and cannot prevent that packet from installing a flow entry.
+In particular, policies that inspect every packet before conntrack need an
+offload exclusion in both directions, independently of the filter verdict.
+
+--- a/root/usr/share/firewall4/templates/ruleset.uc
++++ b/root/usr/share/firewall4/templates/ruleset.uc
+@@ -162,6 +162,7 @@
+ 
+ {% if (length(flowtable_devices)): %}
+ 	chain flow_offload {
++{% fw4.includes('chain-prepend', 'flow_offload') %}
+ 		meta nfproto ipv4 udp sport { 67, 68 } counter return comment "!fw4: Keep DHCPv4 source in slow path"
+ 		meta nfproto ipv4 udp dport { 67, 68 } counter return comment "!fw4: Keep DHCPv4 destination in slow path"
+ 		meta nfproto ipv6 udp sport { 546, 547 } counter return comment "!fw4: Keep DHCPv6 source in slow path"
+@@ -169,6 +170,7 @@
+ 		meta nfproto ipv6 udp dport { 546, 547 } counter return comment "!fw4: Keep DHCPv6 destination in slow path"
+ {%+ include('port-trigger.uc', { fw4, mode: 'offload' }) %}
+ 		meta l4proto { tcp, udp } flow offload @ft;
++{% fw4.includes('chain-append', 'flow_offload') %}
+ 	}
+ 
+ {% endif %}

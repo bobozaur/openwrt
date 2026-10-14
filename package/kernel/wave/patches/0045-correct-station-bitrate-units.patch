@@ -1,0 +1,25 @@
+Subject: [PATCH] report station bitrates in cfg80211 100 kbit/s units
+
+--- a/wireless/driver/shared/stadb.c
++++ b/wireless/driver/shared/stadb.c
+@@ -1542,16 +1542,16 @@
+           stinfo->filled |= BIT(NL80211_STA_INFO_SIGNAL);
+ #endif
+ 
+-          /* TX bitrate (Mbit/s) */
+-          stinfo->txrate.legacy = MTLK_KBPS_TO_MBPS(peer_stats.LastDataDownlinkRate);
++          /* cfg80211 rate units are 100 kbit/s, matching the native bitrate. */
++          stinfo->txrate.legacy = _mtlk_sta_get_tx_data_rate(sta);
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+           stinfo->filled |= STATION_INFO_TX_BITRATE;
+ #else
+           stinfo->filled |= BIT(NL80211_STA_INFO_TX_BITRATE);
+ #endif
+ 
+-          /* RX bitrate (Mbit/s) */
+-          stinfo->rxrate.legacy = MTLK_KBPS_TO_MBPS(peer_stats.LastDataUplinkRate);
++          /* cfg80211 rate units are 100 kbit/s, matching the native bitrate. */
++          stinfo->rxrate.legacy = _mtlk_sta_get_rx_data_rate(sta);
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+           stinfo->filled |= STATION_INFO_RX_BITRATE;
+ #else

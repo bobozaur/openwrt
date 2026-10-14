@@ -1,0 +1,39 @@
+--- a/wpa_supplicant/ucode.c
++++ b/wpa_supplicant/ucode.c
+@@ -4,6 +4,7 @@
+ #include "utils/base64.h"
+ #include "drivers/driver.h"
+ #include "common/ieee802_11_common.h"
++#include "common/wpa_common.h"
+ #include "ap/hostapd.h"
+ #include "wpa_supplicant_i.h"
+ #include "driver_i.h"
+@@ -334,6 +335,8 @@
+ 	ucv_object_add(val, "processed", ucv_boolean_new(network != NULL));
+ 	if (network) {
+ 		ucv_object_add(val, "network_id", ucv_int64_new(network->id));
++		ucv_object_add(val, "wps_run", ucv_int64_new(network->wps_run));
++		ucv_object_add(val, "ieee80211w", ucv_int64_new(wpas_get_ssid_pmf(wpa_s, network)));
+ 		for (i = 0; i < ARRAY_SIZE(fields); i++) {
+ 			char *value = wpa_config_get_no_key(network, fields[i]);
+ 
+@@ -723,6 +726,19 @@
+ 	ret = ucv_object_new(vm);
+ 
+ 	ucv_object_add(ret, "state", ucv_string_new(wpa_supplicant_state_txt(wpa_s->wpa_state)));
++	ucv_object_add(ret, "pairwise_cipher", ucv_string_new(wpa_cipher_txt(wpa_s->pairwise_cipher)));
++#ifdef CONFIG_WPS
++	/* Protocol success precedes reassociation and may supply several profiles.
++	 * The persistence owner must select the network that actually connected. */
++	ucv_object_add(ret, "wps_run", ucv_int64_new(wpa_s->wps_run));
++	ucv_object_add(ret, "wps_success", ucv_boolean_new(wpa_s->wps_success));
++	if (wpa_s->current_ssid) {
++		ucv_object_add(ret, "network_id", ucv_int64_new(wpa_s->current_ssid->id));
++		ucv_object_add(ret, "network_wps_run", ucv_int64_new(wpa_s->current_ssid->wps_run));
++		ucv_object_add(ret, "wps_selected", ucv_boolean_new(!(wpa_s->current_ssid->key_mgmt & WPA_KEY_MGMT_WPS)));
++	}
++#endif
++
+ 
+ 	bss = wpa_s->current_bss;
+ 	if (bss)

@@ -1,0 +1,22 @@
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2490,6 +2490,11 @@ int wave_radio_wiphy_params_set (
+   int res = MTLK_ERR_OK;
+   mtlk_df_user_t *df_user;
+ 
++  /* No firmware fragmentation control is defined by this ABI. Reject the
++   * whole parameter request before any other firmware setting is applied. */
++  if (changed & WIPHY_PARAM_FRAG_THRESHOLD)
++    return -EOPNOTSUPP;
++
+   MTLK_ASSERT(NULL != radio);
+ 
+   df_user = mtlk_df_get_user(mtlk_vap_manager_get_master_df(radio->vap_manager));
+@@ -2500,7 +2505,6 @@ int wave_radio_wiphy_params_set (
+   ILOG1_D("changed = 0x%X", changed);
+ 
+   /* ignore WIPHY_PARAM_RTS_THRESHOLD because it is hardcoded in FW */
+-  /* ignore WIPHY_PARAM_FRAG_THRESHOLD because it is hardcoded in FW */
+   /* ignore WIPHY_PARAM_RETRY_SHORT because it is hardcoded in FW */
+ 
+   if (changed & WIPHY_PARAM_RETRY_LONG) {

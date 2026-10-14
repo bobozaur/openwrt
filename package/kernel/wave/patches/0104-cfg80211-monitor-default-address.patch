@@ -1,0 +1,29 @@
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -804,6 +804,7 @@
+   struct net_device *ndev;
+   struct wave_monitor *mon;
+   struct mtlk_chan_def *home;
++  IEEE_ADDR native_mac;
+   mtlk_core_t *master = _wave_cfg80211_get_maste_core(cfg);
+   mtlk_hw_t *hw = mtlk_vap_get_hw(master->vap_handle);
+   int res;
+@@ -815,6 +816,9 @@
+   if (params->use_4addr > 0 ||
+       (params->flags & (MONITOR_FLAG_ACTIVE | MONITOR_FLAG_COOK_FRAMES)))
+     return ERR_PTR(-EOPNOTSUPP);
++  MTLK_CORE_PDB_GET_MAC(master, PARAM_DB_CORE_MAC_ADDR, &native_mac);
++  if (is_zero_ether_addr(params->macaddr) && !is_valid_ether_addr(native_mac.au8Addr))
++    return ERR_PTR(-ENODEV);
+   ndev = alloc_netdev(sizeof(*mon), name, NET_NAME_USER, wave_monitor_setup);
+   if (!ndev)
+     return ERR_PTR(-ENOMEM);
+@@ -829,7 +833,7 @@
+   SET_NETDEV_DEV(ndev, wiphy_dev(cfg->wiphy));
+   spin_lock_init(&mon->rx_lock);
+   if (is_zero_ether_addr(params->macaddr))
+-    eth_hw_addr_set(ndev, cfg->wiphy->perm_addr);
++    eth_hw_addr_set(ndev, native_mac.au8Addr);
+   else
+     eth_hw_addr_set(ndev, params->macaddr);
+   home = __wave_core_chandef_get(master);

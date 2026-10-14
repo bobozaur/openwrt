@@ -1,0 +1,11 @@
+--- a/wireless/driver/shared/scan_support.c
++++ b/wireless/driver/shared/scan_support.c
+@@ -1368,7 +1368,7 @@
+ 
+   if (request->type == MTLK_SCAN_STA || request->type == MTLK_SCAN_SCHED_STA)
+   {
+-    if (has_peer_connections)
++    if (has_peer_connections || has_stas_connected)
+     {
+       ILOG0_V("Scan by sta - do drv bg scan");
+ 

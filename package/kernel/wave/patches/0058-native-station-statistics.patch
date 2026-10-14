@@ -1,0 +1,334 @@
+Subject: [PATCH] wave: report cached firmware statistics through native station APIs
+
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -8344,6 +8344,7 @@
+     }
+   }
+ 
++  mtlk_sta_record_activity(src_sta);
+   ILOG5_YD("STA %Y found by SID %d", src_sta->info.addr.au8Addr, data->sid);
+ 
+   qos = data->priority;
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -69,7 +69,7 @@
+     *status = pPollClient->isActive;
+ 
+     if (*status) {
+-      sta->activity_timestamp = mtlk_osal_timestamp();
++      mtlk_sta_record_activity(sta);
+     }
+   }
+   else {
+@@ -111,33 +111,7 @@
+ 
+     res = poll_client_req(core->vap_handle, sta, &status);
+ 
+-    /* reset "filled"  bitstring (update it after each new variable is filled in the station info structure) */
+-    info_data->stinfo->filled = 0;
+-
+-    /* connected time (in seconds) */
+-    info_data->stinfo->connected_time = mtlk_sta_get_age(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-    info_data->stinfo->filled |= STATION_INFO_CONNECTED_TIME;
+-#else
+-    info_data->stinfo->filled |= BIT(NL80211_STA_INFO_CONNECTED_TIME);
+-#endif
+-
+-    /* inactive time (in milliseconds) */
+-    info_data->stinfo->inactive_time = mtlk_sta_get_inactive_time(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-    info_data->stinfo->filled |= STATION_INFO_INACTIVE_TIME;
+-#else
+-    info_data->stinfo->filled |= BIT(NL80211_STA_INFO_INACTIVE_TIME);
+-#endif
+-
+-    /* the value is signed, therefore decided to use signal
+-       field of station_info structure, not max_rssi, which is unsigned */
+-    info_data->stinfo->signal = mtlk_sta_get_mgmt_max_rssi(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-    info_data->stinfo->filled |= STATION_INFO_SIGNAL;
+-#else
+-    info_data->stinfo->filled |= BIT(NL80211_STA_INFO_SIGNAL);
+-#endif
++    mtlk_sta_fill_station_info(sta, info_data->stinfo);
+ 
+     mtlk_sta_decref(sta); /* De-reference of find */
+ 
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -1535,6 +1535,29 @@
+                                           WAVE_CORE_REQ_STA_ROLE, TRUE);
+ }
+ 
++/* mac80211 owns association/management lifetime, while firmware owns the
++ * Ethernet data counters. The wiphy mutex pins the native VAP; the lookup
++ * reference pins the cached peer across concurrent disconnect/recovery. */
++static void _wv_ieee80211_op_sta_statistics(struct ieee80211_hw *hw,
++                                           struct ieee80211_vif *vif,
++                                           struct ieee80211_sta *sta,
++                                           struct station_info *sinfo)
++{
++  struct wv_vif_priv *priv = (void *)vif->drv_priv;
++  mtlk_vap_handle_t vap;
++  sta_entry *peer;
++
++  lockdep_assert_wiphy(hw->wiphy);
++  if (!priv->df_user)
++    return;
++  vap = mtlk_df_get_vap_handle(mtlk_df_user_get_df(priv->df_user));
++  peer = mtlk_stadb_find_sta(mtlk_core_get_stadb(mtlk_vap_get_core(vap)), sta->addr);
++  if (!peer)
++    return;
++  mtlk_sta_fill_station_info(peer, sinfo);
++  mtlk_sta_decref(peer);
++}
++
+ static int _wv_ieee80211_op_sta_state (struct ieee80211_hw *hw,
+     struct ieee80211_vif *vif,
+     struct ieee80211_sta *sta,
+@@ -2826,6 +2849,7 @@
+   .remove_interface         = _wv_ieee80211_op_remove_interface,
+   .configure_filter         = _wv_ieee80211_op_configure_filter,
+   .sta_state                = _wv_ieee80211_op_sta_state,
++  .sta_statistics           = _wv_ieee80211_op_sta_statistics,
+   .set_key                  = _wv_ieee80211_op_set_key,
+   .set_default_unicast_key  = _wv_ieee80211_op_set_default_unicast_key,
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 2, 0)
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -6297,7 +6297,7 @@
+   for (i = 0; i < STAT_STA_CNTR_TOTAL; i++) {
+     db_offs = offsets[i].start_offset + (sta_sid * offsets[i].next_idx_offs);
+     hw_cntr = (void *)hw->hw_mhi_stats.db_copy + db_offs;
+-    values[i] = MHI_STATS_STA_CNTR_TO_HOST(*hw_cntr);
++    WRITE_ONCE(values[i], MHI_STATS_STA_CNTR_TO_HOST(*hw_cntr));
+     ILOG3_DDD("[%2d] offs %4d, val %d", i, db_offs, values[i]);
+   }
+ 
+@@ -6810,9 +6810,8 @@
+         if (_mtlk_hw_is_sid_valid(hw, sta_sid)) {
+             stationPhyRxStatusDb_t *sta_status = &phy_db->sta_status[sta_sid];
+ 
++            _mtlk_hw_mhi_sta_fill_tx_rate_statistic(hw, mtlk_sta_get_mhi_tx_stats((sta_entry *)sta), sta_sid);
+             mtlk_sta_update_phy_info((sta_entry *)sta, hw, sta_status);
+-
+-            _mtlk_hw_mhi_sta_fill_tx_rate_statistic(hw, mtlk_sta_get_mhi_tx_stats((sta_entry *)sta), sta_sid);
+ 
+             _mtlk_sta_update_statistics(hw, (sta_entry *)sta, sta_status);
+ 
+--- a/wireless/driver/shared/stadb.c
++++ b/wireless/driver/shared/stadb.c
+@@ -160,7 +160,7 @@
+ {
+   MTLK_ASSERT(sta);
+ 
+-  return __mtlk_sta_rate_info_to_rate(sta, "Data", sta->info.stats.rx_data_rate_info);
++  return __mtlk_sta_rate_info_to_rate(sta, "Data", READ_ONCE(sta->info.stats.rx_data_rate_info));
+ }
+ 
+ static uint32
+@@ -174,7 +174,7 @@
+ static uint32
+ _mtlk_sta_get_tx_data_rate (const sta_entry *sta)
+ {
+-  return mtlk_bitrate_params_to_rate(sta->info.stats.tx_data_rate_params);
++  return mtlk_bitrate_params_to_rate(READ_ONCE(sta->info.stats.tx_data_rate_params));
+ }
+ 
+ static uint8
+@@ -281,6 +281,16 @@
+ }
+ 
+ /******************************************************************************************/
++
++/* Record observed data RX or activity confirmed by the existing firmware
++ * poll. Data-buffer completion does not contain a TX ACK result. */
++void __MTLK_IFUNC
++mtlk_sta_record_activity(sta_entry *sta)
++{
++  mtlk_osal_lock_acquire(&sta->lock);
++  WRITE_ONCE(sta->activity_timestamp, mtlk_osal_timestamp());
++  mtlk_osal_lock_release(&sta->lock);
++}
+ 
+ void __MTLK_IFUNC
+ mtlk_sta_update_mhi_peers_stats(sta_entry *sta)
+@@ -406,7 +416,7 @@
+   stats->FwdRxBytes                           = mtlk_sta_get_cnt(sta, MTLK_STAI_CNT_FWD_RX_BYTES);
+   stats->PSModeEntrances                      = mtlk_sta_get_cnt(sta, MTLK_STAI_CNT_PS_MODE_ENTRANCES);
+ 
+-  stats->LastActivityTimestamp                = mtlk_osal_time_passed_ms(sta->activity_timestamp);
++  stats->LastActivityTimestamp                = mtlk_sta_get_inactive_time(sta);
+ 
+ /* FIXME: currently mtidl_ini.pl just ignore any C preprocessor "#" lines */
+ /* So these items (below) are always present in data struct */
+@@ -1516,6 +1526,49 @@
+   return res;
+ }
+ 
++/* The caller holds a peer reference. Statistics use the existing periodic
++ * firmware cache, not a new firmware request on each station query. */
++void __MTLK_IFUNC
++mtlk_sta_fill_station_info(const sta_entry *sta, struct station_info *sinfo)
++{
++  uint32 tx_rate = _mtlk_sta_get_tx_data_rate(sta);
++  uint32 rx_rate = _mtlk_sta_get_rx_data_rate(sta);
++
++  sinfo->signal = rx_rate == MTLK_BITRATE_INVALID ?
++                   mtlk_sta_get_mgmt_max_rssi(sta) : READ_ONCE(sta->info.stats.max_rssi);
++  sinfo->tx_bytes = mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_TX_BYTES);
++  sinfo->rx_bytes = mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_RX_BYTES);
++  sinfo->tx_packets = mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_TX_FRAMES);
++  sinfo->rx_packets = mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_RX_FRAMES);
++  sinfo->connected_time = mtlk_sta_get_age(sta);
++  sinfo->inactive_time = mtlk_sta_get_inactive_time(sta);
++
++  /* These firmware counters wrap at 32 bits; do not label them as 64-bit
++   * totals or replace unrelated fields already supplied by the stack. */
++  sinfo->filled &= ~(BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
++                     BIT_ULL(NL80211_STA_INFO_RX_BYTES64));
++  sinfo->filled |= BIT_ULL(NL80211_STA_INFO_SIGNAL) |
++                    BIT_ULL(NL80211_STA_INFO_TX_BYTES) |
++                    BIT_ULL(NL80211_STA_INFO_RX_BYTES) |
++                    BIT_ULL(NL80211_STA_INFO_TX_PACKETS) |
++                    BIT_ULL(NL80211_STA_INFO_RX_PACKETS) |
++                    BIT_ULL(NL80211_STA_INFO_CONNECTED_TIME) |
++                    BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME);
++
++  /* cfg80211 and the firmware conversion both use 100 kbit/s. A missing
++   * rate must remain unfilled, not masquerade as a measured zero bitrate. */
++  if (tx_rate != MTLK_BITRATE_INVALID && tx_rate <= U16_MAX) {
++    memset(&sinfo->txrate, 0, sizeof(sinfo->txrate));
++    sinfo->txrate.legacy = tx_rate;
++    sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
++  }
++  if (rx_rate != MTLK_BITRATE_INVALID && rx_rate <= U16_MAX) {
++    memset(&sinfo->rxrate, 0, sizeof(sinfo->rxrate));
++    sinfo->rxrate.legacy = rx_rate;
++    sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_BITRATE);
++  }
++}
++
+ int __MTLK_IFUNC mtlk_stadb_get_sta_by_iter_id(sta_db *stadb, int iter_id, uint8 *mac, struct station_info* stinfo)
+ {
+   int                   res = MTLK_ERR_PARAMS;
+@@ -1529,78 +1582,8 @@
+       if (iter_id == 0) {
+         ieee_addr_get(mac, mtlk_sta_get_addr(sta));
+ 
+-        if (stinfo) {
+-          mtlk_wssa_drv_tr181_peer_stats_t peer_stats;
+-          memset(&peer_stats, 0, sizeof(peer_stats));
+-          mtlk_sta_get_tr181_peer_stats(sta, &peer_stats);
+-
+-          /* Signal Strength */
+-          stinfo->signal = peer_stats.SignalStrength;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-          stinfo->filled |= STATION_INFO_SIGNAL;
+-#else
+-          stinfo->filled |= BIT(NL80211_STA_INFO_SIGNAL);
+-#endif
+-
+-          /* cfg80211 rate units are 100 kbit/s, matching the native bitrate. */
+-          stinfo->txrate.legacy = _mtlk_sta_get_tx_data_rate(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-          stinfo->filled |= STATION_INFO_TX_BITRATE;
+-#else
+-          stinfo->filled |= BIT(NL80211_STA_INFO_TX_BITRATE);
+-#endif
+-
+-          /* cfg80211 rate units are 100 kbit/s, matching the native bitrate. */
+-          stinfo->rxrate.legacy = _mtlk_sta_get_rx_data_rate(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-          stinfo->filled |= STATION_INFO_RX_BITRATE;
+-#else
+-          stinfo->filled |= BIT(NL80211_STA_INFO_RX_BITRATE);
+-#endif
+-
+-          /* TX bytes */
+-          stinfo->tx_bytes = peer_stats.traffic_stats.BytesSent;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-          stinfo->filled |= STATION_INFO_TX_BYTES;
+-#else
+-          stinfo->filled |= BIT(NL80211_STA_INFO_TX_BYTES);
+-#endif
+-
+-          /* RX bytes */
+-          stinfo->rx_bytes = peer_stats.traffic_stats.BytesReceived;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-          stinfo->filled |= STATION_INFO_RX_BYTES;
+-#else
+-          stinfo->filled |= BIT(NL80211_STA_INFO_RX_BYTES);
+-#endif
+-          /* TX packets */
+-          stinfo->tx_packets = peer_stats.traffic_stats.PacketsSent;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-          stinfo->filled |= STATION_INFO_TX_PACKETS;
+-#else
+-          stinfo->filled |= BIT(NL80211_STA_INFO_TX_PACKETS);
+-#endif
+-
+-          /* RX packets */
+-          stinfo->rx_packets = peer_stats.traffic_stats.PacketsReceived;
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-          stinfo->filled |= STATION_INFO_RX_PACKETS;
+-#else
+-          stinfo->filled |= BIT(NL80211_STA_INFO_RX_PACKETS);
+-#endif
+-
+-          /* Connected time --> Doesn't show in the default iw */
+-          stinfo->connected_time = mtlk_sta_get_age(sta);
+-          stinfo->filled |= BIT(NL80211_STA_INFO_CONNECTED_TIME);
+-
+-          /* Invactive time */
+-          stinfo->inactive_time = mtlk_sta_get_inactive_time(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-          stinfo->filled |= STATION_INFO_INACTIVE_TIME;
+-#else
+-          stinfo->filled |= BIT(NL80211_STA_INFO_INACTIVE_TIME);
+-#endif
+-        }
++        if (stinfo)
++          mtlk_sta_fill_station_info(sta, stinfo);
+ 
+         res = MTLK_ERR_OK;
+         break;
+--- a/wireless/driver/shared/stadb.h
++++ b/wireless/driver/shared/stadb.h
+@@ -323,7 +323,7 @@
+ 
+     if (id < STAT_STA_CNTR_TOTAL) {
+         mhi_sta_cntr_t  *cntrs = mtlk_sta_get_mhi_stat_array(sta);
+-        return cntrs[id];
++        return READ_ONCE(cntrs[id]);
+     } else {
+         return 0;
+     }
+@@ -520,8 +520,10 @@
+ static __INLINE uint32
+ mtlk_sta_get_inactive_time (const sta_entry *sta)
+ {
+-  mtlk_osal_timestamp_diff_t diff = mtlk_osal_timestamp_diff(mtlk_osal_timestamp(), sta->activity_timestamp);
+-  return mtlk_osal_timestamp_to_ms(diff);
++  /* Sample the peer before the clock: RX may update it concurrently. */
++  mtlk_osal_timestamp_t last = READ_ONCE(sta->activity_timestamp);
++
++  return mtlk_osal_time_passed_ms(last);
+ }
+ 
+ static __INLINE void
+@@ -902,6 +904,12 @@
+ 
+ int __MTLK_IFUNC
+ mtlk_stadb_get_stat(sta_db *stadb, struct _hst_db *hstdb, mtlk_clpb_t *clpb, uint8 group_cipher);
++void __MTLK_IFUNC
++mtlk_sta_record_activity(sta_entry *sta);
++
++void __MTLK_IFUNC
++mtlk_sta_fill_station_info(const sta_entry *sta, struct station_info *sinfo);
++
+ int __MTLK_IFUNC
+ mtlk_stadb_get_sta_by_iter_id(sta_db *stadb, int iter_id, uint8 *mac, struct station_info* stinfo);
+ 

@@ -1,0 +1,44 @@
+Subject: [PATCH] wave: reject a FixedPower query without a stored request
+
+A cold radio has no FixedPower tuple. Its formatter previously returned
+success without writing any values, while the fixed-arity vendor reply
+copied all four allocated words. Propagate unsupported through the existing
+checked formatter result instead of returning uninitialized output.
+
+Keep the four-word reply for a stored request unchanged. This getter reports
+only the existing requested-value cache, not firmware application or RF power.
+
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -3854,7 +3854,7 @@
+     *intvec_length = 2;
+ }
+ 
+-static void
++static int
+ _mtlk_df_user_get_intvec_by_fixed_pwr_params (uint32 *intvec, uint16 max_length, uint16 *intvec_length, FixedPower_t *fixed_pwr_params)
+ {
+   MTLK_ASSERT(max_length >= 4);
+@@ -3869,7 +3869,10 @@
+   else {
+     ELOG_V("Fixed Power not Set, Getter invalid!");
+     *intvec_length = 0;
+-  }
++    return MTLK_ERR_NOT_SUPPORTED;
++  }
++
++  return MTLK_ERR_OK;
+ }
+ 
+ static int
+@@ -4947,8 +4950,8 @@
+ 
+     /* Fixed TX management power */
+     _DF_USER_GET_ON_PARAM_MEMBER(PRM_ID_FIXED_POWER, WAVE_RADIO_REQ_GET_MASTER_CFG, FALSE, mtlk_master_core_cfg_t, master_core_cfg, fixed_pwr_params)
+-      MTLK_CFG_GET_ITEM_BY_FUNC_VOID(master_core_cfg, fixed_pwr_params, _mtlk_df_user_get_intvec_by_fixed_pwr_params,
+-                                     ((uint32*)data, max_length, length, &master_core_cfg->fixed_pwr_params));
++      MTLK_CFG_GET_ITEM_BY_FUNC(master_core_cfg, fixed_pwr_params, _mtlk_df_user_get_intvec_by_fixed_pwr_params,
++                                ((uint32*)data, max_length, length, &master_core_cfg->fixed_pwr_params), res);
+ 
+     /* Unconnected STA scan time */
+     _DF_USER_GET_ON_PARAM_MEMBER(PRM_ID_UNCONNECTED_STA_SCAN_TIME, WAVE_RADIO_REQ_GET_MASTER_CFG, FALSE, mtlk_master_core_cfg_t, master_cfg, unconnected_sta_scan_time)

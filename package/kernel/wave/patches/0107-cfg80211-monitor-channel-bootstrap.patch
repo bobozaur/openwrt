@@ -1,0 +1,29 @@
+From: AX50 OpenWrt bring-up <noreply@example.invalid>
+Subject: [PATCH] wave: allow exclusive monitor open before channel selection
+
+cfg80211 only dispatches set_monitor_channel while at least one monitor is
+running.  The native cold-radio channel is initially unset, so requiring
+SET_CHAN in ndo_open prevents the standard open-then-tune sequence.
+
+Keep the whole-card claim and leave carrier, RX and TX stopped when no usable
+saved channel exists.  The first channel request on the running monitor uses
+the existing typed activation path; saved-channel reopen is unchanged.
+
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -740,6 +740,15 @@
+   if (res != MTLK_ERR_OK)
+     return _mtlk_df_mtlk_to_linux_error_code(res);
+   mon->claimed = true;
++  /* cfg80211 accepts monitor channel selection only with a running monitor.
++   * A cold radio has no channel yet: reserve the exclusive owner, but keep
++   * RX/TX stopped until the first successful set_monitor_channel request.
++   * A usable saved channel still resumes through the ordinary open path. */
++  if (!cfg80211_chandef_valid(&mon->chandef) ||
++      !cfg80211_chandef_usable(mon->wdev.wiphy, &mon->chandef, IEEE80211_CHAN_DISABLED)) {
++    wv_cfg80211_monitor_suspend(mon);
++    return 0;
++  }
+   res = wave_monitor_start_channel(mon);
+   if (res) {
+     wave_monitor_stop_hardware(mon);

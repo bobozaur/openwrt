@@ -1,0 +1,449 @@
+Subject: [PATCH] wave: follow native software AP_VLAN creation lifetime
+
+Standard hostapd creates a four-address AP_VLAN before assigning its BSS
+MAC through the netdevice ioctl. Allow an initially unattached software
+port, implement the DOWN MAC setter, and select its exact active BSS at
+first open. Keep that parent pinned across close/reopen and preserve the
+existing station, key, multicast and packet lifetime owners.
+
+Reserve headroom before registration and preserve the configured MTU.
+Retire never-opened children before wiphy teardown, and reject their
+parent-dependent control operations without an assertion. AP_VLAN ports
+have no separate MLME; their registration cleanup must not overwrite the
+parent management receive filter.
+
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -663,8 +663,7 @@
+ 
+   df_user = mtlk_df_user_from_ndev(ndev);
+   if (__UNLIKELY(NULL == df_user)) {
+-    dev_kfree_skb_any(skb);
+-    return NETDEV_TX_OK;
++    goto drop;
+   }
+ 
+   if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN &&
+@@ -738,8 +737,8 @@
+ }
+ EXPORT_SYMBOL(_mtlk_df_user_linux_start_tx);
+ 
+-/* AP_VLAN owns a Linux port, never a firmware VAP. The first member keeps
+- * existing cfg80211 station/key operations attached to the parent BSS.
++/* AP_VLAN owns a Linux port, never a firmware VAP. The first member is NULL
++ * until first open selects the parent for cfg80211 station/key operations.
+  * ap_vlan_lock protects both sides of the binding and the station retirement
+  * flag. RX additionally uses RCU through the network-stack handoff.
+  */
+@@ -755,19 +754,72 @@
+ static int wave_ap_vlan_open(struct net_device *ndev)
+ {
+   struct wave_ap_vlan *vlan = netdev_priv(ndev);
+-  mtlk_vap_handle_t vap = mtlk_df_get_vap_handle(vlan->parent->df);
+-
+-  if (!netif_running(vlan->parent->ndev))
+-    return -ENETDOWN;
++  struct wiphy *wiphy = vlan->wdev.wiphy;
++  struct wireless_dev *iter;
++  mtlk_df_user_t *parent = NULL;
++  struct net_device *parent_ndev;
++  mtlk_vap_handle_t vap;
++  int err = 0;
++
++  ASSERT_RTNL();
++  wiphy_lock(wiphy);
++  /* Standard hostapd assigns the BSS MAC after NEW_INTERFACE and before UP.
++   * Resolve that final address here, without guessing from the child name. */
++  list_for_each_entry(iter, &wiphy->wdev_list, list) {
++    mtlk_df_user_t *candidate;
++    mtlk_core_t *core;
++
++    if (iter->iftype != NL80211_IFTYPE_AP || !iter->netdev ||
++        !netif_running(iter->netdev) ||
++        !ether_addr_equal(iter->netdev->dev_addr, ndev->dev_addr))
++      continue;
++    candidate = mtlk_df_user_from_ndev(iter->netdev);
++    core = mtlk_vap_get_core(mtlk_df_get_vap_handle(candidate->df));
++    if (!READ_ONCE(core->slow_ctx->ap_started))
++      continue;
++    if (parent) {
++      err = -EINVAL;
++      goto out;
++    }
++    parent = candidate;
++  }
++  if (!parent || (vlan->parent && vlan->parent != parent)) {
++    err = -ENOLINK;
++    goto out;
++  }
++  parent_ndev = parent->ndev;
++  /* Registration/upper attachment already consumed these reservations.
++   * Do not change them, or the administrator's MTU, during first open. */
++  if (ndev->needed_headroom < parent_ndev->needed_headroom ||
++      ndev->needed_tailroom < parent_ndev->needed_tailroom ||
++      ndev->mtu < parent_ndev->min_mtu ||
++      (parent_ndev->max_mtu && ndev->mtu > parent_ndev->max_mtu)) {
++    err = -EINVAL;
++    goto out;
++  }
++  if (!vlan->parent) {
++    ndev->min_mtu = parent_ndev->min_mtu;
++    ndev->max_mtu = parent_ndev->max_mtu;
++    dev_hold(parent_ndev);
++    WRITE_ONCE(vlan->parent_ndev, parent_ndev);
++    WRITE_ONCE(vlan->parent, parent);
++    list_add_tail(&vlan->node, &parent->ap_vlans);
++  }
++  vap = mtlk_df_get_vap_handle(parent->df);
+   wave_hw_tx_queue_start(mtlk_vap_get_hw(vap), &vlan->tx_queue);
+-  return 0;
++out:
++  wiphy_unlock(wiphy);
++  return err;
+ }
+ 
+ static int wave_ap_vlan_stop(struct net_device *ndev)
+ {
+   struct wave_ap_vlan *vlan = netdev_priv(ndev);
+-  mtlk_vap_handle_t vap = mtlk_df_get_vap_handle(vlan->parent->df);
+-
++  mtlk_vap_handle_t vap;
++
++  if (!vlan->parent)
++    return 0;
++  vap = mtlk_df_get_vap_handle(vlan->parent->df);
+   wave_hw_tx_queue_stop(mtlk_vap_get_hw(vap), &vlan->tx_queue);
+   return 0;
+ }
+@@ -775,8 +827,21 @@
+ static int wave_ap_vlan_iflink(const struct net_device *ndev)
+ {
+   const struct wave_ap_vlan *vlan = netdev_priv(ndev);
+-
+-  return vlan->parent_ndev->ifindex;
++  struct net_device *parent = READ_ONCE(vlan->parent_ndev);
++
++  return parent ? parent->ifindex : ndev->ifindex;
++}
++
++static int wave_ap_vlan_set_mac(struct net_device *ndev, void *addr)
++{
++  struct wave_ap_vlan *vlan = netdev_priv(ndev);
++
++  ASSERT_RTNL();
++  /* Once selected, the BSS owns this child's bindings until deletion.
++   * A same-address ioctl is handled by netif_set_mac_address itself. */
++  if (vlan->parent)
++    return -EBUSY;
++  return eth_mac_addr(ndev, addr);
+ }
+ 
+ static const struct net_device_ops wave_ap_vlan_ops = {
+@@ -784,13 +849,16 @@
+   .ndo_stop = wave_ap_vlan_stop,
+   .ndo_start_xmit = _mtlk_df_user_linux_start_tx,
+   .ndo_get_iflink = wave_ap_vlan_iflink,
++  .ndo_set_mac_address = wave_ap_vlan_set_mac,
++  .ndo_validate_addr = eth_validate_addr,
+ };
+ 
+ static void wave_ap_vlan_destructor(struct net_device *ndev)
+ {
+   struct wave_ap_vlan *vlan = netdev_priv(ndev);
+ 
+-  dev_put(vlan->parent_ndev);
++  if (vlan->parent_ndev)
++    dev_put(vlan->parent_ndev);
+ }
+ 
+ /* netifd enables bridge hairpin for non-isolated WAVE APs. Every bridged
+@@ -823,10 +891,11 @@
+ struct wireless_dev *wave_df_ap_vlan_add(struct wiphy *wiphy, const char *name,
+                                          struct vif_params *params)
+ {
+-  struct wireless_dev *parent = NULL, *iter;
++  struct wireless_dev *iter;
+   struct wave_ap_vlan *vlan;
+   struct net_device *ndev;
+-  mtlk_df_user_t *df_user;
++  u8 address[ETH_ALEN];
++  unsigned int headroom = 0, tailroom = 0;
+   int err;
+ 
+   ASSERT_RTNL();
+@@ -837,32 +906,25 @@
+   /* Four-address children have exactly one receiver. Ordinary dynamic-VLAN
+    * AP ports need a separate multi-station contract, not this peer binding.
+    */
+-  if (params->use_4addr != 1 || !is_valid_ether_addr(params->macaddr))
++  if (params->use_4addr != 1)
+     return ERR_PTR(-EOPNOTSUPP);
++  ether_addr_copy(address, params->macaddr);
+   list_for_each_entry(iter, &wiphy->wdev_list, list) {
+-    if (iter->iftype == NL80211_IFTYPE_AP && iter->netdev &&
+-        netif_running(iter->netdev) &&
+-        ether_addr_equal(iter->netdev->dev_addr, params->macaddr)) {
+-      mtlk_core_t *core;
+-
+-      df_user = mtlk_df_user_from_ndev(iter->netdev);
+-      core = mtlk_vap_get_core(mtlk_df_get_vap_handle(df_user->df));
+-      if (!READ_ONCE(core->slow_ctx->ap_started))
+-        continue;
+-      if (parent)
+-        return ERR_PTR(-EINVAL);
+-      parent = iter;
+-    }
+-  }
+-  if (!parent)
+-    return ERR_PTR(-ENODEV);
+-  df_user = mtlk_df_user_from_ndev(parent->netdev);
++    if (iter->iftype != NL80211_IFTYPE_AP || !iter->netdev)
++      continue;
++    /* A default address is only a seed. No BSS reference is selected until
++     * the normal DOWN MAC assignment and subsequent open have completed. */
++    if (is_zero_ether_addr(address))
++      ether_addr_copy(address, iter->netdev->dev_addr);
++    headroom = max_t(unsigned int, headroom, iter->netdev->needed_headroom);
++    tailroom = max_t(unsigned int, tailroom, iter->netdev->needed_tailroom);
++  }
++  if (!is_valid_ether_addr(address))
++    return ERR_PTR(-EADDRNOTAVAIL);
+   ndev = alloc_netdev(sizeof(*vlan), name, NET_NAME_USER, ether_setup);
+   if (!ndev)
+     return ERR_PTR(-ENOMEM);
+   vlan = netdev_priv(ndev);
+-  vlan->parent = df_user;
+-  vlan->parent_ndev = parent->netdev;
+   vlan->wdev.wiphy = wiphy;
+   vlan->wdev.iftype = NL80211_IFTYPE_AP_VLAN;
+   vlan->wdev.use_4addr = true;
+@@ -870,16 +932,13 @@
+   INIT_LIST_HEAD(&vlan->node);
+   INIT_LIST_HEAD(&vlan->tx_queue.node);
+   vlan->tx_queue.ndev = ndev;
+-  dev_net_set(ndev, dev_net(parent->netdev));
++  dev_net_set(ndev, wiphy_net(wiphy));
+   ndev->ieee80211_ptr = &vlan->wdev;
+   ndev->netdev_ops = &wave_ap_vlan_ops;
+   ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
+-  ndev->mtu = parent->netdev->mtu;
+-  ndev->min_mtu = parent->netdev->min_mtu;
+-  ndev->max_mtu = parent->netdev->max_mtu;
+-  ndev->needed_headroom = parent->netdev->needed_headroom;
+-  ndev->needed_tailroom = parent->netdev->needed_tailroom;
+-  eth_hw_addr_set(ndev, parent->netdev->dev_addr);
++  ndev->needed_headroom = headroom;
++  ndev->needed_tailroom = tailroom;
++  eth_hw_addr_set(ndev, address);
+   SET_NETDEV_DEV(ndev, wiphy_dev(wiphy));
+   netif_carrier_off(ndev);
+   err = cfg80211_register_netdevice(ndev);
+@@ -887,10 +946,8 @@
+     free_netdev(ndev);
+     return ERR_PTR(err);
+   }
+-  dev_hold(parent->netdev);
+   ndev->needs_free_netdev = true;
+   ndev->priv_destructor = wave_ap_vlan_destructor;
+-  list_add_tail(&vlan->node, &df_user->ap_vlans);
+   return &vlan->wdev;
+ }
+ 
+@@ -1089,6 +1146,8 @@
+   struct wave_ap_vlan *vlan = netdev_priv(ndev);
+   sta_entry *sta;
+ 
++  if (!vlan->parent)
++    return NULL;
+   spin_lock_bh(&vlan->parent->ap_vlan_lock);
+   sta = vlan->sta;
+   if (sta)
+@@ -1136,6 +1195,8 @@
+   ASSERT_RTNL();
+   lockdep_assert_wiphy(wdev->wiphy);
+   dev_deactivate(wdev->netdev);
++  if (!parent)
++    goto unregister;
+   spin_lock_bh(&parent->ap_vlan_lock);
+   sta = vlan->sta;
+   if (sta)
+@@ -1157,8 +1218,9 @@
+   spin_unlock_bh(&parent->ap_vlan_lock);
+   if (sta)
+     mtlk_sta_decref(sta);
+-  list_del(&vlan->node);
++  list_del_init(&vlan->node);
+   synchronize_net();
++unregister:
+   cfg80211_unregister_netdevice(wdev->netdev);
+   return 0;
+ }
+@@ -1169,6 +1231,25 @@
+ 
+   list_for_each_entry_safe(vlan, next, &parent->ap_vlans, node)
+     wave_df_ap_vlan_del(&vlan->wdev);
++}
++
++void wave_df_ap_vlan_del_unbound(struct wiphy *wiphy)
++{
++  struct wireless_dev *wdev, *next;
++
++  ASSERT_RTNL();
++  lockdep_assert_wiphy(wiphy);
++  /* Parent teardown already removed attached children. Never-opened ports
++   * belong only to the wiphy and must also leave before it unregisters. */
++  list_for_each_entry_safe(wdev, next, &wiphy->wdev_list, list) {
++    struct wave_ap_vlan *vlan;
++
++    if (wdev->iftype != NL80211_IFTYPE_AP_VLAN)
++      continue;
++    vlan = netdev_priv(wdev->netdev);
++    if (!vlan->parent)
++      wave_df_ap_vlan_del(wdev);
++  }
+ }
+ 
+ 
+--- a/wireless/driver/linux/mtlk_df_user_priv.h
++++ b/wireless/driver/linux/mtlk_df_user_priv.h
+@@ -729,6 +729,7 @@
+ struct wireless_dev *wave_df_ap_vlan_add(struct wiphy *wiphy, const char *name,
+                                          struct vif_params *params);
+ int wave_df_ap_vlan_del(struct wireless_dev *wdev);
++void wave_df_ap_vlan_del_unbound(struct wiphy *wiphy);
+ int wave_df_ap_vlan_bind(struct net_device *parent, const u8 *mac,
+                         struct net_device *vlan);
+ void wave_df_ap_vlan_sta_drop(struct _sta_entry *sta);
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -107,11 +107,6 @@
+ static const struct ieee80211_txrx_stypes
+ wv_mgmt_stypes[NUM_NL80211_IFTYPES] = {
+   [NL80211_IFTYPE_AP] = {
+-    .tx = WV_STYPE_ALL,
+-    .rx = WV_STYPE_AP_RX
+-  },
+-  [NL80211_IFTYPE_AP_VLAN] = {
+-    /* Same as AP */
+     .tx = WV_STYPE_ALL,
+     .rx = WV_STYPE_AP_RX
+   }
+@@ -817,6 +812,9 @@
+ {
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   MTLK_ASSERT(NULL != cfg80211);
++  if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN &&
++      !mtlk_df_user_from_ndev(ndev))
++    return -ENOENT;
+   return wave_radio_sta_get(cfg80211->radio, ndev, mac, sinfo);
+ }
+ 
+@@ -877,6 +875,8 @@
+ {
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   MTLK_ASSERT(NULL != cfg80211);
++  if (wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -EOPNOTSUPP;
+   return wave_radio_mgmt_tx(cfg80211->radio, wdev->netdev, chan, offchan, wait, buf, len, no_cck, dont_wait_for_ack, cookie);
+ }
+ 
+@@ -921,6 +921,10 @@
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   unsigned int subtype;
+ 
++  /* A child has no independent MLME. Its registration or unregister must
++   * not replace the parent BSS's per-interface receive filter. */
++  if (wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return;
+   /* cfg80211 supplies the complete per-interface subtype bitmap. */
+   for (subtype = 0; subtype < 16; subtype++)
+     wave_radio_mgmt_frame_register(cfg80211->radio, wdev->netdev,
+@@ -1550,6 +1554,9 @@
+ {
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   MTLK_ASSERT(NULL != cfg80211);
++  if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN &&
++      !mtlk_df_user_from_ndev(ndev))
++    return -ENOENT;
+   return wave_radio_station_dump(cfg80211->radio, ndev, idx, mac, st_info);
+ }
+ 
+@@ -2278,6 +2285,11 @@
+     return;
+   }
+ 
++  rtnl_lock();
++  wiphy_lock(cfg80211->wiphy);
++  wave_df_ap_vlan_del_unbound(cfg80211->wiphy);
++  wiphy_unlock(cfg80211->wiphy);
++  rtnl_unlock();
+   /* unregister hardware */
+   wiphy_unregister(cfg80211->wiphy);
+ 
+--- a/wireless/driver/linux/vendor_cmds.c
++++ b/wireless/driver/linux/vendor_cmds.c
+@@ -347,6 +347,8 @@
+   int res = MTLK_ERR_VALUE;
+   uint16 recv_num_of_params = data_len / sizeof(int);
+   mtlk_df_user_t *df_user = mtlk_df_user_from_wdev(wdev);
++  if (!df_user && wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -ENOLINK;
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   if (recv_num_of_params < min_num_of_params || recv_num_of_params > max_num_of_params)
+@@ -364,6 +366,8 @@
+   struct sockaddr addr_param;
+   uint16 recv_num_of_params = data_len / (sizeof(addr_param.sa_family) + ETH_ALEN);
+   mtlk_df_user_t *df_user = mtlk_df_user_from_wdev(wdev);
++  if (!df_user && wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -ENOLINK;
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   if (min_num_of_params != 1 || max_num_of_params != 1) {
+@@ -388,6 +392,8 @@
+   int res;
+   uint16 recv_num_of_params = data_len / sizeof(char);
+   mtlk_df_user_t *df_user = mtlk_df_user_from_wdev(wdev);
++  if (!df_user && wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -ENOLINK;
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   res = mtlk_df_ui_set_cfg(df_user, cmd, (char*) data, MTLK_IW_PRIW_PARAM(TEXT_ITEM,recv_num_of_params));
+@@ -1189,6 +1195,8 @@
+   int                      wep_key_data_len = data_len - sizeof(int);
+ 
+   ILOG1_SSD("%s: Invoked from %s (%i)", wdev->netdev->name, current->comm, current->pid);
++  if (!df_user && wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -ENOLINK;
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   memset(&enc_cfg, 0, sizeof(enc_cfg));
+@@ -1230,6 +1238,8 @@
+   int array_size = sizeof(int) * num_of_params;
+   uint16 len = 0;
+ 
++  if (!df_user && wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -ENOLINK;
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   recv_data = mtlk_osal_mem_alloc(array_size, MTLK_MEM_TAG_VENDOR_CMD_DATA);
+@@ -1263,6 +1273,8 @@
+   struct sockaddr recv_data;
+   uint16 len = 0;
+ 
++  if (!df_user && wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -ENOLINK;
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   if (num_of_params > 1) {
+@@ -1298,6 +1310,10 @@
+   char *recv_data;
+   int array_size = TEXT_ARRAY_SIZE;
+   uint16 len = 0;
++
++  if (!df_user && wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -ENOLINK;
++  MTLK_CHECK_DF_USER(df_user);
+ 
+   recv_data = mtlk_osal_mem_alloc(array_size, MTLK_MEM_TAG_VENDOR_CMD_DATA);
+   if (!recv_data)

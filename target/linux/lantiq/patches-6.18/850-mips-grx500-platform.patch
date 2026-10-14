@@ -1,0 +1,122 @@
+--- a/arch/mips/Kconfig
++++ b/arch/mips/Kconfig
+@@ -452,6 +452,34 @@
+ 	select CPU_SUPPORTS_CPUFREQ
+ 	select MIPS_EXTERNAL_TIMER
+ 
++config MACH_GRX500
++	bool "Lantiq GRX500 based platforms"
++	select BOOT_RAW
++	select CEVT_R4K
++	select COMMON_CLK
++	select CPU_MIPSR2_IRQ_EI
++	select CPU_MIPSR2_IRQ_VI
++	select CSRC_R4K
++	select DMA_NONCOHERENT
++	select HAVE_PCI
++	select IRQ_MIPS_CPU
++	select MIPS_CPU_SCACHE
++	select MIPS_GIC
++	select MIPS_L1_CACHE_SHIFT_6
++	select NO_EXCEPT_FILL
++	select PCI_DRIVERS_GENERIC
++	select SYS_HAS_CPU_MIPS32_R2
++	select SYS_HAS_CPU_MIPS32_R3_5
++	select SYS_SUPPORTS_32BIT_KERNEL
++	select SYS_SUPPORTS_BIG_ENDIAN
++	select SYS_SUPPORTS_SMP
++	select SYNC_R4K if SMP
++	select WEAK_ORDERING if SMP
++	select USE_OF
++	help
++	  Support for GRX500 interAptiv systems using the EVA address map
++	  and the boot firmware's IBL secondary processor launch protocol.
++
+ config LANTIQ
+ 	bool "Lantiq based platforms"
+ 	select DMA_NONCOHERENT
+--- a/arch/mips/Kbuild.platforms
++++ b/arch/mips/Kbuild.platforms
+@@ -14,6 +14,7 @@
+ platform-$(CONFIG_ECONET)		+= econet/
+ platform-$(CONFIG_MIPS_GENERIC)		+= generic/
+ platform-$(CONFIG_MACH_JAZZ)		+= jazz/
++platform-$(CONFIG_MACH_GRX500)		+= grx500/
+ platform-$(CONFIG_LANTIQ)		+= lantiq/
+ platform-$(CONFIG_MACH_LOONGSON2EF)	+= loongson2ef/
+ platform-$(CONFIG_MACH_LOONGSON32)	+= loongson32/
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -1002,7 +1002,7 @@
+ 
+ config SERIAL_LANTIQ
+ 	tristate "Lantiq serial driver"
+-	depends on (LANTIQ || X86) || COMPILE_TEST
++	depends on (LANTIQ || X86 || MACH_GRX500) || COMPILE_TEST
+ 	select SERIAL_CORE
+ 	help
+ 	  Support for UART on Lantiq and Intel SoCs.
+--- a/arch/mips/include/asm/mach-generic/spaces.h
++++ b/arch/mips/include/asm/mach-generic/spaces.h
+@@ -30,7 +30,9 @@
+ #endif /* __ASSEMBLER__ */
+ 
+ #ifdef CONFIG_32BIT
++#ifndef CAC_BASE
+ #define CAC_BASE		_AC(0x80000000, UL)
++#endif
+ #ifndef IO_BASE
+ #define IO_BASE			_AC(0xa0000000, UL)
+ #endif
+--- a/arch/mips/include/asm/addrspace.h
++++ b/arch/mips/include/asm/addrspace.h
+@@ -146,4 +146,8 @@
+ #define KDM_TO_PHYS(x)		(_ACAST64_ (x) & TO_PHYS_MASK)
+ #define PHYS_TO_K0(x)		(_ACAST64_ (x) | CAC_BASE)
+ 
++#ifdef CONFIG_MACH_GRX500
++#include <asm/mach-grx500/addrspace.h>
++#endif
++
+ #endif /* _ASM_ADDRSPACE_H */
+--- a/arch/mips/include/asm/uaccess.h
++++ b/arch/mips/include/asm/uaccess.h
+@@ -19,7 +19,12 @@
+ #ifdef CONFIG_32BIT
+ 
+ #define __UA_LIMIT 0x80000000UL
++#ifdef CONFIG_MACH_GRX500
++/* EVA keeps the user address space separate from the kernel alias. */
++#define TASK_SIZE_MAX __UA_LIMIT
++#else
+ #define TASK_SIZE_MAX	KSEG0
++#endif
+ 
+ #define __UA_ADDR	".word"
+ #define __UA_LA		"la"
+--- a/arch/mips/mm/dma-noncoherent.c
++++ b/arch/mips/mm/dma-noncoherent.c
+@@ -51,7 +51,12 @@
+ 
+ void *arch_dma_set_uncached(void *addr, size_t size)
+ {
++	#ifdef CONFIG_MACH_GRX500
++	/* GRX500 uncached DRAM starts at UNCAC_BASE, not at physical zero. */
++	return (void *)((unsigned long)addr - PAGE_OFFSET + UNCAC_BASE);
++#else
+ 	return (void *)(__pa(addr) + UNCAC_BASE);
++#endif
+ }
+ 
+ static inline void dma_sync_virt_for_device(void *addr, size_t size,
+--- a/arch/mips/kernel/smp.c
++++ b/arch/mips/kernel/smp.c
+@@ -478,6 +478,8 @@
+ 	if (!wait_for_completion_timeout(&cpu_starting,
+ 					 msecs_to_jiffies(1000))) {
+ 		pr_crit("CPU%u: failed to start\n", cpu);
++		if (IS_ENABLED(CONFIG_MACH_GRX500))
++			panic("GRX500: dispatched secondary failed to start");
+ 		return -EIO;
+ 	}
+ 

@@ -1,0 +1,105 @@
+Subject: [PATCH] expose shared TX completion progress in existing statistics
+
+Sample the data pool and completion ring when General statistics are read.
+This distinguishes descriptor retention in firmware from host completion
+backlog without adding per-packet instrumentation or another poller.
+
+--- a/wireless/driver/shared/hw_mmb.h
++++ b/wireless/driver/shared/hw_mmb.h
+@@ -234,6 +234,18 @@
+ 
+ void wave_hw_mmb_quiesce(mtlk_hw_t *hw);
+ bool wave_hw_mmb_ready(mtlk_hw_t *hw);
++
++/* On-demand shared TX diagnostics. Firmware and completion advance between
++ * samples; counters describe progress, not one atomic hardware transaction. */
++struct wave_tx_stats {
++  u64 sampled_ns;
++  u32 free_desc;
++  u32 used_peak;
++  u32 pending_cfm;
++  u32 completed_cfm;
++  u32 irq_status;
++};
++bool wave_hw_get_tx_stats(mtlk_hw_t *hw, struct wave_tx_stats *stats);
+ 
+ /* An active native data netdev participates in the shared descriptor pool.
+  * The pool lock protects membership and stop/wake against completion. Control
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -42,6 +42,7 @@
+ #include "drvver.h"
+ 
+ #include "linux/netdevice.h"
++#include <linux/ktime.h>
+ #ifdef MTCFG_SET_PM_QOS
+ #include "linux/pm_qos.h"
+ #endif
+@@ -7029,6 +7030,30 @@
+ {
+   return !READ_ONCE(hw->quiescing) &&
+          READ_ONCE(hw->state) == MTLK_HW_STATE_READY;
++}
++
++bool wave_hw_get_tx_stats(mtlk_hw_t *hw, struct wave_tx_stats *stats)
++{
++  mtlk_handle_t flags;
++
++  mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
++  stats->free_desc = hw->tx.nof_free_bds;
++  stats->used_peak = hw->tx.max_used_bds;
++  mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
++
++  /* The control owner's proc lifetime keeps the pool alive. The register
++   * fence additionally excludes MMIO once terminal shutdown has started. */
++  flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++  if (!wave_hw_mmb_ready(hw)) {
++    mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
++    return false;
++  }
++  stats->sampled_ns = ktime_get_ns();
++  stats->pending_cfm = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->tx.ring.regs);
++  stats->completed_cfm = READ_ONCE(hw->tx.ring.regs.int_OUT_cntr);
++  stats->irq_status = mtlk_ccr_is_interrupt_pending(hw->ccr);
++  mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
++  return true;
+ }
+ 
+ /* Terminal for this probe. Only a fresh PCI probe may restart the card. */
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -6261,9 +6261,6 @@
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->fw_logger_packets_processed, "FW logger packets processed");
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->fw_logger_packets_dropped, "FW logger packets dropped");
+ 
+-  mtlk_aux_seq_printf(s, uint_fmt,  general_stats->tx_msdus_free, "TX MSDUs free");
+-  mtlk_aux_seq_printf(s, uint_fmt,  general_stats->tx_msdus_usage_peak, "TX MSDUs usage peak");
+-
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->dgaf_disabled_tx_pck_dropped, "DGAF disabled: TX DHCP packets converted to Unicast");
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->dgaf_disabled_tx_pck_converted, "DGAF disabled: TX Broadcast packets dropped");
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->radars_detected, "Radars detected");
+@@ -6388,6 +6385,7 @@
+   mtlk_df_user_t *df_user = mtlk_df_get_user(df);
+   mtlk_core_ui_get_stadb_status_req_t get_stadb_status_req;
+   unsigned long sta_cnt = 0;
++  struct wave_tx_stats tx;
+ 
+   /* Get Core general information from DF buffer and don't call Core */
+ 
+@@ -6449,6 +6447,16 @@
+       (unsigned long)df_user->slow_ctx->core_general_stats.core_priv_stats.tx_bcast_nrmcast);
+ 
+   _mtlk_df_ui_print_driver_stats(s, &df_user->slow_ctx->core_general_stats);
++
++  if (wave_hw_get_tx_stats(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df)), &tx)) {
++    mtlk_aux_seq_printf(s, "\nShared TX descriptor statistics\n\n");
++    mtlk_aux_seq_printf(s, "%20llu TX sample monotonic ns\n", tx.sampled_ns);
++    mtlk_aux_seq_printf(s, "%10u TX MSDUs free\n", tx.free_desc);
++    mtlk_aux_seq_printf(s, "%10u TX MSDUs usage peak\n", tx.used_peak);
++    mtlk_aux_seq_printf(s, "%10u TX confirmations pending\n", tx.pending_cfm);
++    mtlk_aux_seq_printf(s, "%10u TX confirmations consumed\n", tx.completed_cfm);
++    mtlk_aux_seq_printf(s, "%08x HW interrupt status\n", tx.irq_status);
++  }
+ 
+ #if MTLK_USE_DIRECTCONNECT_DP_API
+   _mtlk_df_ui_print_litepath(s, df_user);

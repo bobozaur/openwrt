@@ -1,0 +1,87 @@
+Subject: [PATCH] wave: keep broadcast management data in the serializer allocation
+
+A broadcast management indication queued only a pointer to a separate frame.
+Admission failure, cancellation and disabled abilities skipped the callback that
+freed that frame. Copy the header and bytes together into the existing async
+context so its completion owns every outcome, and clean an initialized command
+when enqueue fails.
+
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -480,6 +480,7 @@
+                                 HANDLE_T(ctx));
+   if(MTLK_ERR_OK != res)
+   {
++    mtlk_command_cleanup(&ctx->cmd);
+     mtlk_osal_mem_free(ctx);
+     ELOG_DD("CID-%04x: Failed to enqueue command object (error: %d)", mtlk_vap_get_oid(nic->vap_handle), res);
+     return res;
+@@ -8749,7 +8750,7 @@
+   mtlk_core_t         *cur_core;
+   mtlk_vap_manager_t  *vap_mng;
+   mtlk_vap_handle_t   vap_handle;
+-  uint8 *buf     = frame->frame;
++  uint8 *buf     = (uint8 *)(frame + 1);
+   int    size    = frame->size;
+   int    freq    = frame->freq;
+   unsigned subtype = frame->subtype;
+@@ -8757,7 +8758,9 @@
+   sta_entry *sta;
+   IEEE_ADDR *src_addr;
+ 
+-  MTLK_ASSERT (data_size == sizeof(mtlk_mngmnt_frame_t));
++  MTLK_ASSERT (data_size == sizeof(*frame) + frame->size);
++  /* The serializer owns the copied header and frame as one allocation. */
++  frame->frame = buf;
+ 
+   vap_mng  = mtlk_vap_get_manager(nic->vap_handle);
+   max_vaps = wave_radio_max_vaps_get(wave_vap_radio_get(nic->vap_handle));
+@@ -8842,7 +8845,6 @@
+     }
+   } /* for (i = 0; i < max_vaps; i++) */
+ 
+-  mtlk_osal_mem_free(frame->frame);
+   return MTLK_ERR_OK;
+ }
+ 
+@@ -9048,23 +9050,26 @@
+                data->buf, data->size, &is_broadcast))
+           {
+             if (is_broadcast) {
+-              /* Broad cast frames will be send throught serialzer - we need copy them for all vaps */
+-              mtlk_mngmnt_frame_t frame;
+-              frame.size = data->size;
+-              frame.freq = fd.chan->center_freq;
+-              frame.subtype = subtype;
+-              frame.phy_info = *fd.phy_info; /* including max_rssi */
+-              frame.probe_req_wps_ie = fd.probe_req_wps_ie;
+-              frame.probe_req_interworking_ie = fd.probe_req_interworking_ie;
+-              frame.probe_req_vsie = fd.probe_req_vsie;
+-              frame.pmf_flags = fd.pmf_flags;
+-              frame.frame = mtlk_osal_mem_alloc(data->size, MTLK_MEM_TAG_CFG80211);
+-              if (frame.frame == NULL) {
++              /* Inline payload survives skipped/cancelled serializer work. */
++              mtlk_mngmnt_frame_t *frame;
++              uint32 frame_size = sizeof(*frame) + data->size;
++              frame = mtlk_osal_mem_alloc(frame_size, MTLK_MEM_TAG_CFG80211);
++              if (frame == NULL) {
+                 ELOG_D("CID-%04x: Can't allocate memory for mngmnt frame", mtlk_vap_get_oid(nic->vap_handle));
+               } else {
+-                wave_memcpy(frame.frame, data->size, data->buf, data->size);
++                frame->size = data->size;
++                frame->freq = fd.chan->center_freq;
++                frame->subtype = subtype;
++                frame->phy_info = *fd.phy_info;
++                frame->probe_req_wps_ie = fd.probe_req_wps_ie;
++                frame->probe_req_interworking_ie = fd.probe_req_interworking_ie;
++                frame->probe_req_vsie = fd.probe_req_vsie;
++                frame->pmf_flags = fd.pmf_flags;
++                frame->frame = NULL; /* relocated in the queued copy */
++                wave_memcpy(frame + 1, data->size, data->buf, data->size);
+                 _mtlk_process_hw_task(nic, SERIALIZABLE, _mtlk_core_broadcast_mngmnt_frame_notify, HANDLE_T(nic),
+-                                      &frame, sizeof(mtlk_mngmnt_frame_t));
++                                      frame, frame_size);
++                mtlk_osal_mem_free(frame);
+               }
+             } else {
+               /* unicast frames can be send directly */

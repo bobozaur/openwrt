@@ -1,0 +1,28 @@
+Subject: [PATCH] wave: validate the A0 FixedPower selector before publication
+
+The matching Gen6 A0 firmware implements FixedPower selectors zero through
+four. Other byte values reach the ordinary peer descriptor writer with an
+invalid selector and assert. Reject them before storing the request or
+submitting a firmware message. Keep the other chip-generation paths and
+the existing valid-selector behavior unchanged.
+
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -5629,9 +5629,17 @@
+ _mtlk_core_store_and_send_fixed_pwr_cfg (mtlk_core_t *core, FixedPower_t *fixed_pwr_params)
+ {
+   wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
+   MTLK_ASSERT(NULL != radio);
+ 
++  /* A0 implements selectors 0..4. Other byte values reach its peer
++   * descriptor writer's invalid-selector assertion. Reject them before
++   * either the requested-value cache or the firmware can observe them. */
++  if (mtlk_hw_type_is_gen6(hw) && !mtlk_hw_type_is_gen6_b0(hw) &&
++      fixed_pwr_params->changeType > 4)
++    return MTLK_ERR_PARAMS;
++
+   if (MTLK_ERR_OK != WAVE_RADIO_PDB_SET_BINARY(radio, PARAM_DB_RADIO_FIXED_PWR, fixed_pwr_params, sizeof(*fixed_pwr_params)))
+     ELOG_V("Failed to store Fixed TX management power parameters");
+ 
+   return _mtlk_core_send_fixed_pwr_cfg(core, fixed_pwr_params);

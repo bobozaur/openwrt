@@ -1,0 +1,3514 @@
+Subject: wave: own standalone VLAN/source policy and association-time backhaul admission
+
+Use the Linux bridge as the sole bridged forwarding/querier owner. Standalone
+APs retain exact station/reporting-host VLAN and IGMPv3/MLDv2 source state in a
+bounded host engine, with query and expiry work on the existing radio master.
+Admit filtered ordinary data through exclusive, immutable firmware recipient
+classes only after acknowledged membership; preserve shared command, membership,
+quarantine and DAT_CFM pins. Pool or partial-admission failure remains closed.
+Observe bridge upper changes without blocking the master on RTNL, and restart
+standalone discovery after detach. Preserve explicit aggregate-air mode.
+
+Consume the configured Association Response Multi-AP role through the existing
+nl80211 IE_ASSOC_RESP handoff before STA_ADD, separately from bounded peer
+metadata. The companion hostapd AP-template producer supplies that role; peer
+IEs alone cannot authorize four-address mode. No firmware command or child GTK
+context is invented.
+
+--- a/wireless/driver/Makefile.am
++++ b/wireless/driver/Makefile.am
+@@ -54,6 +54,8 @@
+               linux/l2nat.c linux/l2nat.h \
+               linux/log_osdep.c linux/log_osdep.h \
+               linux/mcast.c linux/mcast.h \
++              linux/wave_mc_policy.c linux/wave_mc_policy.h \
++              linux/wave_mc_native.c linux/wave_mc_native.h \
+               linux/eth_parser.c linux/eth_parser.h \
+               linux/memdefs.h \
+               linux/mib_osdep.c linux/mib_osdep.h \
+--- a/wireless/driver/linux/Kbuild
++++ b/wireless/driver/linux/Kbuild
+@@ -29,7 +29,7 @@
+ obj-m := mtlk.o
+ 
+ mtlk-objs := wave_pmf.o core.o core_ab.o wave_radio_ab.o core_pdb.o\
+-   eth_parser.o mcast.o utils.o osal_defs.o l2nat.o \
++   eth_parser.o mcast.o wave_mc_native.o wave_mc_policy.o utils.o osal_defs.o l2nat.o \
+    mtlk_serializer_osdep.o mtlk_fast_mem.o \
+    mib_osdep.o \
+    progmodel.o log_osdep.o mtlk_df_linux.o mtlk_dfg_linux.o \
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -1876,10 +1876,12 @@
+ 
+     /* Four-address copies select a peer SID (MCF=0), so firmware multicast
+      * membership is irrelevant even for non-link-local IPv4/IPv6 payloads. */
+-    if (!wds && (nbuf_flags & MTLK_NBUFF_MULTICAST) &&
++    if (!wds && ((nbuf_flags & MTLK_NBUFF_MULTICAST) ||
++                 (nic->mcast.native && (nbuf_flags & MTLK_NBUFF_BROADCAST))) &&
+         ((nbuf_flags & MTLK_NBUFF_FORWARD) ||
+          !wave_df_bridge_mcast_owned(mtlk_df_get_user(mtlk_vap_get_df(nic->vap_handle))))) {
+-      mc_index = mtlk_mc_get_grid(nic, data->nbuf, TRUE);
++      mc_index = data->native_control ? MCAST_GROUP_BROADCAST :
++        mtlk_mc_get_grid_peer(nic, data->nbuf, TRUE, data->src_sta);
+       if (MCAST_GROUP_UNDEF == mc_index) {
+         ILOG2_V("Drop due to undefined MC index.");
+         nic->pstats.txerr_undef_mc_index++;
+@@ -3465,15 +3467,10 @@
+ static int
+ _mtlk_core_cfg_init_mcast (mtlk_core_t *core)
+ {
+-  int res;
+   uint8 mcast_flag;
+ 
+-  res = mtlk_core_receive_reliable_multicast(core, &mcast_flag);
+-
+-  if (MTLK_ERR_OK == res)
+-    MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_RELIABLE_MCAST, mcast_flag);
+-
+-  return res;
++  mtlk_mc_publish_reliable_mode(core, -1);
++  return mtlk_core_receive_reliable_multicast(core, &mcast_flag);
+ }
+ 
+ int mtlk_core_init_defaults (mtlk_core_t *core)
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -5144,7 +5144,8 @@
+ 
+   MTLK_ASSERT(vap_handle != 0);
+ 
+-  MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_RELIABLE_MCAST, flag);
++  if (flag != ENABLE_RELIABLE_MULTICAST && flag != DISABLE_RELIABLE_MULTICAST)
++    return MTLK_ERR_PARAMS;
+ 
+   man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+   if (NULL == man_entry) {
+@@ -5157,16 +5158,22 @@
+   man_entry->payload_size = sizeof(UMI_MULTICAST_MODE);
+ 
+   pMcastMode = (UMI_MULTICAST_MODE *)(man_entry->payload);
++  memset(pMcastMode, 0, sizeof(*pMcastMode));
++  pMcastMode->getSetOperation = API_SET_OPERATION;
+   pMcastMode->u8Action = flag;
+   pMcastMode->u8VapID = mtlk_vap_get_id(vap_handle);
+ 
+   ILOG2_DSD("CID-%04x: Multicast FW request: Set %s mode for VAP %d", mtlk_vap_get_oid(vap_handle), flag ? "Reliable Multicast" : "Regular Multicast", pMcastMode->u8VapID);
+ 
++  /* A submitted but unacknowledged mode is not an aggregate-air fallback. */
++  mtlk_mc_publish_reliable_mode(core, -1);
+   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+   if (MTLK_ERR_OK != res) {
+     ELOG_DD("CID-%04x: Set Reliable Multicast failure (%i)", mtlk_vap_get_oid(vap_handle), res);
+     goto FINISH;
+   }
++
++  mtlk_mc_publish_reliable_mode(core, flag);
+ 
+ FINISH:
+   if (man_entry) {
+@@ -5195,12 +5202,20 @@
+   man_entry->payload_size = sizeof(UMI_MULTICAST_MODE);
+ 
+   pMcastMode = (UMI_MULTICAST_MODE *)(man_entry->payload);
++  memset(pMcastMode, 0, sizeof(*pMcastMode));
+   pMcastMode->getSetOperation = API_GET_OPERATION;
+   pMcastMode->u8VapID = mtlk_vap_get_id(vap_handle);
+ 
+   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+   if (MTLK_ERR_OK == res) {
+-    *flag = pMcastMode->u8Action;
++    if (pMcastMode->u8Action != ENABLE_RELIABLE_MULTICAST &&
++        pMcastMode->u8Action != DISABLE_RELIABLE_MULTICAST) {
++      res = MTLK_ERR_MAC;
++      mtlk_mc_publish_reliable_mode(core, -1);
++    } else {
++      *flag = pMcastMode->u8Action;
++      mtlk_mc_publish_reliable_mode(core, *flag);
++    }
+   }
+   else {
+     ELOG_D("CID-%04x: Receive UM_MAN_SET_MULTICAST_MODE_REQ failed", mtlk_vap_get_oid(vap_handle));
+--- a/wireless/driver/linux/mcast.c
++++ b/wireless/driver/linux/mcast.c
+@@ -26,6 +26,7 @@
+ #include <net/addrconf.h>        /* for ipv6_addr_is_multicast() */
+ 
+ #include "mcast.h"
++#include "wave_mc_native.h"
+ #include "mtlk_df_nbuf.h"
+ 
+ #if (defined MTLK_DEBUG_IPERF_PAYLOAD_RX) || (defined MTLK_DEBUG_IPERF_PAYLOAD_TX)
+@@ -143,6 +144,7 @@
+   MTLK_INIT_STEPS_LIST_ENTRY(mcast, MCAST_IP4_RANGES_LIST)
+   MTLK_INIT_STEPS_LIST_ENTRY(mcast, MCAST_IP6_RANGES_LIST)
+   MTLK_INIT_STEPS_LIST_ENTRY(mcast, MCAST_RANGES_INIT)
++  MTLK_INIT_STEPS_LIST_ENTRY(mcast, MCAST_NATIVE)
+ MTLK_INIT_INNER_STEPS_BEGIN(mcast)
+ MTLK_INIT_STEPS_LIST_END(mcast);
+ 
+@@ -174,6 +176,8 @@
+                         mtlk_dlist_init, (&mcast->ip6_ranges_list));
+     MTLK_INIT_STEP(mcast, MCAST_RANGES_INIT, MTLK_OBJ_PTR(mcast),
+                         _mtlk_mc_ranges_init_all, (nic));
++    MTLK_INIT_STEP(mcast, MCAST_NATIVE, MTLK_OBJ_PTR(mcast),
++                    wave_mc_native_init, (nic));
+     INIT_LIST_HEAD(&mcast->pending);
+     INIT_LIST_HEAD(&mcast->memberships);
+     mcast->initialized = true;
+@@ -193,6 +197,8 @@
+     _wave_mc_flush_hosts(nic);
+   mcast->initialized = false;
+   MTLK_CLEANUP_BEGIN(mcast, MTLK_OBJ_PTR(mcast))
++    MTLK_CLEANUP_STEP(mcast, MCAST_NATIVE, MTLK_OBJ_PTR(mcast),
++                      wave_mc_native_destroy, (nic));
+     MTLK_CLEANUP_STEP(mcast, MCAST_RANGES_INIT, MTLK_OBJ_PTR(mcast),
+                       _mtlk_mc_ranges_cleanup_all, (nic));
+     MTLK_CLEANUP_STEP(mcast, MCAST_IP6_RANGES_LIST, MTLK_OBJ_PTR(mcast),
+@@ -411,6 +417,8 @@
+    */
+   if (mtlk_core_mcast_module_is_available(nic))
+     return -1;
++  if (nic->mcast.native)
++    return wave_mc_native_observe(nic, skb, sta);
+   if (!pskb_may_pull(skb, ETH_HLEN))
+     return MTLK_ERR_NOT_IN_USE;
+   ether_header = (struct ethhdr *)skb->data;
+@@ -588,6 +596,11 @@
+   debug_ooo_analyze_packet(FALSE, tx_data->nbuf, 0);
+ #endif
+ 
++  tx_data->src_sta = src_sta;
++  if (nic->mcast.native && !tx_data->native_control &&
++      (nbuf_flags & (MTLK_NBUFF_MULTICAST | MTLK_NBUFF_BROADCAST)) &&
++      !(nbuf_flags & MTLK_NBUFF_FORWARD))
++    wave_mc_native_observe(nic, tx_data->nbuf, NULL);
+   /* analyze and adjust packet's priority */
+   qos_adjust_priority(nic->vap_handle, nic->dscp_table, tx_data->nbuf);
+ 
+@@ -604,6 +617,8 @@
+     /* copy rx_if's into cloned buffer tx_data */
+     clone_data.rx_if = tx_data->rx_if;
+     clone_data.rx_subif = tx_data->rx_subif;
++    clone_data.native_control = tx_data->native_control;
++    clone_data.src_sta = src_sta;
+ 
+     /* Each copy targets the peer SID. Preserve an ordinary BSS group copy only
+      * for ordinary receivers, and never send a peer copy back to its source. */
+@@ -619,6 +634,11 @@
+           send_group = true;
+           continue;
+         }
++        if (nic->mcast.native && !tx_data->native_control &&
++            ((nbuf_flags & MTLK_NBUFF_FORWARD) ||
++             !wave_df_bridge_mcast_owned(mtlk_df_get_user(mtlk_vap_get_df(nic->vap_handle)))) &&
++            !wave_mc_native_receiver(nic, tx_data->nbuf, sta))
++          continue;
+         clone_data.dst_sta = (sta_entry *)sta;
+ 
+         clone_data.nbuf = mtlk_df_nbuf_clone_no_priv(tx_data->nbuf);
+@@ -628,6 +648,10 @@
+           /* One failed recipient must not hide later ordinary/group peers. */
+           continue;
+         }
++        if (tx_data->native_control && tx_data->msg) {
++          clone_data.msg = tx_data->msg;
++          tx_data->msg = NULL;
++        }
+         /* Adjust cloned packet's priority */
+         mtlk_df_nbuf_set_priority(clone_data.nbuf, mtlk_df_nbuf_get_priority(tx_data->nbuf));
+ 
+@@ -635,6 +659,10 @@
+ 
+         ILOG3_Y("Broadcast packet sending to 4addr sta %Y", mtlk_sta_get_addr(clone_data.dst_sta));
+         res = _mtlk_do_send_data_to_sta(nic, &clone_data, nbuf_flags);
++        if (clone_data.msg) {
++          mtlk_hw_release_msg_to_send(mtlk_vap_get_hwapi(nic->vap_handle), clone_data.msg);
++          clone_data.msg = NULL;
++        }
+       }
+       mtlk_stadb_iterate_done(&iter);
+     } /* End of "for each 4addr client" */
+@@ -657,8 +685,9 @@
+ {
+   struct in6_addr ip_addr;
+ 
+-  /* if multicast module is available, wlan driver does not manage MC groups by itself */
+-  if (mtlk_core_mcast_module_is_available(nic))
++  /* The native owner floods control/link-local groups explicitly; its
++   * immutable classes must not inherit a second address-only membership DB. */
++  if (nic->mcast.native || mtlk_core_mcast_module_is_available(nic))
+     return;
+ 
+   /* Add the station to the special all-node multicast group
+@@ -1897,6 +1926,7 @@
+   mtlk_core_t *nic;
+   sta_entry *sta;
+   mtlk_mc_addr_t addr;
++  struct wave_mc_native_class *native;
+   uint32 sid_order;
+   uint16 sid;
+   uint8 group;
+@@ -1942,7 +1972,9 @@
+   valid = !work->command.is_cancelled && nic->mcast.accepting &&
+           !sta->info.mc_retiring && sta->info.sid == work->sid &&
+           sta->info.sid_order == work->sid_order;
+-  if (valid) {
++  if (valid && work->native) {
++    valid = wave_mc_native_command_valid(work->native, sta, work->action);
++  } else if (valid) {
+     if (work->addr.type == MTLK_IPv4)
+       group = _mtlk_mc_find_ip4_group(nic, &work->addr.grp_ip.ip4_addr,
+                                       &work->addr.src_ip.ip4_addr);
+@@ -2020,6 +2052,8 @@
+     }
+   }
+   list_del(&work->pending);
++  if (work->native)
++    wave_mc_native_command_done(work->native, work->sta, work->action);
+   mtlk_osal_lock_release(&work->nic->mcast.lock);
+   if (work->pinned)
+     wave_hw_mc_put(mtlk_vap_get_hw(work->nic->vap_handle), work->group);
+@@ -2031,8 +2065,9 @@
+ /* Caller holds the host membership lock, including across enqueue. This makes
+  * publication of the pending owner atomic with station/VAP admission fencing. */
+ static int
+-_wave_mc_queue_locked(mtlk_core_t *nic, mc_action_t action, int group,
+-                       sta_entry *sta, const mtlk_mc_addr_t *addr)
++_wave_mc_queue_locked_ex(mtlk_core_t *nic, mc_action_t action, int group,
++                          sta_entry *sta, const mtlk_mc_addr_t *addr,
++                          struct wave_mc_native_class *native)
+ {
+   mtlk_core_t *master;
+   struct wave_mc_command *work;
+@@ -2047,7 +2082,9 @@
+   memset(work, 0, sizeof(*work));
+   work->nic = nic;
+   work->sta = sta;
+-  work->addr = *addr;
++  if (addr)
++    work->addr = *addr;
++  work->native = native;
+   work->sid = sta->info.sid;
+   work->sid_order = sta->info.sid_order;
+   work->group = group;
+@@ -2066,8 +2103,11 @@
+   master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(nic->vap_handle));
+   res = mtlk_core_schedule_hw_command(master, &work->command,
+                                       _wave_mc_command_done, HANDLE_T(work));
+-  if (res == MTLK_ERR_OK)
++  if (res == MTLK_ERR_OK) {
++    if (native)
++      wave_mc_native_command_queued(native, sta, action);
+     return res;
++  }
+   /* Enqueue failure has no completion callback. */
+   list_del(&work->pending);
+   mtlk_sta_decref(sta);
+@@ -2079,6 +2119,19 @@
+   return res;
+ }
+ 
++static int
++_wave_mc_queue_locked(mtlk_core_t *nic, mc_action_t action, int group,
++                       sta_entry *sta, const mtlk_mc_addr_t *addr)
++{
++  return _wave_mc_queue_locked_ex(nic, action, group, sta, addr, NULL);
++}
++
++int mtlk_mc_queue_native_locked(mtlk_core_t *nic, int action, int group,
++                                sta_entry *sta, struct wave_mc_native_class *owner)
++{
++  return _wave_mc_queue_locked_ex(nic, action, group, sta, NULL, owner);
++}
++
+ /* Radio-master ownership (or joined/blocked serializers during terminal
+  * teardown) is required. Never call from a serializer-enumeration callback. */
+ static void
+@@ -2113,6 +2166,15 @@
+ 
+   if (!mtlk_vap_is_ap(nic->vap_handle) || !nic->mcast.initialized)
+     return MTLK_ERR_OK;
++  /* Setup copies also pass here on failed STA_ADD. Only a matching live
++   * station incarnation can own native reports or immutable recipient sets.
++   */
++  sta = mtlk_stadb_find_sid(&nic->slow_ctx->stadb, info->sid);
++  if (sta) {
++    if (&sta->info == info)
++      wave_mc_native_drop_sta(nic, sta);
++    mtlk_sta_decref(sta);
++  }
+   mtlk_osal_lock_acquire(&nic->mcast.lock);
+   info->mc_retiring = true;
+   mtlk_osal_lock_release(&nic->mcast.lock);
+@@ -2150,11 +2212,13 @@
+   mtlk_osal_lock_acquire(&nic->mcast.lock);
+   nic->mcast.accepting = false;
+   mtlk_osal_lock_release(&nic->mcast.lock);
++  wave_mc_native_stop_owned(nic);
+   _wave_mc_cancel_owned(nic, NULL);
+   while (!list_empty(&nic->mcast.memberships)) {
+     sta = list_first_entry(&nic->mcast.memberships, sta_entry, mc_membership_node);
+     mtlk_mc_retire_sta_owned(nic, &sta->info);
+   }
++  wave_mc_native_clear_owned(nic);
+ }
+ 
+ static int
+@@ -2515,6 +2579,8 @@
+   mcast_group_info_t  *group;
+   mtlk_dlist_entry_t *entry, *head;
+ 
++  if (nic->mcast.native && !mtlk_core_mcast_module_is_available(nic))
++    return wave_mc_native_grid(nic, nbuf, pin, NULL);
+   if (skb_headlen(nbuf) < sizeof(*ether_header))
+     return MCAST_GROUP_UNDEF;
+ 
+@@ -2661,6 +2727,14 @@
+   }
+ 
+   return group_id;
++}
++
++int mtlk_mc_get_grid_peer(mtlk_core_t *nic, mtlk_nbuf_t *nbuf, BOOL pin,
++                           sta_entry *source)
++{
++  if (nic->mcast.native && !mtlk_core_mcast_module_is_available(nic))
++    return wave_mc_native_grid(nic, nbuf, pin, source);
++  return mtlk_mc_get_grid(nic, nbuf, pin);
+ }
+ 
+ /***********************************************************
+@@ -3039,4 +3113,19 @@
+   MTLK_ASSERT(list_empty(&nic->mcast.memberships));
+   nic->mcast.accepting = true;
+   mtlk_osal_lock_release(&nic->mcast.lock);
+-}
++  wave_mc_native_open_owned(nic);
++}
++
++/* SET/GET and native packet admission share publication ordering on APs.
++ * Station VAPs do not initialize the AP multicast lock. Control serialization
++ * owns their PDB update, including cold readback before station activation. */
++void mtlk_mc_publish_reliable_mode(mtlk_core_t *nic, int mode)
++{
++  bool locked = mtlk_vap_is_ap(nic->vap_handle) && READ_ONCE(nic->mcast.initialized);
++
++  if (locked)
++    mtlk_osal_lock_acquire(&nic->mcast.lock);
++  MTLK_CORE_PDB_SET_INT(nic, PARAM_DB_CORE_RELIABLE_MCAST, mode);
++  if (locked)
++    mtlk_osal_lock_release(&nic->mcast.lock);
++}
+--- a/wireless/driver/linux/mcast.h
++++ b/wireless/driver/linux/mcast.h
+@@ -104,6 +104,7 @@
+   mtlk_osal_spinlock_t lock_ranges;
+   struct list_head pending;
+   struct list_head memberships;
++  struct wave_mc_native *native;
+   bool initialized;
+   bool accepting;
+   MTLK_DECLARE_INIT_STATUS;
+@@ -164,8 +165,10 @@
+ /* Process context outside the radio master/recovery serializers. */
+ void mtlk_mc_close_external(mtlk_core_t *nic, BOOL all);
+ void mtlk_mc_open_owned(mtlk_core_t *nic);
++void mtlk_mc_publish_reliable_mode(mtlk_core_t *nic, int mode);
+ int mtlk_mc_update_stadb (mtlk_core_t *nic, mtlk_core_ui_mc_update_sta_db_t *req);
+ 
++int mtlk_mc_get_grid_peer(mtlk_core_t *nic, mtlk_nbuf_t *nbuf, BOOL pin, sta_entry *source);
+ int mtlk_mc_get_grid(mtlk_core_t *nic, mtlk_nbuf_t *nbuf, BOOL pin)
+     __MTLK_INT_HANDLER_SECTION;
+ 
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -258,6 +258,7 @@
+ 
+   spinlock_t assoc_lock;
+   struct wave_assoc_metadata assoc_metadata[16];
++  bool multi_ap_backhaul_bss; /* protected by assoc_lock */
+ 
+   int corrupted_packets_counter;
+ 
+@@ -792,25 +793,23 @@
+   dev_put(vlan->parent_ndev);
+ }
+ 
+-/* Preserve the existing administrator hairpin decision. Without hairpin,
+- * driver intra-BSS forwarding still serves a non-isolated AP with m2u off.
++/* netifd enables bridge hairpin for non-isolated WAVE APs. Every bridged
++ * frame is handed to that owner; an explicit hairpin-off choice is never
++ * bypassed by driver-local forwarding, VLAN learning or a second querier.
+  */
+ bool wave_df_intra_bss_forwarding(mtlk_df_user_t *df_user)
+ {
+-  bool forwarding = true;
+-
+ #if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
+-  rcu_read_lock();
+-  forwarding = !br_port_flag_is_set(df_user->ndev, BR_HAIRPIN_MODE);
+-  rcu_read_unlock();
++  return !netif_is_bridge_port(df_user->ndev);
++#else
++  return true;
+ #endif
+-  return forwarding;
+ }
+ 
+ /* A bridged parent has already passed VLAN and source policy. Remaining
+  * group frames use BSS flooding rather than the native VLAN-blind cache.
+- * Native RX shortcuts still use their own membership owner; their FORWARD
+- * flag is checked by the caller before selecting this OS/bridge policy.
++ * Standalone RX shortcuts use their native membership owner. Bridged
++ * forwarding remains entirely subject to Linux VLAN/source/port policy.
+  */
+ bool wave_df_bridge_mcast_owned(mtlk_df_user_t *df_user)
+ {
+@@ -942,17 +941,17 @@
+   mtlk_core_t *core = mtlk_vap_get_core(sta->vap_handle);
+   struct net_device *old_ndev;
+   bool old_ref = false, reopen = false;
+-  sta_entry *current;
++  sta_entry *sid_sta;
+   int res;
+ 
+-  current = mtlk_stadb_find_sid(&core->slow_ctx->stadb, binding->sid);
+-  if (current != sta || sta->info.sid_order != binding->sid_order) {
+-    if (current)
+-      mtlk_sta_decref(current);
++  sid_sta = mtlk_stadb_find_sid(&core->slow_ctx->stadb, binding->sid);
++  if (sid_sta != sta || sta->info.sid_order != binding->sid_order) {
++    if (sid_sta)
++      mtlk_sta_decref(sid_sta);
+     binding->result = -ENOENT;
+     return;
+   }
+-  mtlk_sta_decref(current);
++  mtlk_sta_decref(sid_sta);
+   spin_lock_bh(&parent->ap_vlan_lock);
+   if (sta->ap_vlan_retiring || (vlan && vlan->sta && vlan->sta != sta)) {
+     binding->result = sta->ap_vlan_retiring ? -ENOENT : -EBUSY;
+@@ -2243,6 +2242,8 @@
+       wave_hw_mmb_quiesce(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df_user->df)));
+     }
+   }
++  wave_df_multi_ap_backhaul_set(df_user, false);
++  wave_df_assoc_clear(df_user);
+ 
+   if (df_user->hs20_enabled)
+   {
+@@ -9955,6 +9956,26 @@
+   spin_unlock_irqrestore(&df_user->assoc_lock, flags);
+ }
+ 
++void wave_df_multi_ap_backhaul_set(mtlk_df_user_t *df_user, bool backhaul)
++{
++  unsigned long flags;
++
++  spin_lock_irqsave(&df_user->assoc_lock, flags);
++  df_user->multi_ap_backhaul_bss = backhaul;
++  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
++}
++
++bool wave_df_multi_ap_backhaul(mtlk_df_user_t *df_user)
++{
++  unsigned long flags;
++  bool backhaul;
++
++  spin_lock_irqsave(&df_user->assoc_lock, flags);
++  backhaul = df_user->multi_ap_backhaul_bss;
++  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
++  return backhaul;
++}
++
+ static void wave_df_channel_notify_work(struct wiphy *wiphy,
+                                        struct wiphy_work *work)
+ {
+@@ -10027,6 +10048,8 @@
+ {
+   lockdep_assert_wiphy(df_user->ndev->ieee80211_ptr->wiphy);
+   df_user->ap_stop_pending = false;
++  wave_df_multi_ap_backhaul_set(df_user, false);
++  wave_df_assoc_clear(df_user);
+ }
+ 
+ void wave_df_notifications_start_locked(mtlk_df_user_t *df_user)
+--- a/wireless/driver/linux/mtlk_df_user_priv.h
++++ b/wireless/driver/linux/mtlk_df_user_priv.h
+@@ -708,6 +708,7 @@
+   u8 opmode;
+   bool opmode_valid;
+   bool four_addr;
++  bool multi_ap_backhaul_sta;
+   bool pbac;
+   unsigned long expires;
+ };
+@@ -719,6 +720,10 @@
+ bool wave_df_assoc_take(mtlk_df_user_t *df_user, const u8 *mac,
+                        struct wave_assoc_metadata *metadata);
+ void wave_df_assoc_clear(mtlk_df_user_t *df_user);
++/* Accepted AP setup Association Response IEs own the local BSS role. A peer
++ * declaration cannot enable it; flushing stations does not replace it. */
++void wave_df_multi_ap_backhaul_set(mtlk_df_user_t *df_user, bool backhaul);
++bool wave_df_multi_ap_backhaul(mtlk_df_user_t *df_user);
+ 
+ struct _sta_entry;
+ struct wireless_dev *wave_df_ap_vlan_add(struct wiphy *wiphy, const char *name,
+--- a/wireless/driver/linux/mtlk_mmb_drv.c
++++ b/wireless/driver/linux/mtlk_mmb_drv.c
+@@ -21,6 +21,7 @@
+ #include "mtlk_df.h"
+ #include "fw_recovery.h"
+ #include "wave_fapi_if.h"
++#include "wave_mc_native.h"
+ 
+ #include <linux/module.h>
+ #include <linux/init.h>
+@@ -1778,6 +1779,7 @@
+ 
+ MTLK_INIT_STEPS_LIST_BEGIN(bus_drv_mod)
+   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_DFG_INIT)
++  MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_MC_NOTIFY)
+   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_RCVRY_INIT)
+ #ifdef MTCFG_PMCU_SUPPORT
+   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_PMCU_INIT)
+@@ -1802,6 +1804,8 @@
+ #endif /* MTCFG_PMCU_SUPPORT */
+     MTLK_CLEANUP_STEP(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
+                       wave_rcvry_cleanup, ());
++    MTLK_CLEANUP_STEP(bus_drv_mod, DRV_MC_NOTIFY, MTLK_OBJ_PTR(&drv_state),
++                      wave_mc_native_module_exit, ());
+     MTLK_CLEANUP_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
+                       mtlk_dfg_cleanup, ());
+   MTLK_CLEANUP_END(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
+@@ -1821,6 +1825,9 @@
+   MTLK_INIT_TRY(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
+     MTLK_INIT_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
+                    mtlk_dfg_init, ());
++    MTLK_INIT_STEP_EX(bus_drv_mod, DRV_MC_NOTIFY, MTLK_OBJ_PTR(&drv_state),
++                      wave_mc_native_module_init, (),
++                      drv_state.os_res, 0 == drv_state.os_res, MTLK_ERR_NO_RESOURCES);
+     MTLK_INIT_STEP_VOID(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
+                         wave_rcvry_init, ());
+ #ifdef MTCFG_PMCU_SUPPORT
+--- /dev/null
++++ b/wireless/driver/linux/wave_mc_native.c
+@@ -0,0 +1,1449 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Native multicast policy uses immutable firmware recipient sets. The shared
++ * multicast command owner retains all command, membership and descriptor pins.
++ */
++#include "mtlkinc.h"
++#include "core.h"
++#include "mcast.h"
++#include "mtlk_df.h"
++#include "mtlk_df_priv.h"
++#include "mtlk_df_nbuf.h"
++#include "mtlk_df_user_priv.h"
++#include "hw_mmb.h"
++#include "wave_mc_native.h"
++#include "wave_mc_policy.h"
++#include <linux/bitmap.h>
++#include <linux/if_vlan.h>
++#include <linux/igmp.h>
++#include <linux/icmpv6.h>
++#include <linux/timer.h>
++#include <linux/netdevice.h>
++#include <linux/rtnetlink.h>
++#include <linux/if_bridge.h>
++#include <linux/unaligned.h>
++#include <net/addrconf.h>
++#include <net/ip.h>
++#include <net/if_inet6.h>
++#include <net/ipv6.h>
++
++#define LOG_LOCAL_GID GID_MCAST
++#define LOG_LOCAL_FID 2
++#define WAVE_MC_SIDS 256 /* Retained TX descriptor has an eight-bit SID. */
++#define WAVE_MC_IDLE (30 * HZ)
++#define WAVE_MC_RETRY max_t(unsigned long, 1, msecs_to_jiffies(20))
++#define WAVE_MC_QUERY_BUDGET 4
++
++struct wave_mc_native_member {
++  struct wave_mc_native_member *next;
++  sta_entry *sta;
++  uint32 sid_order;
++  uint16 sid;
++  mcast_sta_status_t status;
++};
++
++struct wave_mc_native_class {
++  struct list_head node;
++  struct wave_mc_native *owner;
++  struct wave_mc_key key;
++  union wave_mc_ip last_source;
++  u64 generation;
++  DECLARE_BITMAP(receivers, WAVE_MC_SIDS);
++  struct wave_mc_native_member *members; /* Exact retained station incarnations, never retargeted. */
++  unsigned long last_used;
++  unsigned int pending;
++  u8 id;
++  bool retiring;
++  bool excluded_source;
++};
++
++struct wave_mc_native {
++  mtlk_core_t *core;
++  struct net_device *netdev;
++  struct list_head devices;
++  struct wave_mc_policy *policy;
++  struct list_head classes;
++  unsigned int count;
++  struct timer_list timer;
++  mtlk_command_t tick;
++  bool tick_pending;
++  bool standalone;
++  bool reset_pending;
++  bool bridge_pending;
++  u64 epoch;
++};
++
++struct wave_mc_packet {
++  struct wave_mc_key key;
++  union wave_mc_ip source;
++  unsigned int offset;
++  unsigned int length;
++  u8 reporter[ETH_ALEN];
++  u8 type;
++  bool control;
++  bool exempt;
++};
++
++static bool wave_mc_native_needed(mtlk_core_t *core);
++static bool wave_mc_native_sync_locked(struct wave_mc_native *native);
++
++static bool wave_mc_ip_equal(__be16 proto, const union wave_mc_ip *a,
++                             const union wave_mc_ip *b)
++{
++  return proto == htons(ETH_P_IP) ? a->ip4 == b->ip4 :
++         ipv6_addr_equal(&a->ip6, &b->ip6);
++}
++
++static bool wave_mc_key_equal(const struct wave_mc_key *a,
++                              const struct wave_mc_key *b)
++{
++  return a->vlan == b->vlan && a->proto == b->proto &&
++         wave_mc_ip_equal(a->proto, &a->group, &b->group);
++}
++
++/* At most two physical tags, including skb metadata. VID0 supplies priority,
++ * not another membership domain. PCP/DEI never participate in identity.
++ */
++static void wave_mc_tag_add(u32 *domain, __be16 proto, u16 tci)
++{
++  unsigned int depth = *domain & 3;
++  u16 vid = tci & VLAN_VID_MASK;
++
++  if (!vid)
++    return;
++  *domain |= (u32)vid << (2 + depth * 12);
++  if (proto == htons(ETH_P_8021AD))
++    *domain |= BIT(26 + depth);
++  *domain = (*domain & ~3U) | (depth + 1);
++}
++
++static bool wave_mc_ipv4_alert(const u8 *options, unsigned int length)
++{
++  bool alert = false;
++
++  while (length) {
++    unsigned int len;
++
++    if (*options == IPOPT_END)
++      break;
++    if (*options == IPOPT_NOOP) {
++      options++;
++      length--;
++      continue;
++    }
++    if (length < 2 || options[1] < 2 || options[1] > length)
++      return false;
++    len = options[1];
++    if (*options == IPOPT_RA && len == 4 && !get_unaligned_be16(options + 2))
++      alert = true;
++    options += len;
++    length -= len;
++  }
++  return alert;
++}
++
++static bool wave_mc_ipv6_alert(const u8 *options, unsigned int length)
++{
++  bool alert = false;
++
++  while (length) {
++    unsigned int len;
++
++    if (*options == IPV6_TLV_PAD1) {
++      options++;
++      length--;
++      continue;
++    }
++    if (length < 2 || options[1] > length - 2)
++      return false;
++    len = options[1] + 2;
++    if (*options == IPV6_TLV_ROUTERALERT && len == 4 &&
++        !get_unaligned_be16(options + 2))
++      alert = true;
++    options += len;
++    length -= len;
++  }
++  return alert;
++}
++
++/* Data classification does not modify packet bytes or VLAN offload metadata.
++ * Control packets are fully checksummed before they can mutate policy or use
++ * the control-query flooding exception.
++ */
++static int wave_mc_packet(struct sk_buff *skb, struct wave_mc_packet *packet)
++{
++  struct ethhdr eth_buf;
++  const struct ethhdr *eth;
++  struct vlan_hdr tag_buf;
++  const struct vlan_hdr *tag;
++  __be16 proto;
++  unsigned int depth = 0, offset = ETH_HLEN;
++
++  memset(packet, 0, sizeof(*packet));
++  eth = skb_header_pointer(skb, 0, sizeof(eth_buf), &eth_buf);
++  if (!eth)
++    return -EINVAL;
++  ether_addr_copy(packet->reporter, eth->h_source);
++  proto = eth->h_proto;
++  if (skb_vlan_tag_present(skb)) {
++    if (skb->vlan_proto != htons(ETH_P_8021Q) && skb->vlan_proto != htons(ETH_P_8021AD))
++      return -EINVAL;
++    depth++;
++    wave_mc_tag_add(&packet->key.vlan, skb->vlan_proto, skb_vlan_tag_get(skb));
++  }
++  while (proto == htons(ETH_P_8021Q) || proto == htons(ETH_P_8021AD)) {
++    if (++depth > 2)
++      return -EINVAL;
++    tag = skb_header_pointer(skb, offset, sizeof(tag_buf), &tag_buf);
++    if (!tag)
++      return -EINVAL;
++    wave_mc_tag_add(&packet->key.vlan, proto, ntohs(tag->h_vlan_TCI));
++    proto = tag->h_vlan_encapsulated_proto;
++    offset += VLAN_HLEN;
++  }
++  packet->key.proto = proto;
++  if (proto == htons(0x893a)) { /* IEEE 1905.1 retains its control-group path. */
++    packet->exempt = true;
++    return 0;
++  }
++  if (proto == htons(ETH_P_IP)) {
++    struct iphdr ip_buf;
++    const struct iphdr *ip = skb_header_pointer(skb, offset, sizeof(ip_buf), &ip_buf);
++    unsigned int hlen, length;
++
++    if (!ip || ip->version != 4 || ip->ihl < 5)
++      return -EINVAL;
++    hlen = ip->ihl * 4;
++    length = ntohs(ip->tot_len);
++    if (length < hlen || length > skb->len - offset)
++      return -EINVAL;
++    if (!ipv4_is_multicast(ip->daddr))
++      return -EAFNOSUPPORT;
++    packet->key.group.ip4 = ip->daddr;
++    packet->source.ip4 = ip->saddr;
++    packet->exempt = ipv4_is_local_multicast(ip->daddr);
++    packet->offset = offset + hlen;
++    packet->length = length - hlen;
++    if (ip->protocol != IPPROTO_IGMP)
++      return 0;
++    if (ip->ttl != 1 || (ntohs(ip->frag_off) & (IP_MF | IP_OFFSET)) ||
++        packet->length < sizeof(struct igmphdr) ||
++        !pskb_may_pull(skb, offset + length))
++      return -EINVAL;
++    ip = (const struct iphdr *)(skb->data + offset);
++    packet->type = skb->data[packet->offset];
++    if (packet->type != IGMP_HOST_MEMBERSHIP_QUERY &&
++        packet->type != IGMP_HOST_MEMBERSHIP_REPORT &&
++        packet->type != IGMPV2_HOST_MEMBERSHIP_REPORT &&
++        packet->type != IGMP_HOST_LEAVE_MESSAGE &&
++        packet->type != IGMPV3_HOST_MEMBERSHIP_REPORT)
++      return 0;
++    if (ip_fast_csum((u8 *)ip, ip->ihl) ||
++        csum_fold(skb_checksum(skb, packet->offset, packet->length, 0)))
++      return -EINVAL;
++    if (packet->type != IGMP_HOST_MEMBERSHIP_REPORT &&
++        !(packet->type == IGMP_HOST_MEMBERSHIP_QUERY && packet->length == 8 &&
++          !skb->data[packet->offset + 1]) &&
++        !wave_mc_ipv4_alert((const u8 *)ip + sizeof(*ip), hlen - sizeof(*ip)))
++      return -EINVAL;
++    packet->control = true;
++    packet->exempt = true;
++    return 0;
++  }
++  if (proto == htons(ETH_P_IPV6)) {
++    struct ipv6hdr ip_buf;
++    const struct ipv6hdr *ip = skb_header_pointer(skb, offset, sizeof(ip_buf), &ip_buf);
++    unsigned int length, hop_length;
++    const u8 *hop;
++
++    if (!ip || ip->version != 6 || !ipv6_addr_is_multicast(&ip->daddr))
++      return -EAFNOSUPPORT;
++    length = ntohs(ip->payload_len);
++    if (length > skb->len - offset - sizeof(*ip))
++      return -EINVAL;
++    packet->key.group.ip6 = ip->daddr;
++    packet->source.ip6 = ip->saddr;
++    packet->exempt = (ip->daddr.s6_addr[1] & 15) == 2;
++    if (ip->nexthdr != IPPROTO_HOPOPTS)
++      return 0;
++    if (length < 8 || !pskb_may_pull(skb, offset + sizeof(*ip) + length))
++      return -EINVAL;
++    ip = (const struct ipv6hdr *)(skb->data + offset);
++    hop = (const u8 *)(ip + 1);
++    hop_length = ((unsigned int)hop[1] + 1) * 8;
++    if (hop_length > length)
++      return -EINVAL;
++    if (hop[0] != IPPROTO_ICMPV6)
++      return 0;
++    packet->offset = offset + sizeof(*ip) + hop_length;
++    packet->length = length - hop_length;
++    if (packet->length < sizeof(struct icmp6hdr))
++      return -EINVAL;
++    packet->type = skb->data[packet->offset];
++    if (packet->type != ICMPV6_MGM_QUERY && packet->type != ICMPV6_MGM_REPORT &&
++        packet->type != ICMPV6_MGM_REDUCTION && packet->type != ICMPV6_MLD2_REPORT)
++      return 0;
++    if (ip->hop_limit != 1 || skb->data[packet->offset + 1] ||
++        !wave_mc_ipv6_alert(hop + 2, hop_length - 2) ||
++        csum_ipv6_magic(&ip->saddr, &ip->daddr, packet->length, IPPROTO_ICMPV6,
++          skb_checksum(skb, packet->offset, packet->length, 0)))
++      return -EINVAL;
++    if (!(ipv6_addr_type(&ip->saddr) & IPV6_ADDR_LINKLOCAL) &&
++        !(packet->type != ICMPV6_MGM_QUERY && ipv6_addr_any(&ip->saddr)))
++      return -EINVAL;
++    packet->control = true;
++    packet->exempt = true;
++    return 0;
++  }
++  return -EAFNOSUPPORT;
++}
++
++static void wave_mc_native_wake(struct wave_mc_native *native)
++{
++  unsigned long when = jiffies + 1;
++
++  if (native->core->mcast.accepting && !native->tick_pending &&
++      (!timer_pending(&native->timer) || time_after(native->timer.expires, when)))
++    mod_timer(&native->timer, when);
++}
++
++struct wave_mc_targets {
++  DECLARE_BITMAP(bits, WAVE_MC_SIDS);
++  sta_entry *source;
++  const sta_entry *wanted;
++  bool found;
++  struct wave_mc_native_member *members;
++  bool allocate;
++  bool failed;
++};
++
++static void wave_mc_target(void *ctx, sta_entry *sta)
++{
++  struct wave_mc_targets *targets = ctx;
++  unsigned int sid = mtlk_sta_get_sid(sta);
++  struct wave_mc_native_member *member;
++
++  if (sta == targets->source || sta->info.mc_retiring || sta->ap_vlan_retiring ||
++      rcu_access_pointer(sta->ap_vlan) ||
++      mtlk_sta_get_packets_filter(sta) != MTLK_PCKT_FLTR_ALLOW_ALL)
++    return;
++  if (targets->wanted) {
++    if (sta == targets->wanted)
++      targets->found = true;
++    return;
++  }
++  if (sid >= WAVE_MC_SIDS || sta->peer_ap || mtlk_sta_is_4addr(sta) ||
++      test_and_set_bit(sid, targets->bits))
++    return;
++  if (!targets->allocate || targets->failed)
++    return;
++  member = kzalloc(sizeof(*member), GFP_ATOMIC);
++  if (!member) {
++    targets->failed = true;
++    return;
++  }
++  member->sta = sta;
++  member->sid = sta->info.sid;
++  member->sid_order = sta->info.sid_order;
++  mtlk_sta_incref(sta);
++  member->next = targets->members;
++  targets->members = member;
++}
++
++static void wave_mc_members_free(struct wave_mc_native_member *members)
++{
++  while (members) {
++    struct wave_mc_native_member *next = members->next;
++
++    mtlk_sta_decref(members->sta);
++    kfree(members);
++    members = next;
++  }
++}
++
++static bool wave_mc_class_current(const struct wave_mc_native_class *class)
++{
++  const struct wave_mc_native_member *member;
++
++  for (member = class->members; member; member = member->next)
++    if (member->sta->info.sid != member->sid ||
++        member->sta->info.sid_order != member->sid_order ||
++        member->sta->info.mc_retiring || member->sta->ap_vlan_retiring ||
++        rcu_access_pointer(member->sta->ap_vlan) ||
++        mtlk_sta_get_packets_filter(member->sta) != MTLK_PCKT_FLTR_ALLOW_ALL)
++      return false;
++  return true;
++}
++
++static bool wave_mc_class_ready(struct wave_mc_native_class *class)
++{
++  struct wave_mc_native_member *member;
++
++  if (class->retiring || class->pending || class->id == MCAST_GROUP_UNDEF ||
++      !wave_mc_class_current(class))
++    return false;
++  for (member = class->members; member; member = member->next)
++    if (!(member->sta->info.mc_memberships & BIT(class->id)))
++      return false;
++  return true;
++}
++
++bool wave_mc_native_command_valid(struct wave_mc_native_class *class,
++                                   sta_entry *sta, int action)
++{
++  struct wave_mc_native_member *member;
++
++  for (member = class->members; member; member = member->next)
++    if (member->sta == sta && member->sid == sta->info.sid &&
++        member->sid_order == sta->info.sid_order)
++      return action == MTLK_MC_STA_JOIN_GROUP ?
++        !class->retiring && !class->owner->reset_pending &&
++        wave_mc_native_needed(class->owner->core) &&
++        wave_mc_class_current(class) &&
++        wave_hw_mc_get(mtlk_vap_get_hw(class->owner->core->vap_handle), class->id, FALSE) :
++        class->retiring;
++  return false;
++}
++
++void wave_mc_native_command_queued(struct wave_mc_native_class *class,
++                                    sta_entry *sta, int action)
++{
++  struct wave_mc_native_member *member;
++
++  class->pending++;
++  for (member = class->members; member; member = member->next)
++    if (member->sta == sta)
++      member->status = action == MTLK_MC_STA_JOIN_GROUP ?
++                       MCAST_STA_STATUS_JOIN : MCAST_STA_STATUS_DELETE;
++}
++
++void wave_mc_native_command_done(struct wave_mc_native_class *class,
++                                  sta_entry *sta, int action)
++{
++  struct wave_mc_native_member *member;
++
++  MTLK_ASSERT(class->pending);
++  class->pending--;
++  for (member = class->members; member; member = member->next)
++    if (member->sta == sta)
++      member->status = MCAST_STA_STATUS_NONE;
++  wave_mc_native_wake(class->owner);
++}
++
++static void wave_mc_class_free(struct wave_mc_native_class *class)
++{
++  struct wave_mc_native *native = class->owner;
++
++  MTLK_ASSERT(!class->pending);
++  list_del(&class->node);
++  native->count--;
++  if (class->id != MCAST_GROUP_UNDEF)
++    wave_hw_mc_release_native(mtlk_vap_get_hw(native->core->vap_handle), class->id);
++  wave_mc_members_free(class->members);
++  kfree(class);
++}
++
++static bool wave_mc_native_needed(mtlk_core_t *core)
++{
++  mtlk_df_user_t *user = mtlk_df_get_user(mtlk_vap_get_df(core->vap_handle));
++
++  if (mtlk_core_mcast_module_is_available(core))
++    return false;
++  return READ_ONCE(core->slow_ctx->ap_started) &&
++         !wave_df_bridge_mcast_owned(user);
++}
++
++static bool wave_mc_group_valid(__be16 proto, const void *address, bool zero)
++{
++  if (proto == htons(ETH_P_IP)) {
++    __be32 ip = get_unaligned((const __be32 *)address);
++
++    return (zero && !ip) || ipv4_is_multicast(ip);
++  }
++  {
++    struct in6_addr ip;
++
++    memcpy(&ip, address, sizeof(ip));
++    return (zero && ipv6_addr_any(&ip)) || ipv6_addr_is_multicast(&ip);
++  }
++}
++
++static bool wave_mc_sources_valid(__be16 proto, const u8 *sources, unsigned int count)
++{
++  unsigned int size = proto == htons(ETH_P_IP) ? 4 : 16;
++
++  for (; count; count--, sources += size) {
++    if (proto == htons(ETH_P_IP)) {
++      __be32 ip = get_unaligned((const __be32 *)sources);
++
++      if (!ip || ip == htonl(INADDR_BROADCAST) || ipv4_is_multicast(ip))
++        return false;
++    } else {
++      struct in6_addr ip;
++
++      memcpy(&ip, sources, sizeof(ip));
++      if (ipv6_addr_any(&ip) || ipv6_addr_is_multicast(&ip))
++        return false;
++    }
++  }
++  return true;
++}
++
++/* Validate every advertised record before publishing the first one. Ethernet
++ * padding is outside the bounded IP payload and cannot complete a short record.
++ */
++static int wave_mc_validate_control(const struct wave_mc_packet *packet, const u8 *body)
++{
++  unsigned int size = packet->key.proto == htons(ETH_P_IP) ? 4 : 16;
++  unsigned int base = size == 4 ? 8 : 20;
++  unsigned int count, offset, i, nsrc, length = packet->length;
++  bool query = packet->type == (size == 4 ? IGMP_HOST_MEMBERSHIP_QUERY : ICMPV6_MGM_QUERY);
++
++  if (query) {
++    unsigned int minimum = size == 4 ? 8 : 24;
++    unsigned int version3 = size == 4 ? 12 : 28;
++    unsigned int group_offset = size == 4 ? 4 : 8;
++
++    if (length < minimum || !wave_mc_group_valid(packet->key.proto, body + group_offset, true))
++      return -EINVAL;
++    if (length == minimum)
++      return 0;
++    if (length < version3)
++      return -EINVAL;
++    nsrc = get_unaligned_be16(body + version3 - 2);
++    if (nsrc > (length - version3) / size || length != version3 + nsrc * size ||
++        (nsrc && !wave_mc_group_valid(packet->key.proto, body + group_offset, false)) ||
++        !wave_mc_sources_valid(packet->key.proto, body + version3, nsrc))
++      return -EINVAL;
++    return 0;
++  }
++  if (packet->type != (size == 4 ? IGMPV3_HOST_MEMBERSHIP_REPORT : ICMPV6_MLD2_REPORT)) {
++    unsigned int minimum = size == 4 ? 8 : 24;
++
++    if (length != minimum ||
++        !wave_mc_group_valid(packet->key.proto, body + (size == 4 ? 4 : 8), false))
++      return -EINVAL;
++    return 0;
++  }
++  if (length < 8)
++    return -EINVAL;
++  count = get_unaligned_be16(body + 6);
++  offset = 8;
++  for (i = 0; i < count; i++) {
++    unsigned int record;
++
++    if (length - offset < base)
++      return -EINVAL;
++    nsrc = get_unaligned_be16(body + offset + 2);
++    if (nsrc > (length - offset - base) / size)
++      return -EINVAL;
++    record = base + nsrc * size;
++    if (body[offset + 1] > (length - offset - record) / 4)
++      return -EINVAL;
++    record += body[offset + 1] * 4;
++    if (!wave_mc_group_valid(packet->key.proto, body + offset + 4, false) ||
++        !wave_mc_sources_valid(packet->key.proto, body + offset + base, nsrc))
++      return -EINVAL;
++    offset += record;
++  }
++  return offset == length ? 0 : -EINVAL;
++}
++
++static unsigned int wave_mc_decode8(u8 code)
++{
++  return code < 128 ? code : ((code & 15) | 16) << (((code >> 4) & 7) + 3);
++}
++
++static unsigned int wave_mc_decode16(u16 code)
++{
++  return code < 32768 ? code : ((code & 4095) | 4096) << (((code >> 12) & 7) + 3);
++}
++
++int wave_mc_native_observe(mtlk_core_t *core, struct sk_buff *skb, sta_entry *reporter)
++{
++  struct wave_mc_native *native = core->mcast.native;
++  struct wave_mc_packet packet;
++  struct wave_mc_key key;
++  const u8 *body, *sources = NULL;
++  unsigned int size, base, count, offset, nsrc = 0, i;
++  unsigned long maxresp, qqi = 0;
++  u8 qrv = 0;
++  bool query, suppress = false;
++  int error, result = 0;
++
++  if (!native || !wave_mc_native_needed(core))
++    return 0;
++  error = wave_mc_packet(skb, &packet);
++  if (error)
++    return error;
++  if (!packet.control) {
++    mtlk_osal_lock_acquire(&core->mcast.lock);
++    if (core->mcast.accepting && wave_mc_native_sync_locked(native) &&
++        (packet.key.proto == htons(ETH_P_IP) || packet.key.proto == htons(ETH_P_IPV6))) {
++      if (wave_mc_policy_activate(native->policy, packet.key.vlan, packet.key.proto, jiffies) > 0)
++        wave_mc_native_wake(native);
++    }
++    mtlk_osal_lock_release(&core->mcast.lock);
++    return 0;
++  }
++  if (reporter && !is_valid_ether_addr(packet.reporter))
++    return -EINVAL;
++  body = skb->data + packet.offset;
++  error = wave_mc_validate_control(&packet, body);
++  if (error)
++    return error;
++  size = packet.key.proto == htons(ETH_P_IP) ? 4 : 16;
++  query = packet.type == (size == 4 ? IGMP_HOST_MEMBERSHIP_QUERY : ICMPV6_MGM_QUERY);
++  if (!query && !reporter)
++    return 0; /* OS reports do not identify an over-air station owner. */
++
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  if (!core->mcast.accepting || !wave_mc_native_sync_locked(native) ||
++      (reporter && reporter->info.mc_retiring)) {
++    result = -ESHUTDOWN;
++    goto out;
++  }
++  wave_mc_policy_activate(native->policy, packet.key.vlan, packet.key.proto, jiffies);
++  if (query) {
++    unsigned int v3 = size == 4 ? 12 : 28;
++    unsigned int interval;
++
++    key = packet.key;
++    memset(&key.group, 0, sizeof(key.group));
++    memcpy(&key.group, body + (size == 4 ? 4 : 8), size);
++    if (size == 4) {
++      interval = packet.length == 8 ? body[1] : wave_mc_decode8(body[1]);
++      maxresp = packet.length == 8 && !interval ? 10 * HZ :
++                max_t(unsigned long, 1, msecs_to_jiffies(interval * 100));
++    } else {
++      interval = get_unaligned_be16(body + 4);
++      if (packet.length >= v3)
++        interval = wave_mc_decode16(interval);
++      maxresp = msecs_to_jiffies(interval);
++    }
++    if (packet.length >= v3) {
++      qrv = body[v3 - 4] & 7;
++      suppress = !!(body[v3 - 4] & 8);
++      qqi = (unsigned long)wave_mc_decode8(body[v3 - 3]) * HZ;
++      nsrc = get_unaligned_be16(body + v3 - 2);
++      sources = body + v3;
++    }
++    result = wave_mc_policy_query(native->policy, &key, &packet.source,
++                                  sources, nsrc, qrv, qqi, maxresp, suppress, jiffies);
++    goto out;
++  }
++
++  if (packet.type != (size == 4 ? IGMPV3_HOST_MEMBERSHIP_REPORT : ICMPV6_MLD2_REPORT)) {
++    u8 type = (packet.type == IGMP_HOST_LEAVE_MESSAGE || packet.type == ICMPV6_MGM_REDUCTION) ?
++              WAVE_MC_ASM_LEAVE : WAVE_MC_ASM_JOIN;
++
++    key = packet.key;
++    memset(&key.group, 0, sizeof(key.group));
++    memcpy(&key.group, body + (size == 4 ? 4 : 8), size);
++    result = wave_mc_policy_report(native->policy, &key, reporter, packet.reporter,
++                                   type, NULL, 0, jiffies);
++    if (result)
++      wave_mc_policy_drop_reporter(native->policy, &key, reporter, packet.reporter);
++    goto out;
++  }
++
++  count = get_unaligned_be16(body + 6);
++  base = size == 4 ? 8 : 20;
++  offset = 8;
++  for (i = 0; i < count; i++) {
++    u8 type = body[offset];
++
++    nsrc = get_unaligned_be16(body + offset + 2);
++    key = packet.key;
++    memset(&key.group, 0, sizeof(key.group));
++    memcpy(&key.group, body + offset + 4, size);
++    if (type >= WAVE_MC_IS_INCLUDE && type <= WAVE_MC_BLOCK) {
++      error = wave_mc_policy_report(native->policy, &key, reporter, packet.reporter,
++                                    type, body + offset + base, nsrc, jiffies);
++      if (error) {
++        wave_mc_policy_drop_reporter(native->policy, &key, reporter, packet.reporter);
++        result = error;
++      }
++    }
++    offset += base + nsrc * size + body[offset + 1] * 4;
++  }
++out:
++  wave_mc_native_wake(native);
++  mtlk_osal_lock_release(&core->mcast.lock);
++  return result;
++}
++
++static bool wave_mc_packet_exempt(mtlk_core_t *core, struct sk_buff *skb,
++                                  const struct wave_mc_packet *packet)
++{
++  mtlk_dlist_entry_t *entry, *head;
++  bool exempt = packet->exempt;
++
++  if (packet->control && wave_mc_validate_control(packet, skb->data + packet->offset))
++    return false;
++  if (exempt)
++    return true;
++  /* Explicit configured flood ranges retain their existing group policy.
++   * Exhaustion or incomplete firmware admission never reaches this branch.
++   */
++  mtlk_osal_lock_acquire(&core->mcast.lock_ranges);
++  if (packet->key.proto == htons(ETH_P_IP)) {
++    struct in_addr group = { .s_addr = ntohl(packet->key.group.ip4) };
++
++    mtlk_dlist_foreach(&core->mcast.ip4_ranges_list, entry, head) {
++      mcast_ip4_range *range = MTLK_LIST_GET_CONTAINING_RECORD(entry, mcast_ip4_range, list_entry);
++
++      if (!mtlk_osal_ipv4_masked_addr_cmp(&range->ip4_addr, &range->ip4_mask, &group)) {
++        exempt = true;
++        break;
++      }
++    }
++  } else if (packet->key.proto == htons(ETH_P_IPV6)) {
++    mtlk_dlist_foreach(&core->mcast.ip6_ranges_list, entry, head) {
++      mcast_ip6_range *range = MTLK_LIST_GET_CONTAINING_RECORD(entry, mcast_ip6_range, list_entry);
++
++      if (!mtlk_osal_ipv6_masked_addr_cmp(&range->ip6_addr, &range->ip6_mask,
++                                        &packet->key.group.ip6)) {
++        exempt = true;
++        break;
++      }
++    }
++  }
++  mtlk_osal_lock_release(&core->mcast.lock_ranges);
++  return exempt;
++}
++
++static bool wave_mc_ether_broadcast(struct sk_buff *skb)
++{
++  struct ethhdr buffer;
++  const struct ethhdr *eth = skb_header_pointer(skb, 0, sizeof(buffer), &buffer);
++
++  return eth && is_broadcast_ether_addr(eth->h_dest);
++}
++
++static void wave_mc_retire_oldest(struct wave_mc_native *native,
++                                  const struct wave_mc_native_class *except)
++{
++  struct wave_mc_native_class *class, *oldest = NULL;
++
++  list_for_each_entry(class, &native->classes, node) {
++    if (class == except || class->retiring || class->id == MCAST_GROUP_UNDEF)
++      continue;
++    if (!oldest || time_before(class->last_used, oldest->last_used))
++      oldest = class;
++  }
++  if (oldest)
++    oldest->retiring = true;
++  wave_mc_native_wake(native);
++}
++
++int wave_mc_native_grid(mtlk_core_t *core, struct sk_buff *skb, bool pin, sta_entry *source)
++{
++  struct wave_mc_native *native = core->mcast.native;
++  struct wave_mc_native_class *class;
++  struct wave_mc_packet packet;
++  struct wave_mc_targets targets = { .source = source };
++  u64 generation;
++  int error, result = MCAST_GROUP_UNDEF;
++  unsigned int mode;
++  bool changed = false;
++
++  if (!native || !wave_mc_native_needed(core))
++    return result;
++  error = wave_mc_packet(skb, &packet);
++  if (error)
++    return error == -EAFNOSUPPORT && wave_mc_ether_broadcast(skb) ? MCAST_GROUP_BROADCAST : result;
++  if (packet.control && wave_mc_validate_control(&packet, skb->data + packet.offset))
++    return result;
++  if (wave_mc_packet_exempt(core, skb, &packet))
++    return MCAST_GROUP_BROADCAST;
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  if (!core->mcast.accepting || !wave_mc_native_sync_locked(native))
++    goto out;
++  mode = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_RELIABLE_MCAST);
++  if (mode != ENABLE_RELIABLE_MULTICAST && mode != DISABLE_RELIABLE_MULTICAST)
++    goto out;
++  if (wave_mc_policy_activate(native->policy, packet.key.vlan, packet.key.proto, jiffies) > 0)
++    changed = true;
++  wave_mc_policy_expire(native->policy, jiffies);
++  generation = wave_mc_policy_generation(native->policy);
++  if (mode == ENABLE_RELIABLE_MULTICAST) {
++    list_for_each_entry(class, &native->classes, node) {
++      if (source || class->excluded_source || class->retiring || class->generation != generation ||
++          !wave_mc_key_equal(&class->key, &packet.key) ||
++          !wave_mc_ip_equal(packet.key.proto, &class->last_source, &packet.source))
++        continue;
++      if (!wave_mc_class_current(class)) {
++        class->retiring = true;
++        changed = true;
++        continue;
++      }
++      class->last_used = jiffies;
++      if (wave_mc_class_ready(class) &&
++          wave_hw_mc_get(mtlk_vap_get_hw(core->vap_handle), class->id, pin))
++        result = class->id;
++      goto out;
++    }
++  }
++  wave_mc_policy_foreach_receiver(native->policy, &packet.key, &packet.source,
++                                  jiffies, wave_mc_target, &targets);
++  if (bitmap_empty(targets.bits, WAVE_MC_SIDS))
++    goto out;
++  if (mode == DISABLE_RELIABLE_MULTICAST) {
++    /* The administrator chose one aggregate air frame. Apply the group/source
++     * union, without claiming per-station enforcement or converting its DA.
++     */
++    result = MCAST_GROUP_BROADCAST;
++    goto out;
++  }
++  list_for_each_entry(class, &native->classes, node) {
++    if (class->retiring || !wave_mc_key_equal(&class->key, &packet.key) ||
++        !bitmap_equal(class->receivers, targets.bits, WAVE_MC_SIDS))
++      continue;
++    if (!wave_mc_class_current(class)) {
++      class->retiring = true;
++      changed = true;
++      continue;
++    }
++    class->last_source = packet.source;
++    class->excluded_source = !!source;
++    class->generation = generation;
++    class->last_used = jiffies;
++    if (wave_mc_class_ready(class) &&
++        wave_hw_mc_get(mtlk_vap_get_hw(core->vap_handle), class->id, pin))
++      result = class->id;
++    goto out;
++  }
++  if (native->count >= MC_GROUPS - MC_MIN_GROUP) {
++    wave_mc_retire_oldest(native, NULL);
++    goto out;
++  }
++  class = kzalloc(sizeof(*class), GFP_ATOMIC);
++  if (!class)
++    goto out;
++  bitmap_zero(targets.bits, WAVE_MC_SIDS);
++  targets.allocate = true;
++  wave_mc_policy_foreach_receiver(native->policy, &packet.key, &packet.source,
++                                  jiffies, wave_mc_target, &targets);
++  if (targets.failed) {
++    wave_mc_members_free(targets.members);
++    kfree(class);
++    goto out;
++  }
++  class->owner = native;
++  class->key = packet.key;
++  class->last_source = packet.source;
++  class->excluded_source = !!source;
++  class->generation = generation;
++  bitmap_copy(class->receivers, targets.bits, WAVE_MC_SIDS);
++  class->members = targets.members;
++  class->id = MCAST_GROUP_UNDEF;
++  class->last_used = jiffies;
++  list_add_tail(&class->node, &native->classes);
++  native->count++;
++  changed = true;
++out:
++  if (changed)
++    wave_mc_native_wake(native);
++  mtlk_osal_lock_release(&core->mcast.lock);
++  return result;
++}
++
++bool wave_mc_native_receiver(mtlk_core_t *core, struct sk_buff *skb, const sta_entry *sta)
++{
++  struct wave_mc_packet packet;
++  struct wave_mc_targets targets = { .wanted = sta };
++  int error;
++
++  if (!wave_mc_native_needed(core))
++    return false;
++  error = wave_mc_packet(skb, &packet);
++  if (error)
++    return error == -EAFNOSUPPORT && wave_mc_ether_broadcast(skb);
++  if (packet.control && wave_mc_validate_control(&packet, skb->data + packet.offset))
++    return false;
++  if (wave_mc_packet_exempt(core, skb, &packet))
++    return true;
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  if (core->mcast.accepting && wave_mc_native_sync_locked(core->mcast.native)) {
++    if (wave_mc_policy_activate(core->mcast.native->policy, packet.key.vlan, packet.key.proto, jiffies) > 0)
++      wave_mc_native_wake(core->mcast.native);
++    wave_mc_policy_foreach_receiver(core->mcast.native->policy, &packet.key, &packet.source,
++                                    jiffies, wave_mc_target, &targets);
++  }
++  mtlk_osal_lock_release(&core->mcast.lock);
++  return targets.found;
++}
++
++
++/* Mode changes are event-driven. The module notifier is registered before PCI
++ * probe and unregistered after every device is gone, avoiding RTNL acquisition
++ * from a radio serializer whose cfg80211 caller may already own RTNL.
++ */
++static LIST_HEAD(wave_mc_native_devices);
++static DEFINE_SPINLOCK(wave_mc_native_devices_lock);
++
++static void wave_mc_native_reset_locked(struct wave_mc_native *native)
++{
++  struct wave_mc_native_class *class;
++
++  list_for_each_entry(class, &native->classes, node)
++    class->retiring = true;
++  wave_mc_policy_clear(native->policy);
++  native->standalone = false;
++  native->reset_pending = false;
++  native->epoch++;
++}
++
++static bool wave_mc_native_sync_locked(struct wave_mc_native *native)
++{
++  bool needed;
++
++  if (native->reset_pending)
++    wave_mc_native_reset_locked(native);
++  /* A master tick settles the upper-change notification under RTNL. RX/TX
++   * cannot adopt an intermediate bridge state or a rejected attach attempt. */
++  if (native->bridge_pending)
++    return false;
++  needed = wave_mc_native_needed(native->core);
++  if (!needed) {
++    if (native->standalone)
++      wave_mc_native_reset_locked(native);
++    return false;
++  }
++  if (!native->standalone) {
++    int v4, v6;
++
++    v4 = wave_mc_policy_activate(native->policy, 0, htons(ETH_P_IP), jiffies);
++    v6 = wave_mc_policy_activate(native->policy, 0, htons(ETH_P_IPV6), jiffies);
++    if (v4 < 0 || v6 < 0)
++      return false;
++    native->standalone = true;
++    wave_mc_native_wake(native);
++  }
++  return true;
++}
++
++static int wave_mc_native_netdev_event(struct notifier_block *block,
++                                       unsigned long event, void *ptr)
++{
++  struct netdev_notifier_changeupper_info *info = ptr;
++  struct net_device *dev = netdev_notifier_info_to_dev(ptr);
++  struct wave_mc_native *native;
++
++  MTLK_UNREFERENCED_PARAM(block);
++  if (event != NETDEV_CHANGEUPPER || !netif_is_bridge_master(info->upper_dev))
++    return NOTIFY_DONE;
++  spin_lock_bh(&wave_mc_native_devices_lock);
++  list_for_each_entry(native, &wave_mc_native_devices, devices) {
++    if (READ_ONCE(native->netdev) != dev)
++      continue;
++    mtlk_osal_lock_acquire(&native->core->mcast.lock);
++    native->reset_pending = true;
++    native->bridge_pending = true;
++    wave_mc_native_wake(native);
++    mtlk_osal_lock_release(&native->core->mcast.lock);
++  }
++  spin_unlock_bh(&wave_mc_native_devices_lock);
++  return NOTIFY_DONE;
++}
++
++static struct notifier_block wave_mc_native_notifier = {
++  .notifier_call = wave_mc_native_netdev_event,
++};
++
++int wave_mc_native_module_init(void)
++{
++  return register_netdevice_notifier(&wave_mc_native_notifier);
++}
++
++void wave_mc_native_module_exit(void)
++{
++  unregister_netdevice_notifier(&wave_mc_native_notifier);
++}
++
++struct wave_mc_query_tx {
++  struct list_head node;
++  struct sk_buff *skb;
++  mtlk_hw_msg_t *msg;
++  u64 epoch;
++};
++
++struct wave_mc_query_queue {
++  struct list_head packets;
++  struct wave_mc_native *native;
++};
++
++static u8 wave_mc_encode8(unsigned long value)
++{
++  unsigned int code;
++
++  for (code = 0; code < U8_MAX; code++)
++    if (wave_mc_decode8(code) >= value)
++      return code;
++  return U8_MAX;
++}
++
++static u16 wave_mc_encode16(unsigned long value)
++{
++  unsigned int exponent, mantissa;
++
++  if (value < 32768)
++    return value;
++  for (exponent = 0; exponent < 8; exponent++) {
++    mantissa = DIV_ROUND_UP(value, 1UL << (exponent + 3));
++    if (mantissa <= 8191)
++      return 0x8000 | (exponent << 12) | (mantissa & 4095);
++  }
++  return U16_MAX;
++}
++
++/* The bounded queue owns both packet and a reserved TX descriptor. Nothing is
++ * transmitted while policy's lock is held. Only this explicit query path can
++ * bypass native recipient filtering; received/OS packets cannot set the flag.
++ */
++static int wave_mc_query_emit(void *ctx, const struct wave_mc_key *key,
++                              const void *sources, unsigned int nsrc, u8 qrv,
++                              unsigned long qqi, unsigned long maxresp, bool suppress)
++{
++  struct wave_mc_query_queue *queue = ctx;
++  struct wave_mc_native *native = queue->native;
++  mtlk_core_t *core = native->core;
++  struct net_device *dev = native->netdev;
++  struct wave_mc_query_tx *packet;
++  struct sk_buff *skb;
++  struct ethhdr *eth;
++  unsigned int size = key->proto == htons(ETH_P_IP) ? 4 : 16;
++  unsigned int depth = key->vlan & 3, l2 = ETH_HLEN + depth * VLAN_HLEN;
++  unsigned int query_len = (size == 4 ? 12 : 28) + nsrc * size;
++  unsigned int ip_len = (size == 4 ? 24 : 48) + query_len;
++  unsigned int index;
++  union wave_mc_ip dest = key->group;
++  struct in6_addr local6;
++  __be16 *eth_proto;
++  u8 *query, *cursor;
++  int error;
++
++  if (!core->mcast.accepting || !native->standalone || native->reset_pending ||
++      !wave_mc_native_needed(core) || nsrc > WAVE_MC_QUERY_SOURCES || depth > 2)
++    return -ESHUTDOWN;
++  if (size == 4) {
++    if (!dest.ip4)
++      dest.ip4 = htonl(INADDR_ALLHOSTS_GROUP);
++  } else {
++    if (ipv6_addr_any(&dest.ip6))
++      dest.ip6 = in6addr_linklocal_allnodes;
++    /* Query source is always link-local, even for a global/site-scope group.
++     * ipv6_get_lladdr is not exported; link-local destination selection uses
++     * the exported address owner and its normal usability checks.
++     */
++    error = ipv6_dev_get_saddr(dev_net(dev), dev, &in6addr_linklocal_allnodes, 0, &local6);
++    if (error || !(ipv6_addr_type(&local6) & IPV6_ADDR_LINKLOCAL))
++      return -EADDRNOTAVAIL;
++  }
++  packet = kzalloc(sizeof(*packet), GFP_ATOMIC);
++  if (!packet)
++    return -ENOMEM;
++  skb = mtlk_df_nbuf_alloc(l2 + ip_len + NET_IP_ALIGN);
++  if (!skb) {
++    kfree(packet);
++    return -ENOMEM;
++  }
++  skb_reserve(skb, NET_IP_ALIGN);
++  skb_put_zero(skb, l2 + ip_len);
++  skb->dev = dev;
++  eth = (struct ethhdr *)skb->data;
++  ether_addr_copy(eth->h_source, dev->dev_addr);
++  if (size == 4)
++    ip_eth_mc_map(dest.ip4, eth->h_dest);
++  else
++    ipv6_eth_mc_map(&dest.ip6, eth->h_dest);
++  eth_proto = &eth->h_proto;
++  cursor = skb->data + ETH_HLEN;
++  for (index = 0; index < depth; index++) {
++    struct vlan_hdr *tag = (struct vlan_hdr *)cursor;
++
++    *eth_proto = htons(key->vlan & BIT(26 + index) ? ETH_P_8021AD : ETH_P_8021Q);
++    tag->h_vlan_TCI = htons((key->vlan >> (2 + index * 12)) & VLAN_VID_MASK);
++    eth_proto = &tag->h_vlan_encapsulated_proto;
++    cursor += VLAN_HLEN;
++  }
++  *eth_proto = key->proto;
++  skb->protocol = eth->h_proto;
++  skb_reset_mac_header(skb);
++  skb_set_network_header(skb, l2);
++  if (size == 4) {
++    struct iphdr *ip = (struct iphdr *)cursor;
++    u8 *options = cursor + sizeof(*ip);
++
++    ip->version = 4;
++    ip->ihl = 6;
++    ip->tos = 0xc0;
++    ip->tot_len = htons(ip_len);
++    ip->ttl = 1;
++    ip->protocol = IPPROTO_IGMP;
++    /* As with the bridge's default querier, zero is deliberately subordinate
++     * to a configured external router and needs no invented interface address.
++     */
++    ip->saddr = 0;
++    ip->daddr = dest.ip4;
++    options[0] = IPOPT_RA;
++    options[1] = 4;
++    ip_send_check(ip);
++    query = cursor + 24;
++    query[0] = IGMP_HOST_MEMBERSHIP_QUERY;
++    query[1] = wave_mc_encode8(DIV_ROUND_UP(jiffies_to_msecs(maxresp), 100));
++    memcpy(query + 4, &key->group.ip4, 4);
++    query[8] = (qrv & 7) | (suppress ? 8 : 0);
++    query[9] = wave_mc_encode8(DIV_ROUND_UP(qqi, HZ));
++    put_unaligned_be16(nsrc, query + 10);
++    if (nsrc)
++      memcpy(query + 12, sources, nsrc * 4);
++    put_unaligned(csum_fold(csum_partial(query, query_len, 0)), (__sum16 *)(query + 2));
++  } else {
++    struct ipv6hdr *ip = (struct ipv6hdr *)cursor;
++    u8 *hop = cursor + sizeof(*ip);
++
++    ip->version = 6;
++    ip->payload_len = htons(ip_len - sizeof(*ip));
++    ip->nexthdr = IPPROTO_HOPOPTS;
++    ip->hop_limit = 1;
++    ip->saddr = local6;
++    ip->daddr = dest.ip6;
++    hop[0] = IPPROTO_ICMPV6;
++    hop[2] = IPV6_TLV_ROUTERALERT;
++    hop[3] = 2;
++    hop[6] = IPV6_TLV_PADN;
++    query = hop + 8;
++    query[0] = ICMPV6_MGM_QUERY;
++    put_unaligned_be16(wave_mc_encode16(jiffies_to_msecs(maxresp)), query + 4);
++    memcpy(query + 8, &key->group.ip6, 16);
++    query[24] = (qrv & 7) | (suppress ? 8 : 0);
++    query[25] = wave_mc_encode8(DIV_ROUND_UP(qqi, HZ));
++    put_unaligned_be16(nsrc, query + 26);
++    if (nsrc)
++      memcpy(query + 28, sources, nsrc * 16);
++    put_unaligned(csum_ipv6_magic(&ip->saddr, &ip->daddr, query_len, IPPROTO_ICMPV6,
++                                  csum_partial(query, query_len, 0)), (__sum16 *)(query + 2));
++  }
++  packet->msg = mtlk_hw_get_msg_to_send(mtlk_vap_get_hwapi(core->vap_handle),
++                                      core->vap_handle, &error);
++  if (!packet->msg) {
++    mtlk_df_nbuf_free(skb);
++    kfree(packet);
++    return -ENOBUFS;
++  }
++  packet->skb = skb;
++  packet->epoch = native->epoch;
++  list_add_tail(&packet->node, &queue->packets);
++  return 0;
++}
++
++static void wave_mc_queries_send(struct wave_mc_query_queue *queue)
++{
++  struct wave_mc_native *native = queue->native;
++  mtlk_core_t *core = native->core;
++  struct wave_mc_query_tx *packet, *next;
++
++  list_for_each_entry_safe(packet, next, &queue->packets, node) {
++    mtlk_core_handle_tx_data_t data = {
++      .nbuf = packet->skb,
++      .msg = packet->msg,
++      .native_control = true,
++    };
++    bool live;
++
++    mtlk_osal_lock_acquire(&core->mcast.lock);
++    live = core->mcast.accepting && native->standalone && !native->reset_pending &&
++           packet->epoch == native->epoch && wave_mc_native_needed(core) &&
++           wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle));
++    mtlk_osal_lock_release(&core->mcast.lock);
++    if (live)
++      mtlk_mc_transmit(core, &data, MTLK_NBUFF_MULTICAST,
++                       MTLK_CORE_HOT_PATH_PDB_GET_INT(core, CORE_DB_CORE_BRIDGE_MODE), NULL);
++    else
++      mtlk_df_nbuf_free(data.nbuf);
++    /* A complete all-four-address snapshot can consume only cloned packets. */
++    if (data.msg)
++      mtlk_hw_release_msg_to_send(mtlk_vap_get_hwapi(core->vap_handle), data.msg);
++    list_del(&packet->node);
++    kfree(packet);
++  }
++}
++
++static void wave_mc_classes_update_locked(struct wave_mc_native *native)
++{
++  struct wave_mc_native_class *class, *next;
++  mtlk_core_t *core = native->core;
++
++  list_for_each_entry_safe(class, next, &native->classes, node) {
++    struct wave_mc_native_member *member;
++    bool applied = false;
++
++    if (!native->standalone || !wave_mc_class_current(class) ||
++        time_after_eq(jiffies, class->last_used + WAVE_MC_IDLE))
++      class->retiring = true;
++    if (class->retiring) {
++      for (member = class->members; member; member = member->next) {
++        if (class->id == MCAST_GROUP_UNDEF ||
++            !(member->sta->info.mc_memberships & BIT(class->id)))
++          continue;
++        applied = true;
++        if (member->status == MCAST_STA_STATUS_NONE && !member->sta->info.mc_retiring)
++          mtlk_mc_queue_native_locked(core, MTLK_MC_STA_LEAVE_GROUP,
++                                      class->id, member->sta, class);
++      }
++      if (!class->pending && !applied)
++        wave_mc_class_free(class);
++      continue;
++    }
++    if (class->id == MCAST_GROUP_UNDEF) {
++      class->id = wave_hw_mc_alloc_native(mtlk_vap_get_hw(core->vap_handle));
++      if (class->id == MCAST_GROUP_UNDEF) {
++        wave_mc_retire_oldest(native, class);
++        continue;
++      }
++    }
++    for (member = class->members; member; member = member->next) {
++      if (member->status != MCAST_STA_STATUS_NONE ||
++          (member->sta->info.mc_memberships & BIT(class->id)))
++        continue;
++      mtlk_mc_queue_native_locked(core, MTLK_MC_STA_JOIN_GROUP,
++                                  class->id, member->sta, class);
++    }
++  }
++}
++
++static void wave_mc_native_arm_locked(struct wave_mc_native *native)
++{
++  struct wave_mc_native_class *class;
++  unsigned long deadline = 0, candidate;
++  bool have = false;
++
++  if (!native->core->mcast.accepting ||
++      !wave_hw_mmb_ready(mtlk_vap_get_hw(native->core->vap_handle)))
++    return;
++  if (native->reset_pending || native->bridge_pending ||
++      (!native->standalone && wave_mc_native_needed(native->core))) {
++    deadline = jiffies + WAVE_MC_RETRY;
++    have = true;
++  }
++  if (native->standalone && wave_mc_policy_next_deadline(native->policy, &candidate)) {
++    if (!have || time_before(candidate, deadline))
++      deadline = candidate;
++    have = true;
++  }
++  list_for_each_entry(class, &native->classes, node) {
++    if (class->pending)
++      continue; /* Command completion supplies the next wakeup. */
++    candidate = wave_mc_class_ready(class) ? class->last_used + WAVE_MC_IDLE :
++                                            jiffies + WAVE_MC_RETRY;
++    if (!have || time_before(candidate, deadline))
++      deadline = candidate;
++    have = true;
++  }
++  if (have)
++    mod_timer(&native->timer, time_after(deadline, jiffies) ? deadline : jiffies + 1);
++}
++
++static void wave_mc_native_tick(mtlk_handle_t handle)
++{
++  struct wave_mc_native *native = HANDLE_T_PTR(struct wave_mc_native, handle);
++  struct wave_mc_query_queue queue = { .native = native };
++  mtlk_core_t *core = native->core;
++
++  INIT_LIST_HEAD(&queue.packets);
++  /* cfg80211 may hold RTNL while waiting for this serializer: never wait for
++   * it here. A later tick observes the settled bridge state, including a link
++   * rejected by another notifier. Detach notifies before clearing its flag.
++   */
++  if (READ_ONCE(native->bridge_pending) && rtnl_trylock()) {
++    mtlk_osal_lock_acquire(&core->mcast.lock);
++    native->bridge_pending = false;
++    wave_mc_native_sync_locked(native);
++    mtlk_osal_lock_release(&core->mcast.lock);
++    rtnl_unlock();
++  }
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  if (!native->tick.is_cancelled && core->mcast.accepting &&
++      wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle))) {
++    if (wave_mc_native_sync_locked(native)) {
++      wave_mc_policy_expire(native->policy, jiffies);
++      wave_mc_policy_drain_queries(native->policy, jiffies, WAVE_MC_QUERY_BUDGET,
++                                    wave_mc_query_emit, &queue);
++    }
++    wave_mc_classes_update_locked(native);
++  }
++  mtlk_osal_lock_release(&core->mcast.lock);
++  wave_mc_queries_send(&queue);
++}
++
++static void wave_mc_native_tick_done(serializer_result_t result,
++                                     mtlk_command_t *command, mtlk_handle_t handle)
++{
++  struct wave_mc_native *native = HANDLE_T_PTR(struct wave_mc_native, handle);
++
++  MTLK_UNREFERENCED_PARAM(result);
++  mtlk_command_cleanup(command);
++  mtlk_osal_lock_acquire(&native->core->mcast.lock);
++  native->tick_pending = false;
++  wave_mc_native_arm_locked(native);
++  mtlk_osal_lock_release(&native->core->mcast.lock);
++}
++
++static void wave_mc_native_timer(struct timer_list *timer)
++{
++  struct wave_mc_native *native = timer_container_of(native, timer, timer);
++  mtlk_core_t *core = native->core;
++  mtlk_core_t *master;
++  int error;
++
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  if (!core->mcast.accepting || native->tick_pending)
++    goto out;
++  error = mtlk_command_init(&native->tick, wave_mc_native_tick, HANDLE_T(native), MTLK_SLID);
++  if (error != MTLK_ERR_OK) {
++    mod_timer(&native->timer, jiffies + WAVE_MC_RETRY);
++    goto out;
++  }
++  native->tick_pending = true;
++  master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(core->vap_handle));
++  error = mtlk_core_schedule_hw_command(master, &native->tick,
++                                        wave_mc_native_tick_done, HANDLE_T(native));
++  if (error != MTLK_ERR_OK) {
++    mtlk_command_cleanup(&native->tick);
++    native->tick_pending = false;
++    mod_timer(&native->timer, jiffies + WAVE_MC_RETRY);
++  }
++out:
++  mtlk_osal_lock_release(&core->mcast.lock);
++}
++
++int wave_mc_native_init(mtlk_core_t *core)
++{
++#if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
++  struct wave_mc_native *native;
++
++  if (!mtlk_vap_is_ap(core->vap_handle))
++    return MTLK_ERR_OK;
++  native = kzalloc(sizeof(*native), GFP_KERNEL);
++  if (!native)
++    return MTLK_ERR_NO_MEM;
++  native->policy = wave_mc_policy_create(GFP_KERNEL);
++  if (!native->policy) {
++    kfree(native);
++    return MTLK_ERR_NO_MEM;
++  }
++  native->core = core;
++  INIT_LIST_HEAD(&native->classes);
++  timer_setup(&native->timer, wave_mc_native_timer, 0);
++  core->mcast.native = native;
++  spin_lock_bh(&wave_mc_native_devices_lock);
++  list_add_tail(&native->devices, &wave_mc_native_devices);
++  spin_unlock_bh(&wave_mc_native_devices_lock);
++#endif
++  return MTLK_ERR_OK;
++}
++
++void wave_mc_native_open_owned(mtlk_core_t *core)
++{
++  struct wave_mc_native *native = core->mcast.native;
++
++  if (!native)
++    return;
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  WRITE_ONCE(native->netdev, mtlk_df_user_get_ndev(
++    mtlk_df_get_user(mtlk_vap_get_df(core->vap_handle))));
++  native->reset_pending = true;
++  wave_mc_native_sync_locked(native);
++  wave_mc_native_wake(native);
++  mtlk_osal_lock_release(&core->mcast.lock);
++}
++
++void wave_mc_native_drop_sta(mtlk_core_t *core, sta_entry *sta)
++{
++  struct wave_mc_native *native = core->mcast.native;
++  struct wave_mc_native_class *class;
++
++  if (!native)
++    return;
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  wave_mc_policy_drop_sta(native->policy, sta);
++  list_for_each_entry(class, &native->classes, node) {
++    struct wave_mc_native_member *member;
++
++    for (member = class->members; member; member = member->next) {
++      if (member->sta == sta) {
++        class->retiring = true;
++        break;
++      }
++    }
++  }
++  wave_mc_native_wake(native);
++  mtlk_osal_lock_release(&core->mcast.lock);
++}
++
++void wave_mc_native_stop_owned(mtlk_core_t *core)
++{
++  struct wave_mc_native *native = core->mcast.native;
++  mtlk_core_t *master;
++  bool pending;
++
++  if (!native)
++    return;
++  /* accepting was closed before this join; timer and notifier cannot rearm. */
++  timer_delete_sync(&native->timer);
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  pending = native->tick_pending;
++  WRITE_ONCE(native->netdev, NULL);
++  mtlk_osal_lock_release(&core->mcast.lock);
++  if (pending) {
++    BOOL canceled;
++
++    master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(core->vap_handle));
++    canceled = mtlk_serializer_cancel(&master->slow_ctx->serializer, &native->tick);
++    MTLK_ASSERT(canceled);
++  }
++}
++
++void wave_mc_native_clear_owned(mtlk_core_t *core)
++{
++  struct wave_mc_native *native = core->mcast.native;
++  struct wave_mc_native_class *class, *next;
++
++  if (!native)
++    return;
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  MTLK_ASSERT(!native->tick_pending);
++  list_for_each_entry_safe(class, next, &native->classes, node) {
++    struct wave_mc_native_member *member;
++
++    for (member = class->members; member; member = member->next)
++      MTLK_ASSERT(class->id == MCAST_GROUP_UNDEF ||
++                   !(member->sta->info.mc_memberships & BIT(class->id)));
++    wave_mc_class_free(class);
++  }
++  wave_mc_policy_clear(native->policy);
++  native->standalone = false;
++  native->reset_pending = false;
++  native->bridge_pending = false;
++  native->epoch++;
++  mtlk_osal_lock_release(&core->mcast.lock);
++}
++
++void wave_mc_native_destroy(mtlk_core_t *core)
++{
++  struct wave_mc_native *native = core->mcast.native;
++
++  if (!native)
++    return;
++  spin_lock_bh(&wave_mc_native_devices_lock);
++  list_del(&native->devices);
++  spin_unlock_bh(&wave_mc_native_devices_lock);
++  MTLK_ASSERT(!native->tick_pending && list_empty(&native->classes));
++  timer_delete_sync(&native->timer);
++  mtlk_osal_lock_acquire(&core->mcast.lock);
++  wave_mc_policy_destroy(native->policy);
++  core->mcast.native = NULL;
++  mtlk_osal_lock_release(&core->mcast.lock);
++  kfree(native);
++}
+--- /dev/null
++++ b/wireless/driver/linux/wave_mc_native.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _WAVE_MC_NATIVE_H_
++#define _WAVE_MC_NATIVE_H_
++
++struct nic;
++struct sk_buff;
++struct _sta_entry;
++struct wave_mc_native_class;
++
++int wave_mc_native_module_init(void);
++void wave_mc_native_module_exit(void);
++int wave_mc_native_init(struct nic *core);
++void wave_mc_native_open_owned(struct nic *core);
++void wave_mc_native_stop_owned(struct nic *core);
++void wave_mc_native_clear_owned(struct nic *core);
++void wave_mc_native_destroy(struct nic *core);
++void wave_mc_native_drop_sta(struct nic *core, struct _sta_entry *sta);
++int wave_mc_native_observe(struct nic *core, struct sk_buff *skb,
++                           struct _sta_entry *reporter);
++int wave_mc_native_grid(struct nic *core, struct sk_buff *skb, bool pin,
++                        struct _sta_entry *source);
++bool wave_mc_native_receiver(struct nic *core, struct sk_buff *skb,
++                              const struct _sta_entry *sta);
++
++/* Shared command owner hooks: caller holds the VAP multicast lock. */
++bool wave_mc_native_command_valid(struct wave_mc_native_class *owner,
++                                   struct _sta_entry *sta, int action);
++void wave_mc_native_command_queued(struct wave_mc_native_class *owner,
++                                    struct _sta_entry *sta, int action);
++void wave_mc_native_command_done(struct wave_mc_native_class *owner,
++                                  struct _sta_entry *sta, int action);
++int mtlk_mc_queue_native_locked(struct nic *core, int action, int group,
++                                struct _sta_entry *sta,
++                                struct wave_mc_native_class *owner);
++#endif
+--- /dev/null
++++ b/wireless/driver/linux/wave_mc_policy.c
+@@ -0,0 +1,1017 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Native reporter state follows the IGMPv3/MLDv2 transition tables used by
++ * net/bridge/br_multicast.c. Firmware group IDs and packet ownership remain
++ * outside this engine. EXCLUDE stores running X and blocked Y independently.
++ */
++#include "mtlkinc.h"
++#include "stadb.h"
++#include "wave_mc_policy.h"
++
++#include <linux/etherdevice.h>
++#include <linux/if_ether.h>
++#include <linux/jhash.h>
++#include <linux/jiffies.h>
++#include <linux/list.h>
++#include <linux/rbtree.h>
++#include <linux/slab.h>
++
++#define WAVE_MC_BUCKETS 32
++#define WAVE_MC_MAX_DOMAINS WAVE_MC_MAX_GROUPS
++#define WAVE_MC_DEFAULT_RV 2
++#define WAVE_MC_DEFAULT_QI (125 * HZ)
++#define WAVE_MC_DEFAULT_QRI (10 * HZ)
++#define WAVE_MC_LMI HZ
++
++enum wave_mc_mode { WAVE_MC_INCLUDE, WAVE_MC_EXCLUDE };
++
++struct wave_mc_source {
++  struct rb_node node;
++  union wave_mc_ip addr;
++  unsigned long expires;
++  unsigned long query_at;
++  u8 queries;
++  bool running;
++  bool query_started;
++};
++
++struct wave_mc_reporter {
++  struct list_head list;
++  struct _sta_entry *sta;
++  u8 mac[ETH_ALEN];
++  enum wave_mc_mode mode;
++  struct rb_root sources;
++  unsigned int nsrc;
++  unsigned long group_expires;
++  unsigned long group_query_at;
++  u8 group_queries;
++  bool group_query_started;
++};
++
++struct wave_mc_domain {
++  struct list_head list;
++  u32 vlan;
++  __be16 proto;
++  unsigned int groups;
++  unsigned long qi, qri;
++  unsigned long other_expires;
++  unsigned long general_at;
++  union wave_mc_ip querier_source;
++  u8 rv, startup_queries;
++  bool other_active;
++  bool activated;
++};
++
++struct wave_mc_group {
++  struct hlist_node hash;
++  struct list_head list;
++  struct list_head reporters;
++  struct wave_mc_key key;
++  struct wave_mc_domain *domain;
++};
++
++struct wave_mc_policy {
++  struct hlist_head hash[WAVE_MC_BUCKETS];
++  struct list_head groups;
++  struct list_head domains;
++  unsigned int ngroups, nreporters, nsrc, ndomains;
++  u64 generation;
++  unsigned long gc_at;
++  bool gc_pending;
++  bool specific_first;
++  u8 query_sources[WAVE_MC_QUERY_SOURCES * sizeof(struct in6_addr)];
++};
++
++static unsigned int mc_addr_size(__be16 proto)
++{
++  if (proto == htons(ETH_P_IP))
++    return sizeof(__be32);
++  if (proto == htons(ETH_P_IPV6))
++    return sizeof(struct in6_addr);
++  return 0;
++}
++
++static unsigned long mc_interval(unsigned long value)
++{
++  return min_t(unsigned long, max_t(unsigned long, value, 1), MAX_JIFFY_OFFSET);
++}
++
++static unsigned long mc_product(unsigned long value, unsigned int count)
++{
++  if (value > MAX_JIFFY_OFFSET / count)
++    return MAX_JIFFY_OFFSET;
++  return mc_interval(value * count);
++}
++
++static unsigned long mc_gmi(const struct wave_mc_domain *d)
++{
++  unsigned long interval = mc_product(d->qi, d->rv);
++
++  return interval > MAX_JIFFY_OFFSET - d->qri ? MAX_JIFFY_OFFSET : interval + d->qri;
++}
++
++static unsigned long mc_other_interval(const struct wave_mc_domain *d)
++{
++  unsigned long interval = mc_product(d->qi, d->rv);
++
++  return interval > MAX_JIFFY_OFFSET - d->qri / 2 ?
++         MAX_JIFFY_OFFSET : interval + d->qri / 2;
++}
++
++/* Packet lookups can expire state without walking every source on every frame.
++ * Deletion may leave an early deadline; that causes at most one extra sweep.
++ */
++static void mc_gc_note(struct wave_mc_policy *p, unsigned long when)
++{
++  if (!p->gc_pending || time_before(when, p->gc_at)) {
++    p->gc_at = when;
++    p->gc_pending = true;
++  }
++}
++
++static bool mc_general(const struct wave_mc_key *key)
++{
++  static const union wave_mc_ip zero;
++
++  return !memcmp(&key->group, &zero, mc_addr_size(key->proto));
++}
++
++static unsigned int mc_hash(const struct wave_mc_key *key)
++{
++  return jhash(&key->group, mc_addr_size(key->proto),
++               key->vlan ^ (__force u16)key->proto) & (WAVE_MC_BUCKETS - 1);
++}
++
++static bool mc_key_equal(const struct wave_mc_key *a, const struct wave_mc_key *b)
++{
++  return a->vlan == b->vlan && a->proto == b->proto &&
++         !memcmp(&a->group, &b->group, mc_addr_size(a->proto));
++}
++
++static struct wave_mc_group *mc_group_find(struct wave_mc_policy *p,
++                                           const struct wave_mc_key *key)
++{
++  struct wave_mc_group *g;
++
++  hlist_for_each_entry(g, &p->hash[mc_hash(key)], hash)
++    if (mc_key_equal(&g->key, key))
++      return g;
++  return NULL;
++}
++
++static struct wave_mc_domain *mc_domain_find(struct wave_mc_policy *p,
++                                             const struct wave_mc_key *key)
++{
++  struct wave_mc_domain *d;
++
++  list_for_each_entry(d, &p->domains, list)
++    if (d->vlan == key->vlan && d->proto == key->proto)
++      return d;
++  return NULL;
++}
++
++static struct wave_mc_domain *mc_domain_new(const struct wave_mc_key *key,
++                                            unsigned long now)
++{
++  struct wave_mc_domain *d = kzalloc(sizeof(*d), GFP_ATOMIC);
++
++  if (!d)
++    return NULL;
++  d->vlan = key->vlan;
++  d->proto = key->proto;
++  d->rv = WAVE_MC_DEFAULT_RV;
++  d->qi = WAVE_MC_DEFAULT_QI;
++  d->qri = WAVE_MC_DEFAULT_QRI;
++  d->startup_queries = d->rv;
++  d->general_at = now;
++  return d;
++}
++
++static struct wave_mc_reporter *mc_reporter_find(struct wave_mc_group *g,
++                                                struct _sta_entry *sta,
++                                                const u8 reporter[ETH_ALEN])
++{
++  struct wave_mc_reporter *r;
++
++  if (!g)
++    return NULL;
++  list_for_each_entry(r, &g->reporters, list)
++    if (r->sta == sta && ether_addr_equal(r->mac, reporter))
++      return r;
++  return NULL;
++}
++
++static struct wave_mc_source *mc_source_find(const struct wave_mc_reporter *r,
++                                            const union wave_mc_ip *addr,
++                                            unsigned int size)
++{
++  struct rb_node *node = r->sources.rb_node;
++
++  while (node) {
++    struct wave_mc_source *s = rb_entry(node, struct wave_mc_source, node);
++    int cmp = memcmp(addr, &s->addr, size);
++
++    if (!cmp)
++      return s;
++    node = cmp < 0 ? node->rb_left : node->rb_right;
++  }
++  return NULL;
++}
++
++static int mc_source_add(struct wave_mc_reporter *r,
++                          const union wave_mc_ip *addr, unsigned int size,
++                          unsigned int limit, const struct wave_mc_source *copy,
++                          struct wave_mc_source **result)
++{
++  struct rb_node **link = &r->sources.rb_node, *parent = NULL;
++  struct wave_mc_source *s;
++
++  while (*link) {
++    int cmp;
++
++    parent = *link;
++    s = rb_entry(parent, struct wave_mc_source, node);
++    cmp = memcmp(addr, &s->addr, size);
++    if (!cmp) {
++      *result = s;
++      return 0;
++    }
++    link = cmp < 0 ? &parent->rb_left : &parent->rb_right;
++  }
++  if (r->nsrc == limit)
++    return -ENOSPC;
++  s = kzalloc(sizeof(*s), GFP_ATOMIC);
++  if (!s)
++    return -ENOMEM;
++  if (copy)
++    *s = *copy;
++  else
++    memcpy(&s->addr, addr, size);
++  rb_link_node(&s->node, parent, link);
++  rb_insert_color(&s->node, &r->sources);
++  r->nsrc++;
++  *result = s;
++  return 0;
++}
++
++static void mc_source_del(struct wave_mc_reporter *r, struct wave_mc_source *s)
++{
++  rb_erase(&s->node, &r->sources);
++  r->nsrc--;
++  kfree(s);
++}
++
++static void mc_reporter_free(struct wave_mc_reporter *r, bool referenced)
++{
++  struct rb_node *node;
++
++  while ((node = rb_first(&r->sources)))
++    mc_source_del(r, rb_entry(node, struct wave_mc_source, node));
++  if (referenced)
++    mtlk_sta_decref(r->sta);
++  kfree(r);
++}
++
++static void mc_reporter_del(struct wave_mc_policy *p, struct wave_mc_reporter *r)
++{
++  list_del(&r->list);
++  p->nreporters--;
++  p->nsrc -= r->nsrc;
++  mc_reporter_free(r, true);
++}
++
++static void mc_domain_unused(struct wave_mc_policy *p, struct wave_mc_domain *d)
++{
++  if (d->activated || d->groups || d->other_active)
++    return;
++  list_del(&d->list);
++  p->ndomains--;
++  kfree(d);
++}
++
++static void mc_group_del(struct wave_mc_policy *p, struct wave_mc_group *g)
++{
++  struct wave_mc_domain *d = g->domain;
++
++  hlist_del(&g->hash);
++  list_del(&g->list);
++  d->groups--;
++  p->ngroups--;
++  kfree(g);
++  mc_domain_unused(p, d);
++}
++
++static void mc_refresh(struct wave_mc_source *s, unsigned long expires)
++{
++  s->running = true;
++  s->expires = expires;
++  s->queries = 0;
++  s->query_started = false;
++}
++
++static void mc_source_query(struct wave_mc_source *s,
++                             const struct wave_mc_domain *d, unsigned long now)
++{
++  if (!s->running || s->queries)
++    return;
++  s->queries = d->rv;
++  s->query_at = now;
++  s->query_started = false;
++}
++
++static void mc_group_query(struct wave_mc_reporter *r,
++                            const struct wave_mc_domain *d, unsigned long now)
++{
++  if (r->mode != WAVE_MC_EXCLUDE || r->group_queries)
++    return;
++  r->group_queries = d->rv;
++  r->group_query_at = now;
++  r->group_query_started = false;
++}
++
++/* A new reporter is built in isolation. Even ENOSPC in the last source leaves
++ * the live record and its query work unchanged. No station reference transfers
++ * until the complete replacement is published under the caller's lock.
++ *
++ * With + = union, * = intersection, and - = difference, the bridge RFC tables
++ * are applied to INCLUDE(A) or EXCLUDE(X,Y), where X runs timers and Y blocks:
++ * IS_IN/ALLOW(B): A+B, or (X+B,Y-B); refresh B to GMI.
++ * IS_EX(B): (A*B,B-A), or (B-Y,Y*B); refresh only new EXCLUDE sources to GMI.
++ * TO_IN(B): A+B, or (X+B,Y-B); query old running sources outside B, plus G in EX.
++ * TO_EX(B): as IS_EX, but new EX sources inherit the old group timer; query X.
++ * BLOCK(B): query A*B, or retain (X+(B-Y),Y) and query B-Y.
++ * EX records refresh the group timer. Query-driven timer reductions happen
++ * when the corresponding query is accepted, not while building this record.
++ */
++static int mc_build_reporter(const struct wave_mc_reporter *old,
++                              const struct wave_mc_domain *d, u8 type,
++                              const void *sources, unsigned int nsrc,
++                              unsigned int limit, unsigned long now,
++                              struct wave_mc_reporter **result)
++{
++  struct wave_mc_reporter *r;
++  enum wave_mc_mode mode = old ? old->mode : WAVE_MC_INCLUDE;
++  unsigned int size = mc_addr_size(d->proto), i;
++  bool replace = type == WAVE_MC_IS_EXCLUDE || type == WAVE_MC_TO_EXCLUDE;
++  struct wave_mc_source *s;
++  struct rb_node *node;
++  int err;
++
++  r = kzalloc(sizeof(*r), GFP_ATOMIC);
++  if (!r)
++    return -ENOMEM;
++  r->sources = RB_ROOT;
++  r->mode = mode;
++  if (old) {
++    r->group_expires = old->group_expires;
++    r->group_queries = old->group_queries;
++    r->group_query_at = old->group_query_at;
++    r->group_query_started = old->group_query_started;
++  }
++  if (type == WAVE_MC_ASM_JOIN) {
++    r->mode = WAVE_MC_EXCLUDE;
++    r->group_expires = now + mc_gmi(d);
++    r->group_queries = 0;
++    goto done;
++  }
++  if (!replace && old) {
++    for (node = rb_first(&old->sources); node; node = rb_next(node)) {
++      const struct wave_mc_source *prev = rb_entry(node, struct wave_mc_source, node);
++
++      err = mc_source_add(r, &prev->addr, size, limit, prev, &s);
++      if (err)
++        goto fail;
++      if (type == WAVE_MC_TO_INCLUDE || type == WAVE_MC_ASM_LEAVE)
++        mc_source_query(s, d, now);
++    }
++  }
++  for (i = 0; i < nsrc; i++) {
++    union wave_mc_ip addr = {};
++    const struct wave_mc_source *prev;
++
++    memcpy(&addr, (const u8 *)sources + i * size, size);
++    prev = old ? mc_source_find(old, &addr, size) : NULL;
++    if (type == WAVE_MC_BLOCK && mode == WAVE_MC_INCLUDE) {
++      s = mc_source_find(r, &addr, size);
++      if (s)
++        mc_source_query(s, d, now);
++      continue;
++    }
++    s = mc_source_find(r, &addr, size);
++    if (!s) {
++      err = mc_source_add(r, &addr, size, limit, replace ? prev : NULL, &s);
++      if (err)
++        goto fail;
++      if (!prev && mode == WAVE_MC_EXCLUDE &&
++          (replace || type == WAVE_MC_BLOCK))
++        mc_refresh(s, type == WAVE_MC_IS_EXCLUDE ?
++                      now + mc_gmi(d) : old->group_expires);
++    }
++    switch (type) {
++    case WAVE_MC_IS_INCLUDE:
++    case WAVE_MC_ALLOW:
++    case WAVE_MC_TO_INCLUDE:
++      mc_refresh(s, now + mc_gmi(d));
++      break;
++    case WAVE_MC_TO_EXCLUDE:
++    case WAVE_MC_BLOCK:
++      mc_source_query(s, d, now);
++      break;
++    default:
++      break;
++    }
++  }
++  if (replace) {
++    r->mode = WAVE_MC_EXCLUDE;
++    r->group_expires = now + mc_gmi(d);
++    r->group_queries = 0;
++    r->group_query_started = false;
++  } else if (type == WAVE_MC_TO_INCLUDE || type == WAVE_MC_ASM_LEAVE) {
++    mc_group_query(r, d, now);
++  }
++done:
++  *result = r;
++  return 0;
++fail:
++  mc_reporter_free(r, false);
++  return err;
++}
++
++struct wave_mc_policy *wave_mc_policy_create(gfp_t flags)
++{
++  struct wave_mc_policy *p = kzalloc(sizeof(*p), flags);
++  unsigned int i;
++
++  if (!p)
++    return NULL;
++  INIT_LIST_HEAD(&p->groups);
++  INIT_LIST_HEAD(&p->domains);
++  for (i = 0; i < WAVE_MC_BUCKETS; i++)
++    INIT_HLIST_HEAD(&p->hash[i]);
++  return p;
++}
++
++int wave_mc_policy_activate(struct wave_mc_policy *p, u32 vlan,
++                            __be16 proto, unsigned long now)
++{
++  struct wave_mc_key key = { .vlan = vlan, .proto = proto };
++  struct wave_mc_domain *d;
++
++  if (!mc_addr_size(proto))
++    return -EINVAL;
++  d = mc_domain_find(p, &key);
++  if (!d) {
++    if (p->ndomains == WAVE_MC_MAX_DOMAINS)
++      return -ENOSPC;
++    d = mc_domain_new(&key, now);
++    if (!d)
++      return -ENOMEM;
++    list_add_tail(&d->list, &p->domains);
++    p->ndomains++;
++  }
++  if (d->activated)
++    return 0;
++  d->activated = true;
++  return 1;
++}
++
++void wave_mc_policy_clear(struct wave_mc_policy *p)
++{
++  struct wave_mc_group *g, *gtmp;
++  struct wave_mc_domain *d, *dtmp;
++
++  list_for_each_entry_safe(g, gtmp, &p->groups, list) {
++    struct wave_mc_reporter *r, *tmp;
++
++    list_for_each_entry_safe(r, tmp, &g->reporters, list)
++      mc_reporter_del(p, r);
++    mc_group_del(p, g);
++  }
++  list_for_each_entry_safe(d, dtmp, &p->domains, list) {
++    list_del(&d->list);
++    kfree(d);
++  }
++  p->ndomains = 0;
++  p->gc_pending = false;
++  p->specific_first = false;
++  p->generation++;
++}
++
++void wave_mc_policy_destroy(struct wave_mc_policy *p)
++{
++  if (!p)
++    return;
++  wave_mc_policy_clear(p);
++  kfree(p);
++}
++
++void wave_mc_policy_expire(struct wave_mc_policy *p, unsigned long now)
++{
++  struct wave_mc_group *g, *gtmp;
++  struct wave_mc_domain *d, *dtmp;
++  bool changed = false;
++
++  if (!p->gc_pending || time_before(now, p->gc_at))
++    return;
++  p->gc_pending = false;
++  list_for_each_entry_safe(g, gtmp, &p->groups, list) {
++    struct wave_mc_reporter *r, *tmp;
++
++    list_for_each_entry_safe(r, tmp, &g->reporters, list) {
++      struct rb_node *node, *next;
++
++      if (r->mode == WAVE_MC_EXCLUDE && time_after_eq(now, r->group_expires)) {
++        r->mode = WAVE_MC_INCLUDE;
++        r->group_queries = 0;
++        changed = true;
++      }
++      if (r->mode == WAVE_MC_EXCLUDE)
++        mc_gc_note(p, r->group_expires);
++      for (node = rb_first(&r->sources); node; node = next) {
++        struct wave_mc_source *s = rb_entry(node, struct wave_mc_source, node);
++
++        next = rb_next(node);
++        if (s->running && time_after_eq(now, s->expires)) {
++          s->running = false;
++          s->queries = 0;
++          changed = true;
++        }
++        if (!s->running && r->mode == WAVE_MC_INCLUDE) {
++          mc_source_del(r, s);
++          p->nsrc--;
++        } else if (s->running) {
++          mc_gc_note(p, s->expires);
++        }
++      }
++      if (r->mode == WAVE_MC_INCLUDE && !r->nsrc) {
++        mc_reporter_del(p, r);
++        changed = true;
++      }
++    }
++    if (list_empty(&g->reporters))
++      mc_group_del(p, g);
++  }
++  list_for_each_entry_safe(d, dtmp, &p->domains, list) {
++    if (d->other_active && time_after_eq(now, d->other_expires)) {
++      d->other_active = false;
++      memset(&d->querier_source, 0, sizeof(d->querier_source));
++      d->startup_queries = d->rv;
++      d->general_at = now;
++    }
++    if (d->other_active)
++      mc_gc_note(p, d->other_expires);
++    mc_domain_unused(p, d);
++  }
++  if (changed)
++    p->generation++;
++}
++
++int wave_mc_policy_report(struct wave_mc_policy *p,
++                          const struct wave_mc_key *key,
++                          struct _sta_entry *sta, const u8 reporter[ETH_ALEN],
++                          u8 type, const void *sources, unsigned int nsrc,
++                          unsigned long now)
++{
++  struct wave_mc_reporter *old, *r;
++  struct wave_mc_group *g;
++  struct wave_mc_domain *d;
++  bool new_group = false, new_domain = false;
++  unsigned int limit;
++  int err;
++
++  if (!mc_addr_size(key->proto) || !sta || !reporter ||
++      type < WAVE_MC_IS_INCLUDE || type > WAVE_MC_ASM_LEAVE ||
++      (nsrc && !sources) || (type >= WAVE_MC_ASM_JOIN && nsrc))
++    return -EINVAL;
++  if (nsrc > WAVE_MC_MAX_SOURCES)
++    return -ENOSPC;
++  wave_mc_policy_expire(p, now);
++  g = mc_group_find(p, key);
++  old = mc_reporter_find(g, sta, reporter);
++  if (!old && (type == WAVE_MC_ASM_LEAVE || type == WAVE_MC_BLOCK ||
++               (!nsrc && (type == WAVE_MC_IS_INCLUDE ||
++                           type == WAVE_MC_TO_INCLUDE ||
++                           type == WAVE_MC_ALLOW || type == WAVE_MC_BLOCK))))
++    return 0;
++  if (!old && p->nreporters == WAVE_MC_MAX_REPORTERS)
++    return -ENOSPC;
++  d = mc_domain_find(p, key);
++  if (!d) {
++    if (p->ndomains == WAVE_MC_MAX_DOMAINS)
++      return -ENOSPC;
++    d = mc_domain_new(key, now);
++    if (!d)
++      return -ENOMEM;
++    new_domain = true;
++  }
++  if (!g) {
++    err = -ENOSPC;
++    if (p->ngroups == WAVE_MC_MAX_GROUPS)
++      goto fail_domain;
++    err = -ENOMEM;
++    g = kzalloc(sizeof(*g), GFP_ATOMIC);
++    if (!g)
++      goto fail_domain;
++    g->key.vlan = key->vlan;
++    g->key.proto = key->proto;
++    memcpy(&g->key.group, &key->group, mc_addr_size(key->proto));
++    g->domain = d;
++    INIT_LIST_HEAD(&g->reporters);
++    new_group = true;
++  }
++  limit = WAVE_MC_MAX_SOURCES - p->nsrc + (old ? old->nsrc : 0);
++  err = mc_build_reporter(old, d, type, sources, nsrc, limit, now, &r);
++  if (err)
++    goto fail_group;
++  if (r->mode == WAVE_MC_INCLUDE && !r->nsrc) {
++    mc_reporter_free(r, false);
++    err = 0;
++    goto fail_group;
++  }
++  r->sta = sta;
++  ether_addr_copy(r->mac, reporter);
++  mtlk_sta_incref(sta);
++  if (new_domain) {
++    list_add_tail(&d->list, &p->domains);
++    p->ndomains++;
++  }
++  if (new_group) {
++    list_add_tail(&g->list, &p->groups);
++    hlist_add_head(&g->hash, &p->hash[mc_hash(key)]);
++    d->groups++;
++    p->ngroups++;
++  }
++  p->nsrc += r->nsrc;
++  if (old) {
++    list_replace(&old->list, &r->list);
++    p->nsrc -= old->nsrc;
++    mc_reporter_free(old, true);
++  } else {
++    list_add_tail(&r->list, &g->reporters);
++    p->nreporters++;
++  }
++  p->generation++;
++  if (r->mode == WAVE_MC_EXCLUDE)
++    mc_gc_note(p, r->group_expires);
++  {
++    struct rb_node *node;
++
++    for (node = rb_first(&r->sources); node; node = rb_next(node)) {
++      struct wave_mc_source *s = rb_entry(node, struct wave_mc_source, node);
++
++      if (s->running)
++        mc_gc_note(p, s->expires);
++    }
++  }
++  return 0;
++fail_group:
++  if (new_group)
++    kfree(g);
++fail_domain:
++  if (new_domain)
++    kfree(d);
++  return err;
++}
++
++void wave_mc_policy_drop_reporter(struct wave_mc_policy *p,
++                                  const struct wave_mc_key *key,
++                                  struct _sta_entry *sta,
++                                  const u8 reporter[ETH_ALEN])
++{
++  struct wave_mc_group *g = mc_group_find(p, key);
++  struct wave_mc_reporter *r = mc_reporter_find(g, sta, reporter);
++
++  if (!r)
++    return;
++  mc_reporter_del(p, r);
++  if (list_empty(&g->reporters))
++    mc_group_del(p, g);
++  p->generation++;
++}
++
++void wave_mc_policy_drop_sta(struct wave_mc_policy *p, struct _sta_entry *sta)
++{
++  struct wave_mc_group *g, *gtmp;
++  bool changed = false;
++
++  list_for_each_entry_safe(g, gtmp, &p->groups, list) {
++    struct wave_mc_reporter *r, *tmp;
++
++    list_for_each_entry_safe(r, tmp, &g->reporters, list)
++      if (r->sta == sta) {
++        mc_reporter_del(p, r);
++        changed = true;
++      }
++    if (list_empty(&g->reporters))
++      mc_group_del(p, g);
++  }
++  if (changed)
++    p->generation++;
++}
++
++int wave_mc_policy_query(struct wave_mc_policy *p,
++                         const struct wave_mc_key *key,
++                         const union wave_mc_ip *querier_source,
++                         const void *sources, unsigned int nsrc, u8 qrv,
++                         unsigned long qqi, unsigned long maxresp,
++                         bool suppress, unsigned long now)
++{
++  struct wave_mc_domain *d;
++  struct wave_mc_group *g;
++  struct wave_mc_reporter *r;
++  unsigned long until;
++  unsigned int i, size = mc_addr_size(key->proto);
++  bool general;
++
++  if (!size || !querier_source || qrv > 7 || (nsrc && !sources))
++    return -EINVAL;
++  general = mc_general(key);
++  if ((general && nsrc) || nsrc > WAVE_MC_MAX_SOURCES)
++    return -EINVAL;
++  wave_mc_policy_expire(p, now);
++  d = mc_domain_find(p, key);
++  if (!d) {
++    if (p->ndomains == WAVE_MC_MAX_DOMAINS)
++      return -ENOSPC;
++    d = mc_domain_new(key, now);
++    if (!d)
++      return -ENOMEM;
++    list_add_tail(&d->list, &p->domains);
++    p->ndomains++;
++  }
++  if (d->other_active &&
++      !(key->proto == htons(ETH_P_IP) && !d->querier_source.ip4) &&
++      memcmp(querier_source, &d->querier_source, size) > 0)
++    return 0;
++  memcpy(&d->querier_source, querier_source, size);
++  if (qrv)
++    d->rv = qrv;
++  if (qqi)
++    d->qi = mc_interval(qqi);
++  if (general)
++    d->qri = mc_interval(maxresp);
++  d->other_active = true;
++  d->other_expires = now + mc_other_interval(d);
++  mc_gc_note(p, d->other_expires);
++  if (general || suppress)
++    return 0;
++  g = mc_group_find(p, key);
++  if (!g)
++    return 0;
++  until = now + mc_product(mc_interval(maxresp), d->rv);
++  list_for_each_entry(r, &g->reporters, list) {
++    if (!nsrc) {
++      if (r->mode == WAVE_MC_EXCLUDE && time_after(r->group_expires, until)) {
++        r->group_expires = until;
++        mc_gc_note(p, until);
++      }
++      continue;
++    }
++    for (i = 0; i < nsrc; i++) {
++      union wave_mc_ip addr = {};
++      struct wave_mc_source *s;
++
++      memcpy(&addr, (const u8 *)sources + i * size, size);
++      s = mc_source_find(r, &addr, size);
++      if (s && s->running && time_after(s->expires, until)) {
++        s->expires = until;
++        mc_gc_note(p, until);
++      }
++    }
++  }
++  return 0;
++}
++
++u64 wave_mc_policy_generation(const struct wave_mc_policy *p)
++{
++  return p->generation;
++}
++
++static void mc_deadline(unsigned long value, bool *found, unsigned long *deadline)
++{
++  if (!*found || time_before(value, *deadline)) {
++    *deadline = value;
++    *found = true;
++  }
++}
++
++bool wave_mc_policy_next_deadline(const struct wave_mc_policy *p,
++                                  unsigned long *deadline)
++{
++  const struct wave_mc_group *g;
++  const struct wave_mc_domain *d;
++  bool found = false;
++
++  list_for_each_entry(d, &p->domains, list) {
++    if (d->other_active)
++      mc_deadline(d->other_expires, &found, deadline);
++    else if (d->activated || d->groups)
++      mc_deadline(d->general_at, &found, deadline);
++  }
++  list_for_each_entry(g, &p->groups, list) {
++    const struct wave_mc_reporter *r;
++
++    list_for_each_entry(r, &g->reporters, list) {
++      struct rb_node *node;
++
++      if (r->mode == WAVE_MC_EXCLUDE)
++        mc_deadline(r->group_expires, &found, deadline);
++      if (r->group_queries && !g->domain->other_active)
++        mc_deadline(r->group_query_at, &found, deadline);
++      for (node = rb_first(&r->sources); node; node = rb_next(node)) {
++        const struct wave_mc_source *s = rb_entry(node, struct wave_mc_source, node);
++
++        if (s->running)
++          mc_deadline(s->expires, &found, deadline);
++        if (s->queries && !g->domain->other_active)
++          mc_deadline(s->query_at, &found, deadline);
++      }
++    }
++  }
++  return found;
++}
++
++void wave_mc_policy_foreach_receiver(struct wave_mc_policy *p,
++                                     const struct wave_mc_key *key,
++                                     const union wave_mc_ip *source,
++                                     unsigned long now,
++                                     wave_mc_receiver_fn receive, void *ctx)
++{
++  struct wave_mc_group *g;
++  struct wave_mc_reporter *r;
++  unsigned int size = mc_addr_size(key->proto);
++
++  if (!size)
++    return;
++  wave_mc_policy_expire(p, now);
++  g = mc_group_find(p, key);
++  if (!g)
++    return;
++  list_for_each_entry(r, &g->reporters, list) {
++    struct wave_mc_source *s = mc_source_find(r, source, size);
++
++    if ((s && s->running) || (!s && r->mode == WAVE_MC_EXCLUDE))
++      receive(ctx, r->sta);
++  }
++}
++
++static unsigned int mc_drain_general(struct wave_mc_policy *p,
++                                      unsigned long now, unsigned int budget,
++                                      wave_mc_query_fn emit, void *ctx)
++{
++  struct wave_mc_domain *d, *dtmp;
++  unsigned long retry = max_t(unsigned long, msecs_to_jiffies(20), 1);
++  unsigned int used = 0;
++
++  list_for_each_entry_safe(d, dtmp, &p->domains, list) {
++    struct wave_mc_key key = { .vlan = d->vlan, .proto = d->proto };
++    unsigned long interval;
++
++    if (used == budget)
++      return used;
++    if (d->other_active || (!d->activated && !d->groups) ||
++        time_before(now, d->general_at))
++      continue;
++    /* A failing domain must not monopolize a caller's small packet budget. */
++    list_move_tail(&d->list, &p->domains);
++    used++;
++    if (emit(ctx, &key, NULL, 0, d->rv, d->qi, d->qri, false)) {
++      d->general_at = now + retry;
++      continue;
++    }
++    if (d->startup_queries)
++      d->startup_queries--;
++    interval = d->startup_queries ? max_t(unsigned long, d->qi / 4, 1) : d->qi;
++    d->general_at = now + interval;
++  }
++  return used;
++}
++
++static unsigned int mc_drain_specific(struct wave_mc_policy *p,
++                                       unsigned long now, unsigned int budget,
++                                       wave_mc_query_fn emit, void *ctx)
++{
++  struct wave_mc_domain *d;
++  struct wave_mc_group *g, *gtmp;
++  unsigned long retry = max_t(unsigned long, msecs_to_jiffies(20), 1);
++  unsigned int used = 0;
++
++  list_for_each_entry_safe(g, gtmp, &p->groups, list) {
++    struct wave_mc_reporter *r, *rtmp;
++
++    d = g->domain;
++    if (d->other_active)
++      continue;
++    list_for_each_entry_safe(r, rtmp, &g->reporters, list) {
++      unsigned int size = mc_addr_size(g->key.proto);
++      unsigned long lmqt = now + mc_product(WAVE_MC_LMI, d->rv);
++      struct wave_mc_source *batch[WAVE_MC_QUERY_SOURCES];
++      struct rb_node *node;
++      unsigned int count, i;
++      int err;
++
++      if (used == budget)
++        return used;
++      if (r->group_queries && time_after_eq(now, r->group_query_at)) {
++        list_move_tail(&g->list, &p->groups);
++        list_move_tail(&r->list, &g->reporters);
++        used++;
++        err = emit(ctx, &g->key, NULL, 0, d->rv, d->qi,
++                   WAVE_MC_LMI, r->group_query_started);
++        if (!err) {
++          if (!r->group_query_started) {
++            r->group_queries = d->rv;
++            if (time_after(r->group_expires, lmqt)) {
++              r->group_expires = lmqt;
++              mc_gc_note(p, lmqt);
++            }
++          }
++          r->group_query_started = true;
++          r->group_queries--;
++        }
++        r->group_query_at = now + (err ? retry : WAVE_MC_LMI);
++      }
++      while (used < budget) {
++        unsigned long oldest = 0;
++        bool found = false;
++
++        /* Prefer the oldest due work. Retried low-address sources must not
++         * starve later batches when only a few query packets fit per tick. */
++        for (node = rb_first(&r->sources); node; node = rb_next(node)) {
++          struct wave_mc_source *s = rb_entry(node, struct wave_mc_source, node);
++
++          if (s->running && s->queries && time_after_eq(now, s->query_at))
++            mc_deadline(s->query_at, &found, &oldest);
++        }
++        if (!found)
++          break;
++        count = 0;
++        for (node = rb_first(&r->sources); node && count < WAVE_MC_QUERY_SOURCES;
++             node = rb_next(node)) {
++          struct wave_mc_source *s = rb_entry(node, struct wave_mc_source, node);
++
++          if (!s->running || !s->queries || s->query_at != oldest)
++            continue;
++          batch[count] = s;
++          memcpy(p->query_sources + count * size, &s->addr, size);
++          count++;
++        }
++        if (!count)
++          break;
++        list_move_tail(&g->list, &p->groups);
++        list_move_tail(&r->list, &g->reporters);
++        used++;
++        err = emit(ctx, &g->key, p->query_sources, count,
++                   d->rv, d->qi, WAVE_MC_LMI, false);
++        for (i = 0; i < count; i++) {
++          struct wave_mc_source *s = batch[i];
++
++          if (!err) {
++            if (!s->query_started) {
++              s->queries = d->rv;
++              if (time_after(s->expires, lmqt)) {
++                s->expires = lmqt;
++                mc_gc_note(p, lmqt);
++              }
++            }
++            s->query_started = true;
++            s->queries--;
++          }
++          s->query_at = now + (err ? retry : WAVE_MC_LMI);
++        }
++      }
++    }
++  }
++  return used;
++}
++
++unsigned int wave_mc_policy_drain_queries(struct wave_mc_policy *p,
++                                         unsigned long now,
++                                         unsigned int budget,
++                                         wave_mc_query_fn emit, void *ctx)
++{
++  unsigned int first_budget, used;
++  bool specific_first;
++
++  wave_mc_policy_expire(p, now);
++  if (!budget)
++    return 0;
++  specific_first = p->specific_first;
++  p->specific_first = !specific_first;
++  first_budget = budget / 2 + (budget & 1);
++
++  /* Each class receives a turn before the other consumes the whole budget.
++   * Alternation also covers budget one. Unused quota returns to ready work;
++   * failed callbacks consume quota just like successful ownership transfers.
++   */
++  used = specific_first ?
++         mc_drain_specific(p, now, first_budget, emit, ctx) :
++         mc_drain_general(p, now, first_budget, emit, ctx);
++  used += specific_first ?
++          mc_drain_general(p, now, budget - used, emit, ctx) :
++          mc_drain_specific(p, now, budget - used, emit, ctx);
++  if (used < budget)
++    used += specific_first ?
++            mc_drain_specific(p, now, budget - used, emit, ctx) :
++            mc_drain_general(p, now, budget - used, emit, ctx);
++  return used;
++}
+--- /dev/null
++++ b/wireless/driver/linux/wave_mc_policy.h
+@@ -0,0 +1,123 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _WAVE_MC_POLICY_H_
++#define _WAVE_MC_POLICY_H_
++
++#include <linux/gfp.h>
++#include <linux/in6.h>
++#include <linux/types.h>
++
++struct _sta_entry;
++struct wave_mc_policy;
++
++union wave_mc_ip {
++  __be32 ip4;
++  struct in6_addr ip6;
++};
++
++struct wave_mc_key {
++  u32 vlan;
++  __be16 proto;
++  union wave_mc_ip group;
++};
++
++/* IGMPv3 and MLDv2 use these same record numbers. */
++enum wave_mc_record {
++  WAVE_MC_IS_INCLUDE = 1,
++  WAVE_MC_IS_EXCLUDE,
++  WAVE_MC_TO_INCLUDE,
++  WAVE_MC_TO_EXCLUDE,
++  WAVE_MC_ALLOW,
++  WAVE_MC_BLOCK,
++  WAVE_MC_ASM_JOIN,
++  WAVE_MC_ASM_LEAVE,
++};
++
++#define WAVE_MC_MAX_GROUPS 128
++#define WAVE_MC_MAX_REPORTERS 512
++#define WAVE_MC_MAX_SOURCES 4096
++#define WAVE_MC_QUERY_SOURCES 64
++
++/* All calls after create, including callbacks, require the caller's multicast
++ * lock. The caller owns timer/work scheduling, packet validation, VLAN identity,
++ * firmware admission. There is no private workqueue.
++ * Each reporter holds the exact station incarnation until drop/clear/destroy.
++ * Sources are packed network-order IPv4 (4-byte) or IPv6 (16-byte) addresses.
++ */
++struct wave_mc_policy *wave_mc_policy_create(gfp_t flags);
++void wave_mc_policy_destroy(struct wave_mc_policy *policy);
++void wave_mc_policy_clear(struct wave_mc_policy *policy);
++
++/* Activate only a protocol/VLAN domain known to the caller's live interface or
++ * validated traffic. This starts general queries before any membership exists,
++ * retaining the domain until clear/destroy. Repeated activation preserves its
++ * deadlines, learned intervals and elected external querier. Returns 1 when
++ * newly activated, 0 when already active, or a negative errno on failure,
++ * without changing existing domains; it creates no reporter or station.
++ */
++int wave_mc_policy_activate(struct wave_mc_policy *policy, u32 vlan,
++                            __be16 proto, unsigned long now);
++
++/* Failure leaves the previous complete record intact. The caller must close
++ * its forwarding/admission contribution with drop_reporter before continuing
++ * after an allocation/capacity failure; other reporters remain independent.
++ */
++int wave_mc_policy_report(struct wave_mc_policy *policy,
++                          const struct wave_mc_key *key,
++                          struct _sta_entry *sta, const u8 reporter[6],
++                          u8 type, const void *sources, unsigned int nsrc,
++                          unsigned long now);
++void wave_mc_policy_drop_reporter(struct wave_mc_policy *policy,
++                                  const struct wave_mc_key *key,
++                                  struct _sta_entry *sta,
++                                  const u8 reporter[6]);
++void wave_mc_policy_drop_sta(struct wave_mc_policy *policy,
++                             struct _sta_entry *sta);
++
++/* key.group == zero identifies a general query. Supply validated external
++ * queries, never a locally generated query echo. The domain elects the lowest
++ * external source (IPv4 elected zero is replaceable, as in the Linux bridge).
++ * Native queries are a fallback subordinate to observed external queriers,
++ * including IPv6; this is not election against the interface's own LL address.
++ * QRV/QQI zero retain the learned value; maxresp is already decoded to jiffies.
++ * A suppressed query does not lower group/source timers.
++ */
++int wave_mc_policy_query(struct wave_mc_policy *policy,
++                         const struct wave_mc_key *key,
++                         const union wave_mc_ip *querier_source,
++                         const void *sources, unsigned int nsrc, u8 qrv,
++                         unsigned long qqi, unsigned long maxresp,
++                         bool suppress, unsigned long now);
++void wave_mc_policy_expire(struct wave_mc_policy *policy, unsigned long now);
++u64 wave_mc_policy_generation(const struct wave_mc_policy *policy);
++bool wave_mc_policy_next_deadline(const struct wave_mc_policy *policy,
++                                  unsigned long *deadline);
++
++typedef void (*wave_mc_receiver_fn)(void *ctx, struct _sta_entry *sta);
++/* Reports the union of matching hosts; a station may be reported more than once.
++ * A receiver pointer is borrowed under the lock. Retain a station reference
++ * before using it after the callback. No aggregate-air filtering is implied.
++ */
++void wave_mc_policy_foreach_receiver(struct wave_mc_policy *policy,
++                                     const struct wave_mc_key *key,
++                                     const union wave_mc_ip *source,
++                                     unsigned long now,
++                                     wave_mc_receiver_fn receive, void *ctx);
++
++typedef int (*wave_mc_query_fn)(void *ctx, const struct wave_mc_key *key,
++                               const void *sources, unsigned int nsrc,
++                               u8 qrv, unsigned long qqi,
++                               unsigned long maxresp, bool suppress);
++/* emit returns zero only after accepting ownership for prompt TX. It must not
++ * sleep, reenter this engine, or retain key/source pointers. A nonzero result
++ * retains the query count and retries after 20 ms. Last-member shortening starts
++ * with the first accepted query, so delayed/allocation-failed emission cannot
++ * expire a receiver before its probe. Received queries may shorten immediately.
++ * The callback-attempt budget is shared fairly between general and last-member
++ * queries, alternating the first class across calls even when budget is one.
++ */
++unsigned int wave_mc_policy_drain_queries(struct wave_mc_policy *policy,
++                                         unsigned long now,
++                                         unsigned int budget,
++                                         wave_mc_query_fn emit, void *ctx);
++
++#endif
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2048,6 +2048,54 @@
+   return _wave_radio_tx_power(radio, WAVE_TX_POWER_MAC, limit, NULL);
+ }
+ 
++#define WAVE_MULTI_AP_EXTENSION    6
++#define WAVE_MULTI_AP_BACKHAUL_BSS BIT(6)
++#define WAVE_MULTI_AP_BACKHAUL_STA BIT(7)
++
++/* Select the Multi-AP IE itself: a later WFA IE may have a different type.
++ * Only one complete extension declaration can authorize a local/peer role. */
++static bool wave_multi_ap_role(const u8 *ies, size_t len, u8 role)
++{
++  bool found = false, extension = false, backhaul = false;
++
++  if (!ies)
++    return false;
++  while (len) {
++    const u8 *attr;
++    size_t size, left;
++
++    if (len < 2 || ies[1] > len - 2)
++      return false;
++    size = ies[1] + 2;
++    if (ies[0] == WLAN_EID_VENDOR_SPECIFIC && ies[1] >= 4 &&
++        ies[2] == ((WLAN_OUI_WFA >> 16) & 0xff) &&
++        ies[3] == ((WLAN_OUI_WFA >> 8) & 0xff) &&
++        ies[4] == (WLAN_OUI_WFA & 0xff) &&
++        ies[5] == WLAN_OUI_TYPE_WFA_MULTI_AP) {
++      if (found)
++        return false;
++      found = true;
++      attr = ies + 6;
++      left = ies[1] - 4;
++      while (left) {
++        if (left < 2 || attr[1] > left - 2)
++          return false;
++        if (attr[0] == WAVE_MULTI_AP_EXTENSION) {
++          if (extension || attr[1] != 1)
++            return false;
++          extension = true;
++          backhaul = !!(attr[2] & role);
++        }
++        left -= attr[1] + 2;
++        attr += attr[1] + 2;
++      }
++    }
++    ies += size;
++    len -= size;
++  }
++  return found && extension && backhaul;
++}
++
+ int wave_radio_beacon_change(
+   wave_radio_t *radio,
+   struct net_device *ndev,
+@@ -2055,6 +2103,7 @@
+ {
+   int res = MTLK_ERR_OK;
+   mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
++  mtlk_df_t *master_df;
+   mtlk_vap_handle_t vap_handle;
+   uint8 vap_idx;
+   mtlk_beacon_data_t beacon_data;
+@@ -2069,7 +2118,7 @@
+   vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
+   vap_idx = mtlk_vap_get_id(vap_handle);
+ 
+-  df_user = mtlk_df_get_user(mtlk_vap_manager_get_master_df(radio->vap_manager));
++  master_df = mtlk_vap_manager_get_master_df(radio->vap_manager);
+ 
+   if (beacon->head_len < 0 || beacon->tail_len < 0 || beacon->probe_resp_len < 0 ||
+       beacon->head_len > 65535 || beacon->tail_len > 65535 || beacon->probe_resp_len > 65535)
+@@ -2078,8 +2127,16 @@
+   beacon_data.vap_idx = vap_idx;
+   beacon_data.bmgr_priv = &radio->bmgr_priv;
+ 
+-  res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user), WAVE_CORE_REQ_SET_BEACON, &clpb, &beacon_data, sizeof(beacon_data));
++  res = _mtlk_df_user_invoke_core(master_df, WAVE_CORE_REQ_SET_BEACON, &clpb, &beacon_data, sizeof(beacon_data));
+   res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_SET_BEACON, TRUE);
++  /* Userspace MLME supplies its local Association Response IEs during AP
++   * setup, before ADD_STA. Omission preserves the accepted template's role;
++   * a successful explicit replacement, including an empty one, replaces it.
++   * Beacon contents and received peer declarations do not own this policy. */
++  if (res == MTLK_ERR_OK && beacon->assocresp_ies)
++    wave_df_multi_ap_backhaul_set(df_user,
++      wave_multi_ap_role(beacon->assocresp_ies, beacon->assocresp_ies_len,
++                         WAVE_MULTI_AP_BACKHAUL_BSS));
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+ 
+@@ -2167,6 +2224,8 @@
+   ILOG1_SSD("%s: Invoked from %s (%i)", ndev->name, current->comm, current->pid);
+   MTLK_CHECK_DF_USER(df_user);
+ 
++  /* A new BSS cannot inherit the previous response template's local role. */
++  wave_df_multi_ap_backhaul_set(df_user, false);
+   res = _wave_radio_abort_and_prevent_scan(radio);
+   if (res != MTLK_ERR_OK)
+     goto finish;
+@@ -2267,6 +2326,8 @@
+   if (beacon_accepted && (linux_error || res != MTLK_ERR_OK)) {
+     int stop_res;
+ 
++    wave_df_multi_ap_backhaul_set(df_user, false);
++    wave_df_assoc_clear(df_user);
+     clpb = NULL;
+     stop_res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user),
+                                         WAVE_CORE_REQ_DEACTIVATE, &clpb, NULL, 0);
+@@ -2318,8 +2379,10 @@
+       break;
+     mtlk_osal_msleep(100);
+   }
+-  if (res == MTLK_ERR_OK)
++  if (res == MTLK_ERR_OK) {
+     wave_df_assoc_clear(df_user);
++    wave_df_multi_ap_backhaul_set(df_user, false);
++  }
+ 
+ finish:
+   if (scan_paused == 1 && _wave_radio_allow_or_resume_scan(radio) != MTLK_ERR_OK)
+@@ -2362,31 +2425,6 @@
+ {
+   return !(MTLK_VHT_MCS_MAP_INVALID == vht_mcs_info->rx_mcs_map ||
+            MTLK_VHT_MCS_MAP_INVALID == vht_mcs_info->tx_mcs_map);
+-}
+-
+-/* Multi-AP's extension attribute explicitly identifies a backhaul station.
+- * Merely finding the WFA OUI/type also matches fronthaul-only associations.
+- */
+-static bool wave_multi_ap_backhaul_sta(const u8 *ie)
+-{
+-  const u8 *pos, *end;
+-  bool backhaul = false;
+-
+-  if (!ie || ie[-1] < 4 || ie[3] != WLAN_OUI_TYPE_WFA_MULTI_AP)
+-    return false;
+-  pos = ie + 4;
+-  end = ie + ie[-1];
+-  while (end - pos >= 2) {
+-    u8 id = pos[0], len = pos[1];
+-
+-    pos += 2;
+-    if (len > end - pos)
+-      return false;
+-    if (id == 6 && len == 1)
+-      backhaul |= !!(pos[0] & BIT(7));
+-    pos += len;
+-  }
+-  return pos == end && backhaul;
+ }
+ 
+ void wave_radio_assoc_req_capture(struct net_device *ndev,
+@@ -2431,8 +2469,8 @@
+       elems.vendor_brcm[3] == WLAN_EID_BRCM_VENDOR_VERSION_2 &&
+       (elems.vendor_brcm[6] & WLAN_EID_BRCM_VENDOR_DWDS_CAPABLE))
+     metadata.four_addr = true;
+-  if (wave_multi_ap_backhaul_sta(elems.vendor_wfa))
+-    metadata.four_addr = true;
++  metadata.multi_ap_backhaul_sta =
++    wave_multi_ap_role(buf + offset, len - offset, WAVE_MULTI_AP_BACKHAUL_STA);
+   if (elems.opmode_notif) {
+     metadata.opmode = *elems.opmode_notif;
+     metadata.opmode_valid = true;
+@@ -2525,8 +2563,12 @@
+     return MTLK_ERR_NOT_READY;
+   info->bss_coex_20_40 = metadata.coexistence;
+   info->vendor = metadata.vendor;
+-  if (wave_pdb_get_int(param_db_core, PARAM_DB_CORE_4ADDR_MODE) == MTLK_CORE_4ADDR_DYNAMIC &&
+-      metadata.four_addr)
++  /* Multi-AP is a pair of roles, separate from legacy dynamic WDS policy.
++   * Hostapd accepts this peer IE even on an ordinary AP, so it cannot by
++   * itself authorize four-address firmware station creation. */
++  if ((wave_pdb_get_int(param_db_core, PARAM_DB_CORE_4ADDR_MODE) == MTLK_CORE_4ADDR_DYNAMIC &&
++       metadata.four_addr) ||
++      (metadata.multi_ap_backhaul_sta && wave_df_multi_ap_backhaul(df_user)))
+     info->WDS_client_type = FOUR_ADDRESSES_STATION;
+   if (params->link_sta_params.opmode_notif_used || metadata.opmode_valid) {
+     info->opmode_notif = params->link_sta_params.opmode_notif_used ?
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -726,6 +726,7 @@
+   uint32         ref_cnt;
+   uint32         pins;
+   bool           quarantined;
++  bool           native; /* Exclusive immutable native recipient-set owner. */
+ } mtlk_hw_mc_t;
+ 
+ 
+@@ -2439,7 +2440,7 @@
+       mtlk_handle_eapol(vap_handle, skb->data, skb->len);
+       mtlk_df_nbuf_free(skb);
+     } else {
+-      mtlk_core_handle_tx_data_t tx_data;
++      mtlk_core_handle_tx_data_t tx_data = {0};
+       tx_data.nbuf = skb;
+       tx_data.msg = NULL;
+       tx_data.dst_sta = NULL;
+@@ -8811,6 +8812,49 @@
+   mtlk_osal_lock_release(&hw->mc_group_lock);
+ }
+ 
++/* Native source policy owns immutable recipient sets. These IDs share the
++ * same pin/quarantine pool, but never alias an address-keyed helper group or
++ * another VAP's recipient set. A host owner is released only after its command
++ * and applied-membership owners have withdrawn; DAT_CFM may retain TX pins.
++ */
++int wave_hw_mc_alloc_native(mtlk_hw_t *hw)
++{
++  int id, result = MCAST_GROUP_UNDEF;
++
++  mtlk_osal_lock_acquire(&hw->mc_group_lock);
++  if (!READ_ONCE(hw->quiescing)) {
++    for (id = MC_MIN_GROUP; id < MC_GROUPS; id++) {
++      mtlk_hw_mc_t *group = &hw->mc_groups[id];
++
++      if (group->ref_cnt || group->pins || group->quarantined)
++        continue;
++      memset(group, 0, sizeof(*group));
++      group->native = true;
++      group->ref_cnt = 1;
++      result = id;
++      break;
++    }
++  }
++  mtlk_osal_lock_release(&hw->mc_group_lock);
++  return result;
++}
++
++void wave_hw_mc_release_native(mtlk_hw_t *hw, uint8 id)
++{
++  mtlk_hw_mc_t *group;
++
++  MTLK_ASSERT(id >= MC_MIN_GROUP && id < MC_GROUPS);
++  mtlk_osal_lock_acquire(&hw->mc_group_lock);
++  group = &hw->mc_groups[id];
++  MTLK_ASSERT(group->native && group->ref_cnt == 1);
++  if (group->native && group->ref_cnt == 1) {
++    group->ref_cnt = 0;
++    if (!group->pins && !group->quarantined)
++      memset(group, 0, sizeof(*group));
++  }
++  mtlk_osal_lock_release(&hw->mc_group_lock);
++}
++
+ /* Group IDs are shared by all VAPs of this hardware. Match semantic keys,
+  * and admit the requested ID under the same lock as reference changes. A
+  * failed request must leave every existing owner and reference unchanged. */
+@@ -8848,7 +8892,8 @@
+   mtlk_osal_lock_acquire(&hw->mc_group_lock);
+   for (i = MC_MIN_GROUP; i < MC_GROUPS; i++) {
+     if (hw->mc_groups[i].ref_cnt || hw->mc_groups[i].pins || hw->mc_groups[i].quarantined) {
+-      if (_mtlk_hw_mc_addr_equal(&hw->mc_groups[i].mc_addr, &req->mc_addr))
++      if (!hw->mc_groups[i].native &&
++          _mtlk_hw_mc_addr_equal(&hw->mc_groups[i].mc_addr, &req->mc_addr))
+         found = i;
+     } else if (!first_free) {
+       first_free = i;
+--- a/wireless/driver/shared/hw_mmb.h
++++ b/wireless/driver/shared/hw_mmb.h
+@@ -263,6 +263,8 @@
+ };
+ void wave_hw_tx_queue_start(mtlk_hw_t *hw, struct wave_tx_queue *queue);
+ void wave_hw_tx_queue_stop(mtlk_hw_t *hw, struct wave_tx_queue *queue);
++int wave_hw_mc_alloc_native(mtlk_hw_t *hw);
++void wave_hw_mc_release_native(mtlk_hw_t *hw, uint8 id);
+ struct wave_pmf;
+ void wave_hw_mmb_detach_pmf(mtlk_hw_t *hw, struct wave_pmf *pmf);
+ void wave_hw_mmb_flush_sta_tx(mtlk_hw_t *hw, unsigned int radio_id);
+--- a/wireless/driver/shared/mtlkhal.h
++++ b/wireless/driver/shared/mtlkhal.h
+@@ -102,8 +102,10 @@
+ typedef struct _mtlk_core_handle_tx_data_t
+ {
+   mtlk_nbuf_t               *nbuf;     /* Network buffer         */
+-  mtlk_hw_msg_t             *msg;      /* Optional native TX reservation; not copied to clones */
++  mtlk_hw_msg_t             *msg;      /* Optional TX reservation; query may transfer it to one clone */
+   sta_entry                 *dst_sta;  /* Dest. station Entry    */
++  sta_entry                 *src_sta;  /* Borrowed for this synchronous forwarding call. */
++  bool                       native_control; /* Owned query; bypass policy reentry. */
+   mtlk_ndev_t               *rx_if;    /* RX interface           */
+   void                      *rx_subif; /* pointer to DC DP subinterface data: struct dp_subif */
+ } __MTLK_IDATA mtlk_core_handle_tx_data_t;

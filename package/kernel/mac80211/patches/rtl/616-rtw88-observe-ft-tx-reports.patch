@@ -1,0 +1,57 @@
+--- a/drivers/net/wireless/realtek/rtw88/tx.c
++++ b/drivers/net/wireless/realtek/rtw88/tx.c
+@@ -231,12 +231,32 @@
+ 	ieee80211_tx_status_irqsafe(rtwdev->hw, skb);
+ }
+ 
++/* Observe only FT authentication requests and reassociation. */
++static bool rtw_ft_tx_report_frame(struct sk_buff *skb,
++				   struct ieee80211_hdr_3addr *hdr)
++{
++	__le16 auth[2];
++
++	if (skb_copy_bits(skb, 0, hdr, sizeof(*hdr)))
++		return false;
++	if (ieee80211_is_reassoc_req(hdr->frame_control))
++		return true;
++	if (!ieee80211_is_auth(hdr->frame_control) ||
++	    skb_copy_bits(skb, sizeof(*hdr), auth, sizeof(auth)))
++		return false;
++	return auth[0] == cpu_to_le16(WLAN_AUTH_FT) &&
++	       auth[1] == cpu_to_le16(1);
++}
++
+ void rtw_tx_report_handle(struct rtw_dev *rtwdev, struct sk_buff *skb, int src)
+ {
++	static atomic_t ft_report_budget = ATOMIC_INIT(16);
+ 	struct rtw_tx_report *tx_report = &rtwdev->tx_report;
+ 	struct rtw_c2h_cmd *c2h;
+ 	struct sk_buff *cur, *tmp;
++	struct ieee80211_hdr_3addr report_hdr;
+ 	unsigned long flags;
++	bool ft_report = false;
+ 	u8 sn, st;
+ 	u8 *n;
+ 
+@@ -255,11 +275,21 @@
+ 		n = (u8 *)IEEE80211_SKB_CB(cur)->status.status_driver_data;
+ 		if (*n == sn) {
+ 			__skb_unlink(cur, &tx_report->queue);
++			/* Snapshot before mac80211 takes ownership of this skb. */
++			ft_report = rtw_ft_tx_report_frame(cur, &report_hdr);
+ 			rtw_tx_report_tx_status(rtwdev, cur, st == 0);
+ 			break;
+ 		}
+ 	}
+ 	spin_unlock_irqrestore(&tx_report->q_lock, flags);
++
++	/* No printk under the report-queue lock; never more than 16 per load. */
++	if (ft_report && atomic_add_unless(&ft_report_budget, -1, 0))
++		rtw_warn(rtwdev,
++			 "FT TX report: src=%#x sn=%#x status=%#x subtype=%u seq_ctrl=%#x receiver=%pM\n",
++			 src, sn, st,
++			 (le16_to_cpu(report_hdr.frame_control) & IEEE80211_FCTL_STYPE) >> 4,
++			 le16_to_cpu(report_hdr.seq_ctrl), report_hdr.addr1);
+ }
+ 
+ static u8 rtw_get_mgmt_rate(struct rtw_dev *rtwdev, struct sk_buff *skb,

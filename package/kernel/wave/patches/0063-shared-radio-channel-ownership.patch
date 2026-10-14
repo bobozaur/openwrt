@@ -1,0 +1,361 @@
+--- a/wireless/driver/linux/cfg80211.h
++++ b/wireless/driver/linux/cfg80211.h
+@@ -55,6 +55,8 @@
+ void            __MTLK_IFUNC wv_cfg80211_peer_disconnect (struct net_device *ndev, const IEEE_ADDR *mac_addr);
+ 
+ bool wv_cfg80211_get_chans_dfs_required(struct wiphy *wiphy, u32 center_freq, u32 bandwidth);
++bool wv_cfg80211_chandef_dfs_required(struct wiphy *wiphy,
++                                    const struct cfg80211_chan_def *chandef);
+ int wv_cfg80211_update_supported_bands(mtlk_handle_t hw_handle, wave_uint radio_id, struct wiphy *wiphy, u32 num_sts);
+ void wv_cfg80211_radar_event(struct wireless_dev *wdev, struct cfg80211_chan_def *chandef,
+                              uint32 cac_started, uint8 rbm);
+--- a/wireless/driver/shared/scan_support.c
++++ b/wireless/driver/shared/scan_support.c
+@@ -687,18 +687,16 @@
+     if (wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle))) {
+       struct set_chan_param_data cpd = {0};
+ 
+-      /* Finish the firmware scan on mac80211's operating channel before
+-       * publishing completion. The AP and STA wiphys share this hardware,
+-       * but an old AP channel is not the STA return-channel owner. */
++      /* Restore both the shared operating channel and its permission owner
++       * before publishing completion. Scan origin does not transfer ownership. */
+       cpd.chandef = ss->orig_chandef;
+       cpd.switch_type = ST_NORMAL;
+-      cpd.station = ss->req.type == MTLK_SCAN_STA;
++      cpd.station = ss->orig_station;
+       cpd.block_tx_pre = TRUE;
+       cpd.dont_notify_kernel = TRUE;
+       cpd.vap_id = mtlk_vap_get_id(core->vap_handle);
+       cpd.ndev = mtlk_df_user_get_ndev(mtlk_df_get_user(df));
+-      res = core_cfg_set_chan(core, &ss->orig_chandef,
+-                              cpd.station ? &cpd : NULL);
++      res = core_cfg_set_chan(core, &ss->orig_chandef, &cpd);
+     } else
+       res = MTLK_ERR_NOT_READY;
+     if (res != MTLK_ERR_OK)
+@@ -1068,11 +1066,16 @@
+ 
+     if (++ss->chan_in_chunk > ss->NumChansInChunk)
+     {
++      struct set_chan_param_data cpd = {0};
++
+       ILOG2_S("%s: taking a break in a BG scan", name);
+       ss->flags |= SDF_BG_BREAK;
+ 
+       /* this skips the HDK config and pays no attention to is_scan_running() */
+-      if ((res = core_cfg_send_set_chan(core, &ss->orig_chandef, NULL)) != MTLK_ERR_OK)
++      cpd.chandef = ss->orig_chandef;
++      cpd.switch_type = ST_NORMAL;
++      cpd.station = ss->orig_station;
++      if ((res = core_cfg_send_set_chan(core, &ss->orig_chandef, &cpd)) != MTLK_ERR_OK)
+         goto end_scan;
+ 
+       mtlk_osal_timer_set(&ss->scan_timer, ss->ChanChunkInterval);
+@@ -1304,6 +1307,7 @@
+   wv_mac80211_t *mac80211 = wave_radio_mac80211_get(radio);
+   BOOL has_peer_connections = mtlk_vap_manager_has_peer_connections(vap_mgr);
+   BOOL has_stas_connected = wv_mac80211_has_sta_connections(mac80211);
++  bool ap_active = wave_radio_ap_active(radio);
+   BOOL do_background_scan = FALSE;
+   int i;
+ 
+@@ -1356,8 +1360,11 @@
+     goto no_clean_exit;
+   }
+ 
+-  /* Save the info to what channel (and how wide) we have to return to after the scan */
+-  if (request->type == MTLK_SCAN_STA)
++  /* An active AP owns the shared home channel even before its first client.
++   * With no AP, mac80211's cached channel remains authoritative for STA scans. */
++  ss->orig_station = !ap_active &&
++    (request->type == MTLK_SCAN_STA || wave_radio_channel_is_station(radio));
++  if (request->type == MTLK_SCAN_STA && !ap_active)
+     ss->orig_chandef = request->sta_return_chandef;
+   else
+     ss->orig_chandef = *current_chandef;
+@@ -1367,7 +1374,7 @@
+ 
+   if (request->type == MTLK_SCAN_STA || request->type == MTLK_SCAN_SCHED_STA)
+   {
+-    if (has_peer_connections || has_stas_connected)
++    if (ap_active || has_peer_connections || has_stas_connected)
+     {
+       ILOG0_V("Scan by sta - do drv bg scan");
+ 
+--- a/wireless/driver/shared/scan_support.h
++++ b/wireless/driver/shared/scan_support.h
+@@ -243,6 +243,7 @@
+   mtlk_core_t *requester_core;
+   uint32 flags;        /* flags from scanDescriptionFlags */
+   struct mtlk_chan_def orig_chandef; /* what to return to after scan, if any */
++  bool orig_station; /* Permission owner of the saved operating channel. */
+   u8 max_widths[NUM_SUPPORTED_BANDS];
+   struct mtlk_scan_request req; /* sched scan stuff can get saved here, too */
+   mtlk_osal_event_t scan_end_event;
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -737,13 +737,25 @@
+     return wave_radio_cac_active(radio) ? MTLK_ERR_OK : MTLK_ERR_NOT_READY;
+   if (wave_radio_cac_active(radio) && !(cpd && cpd->cac_time))
+     return MTLK_ERR_BUSY;
++  /* A station-origin command cannot lend its NO_IR permission to an AP.
++   * Check before SET_CHAN while firmware may still own active beacons. */
++  if (cpd && cpd->station && wave_radio_ap_active(radio)) {
++    if (!wave_radio_native_chandef(radio, mcd, &cd) ||
++        !cfg80211_reg_can_beacon(wiphy, &cd, NL80211_IFTYPE_AP))
++      return MTLK_ERR_NOT_READY;
++    /* Firmware's post-CSA TX fence applies to every VAP. The daemon removes
++     * STA before establishing AP operation on a DFS destination. */
++    if (cpd->station_csa && wv_cfg80211_chandef_dfs_required(wiphy, &cd))
++      return MTLK_ERR_NOT_READY;
++  }
+   if (!wave_radio_dfs_tx_blocked(radio))
+     return MTLK_ERR_OK;
+   if (!wave_radio_native_chandef(radio, mcd, &cd))
+     return MTLK_ERR_PARAMS;
+   if (cpd && cpd->cac_time)
+     return cfg80211_chandef_dfs_usable(wiphy, &cd) ? MTLK_ERR_OK : MTLK_ERR_NOT_READY;
+-  if (cpd ? cpd->station : wave_radio_channel_is_station(radio))
++  if (wave_radio_channel_uses_sta_rules(radio,
++        cpd ? cpd->station : wave_radio_channel_is_station(radio)))
+     return cfg80211_chandef_usable(wiphy, &cd, IEEE80211_CHAN_DISABLED) ?
+       MTLK_ERR_OK : MTLK_ERR_NOT_READY;
+   return cfg80211_reg_can_beacon(wiphy, &cd, NL80211_IFTYPE_AP) ?
+@@ -753,6 +765,27 @@
+ bool wave_radio_channel_is_station(wave_radio_t *radio)
+ {
+   return radio->channel_station;
++}
++
++/* Master-serialized physical permission; command origin stays separate. */
++bool wave_radio_channel_uses_sta_rules(wave_radio_t *radio, bool station)
++{
++  return station && !wave_radio_ap_active(radio);
++}
++
++void wave_radio_ap_channel_changed(wave_radio_t *radio, const struct mtlk_chan_def *cd)
++{
++  unsigned int i, count = mtlk_vap_manager_get_max_vaps_count(radio->vap_manager);
++  mtlk_vap_handle_t vap;
++
++  for (i = 0; i < count; i++) {
++    if (mtlk_vap_manager_get_vap_handle(radio->vap_manager, i, &vap) != MTLK_ERR_OK ||
++        !mtlk_vap_is_ap(vap) || !mtlk_vap_get_core(vap)->slow_ctx->ap_started)
++      continue;
++    /* Existing AP-wiphy work owns the notification and cancels it on stop. */
++    wv_cfg80211_ch_switch_notify(mtlk_df_user_get_ndev(
++      mtlk_df_get_user(mtlk_vap_get_df(vap))), cd, true);
++  }
+ }
+ 
+ void wave_radio_channel_station_set(wave_radio_t *radio, bool station)
+@@ -783,7 +816,8 @@
+     goto out;
+   if (ctx->stopping || ctx->radar_generation != generation ||
+       !wave_radio_native_chandef(radio, mcd, &cd) ||
+-      ((cpd ? cpd->station : wave_radio_channel_is_station(radio)) ?
++      (wave_radio_channel_uses_sta_rules(radio,
++         cpd ? cpd->station : wave_radio_channel_is_station(radio)) ?
+        !cfg80211_chandef_usable(wiphy, &cd, IEEE80211_CHAN_DISABLED) :
+        !cfg80211_reg_can_beacon(wiphy, &cd, NL80211_IFTYPE_AP))) {
+     ctx->tx_blocked = true;
+--- a/wireless/driver/linux/wave_radio.h
++++ b/wireless/driver/linux/wave_radio.h
+@@ -327,6 +327,8 @@
+                                  const struct set_chan_param_data *cpd);
+ int wave_radio_ap_tx_check(wave_radio_t *radio, u32 generation, bool acknowledged);
+ bool wave_radio_channel_is_station(wave_radio_t *radio);
++bool wave_radio_channel_uses_sta_rules(wave_radio_t *radio, bool station);
++void wave_radio_ap_channel_changed(wave_radio_t *radio, const struct mtlk_chan_def *cd);
+ void wave_radio_channel_station_set(wave_radio_t *radio, bool station);
+ u32 wave_radio_dfs_generation(wave_radio_t *radio);
+ int wave_radio_dfs_channel_done(wave_radio_t *radio,
+@@ -369,4 +371,3 @@
+                           const mtlk_guid_t *evt,
+                           void              *buffer,
+                           uint32            *size);
+-
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -531,7 +531,9 @@
+   primary_chan_num = ieee80211_frequency_to_channel(cd->chan.center_freq);
+   req->primary_chan_idx = (primary_chan_num - req->low_chan_num) / CHANNUMS_PER_20MHZ;
+ 
+-  if (!(cpd ? cpd->station : wave_radio_channel_is_station(radio)) && _is_radar_det_needed(radio, cd)) {
++  if (!wave_radio_channel_uses_sta_rules(radio,
++        cpd ? cpd->station : wave_radio_channel_is_station(radio)) &&
++      _is_radar_det_needed(radio, cd)) {
+     req->isRadarDetectionNeeded = 1;
+   } else {
+     req->isRadarDetectionNeeded = 0;
+@@ -694,10 +696,22 @@
+     if (MTLK_ERR_OK != mtlk_vap_manager_get_vap_handle(mtlk_df_get_vap_manager(df), cpd->vap_id, &vap_handle)) {
+       MTLK_CLPB_EXIT(MTLK_ERR_NO_ENTRY);
+     }
++    /* An idle station wiphy has no operating-channel claim. Its next
++     * transition out of IDLE reapplies the requested channel below. */
++    if (cpd->station_idle && wave_radio_ap_active(radio))
++      MTLK_CLPB_EXIT(MTLK_ERR_OK);
+     if (!cpd->cac_transition) {
+       res = wave_radio_role_check(radio, cpd->station);
+       if (res != MTLK_ERR_OK)
+         MTLK_CLPB_EXIT(res);
++      if (cpd->station ? wave_radio_ap_active(radio) : wave_radio_sta_active(radio)) {
++        struct mtlk_chan_def *home = is_scan_running(ss) ? &ss->orig_chandef : ccd;
++
++        /* A shared radio changes channel only through its coordinated CSA
++         * owner. Ordinary setup/reconnect must match the current home channel. */
++        if (!cpd->station_csa && !mtlk_core_is_chandef_identical(&cpd->chandef, home))
++          MTLK_CLPB_EXIT(MTLK_ERR_BUSY);
++      }
+     }
+ 
+     if (cpd->cac_time)
+@@ -791,9 +805,16 @@
+       core->slow_ctx->is_block_tx = FALSE;
+     }
+ 
+-    if (is_scan_running(ss))
++    if (is_scan_running(ss)) {
+       /* save what we just set so the scan can return to it when it finishes */
+       ss->orig_chandef = *ccd;
++      ss->orig_station = wave_radio_channel_uses_sta_rules(radio, cpd->station);
++    }
++
++    /* One firmware CSA applies to all VAPs. Publish the confirmed channel
++     * to the paired AP owner without submitting a second timed retune. */
++    if (cpd->station_csa && !cpd->block_tx_post)
++      wave_radio_ap_channel_changed(radio, ccd);
+ 
+     /* In case of a successful NORMAL or CSA switch, notify the kernel, too, because hostapd need to know */
+     if (!cpd->dont_notify_kernel && (cpd->switch_type == ST_NORMAL || cpd->switch_type == ST_CSA))
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -606,13 +606,15 @@
+       return res;
+   }
+ 
+-  if (changed & IEEE80211_CONF_CHANGE_CHANNEL) {
++  if ((changed & IEEE80211_CONF_CHANGE_CHANNEL) ||
++      ((changed & IEEE80211_CONF_CHANGE_IDLE) && !(conf->flags & IEEE80211_CONF_IDLE))) {
+     memset(&cpd, 0, sizeof(cpd));
+     wave_radio_chandef_copy(&cpd.chandef, chandef);
+     /* master ndev ptr will be used to notify hostapd of AP VAP channel switch via cfg80211 API */
+     cpd.ndev = mtlk_df_user_get_ndev(mtlk_df_get_user(master_df));
+     cpd.vap_id = mtlk_vap_get_id(master_vap_handle);
+     cpd.station = true;
++    cpd.station_idle = !!(conf->flags & IEEE80211_CONF_IDLE);
+     cpd.dont_notify_kernel = TRUE;
+ 
+ 
+@@ -706,8 +708,7 @@
+   mtlk_vap_handle_t master_vap_handle;
+   mtlk_scan_support_t *scan_support;
+   int beacon_period;
+-  int vap_index = 0;
+-  int max_vaps_count = 0;
++  u32 csa_count;
+   mtlk_core_t *master_core;
+   struct vendor_csa_received csa;
+   int res = MTLK_ERR_PARAMS;
+@@ -749,57 +750,18 @@
+   /* master ndev ptr will be used to notify hostapd of AP VAP channel switch via cfg80211 API */
+   cpd.ndev = mtlk_df_user_get_ndev(mtlk_df_get_user(master_df));
+   cpd.vap_id = mtlk_vap_get_id(master_vap_handle);
+-    cpd.station = true;
+-    cpd.dont_notify_kernel = TRUE;
+-
+-  /* Update beacon period */
+-  beacon_period = DEFAULT_BEACON_INTERVAL;
+-
+-  /* TODO: when multiple sta role vifs exist need to check which vif got the CSA
+-   * and set up a general policy regarding master sta role interface */
+-  max_vaps_count = __wv_mac80211_max_vaps_count_get(mac80211);
+-  for (vap_index = 0; vap_index < max_vaps_count; vap_index++) {
+-    struct wv_vif_priv *curr_vif_priv = _wv_mac80211_get_vif_priv(mac80211, vap_index);
+-    mtlk_vap_handle_t curr_vap_handle;
+-    mtlk_core_t *curr_core;
+-
+-    if (curr_vif_priv == NULL) {
+-      continue;
+-    }
+-
+-    if (curr_vif_priv->df_user == NULL) {
+-      ELOG_V("df_user is NULL");
+-      continue;
+-    }
+-    curr_vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(curr_vif_priv->df_user));
+-    curr_core = mtlk_vap_get_core(curr_vap_handle);
+-
+-    if (NET_STATE_CONNECTED != mtlk_core_get_net_state(curr_core)) {
+-      continue;
+-    }
+-
+-    if (IEEE80211_STA_AUTHORIZED == curr_vif_priv->current_state) {
+-      /* found sta connected to peer ap */
+-      beacon_period = curr_vif_priv->beacon_int;
+-      break;
+-    }
+-  }
+-
+-  scan_support =
+-      mtlk_core_get_scan_support(mtlk_vap_get_core(master_vap_handle));
+-
+-  if (scan_support->dfs_debug_params.beacon_count > 0) {
+-    cpd.switch_type = ST_CSA;
+-    cpd.chan_switch_time =
+-        scan_support->dfs_debug_params.beacon_count * beacon_period;
+-    ILOG1_D("Using debug CSA Beacon count: %d",
+-        scan_support->dfs_debug_params.beacon_count);
+-  } else {
+-    if (ch_switch->count != 0){
+-      cpd.switch_type = ST_CSA;
+-      cpd.chan_switch_time = ch_switch->count * beacon_period;
+-    }
+-  }
++  cpd.station = true;
++  cpd.station_csa = true;
++  cpd.dont_notify_kernel = TRUE;
++
++  beacon_period = vif->bss_conf.beacon_int ?: DEFAULT_BEACON_INTERVAL;
++  scan_support = mtlk_core_get_scan_support(master_core);
++  csa_count = scan_support->dfs_debug_params.beacon_count > 0 ?
++                scan_support->dfs_debug_params.beacon_count : ch_switch->count;
++  if (beacon_period <= 0 || csa_count > 0xffffU / beacon_period)
++    goto end;
++  cpd.switch_type = ST_CSA;
++  cpd.chan_switch_time = csa_count * beacon_period;
+ 
+   cpd.block_tx_pre = ch_switch->block_tx;
+   cpd.radar_required = FALSE;
+@@ -860,16 +822,8 @@
+   }
+ 
+ end:
+-  /* Notify mac80211 that peer AP initiated ch switch (via CSA) is done */
+-  for (vap_index = max_vaps_count - 1; vap_index >= 0; vap_index--) {
+-    /*MAC80211 TODO: disable removing an interface while we call chswitch_done for this interface*/
+-    struct wv_vif_priv *curr_vif_priv = _wv_mac80211_get_vif_priv(mac80211, vap_index);
+-    if (curr_vif_priv == NULL) {
+-      continue;
+-    }
+-
+-    ieee80211_chswitch_done(curr_vif_priv->vif, res == MTLK_ERR_OK, 0);
+-  }
++  /* The blocked firmware confirmation completes this VIF's CSA. */
++  ieee80211_chswitch_done(vif, res == MTLK_ERR_OK, 0);
+ }
+ 
+ static int _wv_ieee80211_op_start (struct ieee80211_hw *hw)
+--- a/wireless/driver/shared/mtlk_coreui.h
++++ b/wireless/driver/shared/mtlk_coreui.h
+@@ -1667,6 +1667,8 @@
+   u8 rf_gain[PHY_STATISTICS_MAX_RX_ANT];
+   BOOL dont_notify_kernel;
+   bool station; /* The paired STA wiphy uses the protected AP master for control. */
++  bool station_idle; /* No active STA claim; radio may serve its paired AP. */
++  bool station_csa; /* Native upstream-CSA callback owns the shared switch. */
+   u8 cac_transition; /* Internal ACK-owned completion/abort, never userspace input. */
+ };
+ 

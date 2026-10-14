@@ -1,0 +1,657 @@
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -639,6 +639,8 @@
+ 
+ void wv_cfg80211_monitor_suspend(struct wave_monitor *mon)
+ {
++  wave_hw_monitor_set_tx(mon->hw, mon, false);
++  netif_tx_disable(mon->wdev.netdev);
+   netif_carrier_off(mon->wdev.netdev);
+   wave_monitor_rx_clear(mon);
+ }
+@@ -646,6 +648,7 @@
+ struct wave_monitor_channel_command {
+   struct wave_monitor *mon;
+   struct cfg80211_chan_def chandef;
++  bool tx_allowed;
+   int result;
+ };
+ 
+@@ -666,7 +669,13 @@
+   cpd.dont_notify_kernel = TRUE;
+   cpd.switch_type = ST_NORMAL;
+   cpd.block_tx_pre = TRUE;
+-  cpd.block_tx_post = TRUE; /* Passive reception never grants transmission. */
++  /* Other usable channels stay passive. Explicit user DATA TX requires a
++   * successful legal 20 MHz SET_CHAN; mode2 still disables automatic replies. */
++  cmd->tx_allowed = (cmd->chandef.width == NL80211_CHAN_WIDTH_20 ||
++                     cmd->chandef.width == NL80211_CHAN_WIDTH_20_NOHT) &&
++      cfg80211_chandef_usable(mon->wdev.wiphy, &cmd->chandef,
++          IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR);
++  cpd.block_tx_post = !cmd->tx_allowed;
+   cmd->result = wave_core_vap_activate(mon->master, cpd.chandef.chan.band, TRUE);
+   if (cmd->result == MTLK_ERR_OK)
+     cmd->result = core_cfg_set_chan(mon->master, &cpd.chandef, &cpd);
+@@ -691,6 +700,8 @@
+     if (res == MTLK_ERR_OK)
+       res = ctx.result;
+   }
++  if (res == MTLK_ERR_OK && !wave_hw_monitor_set_tx(mon->hw, mon, ctx.tx_allowed))
++    res = MTLK_ERR_NOT_READY;
+   if (res == MTLK_ERR_OK) {
+     spin_lock_irqsave(&mon->rx_lock, flags);
+     mon->band = mon->chandef.chan->band;
+@@ -698,6 +709,7 @@
+     mon->receiving = true;
+     spin_unlock_irqrestore(&mon->rx_lock, flags);
+     netif_carrier_on(mon->wdev.netdev);
++    netif_start_queue(mon->wdev.netdev);
+   }
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+@@ -706,8 +718,7 @@
+ {
+   int res = MTLK_ERR_OK;
+ 
+-  netif_carrier_off(mon->wdev.netdev);
+-  wave_monitor_rx_clear(mon);
++  wv_cfg80211_monitor_suspend(mon);
+   if (mon->removing) {
+     if (mon->claimed)
+       wave_hw_mmb_quiesce(mon->hw);
+@@ -752,9 +763,15 @@
+   return res;
+ }
+ 
+-static netdev_tx_t wave_monitor_reject_tx(struct sk_buff *skb, struct net_device *ndev)
+-{
+-  /* Full capture is independent of the still unsupported raw TX owner. */
++static netdev_tx_t wave_monitor_xmit(struct sk_buff *skb, struct net_device *ndev)
++{
++  struct wave_monitor *mon = netdev_priv(ndev);
++  uint64 cookie;
++
++  if (READ_ONCE(mon->receiving) &&
++      wave_hw_monitor_tx(mon->master->vap_handle, mon, skb,
++                         READ_ONCE(mon->frequency), &cookie) == MTLK_ERR_OK)
++    return NETDEV_TX_OK; /* Native CFM/fenced retirement now owns skb/dev. */
+   ndev->stats.tx_dropped++;
+   ndev->stats.tx_errors++;
+   dev_kfree_skb_any(skb);
+@@ -764,7 +781,7 @@
+ static const struct net_device_ops wave_monitor_netdev_ops = {
+   .ndo_open = wave_monitor_open,
+   .ndo_stop = wave_monitor_close,
+-  .ndo_start_xmit = wave_monitor_reject_tx,
++  .ndo_start_xmit = wave_monitor_xmit,
+ };
+ 
+ static void wave_monitor_setup(struct net_device *ndev)
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -44,6 +44,8 @@
+ #include "linux/netdevice.h"
+ #include <linux/ktime.h>
+ #include <linux/atomic.h>
++#include <linux/unaligned.h>
++#include <net/ieee80211_radiotap.h>
+ #ifdef MTCFG_SET_PM_QOS
+ #include "linux/pm_qos.h"
+ #endif
+@@ -393,6 +395,7 @@
+ static int            _mtlk_hw_set_prop(mtlk_hw_t *hw, mtlk_hw_prop_e prop_id, void *buffer, uint32 size);
+ static int            _mtlk_hw_get_prop(mtlk_hw_t *hw, mtlk_hw_prop_e prop_id, void *buffer, uint32 size)                   __MTLK_INT_HANDLER_SECTION;
+ static void wave_hw_mmb_quiesce_locked(mtlk_hw_t *hw);
++static void wave_hw_monitor_flush_tx(mtlk_hw_t *hw);
+ static int            _mtlk_hw_load_file(mtlk_hw_t *hw, const char *name, mtlk_df_fw_file_buf_t *fb);
+ static void           _mtlk_hw_unload_file(mtlk_hw_t *hw, mtlk_df_fw_file_buf_t *fb);
+ static int            _mtlk_hw_get_info(mtlk_hw_t *card, char *hw_info, uint32 size);
+@@ -866,6 +869,7 @@
+   u32                   fw_features;
+   bool                  monitor_dirty;
+   bool                  monitor_fenced;
++  bool                  monitor_tx_enabled; /* protected by BSS tx_bdr.lock */
+   mtlk_ccr_t            *ccr;
+   mtlk_hw_mmb_t         *mmb;
+   unsigned char         *mmb_base;
+@@ -2152,6 +2156,34 @@
+   return smp_load_acquire(&hw->monitor_fenced);
+ }
+ 
++bool wave_hw_monitor_set_tx(mtlk_hw_t *hw, const struct wave_monitor *mon, bool enable)
++{
++  bool valid = false;
++
++  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR))
++    return false;
++  mtlk_osal_lock_acquire(&hw->bss_mgmt.tx_bdr.lock);
++  if (READ_ONCE(hw->monitor) == mon) {
++    valid = !enable || (wave_hw_monitor_is_owner(hw, mon) &&
++                       !wave_hw_monitor_fenced(hw) && wave_hw_mmb_ready(hw));
++    WRITE_ONCE(hw->monitor_tx_enabled, valid && enable);
++  }
++  mtlk_osal_lock_release(&hw->bss_mgmt.tx_bdr.lock);
++  return valid;
++}
++
++static void wave_hw_monitor_disable_tx(mtlk_hw_t *hw)
++{
++  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR)) {
++    WRITE_ONCE(hw->monitor_tx_enabled, false);
++    return;
++  }
++  mtlk_osal_lock_acquire(&hw->bss_mgmt.tx_bdr.lock);
++  WRITE_ONCE(hw->monitor_tx_enabled, false);
++  mtlk_osal_lock_release(&hw->bss_mgmt.tx_bdr.lock);
++}
++
++
+ bool wave_hw_monitor_dirty(mtlk_hw_t *hw)
+ {
+   return READ_ONCE(hw->monitor_dirty);
+@@ -2197,6 +2229,7 @@
+   hw->monitor_vap = vap;
+   hw->monitor_saved_net_state = mtlk_core_get_net_state(mtlk_vap_get_core(vap));
+   hw->monitor_dirty = false;
++  WRITE_ONCE(hw->monitor_tx_enabled, false);
+   rcu_assign_pointer(hw->monitor, mon);
+   res = MTLK_ERR_OK;
+ out:
+@@ -2207,6 +2240,8 @@
+ void wave_hw_monitor_release(mtlk_hw_t *hw, struct wave_monitor *mon)
+ {
+   unsigned long flags;
++
++  wave_hw_monitor_set_tx(hw, mon, false);
+ 
+   spin_lock_irqsave(&hw->monitor_lock, flags);
+   if (hw->monitor == mon) {
+@@ -7448,6 +7483,7 @@
+     res = MTLK_ERR_OK;
+     goto out;
+   }
++  wave_hw_monitor_disable_tx(hw);
+   flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
+   WRITE_ONCE(hw->state, MTLK_HW_STATE_APPFATAL);
+   _mtlk_mmb_stop_events_completely(hw);
+@@ -7466,6 +7502,7 @@
+   _mtlk_mmb_cleanup_reset_mac(hw);
+   mtlk_ccr_reset_mac(hw->ccr);
+   smp_store_release(&hw->monitor_fenced, true);
++  wave_hw_monitor_flush_tx(hw);
+   res = MTLK_ERR_OK;
+ out:
+   mutex_unlock(&hw->quiesce_lock);
+@@ -7496,6 +7533,7 @@
+   lockdep_assert_held(&hw->quiesce_lock);
+   if (hw->quiescing)
+     return;
++  wave_hw_monitor_disable_tx(hw);
+   flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
+   WRITE_ONCE(hw->quiescing, true);
+   WRITE_ONCE(hw->state, MTLK_HW_STATE_UNLOADING);
+@@ -7521,6 +7559,7 @@
+   wave_mmb_drv_drain_dma(mtlk_ccr_get_device(hw->ccr));
+   _mtlk_mmb_cleanup_reset_mac(hw);
+   mtlk_ccr_reset_mac(hw->ccr);
++  wave_hw_monitor_flush_tx(hw);
+ }
+ 
+ void wave_hw_mmb_quiesce(mtlk_hw_t *hw)
+@@ -11101,12 +11140,66 @@
+   }
+ }
+ 
++/* A successful queue publication holds the exact monitor netdev until native
++ * CFM or post-DMA-fence retirement. This is not a mac80211 STA skb. */
++static void wave_bss_complete_raw(struct mtlk_hw_bss_req_mirror *entry,
++                                  bool completed)
++{
++  struct sk_buff *skb = xchg(&entry->skb, NULL);
++  struct net_device *ndev;
++
++  if (!skb)
++    return;
++  ndev = skb->dev;
++  if (completed) {
++    ndev->stats.tx_packets++;
++    ndev->stats.tx_bytes += skb->len;
++  } else {
++    ndev->stats.tx_dropped++;
++    ndev->stats.tx_errors++;
++  }
++  dev_kfree_skb_any(skb);
++  dev_put(ndev);
++}
++
++static void wave_hw_monitor_flush_tx(mtlk_hw_t *hw)
++{
++  mtlk_mmb_advanced_bdr_t *queues[] = { &hw->bss_mgmt.tx_bdr, &hw->bss_mgmt.tx_res_bdr };
++  unsigned int q, i;
++
++  if (WARN_ON(!READ_ONCE(hw->quiescing) && !wave_hw_monitor_fenced(hw)))
++    return;
++  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR))
++    return;
++  /* RAW producers have joined the queue gate; IRQ/tasklet/DMA are fenced.
++   * Keep native BD/list ownership for its existing reset/free operation. */
++  for (q = 0; q < ARRAY_SIZE(queues); q++) {
++    for (i = 0; i < queues[q]->basic.nof_bds; i++) {
++      struct mtlk_hw_bss_req_mirror *entry =
++        _mtlk_basic_bdr_get_mirror_bd(&queues[q]->basic, i, struct mtlk_hw_bss_req_mirror);
++      if (entry->extra_processing != PROCESS_RAW_DATA || !entry->skb)
++        continue;
++      if (entry->dma_addr) {
++        mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), entry->dma_addr,
++                                  entry->size, MTLK_DATA_TO_DEVICE);
++        entry->dma_addr = 0;
++      }
++      wave_bss_complete_raw(entry, false);
++    }
++  }
++}
++
++
+ static void wave_bss_discard_skb(mtlk_hw_t *hw, struct mtlk_hw_bss_req_mirror *entry)
+ {
+   wave_radio_t *radio;
+ 
+   if (!entry->skb)
+     return;
++  if (entry->extra_processing == PROCESS_RAW_DATA) {
++    wave_bss_complete_raw(entry, false);
++    return;
++  }
+   radio = __mtlk_hw_wave_radio_get(hw, entry->radio_id);
+   if (WARN_ON(!radio || !wave_radio_mac80211_get(radio)))
+     return;
+@@ -11149,6 +11242,8 @@
+                                 bss_req->size, MTLK_DATA_TO_DEVICE);
+       bss_req->dma_addr = 0;
+     }
++    if (bss_req->extra_processing == PROCESS_RAW_DATA)
++      wave_bss_complete_raw(bss_req, false);
+     /* Native VIF owners detach their pending references before destruction. */
+     WARN_ON(bss_req->pmf);
+     WARN_ON(bss_req->skb);
+@@ -11834,6 +11929,146 @@
+ #define  MTLK_HOST_TO_MAC_PAYLOAD(dma) CPU_TO_LE32(dma & ~7);
+ #endif
+ 
++/* The monitor's ordinary radiotap TX path uses the native full-buffer PD9
++ * representation. No action header is manufactured in the packet itself.
++ * Unsupported controls are rejected rather than silently reinterpreted.
++ */
++static bool wave_raw_tx_owner(mtlk_hw_t *hw, mtlk_vap_handle_t vap,
++                              const struct sk_buff *skb)
++{
++  struct wireless_dev *wdev;
++  struct mtlk_chan_def *cd;
++  struct ieee80211_channel *channel;
++  mtlk_core_t *core = mtlk_vap_get_core(vap);
++
++  if (!skb || !skb->dev || !(wdev = skb->dev->ieee80211_ptr) ||
++      wdev->iftype != NL80211_IFTYPE_MONITOR ||
++      !READ_ONCE(hw->monitor_tx_enabled) ||
++      !wave_hw_monitor_is_owner(hw, netdev_priv(skb->dev)) ||
++      READ_ONCE(hw->monitor_vap) != vap || wave_hw_monitor_fenced(hw) ||
++      wave_vap_radio_id_get(vap) != 0 || mtlk_vap_get_id(vap) != 0 ||
++      !mtlk_vap_is_master_ap(vap) || !wave_hw_mmb_ready(hw))
++    return false;
++  cd = __wave_core_chandef_get(core);
++  channel = ieee80211_get_channel(wdev->wiphy, cd->chan.center_freq);
++  return is_channel_certain(cd) && cd->width == CW_20 && channel &&
++         !(channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR |
++                             IEEE80211_CHAN_RADAR)) &&
++         (mtlk_core_get_net_state(core) & (NET_STATE_ACTIVATING | NET_STATE_CONNECTED));
++}
++
++static int wave_raw_tx_frame(mtlk_vap_handle_t vap, const u8 *frame, size_t length)
++{
++  const struct ieee80211_hdr *hdr = (const void *)frame;
++  mtlk_core_t *core = mtlk_vap_get_core(vap);
++  IEEE_ADDR own;
++  u16 fc, ds;
++  unsigned int hdrlen;
++
++  if (length < 24 || length > BSS_MGMT_FRAME_SIZE)
++    return MTLK_ERR_PARAMS;
++  fc = le16_to_cpu(hdr->frame_control);
++  ds = fc & (IEEE80211_FCTL_TODS | IEEE80211_FCTL_FROMDS);
++  /* Qualified plaintext geometry only: no crypto, fragments, HT-Control,
++   * caller-owned sequence, ACK/retry policy or aggregation interpretation. */
++  if ((fc & ~(IEEE80211_FCTL_TODS | IEEE80211_FCTL_FROMDS |
++              IEEE80211_STYPE_QOS_DATA)) != IEEE80211_FTYPE_DATA ||
++      (ds && ds != (IEEE80211_FCTL_TODS | IEEE80211_FCTL_FROMDS)) ||
++      hdr->duration_id || hdr->seq_ctrl ||
++      !is_broadcast_ether_addr(hdr->addr1) ||
++      core->slow_ctx->rsn_enabled || core->slow_ctx->wep_enabled ||
++      mtlk_stadb_stas_num(&core->slow_ctx->stadb))
++    return MTLK_ERR_NOT_SUPPORTED;
++  hdrlen = ds ? 30 : 24;
++  if (fc & IEEE80211_STYPE_QOS_DATA)
++    hdrlen += 2;
++  if (length < hdrlen)
++    return MTLK_ERR_PARAMS;
++  MTLK_CORE_PDB_GET_MAC(core, PARAM_DB_CORE_MAC_ADDR, &own);
++  if (memcmp(hdr->addr2, own.au8Addr, ETH_ALEN) ||
++      (ds ? !is_broadcast_ether_addr(hdr->addr3) ||
++            memcmp(frame + 24, own.au8Addr, ETH_ALEN)
++          : memcmp(hdr->addr3, own.au8Addr, ETH_ALEN)) ||
++      ((fc & IEEE80211_STYPE_QOS_DATA) && get_unaligned_le16(frame + hdrlen - 2)))
++    return MTLK_ERR_NOT_SUPPORTED;
++  return MTLK_ERR_OK;
++}
++
++static int wave_raw_tx_radiotap(struct sk_buff *skb, int frequency)
++{
++  struct ieee80211_radiotap_iterator iterator;
++  struct ieee80211_radiotap_header *header;
++  unsigned int rtlen;
++  bool fcs = false;
++  int res;
++
++  if (skb_is_gso(skb) || skb->ip_summed == CHECKSUM_PARTIAL ||
++      !pskb_may_pull(skb, sizeof(*header)))
++    return MTLK_ERR_PARAMS;
++  header = (void *)skb->data;
++  rtlen = le16_to_cpu(header->it_len);
++  if (header->it_version || rtlen < sizeof(*header) ||
++      rtlen > skb->len || skb->len - rtlen < 24 ||
++      skb->len - rtlen > BSS_MGMT_FRAME_SIZE + 4 ||
++      !pskb_may_pull(skb, rtlen))
++    return MTLK_ERR_PARAMS;
++  header = (void *)skb->data;
++  /* The native iterator also returns ENOENT on unknown field alignment.
++   * Admit only this explicit first-namespace mask before walking anything. */
++  if (get_unaligned_le32(&header->it_present) &
++      ~(BIT(IEEE80211_RADIOTAP_TSFT) | BIT(IEEE80211_RADIOTAP_FLAGS) |
++        BIT(IEEE80211_RADIOTAP_CHANNEL) | BIT(IEEE80211_RADIOTAP_DBM_ANTSIGNAL) |
++        BIT(IEEE80211_RADIOTAP_DBM_ANTNOISE) | BIT(IEEE80211_RADIOTAP_ANTENNA) |
++        BIT(IEEE80211_RADIOTAP_RX_FLAGS) | BIT(IEEE80211_RADIOTAP_TX_FLAGS)))
++    return MTLK_ERR_NOT_SUPPORTED;
++  res = ieee80211_radiotap_iterator_init(&iterator, header, rtlen, NULL);
++  if (res)
++    return MTLK_ERR_PARAMS;
++  while (!(res = ieee80211_radiotap_iterator_next(&iterator))) {
++    if (!iterator.is_radiotap_ns)
++      return MTLK_ERR_NOT_SUPPORTED;
++    switch (iterator.this_arg_index) {
++    case IEEE80211_RADIOTAP_FLAGS:
++      if (*iterator.this_arg & ~IEEE80211_RADIOTAP_F_FCS)
++        return MTLK_ERR_NOT_SUPPORTED;
++      fcs = *iterator.this_arg & IEEE80211_RADIOTAP_F_FCS;
++      break;
++    case IEEE80211_RADIOTAP_TX_FLAGS:
++      /* In particular NOSEQNO, NOACK, RTS/CTS and forced ordering are not
++       * implemented by this hardware owner. Broadcast has no RF ACK claim. */
++      if (get_unaligned_le16(iterator.this_arg))
++        return MTLK_ERR_NOT_SUPPORTED;
++      break;
++    case IEEE80211_RADIOTAP_CHANNEL:
++      if (get_unaligned_le16(iterator.this_arg) != frequency)
++        return MTLK_ERR_PARAMS;
++      break;
++    case IEEE80211_RADIOTAP_TSFT:
++    case IEEE80211_RADIOTAP_DBM_ANTSIGNAL:
++    case IEEE80211_RADIOTAP_DBM_ANTNOISE:
++    case IEEE80211_RADIOTAP_ANTENNA:
++    case IEEE80211_RADIOTAP_RX_FLAGS:
++      /* Receive annotations do not request a transmit policy. */
++      break;
++    default:
++      return MTLK_ERR_NOT_SUPPORTED;
++    }
++  }
++  if (res != -ENOENT)
++    return MTLK_ERR_PARAMS;
++  skb_pull(skb, rtlen);
++  if (fcs) {
++    if (skb->len < 28)
++      return MTLK_ERR_PARAMS;
++    if (pskb_trim(skb, skb->len - 4))
++      return MTLK_ERR_NO_MEM;
++  }
++  if (skb_linearize(skb))
++    return MTLK_ERR_NO_MEM;
++  return MTLK_ERR_OK;
++}
++
++
+ static int
+ _mtlk_mmb_bss_mgmt_tx(mtlk_hw_t *hw,
+                       struct mtlk_hw_bss_req_mirror *bss_req, mtlk_vap_handle_t vap_handle)
+@@ -11846,8 +12081,13 @@
+   uint32 packet_length = bss_req->size;
+   BOOL mcf;
+ 
++  /* Monitor completion deliberately keeps the generic/AP DFS fence set.
++   * Only the typed RAW owner has a separate permission published after the
++   * legal20MHz SET_CHAN ACK; revalidate its live channel on every resend. */
+   if (READ_ONCE(hw->quiescing) ||
+-      wave_radio_dfs_tx_blocked(wave_vap_radio_get(vap_handle)))
++      (wave_radio_dfs_tx_blocked(wave_vap_radio_get(vap_handle)) &&
++       (bss_req->extra_processing != PROCESS_RAW_DATA ||
++        !wave_raw_tx_owner(hw, vap_handle, bss_req->skb))))
+     return MTLK_ERR_NOT_READY;
+ 
+ #ifdef BD_DBG
+@@ -11868,6 +12108,20 @@
+   mtlk_dump(3, bss_req->virt_addr, bss_req->size, "BSS Mgmt TX frame:");
+ 
+   switch (bss_req->extra_processing) {
++    case PROCESS_RAW_DATA:
++        /* PD9 descriptor classification is separate from the untouched
++         * DATA/QoS header in the native DMA payload. */
++        if (!wave_raw_tx_owner(hw, vap_handle, bss_req->skb) ||
++            wave_raw_tx_frame(vap_handle, bss_req->virt_addr, bss_req->size) != MTLK_ERR_OK)
++          return MTLK_ERR_NOT_READY;
++        dst_addr = WLAN_GET_ADDR1(bss_req->virt_addr);
++        mcf = TRUE;
++        sid = DB_UNKNOWN_SID;
++        type = IEEE80211_FTYPE_MGMT >> 2;
++        subtype = MAN_TYPE_ACTION;
++        frame_type = FRAME_TYPE_ETHERNET;
++        ntid = NTS_TIDS_GEN6 - 1;
++        break;
+     case PROCESS_MANAGEMENT:
+         /* 1. dst address mc bit */
+         dst_addr = WLAN_GET_ADDR1(bss_req->virt_addr);
+@@ -12022,7 +12276,8 @@
+ 
+   mtlk_dump(3, &bss_hd, sizeof(bss_hd), "BSS Mgmt TX HD:");
+ 
+-  mtlk_core_on_bss_tx(mtlk_vap_get_core(vap_handle), bss_req->subtype);
++  if (bss_req->extra_processing != PROCESS_RAW_DATA)
++    mtlk_core_on_bss_tx(mtlk_vap_get_core(vap_handle), bss_req->subtype);
+ 
+ #ifdef BD_DBG
+    set_bit(bss_req->hdr.index, hw->bss_mgmt.used_bd_map);
+@@ -12164,6 +12419,8 @@
+   uint32 net_state;
+   int res;
+ 
++  if (extra_processing == PROCESS_RAW_DATA)
++    return MTLK_ERR_NOT_SUPPORTED;
+   if (READ_ONCE(hw->quiescing))
+     return MTLK_ERR_NOT_READY;
+   if (!buf || (extra_processing == PROCESS_EAPOL ? len < ETH_HLEN : len < 24))
+@@ -12373,6 +12630,94 @@
+   return MTLK_ERR_OK;
+ }
+ 
++
++/* The BSS queue lock is the publication gate for both initial RAW requests
++ * and CFM-driven reserve resubmission. Disabling TX takes this same lock
++ * before the existing DMA/IRQ fence. No monitor_lock -> queue lock inversion.
++ */
++int wave_hw_monitor_tx(mtlk_vap_handle_t vap, struct wave_monitor *owner,
++                       struct sk_buff *skb, int frequency, uint64 *cookie)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(vap);
++  struct mtlk_bss_management *queues = &hw->bss_mgmt;
++  struct mtlk_hw_bss_req_mirror *request;
++  mtlk_dlist_entry_t *entry;
++  struct net_device *ndev;
++  uint64 id;
++  bool reserve = false;
++  int res;
++
++  if (!cookie || !skb || !skb->dev || netdev_priv(skb->dev) != owner ||
++      !wave_raw_tx_owner(hw, vap, skb))
++    return MTLK_ERR_NOT_READY;
++  res = wave_raw_tx_radiotap(skb, frequency);
++  if (res != MTLK_ERR_OK)
++    return res;
++  res = wave_raw_tx_frame(vap, skb->data, skb->len);
++  if (res != MTLK_ERR_OK)
++    return res;
++
++  mtlk_osal_lock_acquire(&queues->tx_bdr.lock);
++  if (!wave_raw_tx_owner(hw, vap, skb) ||
++      __wave_core_chandef_get(mtlk_vap_get_core(vap))->chan.center_freq != frequency) {
++    res = MTLK_ERR_NOT_READY;
++    goto unlock;
++  }
++  entry = mtlk_dlist_pop_front(&queues->tx_bdr.free_list);
++  mtlk_mmb_bss_mgmt_update_free_list_stat(queues);
++  if (entry) {
++    mtlk_dlist_push_back(&queues->tx_bdr.used_list, entry);
++  } else {
++    entry = mtlk_dlist_pop_front(&queues->tx_res_bdr.free_list);
++    mtlk_mmb_bss_mgmt_update_res_free_list_stat(queues);
++    if (!entry) {
++      res = MTLK_ERR_NO_MEM;
++      goto unlock;
++    }
++    reserve = true;
++  }
++  request = MTLK_LIST_GET_CONTAINING_RECORD(entry, struct mtlk_hw_bss_req_mirror,
++                                           hdr.list_entry);
++  id = ++queues->cookie_counter;
++  if (!id)
++    id = ++queues->cookie_counter;
++  request->pmf = NULL;
++  request->dma_addr = 0;
++  request->vap_id = mtlk_vap_get_id(vap);
++  request->radio_id = wave_vap_radio_id_get(vap);
++  request->cookie = id;
++  wave_memcpy(request->virt_addr, BSS_MGMT_FRAME_SIZE, skb->data, skb->len);
++  request->size = skb->len;
++  request->extra_processing = PROCESS_RAW_DATA;
++  /* This is a native PD9 classifier tag, never a replacement packet header. */
++  request->action_code = WLAN_CATEGORY_PUBLIC;
++  request->subtype = (get_unaligned_le16(skb->data) & IEEE80211_FCTL_STYPE) >> 4;
++  request->is_broadcast = TRUE;
++  memcpy(request->dst_addr.au8Addr, skb->data + 4, ETH_ALEN);
++  request->power_mgmt_on = FALSE;
++  request->tid = NTS_TID_USE_DEFAULT;
++  ndev = skb->dev;
++  dev_hold(ndev);
++  request->skb = skb;
++  if (reserve) {
++    mtlk_dlist_push_back(&queues->tx_res_bdr.used_list, entry);
++  } else {
++    res = _mtlk_mmb_bss_mgmt_tx(hw, request, vap);
++    if (res != MTLK_ERR_OK) {
++      request->skb = NULL; /* An unsuccessful caller still owns its skb. */
++      dev_put(ndev);
++      mtlk_dlist_remove(&queues->tx_bdr.used_list, entry);
++      mtlk_dlist_push_back(&queues->tx_bdr.free_list, entry);
++      goto unlock;
++    }
++  }
++  *cookie = id;
++  res = MTLK_ERR_OK;
++unlock:
++  mtlk_osal_lock_release(&queues->tx_bdr.lock);
++  return res;
++}
++
+ /* This runs from the tasklet context, and possibly on a different CPU
+  * than _mgmt_tx(), therefore a lock is needed in it (a simple spin_lock() will do) */
+ int _mtlk_mmb_handle_bss_cfm(mtlk_hw_t *hw, HOST_DSC *pHD)
+@@ -12394,6 +12739,7 @@
+   uint8  status = MTLK_BFIELD_GET(u32frameInfo0, TX_BSS_EXTRA_STATUS);
+   mtlk_vap_handle_t    vap_handle, vap_handle_res;
+   wave_radio_t *radio;
++  bool raw;
+ 
+   MTLK_ASSERT(hw);
+ 
+@@ -12432,6 +12778,11 @@
+   }
+ #endif
+ 
++  raw = bss_req->extra_processing == PROCESS_RAW_DATA;
++  if (raw && (!bss_req->skb || !bss_req->dma_addr ||
++              radio_id != bss_req->radio_id || vap_id != bss_req->vap_id))
++    goto the_trap;
++
+   /* Confirmations can be received after VAP was traffic stopped */
+   if (__UNLIKELY(_mtlk_mmb_get_vap_is_not_ready(hw, radio_id, vap_id))) {
+     ILOG2_DD("Received bss frame cfm when VAP traffic was stopped radio_id:%d, vap_id:%d",
+@@ -12457,6 +12808,8 @@
+   mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->dma_addr, bss_req->size, MTLK_DATA_TO_DEVICE);
+   bss_req->dma_addr = 0;
+   wave_bss_complete_pmf(bss_req);
++  if (raw)
++    wave_bss_complete_raw(bss_req, status == 1);
+ 
+   if (PROCESS_MANAGEMENT == bss_req->extra_processing)
+   {
+@@ -12562,10 +12915,12 @@
+       continue;
+     }
+ 
+-    mtlk_core_on_bss_res_freed(mtlk_vap_get_core(vap_handle_res)); /* update counter */
++    if (bss_req->extra_processing != PROCESS_RAW_DATA)
++      mtlk_core_on_bss_res_freed(mtlk_vap_get_core(vap_handle_res)); /* update counter */
+ 
+     /* core net state is NET_STATE_DEACTIVATING in case of VAP traffic was stopped */
+-    if (0 == ((NET_STATE_CONNECTED | NET_STATE_DEACTIVATING) &
++    if (bss_req->extra_processing != PROCESS_RAW_DATA &&
++        0 == ((NET_STATE_CONNECTED | NET_STATE_DEACTIVATING) &
+         mtlk_core_get_net_state(mtlk_vap_get_core(vap_handle_res)))) {
+       WLOG_DD("Drop bss frame from reserved queue due to VAP is not active radio_id:%d, vap_id:%d",
+                bss_req->radio_id, bss_req->vap_id);
+@@ -12580,7 +12935,8 @@
+ 
+     /* vap_handle from cfm frame we need to decrease it only after new frame
+        is sent for not having rase condition with waiting of unconf_bss */
+-    mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
++    if (!raw)
++      mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
+     return MTLK_ERR_OK;
+   }
+ 
+@@ -12589,7 +12945,8 @@
+   mtlk_dlist_remove(&bss_mgmt->tx_bdr.used_list, &bss_req->hdr.list_entry);
+   mtlk_dlist_push_back(&bss_mgmt->tx_bdr.free_list, &bss_req->hdr.list_entry);
+   mtlk_osal_lock_release(&bss_mgmt->tx_bdr.lock);
+-  mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
++  if (!raw)
++    mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
+   return MTLK_ERR_OK;
+ 
+ the_trap:
+--- a/wireless/driver/shared/hw_mmb.h
++++ b/wireless/driver/shared/hw_mmb.h
+@@ -400,6 +400,7 @@
+   PROCESS_MANAGEMENT = 0,
+   PROCESS_EAPOL,
+   PROCESS_NULL_DATA_PACKET,
++  PROCESS_RAW_DATA,
+ };
+ 
+ uint8 __MTLK_IFUNC
+@@ -422,6 +423,9 @@
+ bool wave_hw_monitor_is_owner(mtlk_hw_t *hw, const struct wave_monitor *mon);
+ bool wave_hw_monitor_dirty(mtlk_hw_t *hw);
+ bool wave_hw_monitor_fenced(mtlk_hw_t *hw);
++bool wave_hw_monitor_set_tx(mtlk_hw_t *hw, const struct wave_monitor *mon, bool enable);
++int wave_hw_monitor_tx(mtlk_vap_handle_t vap, struct wave_monitor *owner,
++                       struct sk_buff *skb, int frequency, uint64 *cookie);
+ bool wave_hw_monitor_user_get(mtlk_hw_t *hw);
+ void wave_hw_monitor_user_put(mtlk_hw_t *hw);
+ int wave_hw_monitor_claim(mtlk_hw_t *hw, mtlk_vap_handle_t vap, struct wave_monitor *mon);

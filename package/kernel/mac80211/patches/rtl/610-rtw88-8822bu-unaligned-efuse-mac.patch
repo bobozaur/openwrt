@@ -1,0 +1,14 @@
+Subject: [PATCH] wifi: rtw88: avoid aligned loads from packed USB efuse MAC
+
+--- a/drivers/net/wireless/realtek/rtw88/rtw8822b.c
++++ b/drivers/net/wireless/realtek/rtw88/rtw8822b.c
+@@ -29,7 +29,8 @@
+ static void rtw8822bu_efuse_parsing(struct rtw_efuse *efuse,
+ 				    struct rtw8822b_efuse *map)
+ {
+-	ether_addr_copy(efuse->addr, map->u.mac_addr);
++	/* The USB efuse field is packed and may be odd-aligned on MIPS. */
++	memcpy(efuse->addr, map->u.mac_addr, ETH_ALEN);
+ }
+ 
+ static void rtw8822bs_efuse_parsing(struct rtw_efuse *efuse,

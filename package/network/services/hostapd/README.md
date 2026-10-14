@@ -1,3 +1,63 @@
+# Native AP/STA channel metadata
+
+Negotiated channel definitions retain the center-channel index returned by
+`ieee80211_freq_to_chan()` on every supported band, including 2.4 GHz. The
+frequency-info fallback uses the same native conversion for HT20/40, with
+center frequency equal to the primary frequency plus ten MHz per secondary
+channel offset, as in `hostapd_set_freq_params()`. Both representations now
+agree with hostapd's actual channel-switch callback.
+
+The exact channel/beaconing permission checks remain active. This metadata
+correction does not relax channel geometry or regulatory checks, change the
+80/160/320 MHz mapping, or alter security and scan timing.
+
+Pausing an AP requests native peer disconnection while station keys still exist,
+then retires hostapd station state before stopping the driver. Peers establish
+fresh associations when the AP resumes; a paused AP does not retain station
+records whose driver keys and peer identifiers have been removed. Native PMF
+handling remains responsible for protected management frames.
+
+# Connection scan watchdog recovery
+
+An nl80211 watchdog abort remains an incomplete scan: its cached BSS entries
+cannot drive network selection. When the matching native aborted completion
+confirms that watchdog request, an enabled, still-connecting owner schedules a
+fresh scan through the normal one-second retry path. The real completion also
+establishes scan-event support for the existing learned-event timeout; neither
+the initial nor learned timeout budget is changed.
+
+Explicit `ABORT_SCAN`, manual or external scans, special scan handlers, and
+removed, disabled or disconnected owners do not gain this retry. `DISCONNECT`
+continues to cancel pending scans and request abortion of an active scan. A
+retry is observable at the normal INFO level as `CTRL-EVENT-SCAN-FAILED` with
+`retry=1 reason=watchdog`; `ret` contains the platform's negative `ETIMEDOUT`.
+Driver provenance is cleared on new scan attempts, failed abortion, explicit
+cancellation, completion and interface/link retirement.
+
+# Supplicant WPS credential events
+
+The `wps_credentials` ubus event retains `ifname`, `ssid`, `encryption` and
+`key`. Its `processed` flag is true only after the supplicant has accepted the
+native network profile, applied its security adjustments, and completed any
+requested configuration-file write. Accepted events also contain `network_id`
+and the native configuration strings `proto`, `key_mgmt` and `pairwise`.
+
+With `wps_cred_processing=1`, credentials are handed to an external handler and
+`processed` is false; native profile fields are absent. An event does not imply
+that credentials have been committed to UCI or that association has completed.
+Consumers must preserve the accepted security policy and their own configuration
+ownership when implementing persistence.
+
+# EAP peer identity with mbedTLS
+
+The mbedTLS backend delegates an explicitly configured certificate-name policy
+or `hash://server/sha256/` leaf pin to its existing EAP certificate verifier. This
+allows suffix and alternative-name policies without substituting a single TLS
+hostname. Missing peer-identity policy still retains mbedTLS's refusal to verify
+an unspecified hostname. The native policy is unchanged: name constraints keep
+normal certificate-chain checks; a configured leaf pin uses the existing pin
+branch and does not additionally apply the separate name constraints.
+
 # UBUS methods - hostapd
 
 ## bss_mgmt_enable
@@ -28,7 +88,7 @@ Initiate an 802.11v transition request.
 | validity_period | int32 | no | validity of the BSS Transition Candiate List |
 | neighbors | array | no | BSS Transition Candidate List |
 | abridged | bool | no | prefer APs in the BSS Transition Candidate List |
-| dialog_token | int32 | no | identifier for the request/report transaction |
+| dialog_token | int32 | no | request/report identifier, 1–255; defaults to 1 when omitted |
 | mbo_reason | int32 | no | MBO Transition Reason Code Attribute |
 | cell_pref | int32 | no | MBO Cellular Data Connection Preference Attribute |
 | reassoc_delay | int32 | no | MBO Re-association retry delay |

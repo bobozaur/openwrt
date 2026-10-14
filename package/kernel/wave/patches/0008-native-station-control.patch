@@ -1,0 +1,276 @@
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -634,12 +634,9 @@
+ 
+     if (res != MTLK_ERR_OK)
+       ELOG_V("wv_ieee80211_config - error setting channel");
+-    else {
+-
+-    }
+-  }
+-
+-  return LINUX_ERR_OK;
++  }
++
++  return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+ 
+ /* Channel switch operation when CSAs were received from peer AP */
+@@ -836,15 +833,14 @@
+   master_df = _wv_mac80211_master_df_get(mac80211);
+   WAVE_WV_CHECK_PTR_RES(master_df);
+ 
+-  /* from this point on, and until ieee80211_stop AP VAPs should not control channel settings */
+-  wave_radio_set_sta_vifs_exist(mac80211->radio, TRUE);
+-
+   max_vaps_count = __wv_mac80211_max_vaps_count_get(mac80211);
+   mac80211->vif_array = (struct ieee80211_vif **)mtlk_osal_mem_alloc((sizeof(struct ieee80211_vif *) * max_vaps_count), MTLK_MEM_TAG_MAC80211);
+   if (NULL == mac80211->vif_array) {
+-    return MTLK_ERR_NO_MEM;
++    return -ENOMEM;
+   }
+   memset(mac80211->vif_array, 0, sizeof(struct ieee80211_vif *) * max_vaps_count);
++  /* Publish channel ownership only after the station state exists. */
++  wave_radio_set_sta_vifs_exist(mac80211->radio, TRUE);
+ 
+   return LINUX_ERR_OK;
+ }
+@@ -1978,6 +1974,24 @@
+   ILOG2_SD("%s: return with %d",
+       ieee80211_vif_to_wdev(vif)->netdev->name, _mtlk_df_mtlk_to_linux_error_code(res));
+   return _mtlk_df_mtlk_to_linux_error_code(res);
++}
++
++static void
++_wv_ieee80211_op_cancel_hw_scan(struct ieee80211_hw *hw, struct ieee80211_vif *vif)
++{
++  wv_mac80211_t *mac80211 = __wv_ieee80211_hw_get_mac80211(hw);
++  mtlk_df_t *master_df;
++  int res;
++
++  WAVE_WV_CHECK_PTR_VOID(mac80211);
++  master_df = _wv_mac80211_master_df_get(mac80211);
++  WAVE_WV_CHECK_PTR_VOID(master_df);
++
++  /* The master serializer owns the scan timer and exactly one completion.
++   * mac80211 already holds its wiphy mutex; completion only queues work. */
++  res = wave_core_cancel_scan(mtlk_vap_get_core(mtlk_df_get_vap_handle(master_df)), false);
++  if (res != MTLK_ERR_OK)
++    ELOG_D("Failed to cancel station scan: %d", res);
+ }
+ 
+ /* Setting up passive scan flag on radar channels */
+@@ -2523,6 +2537,7 @@
+   .conf_tx                  = _wv_ieee80211_op_conf_tx,
+   .channel_switch           = _wv_ieee80211_op_channel_switch,
+   .hw_scan                  = _wv_ieee80211_op_hw_scan,
++  .cancel_hw_scan           = _wv_ieee80211_op_cancel_hw_scan,
+   .sw_scan_complete         = _wv_ieee80211_op_sw_scan_complete,
+ };
+ 
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -610,6 +610,10 @@
+     radio->control_ready = false;
+     wiphy_unlock(wiphy);
+   }
++  /* A station can scan while every AP netdev is down. Stop each radio's
++   * scan owner before the first station teardown fences shared firmware. */
++  for (i = 0; i < radio_descr->num_radios; i++)
++    wave_core_cancel_scan(wave_radio_master_core_get(&radio_descr->radio[i]), true);
+   for (i = 0; i < radio_descr->num_radios; i++)
+     _wave_radio_mac80211_deinit(&radio_descr->radio[i]);
+ }
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -18,6 +18,7 @@
+  */
+ #include "mtlkinc.h"
+ #include <crypto/arc4.h>
++#include <linux/unaligned.h>
+ 
+ #include "core_priv.h"
+ #include "mtlk_df.h"
+@@ -3899,23 +3900,106 @@
+   MTLK_CLPB_END;
+ }
+ 
++struct wave_cancel_scan_context {
++  mtlk_core_t *master;
++  bool terminal;
++};
++
++static void wave_cancel_scan_command(mtlk_handle_t handle)
++{
++  struct wave_cancel_scan_context *ctx = HANDLE_T_PTR(struct wave_cancel_scan_context, handle);
++
++  abort_scan_sync(ctx->master);
++  if (ctx->terminal)
++    pause_or_prevent_scan(ctx->master);
++}
++
++/* Process context, outside the master serializer. A stack command avoids
++ * allocating a clipboard or async context during cancellation and teardown. */
++int wave_core_cancel_scan(mtlk_core_t *master, bool terminal)
++{
++  struct wave_cancel_scan_context ctx = { .master = master, .terminal = terminal };
++  mtlk_serializer_t *serializer = &master->slow_ctx->serializer;
++  mtlk_command_t command;
++  int res;
++
++  res = mtlk_command_init(&command, wave_cancel_scan_command, HANDLE_T(&ctx), MTLK_SLID);
++  if (res == MTLK_ERR_OK) {
++    res = mtlk_serializer_execute_blocked(serializer, _MTLK_CORE_PRIORITY_INTERNAL,
++                                         &command, 2000);
++    mtlk_command_cleanup(&command);
++  }
++  if (res != MTLK_ERR_OK) {
++    /* Teardown cannot free mac80211's scan request while a producer owns it.
++     * Stop firmware waits, drain/join the serializer, then take exclusive
++     * ownership of its timer and pending scan before unregistering hardware. */
++    ELOG_D("Scan cancellation failed, making the card terminal: %d", res);
++    ctx.terminal = true;
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(master->vap_handle));
++    mtlk_serializer_stop(serializer);
++    mtlk_osal_timer_cancel_sync(&__wave_core_scan_support_get(master)->scan_timer);
++    wave_cancel_scan_command(HANDLE_T(&ctx));
++    res = MTLK_ERR_OK;
++  }
++  return res;
++}
++
++static bool wave_eapol_frame_valid(const void *data, size_t len)
++{
++  const uint8 *frame = data;
++
++  /* Ethernet followed by the four-byte 802.1X header. Padding is valid. */
++  return frame && len >= ETH_HLEN + 4 &&
++         get_unaligned_be16(frame + 12) == ETH_P_PAE &&
++         get_unaligned_be16(frame + ETH_HLEN + 2) <= len - ETH_HLEN - 4;
++}
++
++int mtlk_core_tx_eapol(mtlk_vap_handle_t vap_handle, const void *data, size_t len)
++{
++  mtlk_core_t *core = mtlk_vap_get_core(vap_handle);
++  const struct ethhdr *eth = data;
++  sta_entry *sta;
++  uint64 cookie;
++  int res;
++
++  if (!wave_eapol_frame_valid(data, len) || is_multicast_ether_addr(eth->h_dest))
++    return MTLK_ERR_PARAMS;
++  sta = mtlk_stadb_find_sta(&core->slow_ctx->stadb, eth->h_dest);
++  if (!sta)
++    return MTLK_ERR_NOT_HANDLED;
++  if (MTLK_PCKT_FLTR_DISCARD_ALL == mtlk_sta_get_packets_filter(sta)) {
++    mtlk_sta_on_packet_dropped(sta, MTLK_TX_DISCARDED_DROP_ALL_FILTER);
++    res = MTLK_ERR_NOT_HANDLED;
++  } else {
++    /* ndo_start_xmit cannot sleep. The management ring copies the frame
++     * before returning and owns no mac80211 skb for Ethernet EAPOL. */
++    res = mtlk_mmb_bss_mgmt_tx(vap_handle, data, len, 0, FALSE, FALSE, FALSE,
++                              &cookie, PROCESS_EAPOL, NULL,
++                              FALSE, NTS_TID_USE_DEFAULT);
++    if (res == MTLK_ERR_OK)
++      mtlk_sta_on_tx_packet_802_1x(sta);
++    else
++      mtlk_sta_on_tx_packet_discarded_802_1x(sta);
++  }
++  mtlk_sta_decref(sta);
++  return res;
++}
++
+ int mtlk_handle_eapol(mtlk_vap_handle_t vap_handle, void *data, int data_len)
+ {
+   mtlk_df_t *df               = mtlk_vap_get_df(vap_handle);
+   mtlk_df_user_t *df_user     = mtlk_df_get_user(df);
+-  struct wireless_dev *wdev;
++  struct net_device *ndev = mtlk_df_user_get_ndev(df_user);
+   struct ethhdr *ether_header = (struct ethhdr *)data;
+   mtlk_core_t *nic            = mtlk_vap_get_core(vap_handle);
+-  sta_entry *sta              = mtlk_stadb_find_sta(&nic->slow_ctx->stadb, ether_header->h_source);
+-  mtlk_nbuf_t *evt_nbuf;
+-  uint8 *cp;
+-
+-  if (mtlk_vap_is_ap(vap_handle))
+-    wdev = mtlk_df_user_get_wdev(df_user);
+-  else
+-    wdev = (struct wireless_dev *)mtlk_df_user_get_ndev(df_user)->ieee80211_ptr;
+-
+-  MTLK_ASSERT(NULL != wdev);
++  sta_entry *sta;
++  struct sk_buff *skb;
++
++  if (data_len < 0 || !wave_eapol_frame_valid(data, data_len))
++    return MTLK_ERR_PARAMS;
++  if (!ndev || !netif_running(ndev) || !netif_device_present(ndev))
++    return MTLK_ERR_NOT_READY;
++  sta = mtlk_stadb_find_sta(&nic->slow_ctx->stadb, ether_header->h_source);
+ 
+   CAPWAP1(mtlk_hw_mmb_get_card_idx(mtlk_vap_get_hw(vap_handle)), data, data_len, 0, 0);
+ 
+@@ -3932,19 +4016,15 @@
+     mtlk_sta_decref(sta);               /* De-reference of find */
+   }
+ 
+-  evt_nbuf = wv_cfg80211_vendor_event_alloc(wdev, data_len,
+-                                            LTQ_NL80211_VENDOR_EVENT_RX_EAPOL);
+-  if (!evt_nbuf)
+-  {
++  skb = netdev_alloc_skb(ndev, data_len + NET_IP_ALIGN);
++  if (!skb)
+     return MTLK_ERR_NO_MEM;
+-  }
+-
+-  cp = mtlk_df_nbuf_put(evt_nbuf, data_len);
+-  wave_memcpy(cp, data_len, data, data_len);
+-
+-  ILOG3_D("CID-%04x: EAPOL RX", mtlk_vap_get_oid(vap_handle));
+-  mtlk_dump(3, evt_nbuf->data, evt_nbuf->len, "EAPOL RX vendor frame");
+-  wv_cfg80211_vendor_event(evt_nbuf);
++  skb_reserve(skb, NET_IP_ALIGN);
++  skb_put_data(skb, data, data_len);
++  skb->protocol = eth_type_trans(skb, ndev);
++  /* AF_PACKET is the standard hostapd/supplicant control-port transport.
++   * RX takes the copy; the firmware-ring caller retains its original buffer. */
++  netif_rx(skb);
+ 
+   return MTLK_ERR_OK;
+ 
+--- a/wireless/driver/linux/core.h
++++ b/wireless/driver/linux/core.h
+@@ -904,6 +904,8 @@
+ int core_ap_remove_sta(struct nic *nic, sta_info *info);
+ int mtlk_mbss_send_vap_activate(struct nic *nic, u8 band);
+ int mtlk_handle_eapol(mtlk_vap_handle_t vap_handle, void *data, int data_len);
++int mtlk_core_tx_eapol(mtlk_vap_handle_t vap_handle, const void *data, size_t len);
++int wave_core_cancel_scan(mtlk_core_t *master, bool terminal);
+ int _handle_radar_event(mtlk_handle_t core_object, const void *payload, uint32 size);
+ int mtlk_core_is_chandef_identical(struct mtlk_chan_def *chan1, struct mtlk_chan_def *chan2);
+ int mtlk_core_is_band_supported(mtlk_core_t *nic, mtlk_hw_band_e band);
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -650,6 +650,23 @@
+ 
+   df_user = mtlk_df_user_from_ndev(ndev);
+   if (__UNLIKELY(NULL == df_user)) {
++    dev_kfree_skb_any(skb);
++    return NETDEV_TX_OK;
++  }
++
++  if (!pskb_may_pull(skb, ETH_HLEN)) {
++    dev_core_stats_tx_dropped_inc(ndev);
++    dev_kfree_skb_any(skb);
++    return NETDEV_TX_OK;
++  }
++  if (get_unaligned_be16(skb->data + 12) == ETH_P_PAE) {
++    int res = MTLK_ERR_NO_MEM;
++
++    if (!skb_linearize(skb))
++      res = mtlk_core_tx_eapol(mtlk_df_get_vap_handle(df_user->df),
++                              skb->data, skb->len);
++    if (res != MTLK_ERR_OK)
++      dev_core_stats_tx_dropped_inc(ndev);
+     dev_kfree_skb_any(skb);
+     return NETDEV_TX_OK;
+   }

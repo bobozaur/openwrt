@@ -1,0 +1,42 @@
+Subject: [PATCH] mbedtls: delegate configured EAP peer identity verification
+
+mbedTLS 3.6.7 distinguishes an unspecified TLS hostname from an explicit
+request to use another peer-verification policy. EAP already verifies its
+configured leaf-certificate pin or domain and certificate-subject constraints
+in the native callback. Select that callback without replacing its policy
+with one SNI hostname. Preserve its pin/name policy, chain handling, and
+refusal of a missing peer identity policy.
+
+--- a/src/crypto/tls_mbedtls.c
++++ b/src/crypto/tls_mbedtls.c
+@@ -625,8 +625,29 @@
+ 	mbedtls_ssl_conf_export_keys_ext_cb(
+ 	    &conn->tls_conf->conf, tls_connection_export_keys_cb, conn);
+   #endif
+-	if (conn->verify_peer)
++	if (conn->verify_peer) {
++		struct tls_conf *conf = conn->tls_conf;
++
++		/* EAP peer identity is checked by tls_mbedtls_verify_cb(), using
++		 * either a pinned leaf certificate or configured name constraints.
++		 * These cannot be represented as one TLS hostname. Explicitly use
++		 * that verifier for mbedTLS versions which reject an unspecified
++		 * hostname; keep their refusal when no identity policy is configured.
++		 * The existing pin/name policy and chain verification are unchanged. */
++		if (conf->verify_depth0_only ||
++		    (conf->domain_match && conf->domain_match[0]) ||
++		    (conf->suffix_match && conf->suffix_match[0]) ||
++		    (conf->subject_match && conf->subject_match[0]) ||
++		    (conf->altsubject_match && conf->altsubject_match[0]) ||
++		    (conf->check_cert_subject && conf->check_cert_subject[0])) {
++			ret = mbedtls_ssl_set_hostname(&conn->ssl, NULL);
++			if (ret != 0) {
++				elog(ret, "mbedtls_ssl_set_hostname");
++				return -1;
++			}
++		}
+ 		mbedtls_ssl_set_verify(&conn->ssl, tls_mbedtls_verify_cb, conn);
++	}
+ 
+ 	return 0;
+ }

@@ -1,0 +1,38 @@
+Subject: [PATCH] wave: remove the CCMP ICV before delivering management frames
+
+The generic firmware BSS receive path retains both the CCMP header and ICV.
+Removing only the header leaves eight bytes after the management body. In
+particular, an FT-over-DS request then reaches hostapd with an invalid trailing
+information element and is rejected before authentication can complete.
+
+Remove both fields before AP cfg80211 or STA mac80211 delivery. This also
+satisfies the existing RX_FLAG_IV_STRIPPED contract, which includes the ICV.
+Keep the WEP authentication and group/BIP paths unchanged. Firmware-handled
+Block Ack frames use a separate normalization path.
+
+--- a/wireless/driver/shared/frame.c
++++ b/wireless/driver/shared/frame.c
+@@ -627,16 +627,19 @@
+     }
+     else {
+       if (mtlk_vap_is_ap(core->vap_handle) || !is_multicast_ether_addr(head->dst_addr.au8Addr)) {
+-        if (flen < IEEE80211_CCMP_HEADER_LEN) {
++        if (flen < IEEE80211_CCMP_HEADER_LEN + IEEE80211_CCMP_MIC_LEN) {
+           ILOG1_D("CID-%04x: Management Frame length is wrong", mtlk_vap_get_oid(core->vap_handle));
+           res = MTLK_ERR_NOT_IN_USE;
+           goto end;
+         }
+-        /* Remove security header from managment frames with decreasing the length */
++        /* Generic BSS RX retains the authenticated CCMP header and ICV.
++         * Deliver only the plaintext management body to both consumers;
++         * IV_STRIPPED makes mac80211 skip its own CCMP trailer removal.
++         */
+         mtlk_dump(3, head, *buflen, "dump of man frame with security header");
+-        flen -= IEEE80211_CCMP_HEADER_LEN;
+-        *buflen -= IEEE80211_CCMP_HEADER_LEN;
++        flen -= IEEE80211_CCMP_HEADER_LEN + IEEE80211_CCMP_MIC_LEN;
++        *buflen -= IEEE80211_CCMP_HEADER_LEN + IEEE80211_CCMP_MIC_LEN;
+         memmove(fbuf, fbuf + IEEE80211_CCMP_HEADER_LEN, flen);
+           fd->pmf_flags |= MTLK_MGMT_FRAME_DECRYPTED;
+           fd->pmf_flags |= MTLK_MGMT_FRAME_IV_STRIPPED;
+       }

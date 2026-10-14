@@ -1,0 +1,106 @@
+Subject: [PATCH] wave: restore monitor PCI admission before PLL initialization
+
+Use the existing cold-start order after the monitor DMA/CPU fence. Keep
+shared IRQ admission closed until firmware load, and refence partial or
+later failed restarts before returning to the recovery owner.
+
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -7647,12 +7647,12 @@
+  * the existing recovery owner has blocked all its slave VAP serializers.
+  * It has the same PCI/IRQ/tasklet/DMA/reset boundary as terminal quiesce but
+  * retains restartable TXMM and core objects. It never clears quiescing. */
+-int wave_hw_monitor_fence(mtlk_hw_t *hw)
++static int _wave_hw_monitor_fence_locked(mtlk_hw_t *hw)
+ {
+   mtlk_handle_t flags;
+   int res = MTLK_ERR_NOT_READY;
+ 
+-  mutex_lock(&hw->quiesce_lock);
++  lockdep_assert_held(&hw->quiesce_lock);
+   if (hw->quiescing || !wave_hw_monitor_held(hw))
+     goto out;
+   if (hw->monitor_fenced) {
+@@ -7684,6 +7684,15 @@
+   wave_hw_monitor_flush_tx(hw);
+   res = MTLK_ERR_OK;
+ out:
++  return res;
++}
++
++int wave_hw_monitor_fence(mtlk_hw_t *hw)
++{
++  int res;
++
++  mutex_lock(&hw->quiesce_lock);
++  res = _wave_hw_monitor_fence_locked(hw);
+   mutex_unlock(&hw->quiesce_lock);
+   return res;
+ }
+@@ -10966,6 +10975,22 @@
+ #if MTLK_DCDP_SEPARATE_REG
+   _mtlk_mmb_data_path_unregister(hw);
+ #endif
++  if (fresh_monitor) {
++    mtlk_handle_t flags;
++
++    hw->perform_isr_action = isr_action_init;
++    /* Match cold startup: finish PCI/tasklet admission before power/PLL
++     * initialization. The old DMA/rings and CPUs are already fenced.
++     * Keep shared IRQ admission closed until the fresh firmware is loaded.
++     * Even a partial restart must be refenced on failure. */
++    flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++    WRITE_ONCE(hw->monitor_fenced, false);
++    mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
++    res = wave_mmb_drv_restart_dma(mtlk_ccr_get_device(hw->ccr));
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++
+   /* Power ON chip */
+   _mtlk_mmb_power_on(hw);
+ 
+@@ -10987,17 +11012,13 @@
+     return res;
+   }
+ 
+-  if (hw->monitor_fenced) {
++  if (fresh_monitor) {
+     mtlk_handle_t flags;
+ 
+-    res = wave_mmb_drv_restart_dma(mtlk_ccr_get_device(hw->ccr));
+-    if (res != MTLK_ERR_OK)
+-      return res;
+-    /* Fresh tasklets and PCI admission are ready; firmware CPUs are still
+-     * reset. Bootstrap IRQs may now run the existing initialization action. */
++    /* PCI/tasklets and PLL are ready; firmware CPUs are still reset.
++     * Bootstrap IRQs may now run the existing initialization action. */
+     flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
+     hw->monitor_irqs_blocked = false;
+-    WRITE_ONCE(hw->monitor_fenced, false);
+     mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
+   }
+   _mtlk_mmb_run_firmware(hw);
+@@ -11176,11 +11197,22 @@
+ mtlk_hw_mmb_restore(mtlk_hw_t *hw)
+ {
+   int res;
++  bool restore_monitor;
+ 
+   /* Terminal removal/failure may not interleave a new DMA enable with its
+    * fence. quiescing is never cleared by the restartable recovery path. */
+   mutex_lock(&hw->quiesce_lock);
++  restore_monitor = wave_hw_monitor_fenced(hw);
+   res = _wave_hw_mmb_restore(hw);
++  if (res != MTLK_ERR_OK && restore_monitor) {
++    /* PCI or tasklets may have restarted before any later init failure.
++     * Retire that attempt before returning to either recovery caller. Keep
++     * ordinary fault recovery restartable; the monitor netdev caller owns
++     * its existing terminal-on-error decision. Preserve the original error. */
++    if (_wave_hw_monitor_fence_locked(hw) != MTLK_ERR_OK &&
++        !READ_ONCE(hw->quiescing))
++      wave_hw_mmb_quiesce_locked(hw);
++  }
+   mutex_unlock(&hw->quiesce_lock);
+   return res;
+ }

@@ -1,0 +1,48 @@
+Subject: [PATCH] FT: refresh target security IEs before SME reassociation validation
+
+FT over DS can associate directly with a new AP without running the SME
+authentication setup. The stored AP security IEs can therefore still belong
+to the source AP when the target Reassociation Response is validated. If the
+APs advertise different compatible AKM sets, the strict RSNE comparison fails
+even though the target's response and FT MIC are valid.
+
+Use the existing target BSS and security IE refresh for SME associations as
+well as driver BSS selection, after obtaining the actual associated BSSID and
+before processing the response. Abort if the target information cannot be
+loaded; do not validate against stale IEs. Keep all FT cryptographic checks,
+RSNE comparison rules and deferred key installation unchanged.
+
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -4759,16 +4759,25 @@
+ 		return -1;
+ 	}
+ 
++	/*
++	 * FT over DS skips the SME authentication path that normally selects
++	 * the target AP's security IEs. Refresh them before validating the FT
++	 * Reassociation Response, rather than comparing it with the old AP.
++	 */
+ 	if (ft_completed &&
+-	    (wpa_s->drv_flags & WPA_DRIVER_FLAGS_BSS_SELECTION)) {
++	    (wpa_s->drv_flags & (WPA_DRIVER_FLAGS_BSS_SELECTION |
++				WPA_DRIVER_FLAGS_SME))) {
+ 		wpa_msg(wpa_s, MSG_INFO, "Attempt to roam to " MACSTR,
+ 			MAC2STR(bssid));
+-		if (!wpa_supplicant_update_current_bss(wpa_s, bssid)) {
++		if (!wpa_supplicant_update_current_bss(wpa_s, bssid) ||
++		    !wpa_bss_get_ie(wpa_s->current_bss, WLAN_EID_RSN) ||
++		    wpa_supplicant_assoc_update_ie(wpa_s) < 0) {
+ 			wpa_printf(MSG_ERROR,
+-				   "Can't find target AP's information!");
+-			return 0;
+-		}
+-		wpa_supplicant_assoc_update_ie(wpa_s);
++				   "Could not update FT target AP security information");
++			wpa_supplicant_deauthenticate(wpa_s,
++						      WLAN_REASON_INVALID_IE);
++			return -1;
++		}
+ 	}
+ 
+ 	if (data && wpa_supplicant_event_associnfo(wpa_s, data) < 0)

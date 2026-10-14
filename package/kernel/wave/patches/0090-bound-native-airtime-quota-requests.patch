@@ -1,0 +1,65 @@
+Subject: [PATCH] wave: bound native airtime quota request arrays
+
+Check the fixed vendor request header before reading its variable length.
+Require exactly one SID/grant pair per declared entry and bound both loops
+against the hardware and UMI arrays. The hardware max-SID getter returns a
+capacity, so reject that index as well as larger values.
+
+Preserve the vendor quota layout, firmware transaction and returned status.
+This adds no standard airtime-weight capability or new firmware semantics.
+
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -4660,8 +4660,8 @@
+     current->comm, current->pid, total_len);
+   MTLK_CHECK_DF_USER(df_user);
+ 
+-  if (NULL == data) {
+-    ELOG_V("SET_ATF_QUOTAS: is NULL");
++  if (NULL == data || total_len < (int)sizeof(struct mtlk_atf_quotas)) {
++    ELOG_V("SET_ATF_QUOTAS: missing fixed header");
+     res = MTLK_ERR_PARAMS;
+     goto end;
+   }
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -3351,12 +3351,18 @@
+     return MTLK_ERR_UNKNOWN;
+   }
+ 
++  /* The variable payload is exactly one SID/grant pair per declared entry.
++   * Validate its extent before either loop reads or serializes a grant. */
++  if (mtlk_quotas->data_len !=
++      (uint32)mtlk_quotas->nof_grants * sizeof(mtlk_quotas->sta_grant[0]))
++    return MTLK_ERR_PARAMS;
++
+   /* Data in UMI_ATF_QUOTAS contain arrays whose dimensions are HW-dependent */
+   radio = wave_vap_radio_get(core->vap_handle);
+   max_vaps = wave_radio_max_vaps_get(radio);
+   max_stas = wave_radio_max_stas_get(radio);
+ 
+-  if (mtlk_quotas->nof_bss > max_vaps) {
++  if (mtlk_quotas->nof_bss > max_vaps || mtlk_quotas->nof_bss > GEN6_MAX_VAP) {
+     ELOG_DD("nof_bss (%d) > max_vaps (%d)", mtlk_quotas->nof_bss, max_vaps);
+     return MTLK_ERR_PARAMS;
+   }
+@@ -3366,12 +3372,18 @@
+     return MTLK_ERR_PARAMS;
+   }
+ 
++  if (mtlk_quotas->nof_grants > mtlk_quotas->nof_sta ||
++      mtlk_quotas->nof_grants > GEN6_MAX_SID)
++    return MTLK_ERR_PARAMS;
++
+   max_sid = wave_hw_max_sid_get(mtlk_vap_get_hw(core->vap_handle));
+ 
+   {
+     int i;
+     for (i = 0; i < mtlk_quotas->nof_grants; i++) {
+-      if (mtlk_quotas->sta_grant[i].sid > max_sid) {
++      /* max_sid is a capacity, not the last valid array index. */
++      if (mtlk_quotas->sta_grant[i].sid >= max_sid ||
++          mtlk_quotas->sta_grant[i].sid >= GEN6_MAX_SID) {
+         ELOG_DDD("SID (%d) number (%d) more than max SID (%d)",
+                  mtlk_quotas->sta_grant[i].sid, i, max_sid);
+         return MTLK_ERR_PARAMS;

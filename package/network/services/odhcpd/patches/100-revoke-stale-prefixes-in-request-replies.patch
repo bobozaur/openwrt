@@ -1,0 +1,37 @@
+Subject: [PATCH] dhcpv6: revoke stale leases in Request replies
+
+A client recovering from NoBinding retains previously granted prefixes that
+a Reply omits. Include the existing zero-lifetime comparison in Request
+Replies and rapid-commit Replies, while preserving Advertise hint semantics.
+This implements the stale-configuration signaling required by RFC 9096 3.5.
+
+--- a/src/dhcpv6-ia.c
++++ b/src/dhcpv6-ia.c
+@@ -571,7 +571,7 @@
+ 
+ static size_t build_ia(uint8_t *buf, size_t buflen, uint16_t status,
+ 		const struct dhcpv6_ia_hdr *ia, struct dhcpv6_lease *a,
+-		struct interface *iface, bool request)
++		struct interface *iface, bool advertise)
+ {
+ 	struct dhcpv6_ia_hdr o_ia = {
+ 		.type = ia->type,
+@@ -744,7 +744,8 @@
+ 			o_ia.t2 = htonl(1);
+ 	}
+ 
+-	if (!request) {
++	/* Replies must revoke stale hints; Advertise must omit them (RFC 9096). */
++	if (!advertise) {
+ 		uint8_t *odata, *end = ((uint8_t*)ia) + htons(ia->len) + DHCPV6_OPT_HDR_SIZE;
+ 		uint16_t otype, olen;
+ 
+@@ -1293,7 +1294,7 @@
+ 
+ 			ia_response_len = build_ia(
+ 				buf, buflen, status, ia, a, iface,
+-				hdr->msg_type != DHCPV6_MSG_REBIND);
++				hdr->msg_type == DHCPV6_MSG_SOLICIT && !rapid_commit);
+ 
+ 			/* Was only a solicitation: mark binding for removal in 60 seconds */
+ 			if (assigned) {

@@ -150,7 +150,15 @@ setup_interface () {
 	[ -n "$ZONE" ] && json_add_string zone "$ZONE"
 	proto_close_data
 
+	proto_add_dynamic_children
+	setup_dynamic_interfaces "$prefsig" "$addrsig"
+	proto_close_dynamic_children
 	proto_send_update "$INTERFACE"
+}
+
+setup_dynamic_interfaces() {
+	local prefsig="$1"
+	local addrsig="$2"
 
 	# If the flag '$DYNAMIC' is set to '0' (default=1), then the dynamic
 	# interfaces for the proto 'map', 'dslite' or '464xlat' are not
@@ -175,7 +183,7 @@ setup_interface () {
 
 	if [ "$IFACE_MAP" != 0 ] && [ -n "$MAPTYPE" ] && [ -n "$MAPRULE" ]; then
 		[ -z "$IFACE_MAP" -o "$IFACE_MAP" = 1 ] && IFACE_MAP=${INTERFACE}_4
-		json_init
+		json_add_object ""
 		json_add_string name "$IFACE_MAP"
 		json_add_string ifname "@$INTERFACE"
 		json_add_string proto map
@@ -189,10 +197,9 @@ setup_interface () {
 		[ -n "$ENCAPLIMIT_MAP" ] && json_add_string encaplimit "$ENCAPLIMIT_MAP"
 		[ -n "$IFACE_MAP_DELEGATE" ] && json_add_boolean delegate "$IFACE_MAP_DELEGATE"
 		json_close_object
-		ubus call network add_dynamic "$(json_dump)"
 	elif [ -n "$AFTR" ] && [ "$IFACE_DSLITE" != 0 ] && [ -f /lib/netifd/proto/dslite.sh ]; then
 		[ -z "$IFACE_DSLITE" -o "$IFACE_DSLITE" = 1 ] && IFACE_DSLITE=${INTERFACE}_4
-		json_init
+		json_add_object ""
 		json_add_string name "$IFACE_DSLITE"
 		json_add_string ifname "@$INTERFACE"
 		json_add_string proto "dslite"
@@ -204,10 +211,9 @@ setup_interface () {
 		[ -n "$ENCAPLIMIT_DSLITE" ] && json_add_string encaplimit "$ENCAPLIMIT_DSLITE"
 		[ -n "$IFACE_DSLITE_DELEGATE" ] && json_add_boolean delegate "$IFACE_DSLITE_DELEGATE"
 		json_close_object
-		ubus call network add_dynamic "$(json_dump)"
 	elif [ "$IFACE_464XLAT" != 0 ] && [ -f /lib/netifd/proto/464xlat.sh ]; then
 		[ -z "$IFACE_464XLAT" -o "$IFACE_464XLAT" = 1 ] && IFACE_464XLAT=${INTERFACE}_4
-		json_init
+		json_add_object ""
 		json_add_string name "$IFACE_464XLAT"
 		json_add_string ifname "@$INTERFACE"
 		json_add_string proto "464xlat"
@@ -217,7 +223,6 @@ setup_interface () {
 		[ -n "$ZONE_464XLAT" ] && json_add_string zone "$ZONE_464XLAT"
 		[ -n "$IFACE_464XLAT_DELEGATE" ] && json_add_boolean delegate "$IFACE_464XLAT_DELEGATE"
 		json_close_object
-		ubus call network add_dynamic "$(json_dump)"
 	fi
 
 	# TODO: $SNTP_IP $SIP_IP $SNTP_FQDN $SIP_DOMAIN

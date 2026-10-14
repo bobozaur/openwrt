@@ -1,0 +1,32 @@
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -4405,6 +4405,7 @@
+ 		   iface->conf ? iface->conf->bss[0]->iface : "N/A",
+ 		   hostapd_state_text(iface->state), hostapd_state_text(s));
+ 	iface->state = s;
++	hostapd_ucode_iface_state_changed(iface);
+ }
+ 
+ 
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -26,6 +26,7 @@
+ #include "fst/fst.h"
+ #include "wnm_ap.h"
+ #include "hostapd.h"
++#include "ucode.h"
+ #include "ieee802_11.h"
+ #include "ieee802_11_auth.h"
+ #include "sta_info.h"
+@@ -1470,6 +1471,11 @@
+ 		cf1, cf2, is_dfs0, is_dfs, punct_bitmap);
+ 	if (!finished)
+ 		return;
++
++	/* A shared fullmac radio can complete a switch initiated by its STA
++	 * role. Its AP owner must refresh beacons without issuing another CSA. */
++	if (!hapd->csa_in_progress)
++		hostapd_ucode_iface_channel_changed(hapd->iface);
+ 
+ 	if (hapd->csa_in_progress &&
+ 	    freq == hapd->cs_freq_params.freq) {

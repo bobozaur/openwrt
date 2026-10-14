@@ -1,0 +1,16 @@
+Subject: [PATCH] wave: honor optional async callbacks on allocation failure
+
+--- a/wireless/driver/linux/mtlk_df_linux.c
++++ b/wireless/driver/linux/mtlk_df_linux.c
+@@ -392,10 +392,8 @@
+ err_clpb_create:
+   mtlk_osal_mem_free(invocation_context);
+ err_ctx_alloc:
+-  if(MTLK_ERR_OK != res)
+-  {
++  if (clb && MTLK_ERR_OK != res)
+     clb(ctx, res, NULL);
+-  }
+ }
+ 
+ int

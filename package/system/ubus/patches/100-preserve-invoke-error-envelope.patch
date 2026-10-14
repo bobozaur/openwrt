@@ -1,0 +1,64 @@
+Subject: [PATCH] libubus: retain the request envelope on early invoke errors
+
+An object can disappear while its invocation is queued during a nested
+synchronous call. Initialize the caller, sequence and requested object before
+validating the local object so NOT_FOUND reaches the waiting caller. Missing
+method errors need the same envelope.
+
+Read no_reply before validation and close unclaimed incoming descriptors on
+the common exit. Deferred handlers retain the existing completion ownership.
+
+--- a/libubus-obj.c
++++ b/libubus-obj.c
+@@ -54,13 +54,17 @@
+ 		    struct ubus_object *obj, struct blob_attr **attrbuf, int fd)
+ {
+ 	struct ubus_request_data req = {
++		.peer = hdr->peer,
++		.seq = hdr->seq,
++		.object = blob_get_u32(attrbuf[UBUS_ATTR_OBJID]),
+ 		.fd = -1,
+ 		.req_fd = fd,
+ 	};
+ 	ubus_handler_t handler;
+ 	int method;
+ 	int ret;
+-	bool no_reply = false;
++	bool no_reply = attrbuf[UBUS_ATTR_NO_REPLY] &&
++		blob_get_int8(attrbuf[UBUS_ATTR_NO_REPLY]);
+ 
+ 	if ((!obj && !ubus_context_is_channel(ctx)) ||
+ 	    (!ctx->request_handler && ubus_context_is_channel(ctx))) {
+@@ -73,18 +77,11 @@
+ 		goto send;
+ 	}
+ 
+-	if (attrbuf[UBUS_ATTR_NO_REPLY])
+-		no_reply = blob_get_int8(attrbuf[UBUS_ATTR_NO_REPLY]);
+-
+-	req.peer = hdr->peer;
+-	req.seq = hdr->seq;
+-
+ 	if (ubus_context_is_channel(ctx)) {
+ 		handler = ctx->request_handler;
+ 		goto found;
+ 	}
+ 
+-	req.object = obj->id;
+ 	if (attrbuf[UBUS_ATTR_USER] && attrbuf[UBUS_ATTR_GROUP]) {
+ 		req.acl.user = blobmsg_get_string(attrbuf[UBUS_ATTR_USER]);
+ 		req.acl.group = blobmsg_get_string(attrbuf[UBUS_ATTR_GROUP]);
+@@ -110,12 +107,12 @@
+ 
+ 	ret = handler(ctx, obj, &req, blob_data(attrbuf[UBUS_ATTR_METHOD]),
+ 		      attrbuf[UBUS_ATTR_DATA]);
++send:
+ 	if (req.req_fd >= 0)
+ 		close(req.req_fd);
+ 	if (req.deferred || no_reply)
+ 		return;
+ 
+-send:
+ 	ubus_complete_deferred_request(ctx, &req, ret);
+ }
+ 

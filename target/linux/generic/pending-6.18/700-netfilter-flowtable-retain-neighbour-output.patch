@@ -1,0 +1,24 @@
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -203,14 +203,16 @@
+ 	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
+ 		nft_dev_path_info(&stack, &info, ha, &ft->data);
+ 
+-	if (info.outdev)
+-		route->tuple[dir].out.ifindex = info.outdev->ifindex;
+-	else
+-		route->tuple[dir].out.ifindex = dst->dev->ifindex;
+-
++	/* Keep neighbour output on its route device unless the resolved path
++	 * can also replace the flow's ingress and encapsulation information.
++	 */
++	route->tuple[dir].out.ifindex = dst->dev->ifindex;
+ 	if (!info.indev || !nft_flowtable_find_dev(info.indev, ft))
+ 		return;
+ 
++	if (info.outdev)
++		route->tuple[dir].out.ifindex = info.outdev->ifindex;
++
+ 	route->tuple[!dir].in.ifindex = info.indev->ifindex;
+ 	for (i = 0; i < info.num_encaps; i++) {
+ 		route->tuple[!dir].in.encap[i].id = info.encap[i].id;

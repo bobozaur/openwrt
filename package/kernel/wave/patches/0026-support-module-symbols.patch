@@ -1,0 +1,13 @@
+Subject: [PATCH] retain support symbols alongside OpenWrt staged symbols
+
+--- a/wireless/driver/linux/Kbuild
++++ b/wireless/driver/linux/Kbuild
+@@ -20,7 +20,7 @@
+ 
+ EXTRA_CFLAGS+=-DMTLK_FW_MBSS_API_VERSION=$(_FW_MBSS_API_VERSION) -g
+ 
+-KBUILD_EXTRA_SYMBOLS += $(abs_top_builddir)/tools/mtlkroot/linux/Module.symvers
++override KBUILD_EXTRA_SYMBOLS += $(abs_top_builddir)/tools/mtlkroot/linux/Module.symvers
+ 
+ ifeq ($(CONFIG_DC_DP_LIB_SUPPORT), y)
+ KBUILD_EXTRA_SYMBOLS += $(modvers_path)/directconnect-dp.symvers

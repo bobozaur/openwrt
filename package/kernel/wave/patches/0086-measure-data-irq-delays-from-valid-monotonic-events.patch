@@ -1,0 +1,286 @@
+Subject: [PATCH] wave: measure data IRQ delays from valid monotonic events
+
+The shared tasklet visits empty rings before their first IRQ. Subtracting
+an uninitialized realtime timestamp records Unix-epoch nanoseconds as a
+permanent maximum; MSI also never populated the old timestamp fields.
+
+Stamp both IRQ paths with monotonic time, sample only nonempty work owned
+by that interrupt domain, and retain the same timestamp through processing.
+Use native atomic64 values for coherent hardirq/tasklet/control snapshots
+on 32-bit hosts. Packet budgets, scheduling and firmware ABI are unchanged.
+
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -43,6 +43,7 @@
+ 
+ #include "linux/netdevice.h"
+ #include <linux/ktime.h>
++#include <linux/atomic.h>
+ #ifdef MTCFG_SET_PM_QOS
+ #include "linux/pm_qos.h"
+ #endif
+@@ -669,8 +670,8 @@
+   mtlk_ring_buffer        ring;          /* TX ring data */
+ #ifdef MTLK_DEBUG
+   uint32                  max_received_cfm;      /* max received cfm for packets within one tasklet */
+-  uint64                  max_int_tasklet_time;  /* time between interrupt to tasklet */
+-  uint64                  max_int_processed_cfm; /* time between interrupt and cfm processed */
++  atomic64_t                  max_int_tasklet_time;  /* time between interrupt to tasklet */
++  atomic64_t                  max_int_processed_cfm; /* time between interrupt and cfm processed */
+ #endif
+ #ifdef BD_DBG
+   volatile unsigned long *used_bd_map;   /* bitmap of BD buffers, currently being processed within FW, one per BD */
+@@ -686,8 +687,8 @@
+   mtlk_nbuf_t            *last_fragment; /* fragments received and not yet sent up */
+ #ifdef MTLK_DEBUG
+   uint32                  max_received_pckts;       /* max received packets within one tasklet */
+-  uint64                  max_int_tasklet_time;     /* time between interrupt to tasklet */
+-  uint64                  max_int_processed_packet; /* time between interrupt to packet processed */
++  atomic64_t                  max_int_tasklet_time;     /* time between interrupt to tasklet */
++  atomic64_t                  max_int_processed_packet; /* time between interrupt to packet processed */
+ #endif
+ };
+ 
+@@ -907,12 +908,12 @@
+ 
+   struct mtlk_tx         tx;      /* DAT TX-related variables */
+ #ifdef MTLK_DEBUG
+-  mtlk_dbg_hres_ts_t     tx_interrupt_time;
++  atomic64_t            tx_interrupt_time_ns;
+ #endif
+ 
+   struct mtlk_rx         rx;      /* DAT RX-related variables */
+ #ifdef MTLK_DEBUG
+-  mtlk_dbg_hres_ts_t     rx_interrupt_time;
++  atomic64_t            rx_interrupt_time_ns;
+ #endif
+ 
+   mtlk_mmb_advanced_bdr_t tx_man;  /* Tx MM related */
+@@ -2781,13 +2782,57 @@
+ }
+ #endif
+ 
++#ifdef MTLK_DEBUG
++/* IRQ timestamps and maxima cross hardirq/tasklet/control contexts on 32-bit
++ * hosts. Monotonic atomic64 values avoid clock steps and torn snapshots.
++ */
++static void wave_hw_stamp_data_irq(mtlk_hw_t *hw, uint32 pending)
++{
++  uint64 now = ktime_get_ns();
++
++  if (pending & MTLK_IRQ_TXOUT)
++    atomic64_set(&hw->tx_interrupt_time_ns, now);
++  if (pending & MTLK_IRQ_RX)
++    atomic64_set(&hw->rx_interrupt_time_ns, now);
++}
++
++static uint64 wave_hw_data_irq_time(mtlk_irq_handler_data *ihd, uint32 type)
++{
++  mtlk_hw_t *hw = ihd->hw;
++  uint32 pending = hw->irq_mode == MTLK_IRQ_MODE_LEGACY ?
++                   ihd->status : ihd->irq_no;
++
++  /* The shared tasklet also visits rings that did not raise this IRQ. */
++  if (!(pending & type))
++    return 0;
++  return atomic64_read(type == MTLK_IRQ_TXOUT ?
++                       &hw->tx_interrupt_time_ns : &hw->rx_interrupt_time_ns);
++}
++
++static void wave_hw_update_irq_delay(atomic64_t *maximum, uint64 started)
++{
++  uint64 now, elapsed;
++  s64 previous;
++
++  if (!started)
++    return;
++  now = ktime_get_ns();
++  if (now < started)
++    return;
++  elapsed = now - started;
++  previous = atomic64_read(maximum);
++  while (elapsed > (uint64)previous &&
++         !atomic64_try_cmpxchg(maximum, &previous, elapsed))
++    ;
++}
++#endif
++
+ static int
+ _mtlk_mmb_data_txout_process (mtlk_irq_handler_data *ihd)
+ {
+   int res = MTLK_ERR_OK;
+ #ifdef MTLK_DEBUG
+-  mtlk_dbg_hres_ts_t       time_current;
+-  uint64  time_diff;
++  uint64 irq_started;
+ #endif
+   mtlk_hw_t *hw = ihd->hw;
+ 
+@@ -2795,15 +2840,6 @@
+ 
+   if (__LIKELY(!READ_ONCE(hw->mac_events_stopped))) {
+     uint32 cur_hd, hds_to_process;
+-
+-#ifdef MTLK_DEBUG
+-    /* update max interrupt to tasklet statistic */
+-    mtlk_dbg_hres_ts(&time_current);
+-    time_diff = mtlk_dbg_hres_diff_uint64(&time_current, &hw->tx_interrupt_time);
+-    if(hw->tx.max_int_tasklet_time < time_diff) {
+-      hw->tx.max_int_tasklet_time = time_diff;
+-    }
+-#endif
+ 
+     hds_to_process = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->tx.ring.regs);
+     MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_TXOUT_START, hds_to_process);
+@@ -2811,6 +2847,11 @@
+       MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_TXOUT_END, 0);
+       return MTLK_ERR_OK;
+     }
++
++#ifdef MTLK_DEBUG
++    irq_started = wave_hw_data_irq_time(ihd, MTLK_IRQ_TXOUT);
++    wave_hw_update_irq_delay(&hw->tx.max_int_tasklet_time, irq_started);
++#endif
+ 
+     if (hds_to_process > hw->data_txout_lim) {
+       hds_to_process = hw->data_txout_lim;
+@@ -2836,12 +2877,7 @@
+       hw->tx.max_received_cfm = hds_to_process;
+     }
+ 
+-    /* update max interrupt to processed cfm statistic */
+-    mtlk_dbg_hres_ts(&time_current);
+-    time_diff = mtlk_dbg_hres_diff_uint64(&time_current, &hw->tx_interrupt_time);
+-    if(hw->tx.max_int_processed_cfm < time_diff) {
+-      hw->tx.max_int_processed_cfm = time_diff;
+-    }
++    wave_hw_update_irq_delay(&hw->tx.max_int_processed_cfm, irq_started);
+ #endif
+ 
+     mtlk_ccr_ring_clear_interrupt(hw->ccr, &hw->tx.ring.regs, hds_to_process);
+@@ -2860,22 +2896,12 @@
+ {
+   int res = MTLK_ERR_OK;
+ #ifdef MTLK_DEBUG
+-  mtlk_dbg_hres_ts_t       time_current;
+-  uint64  time_diff;
++  uint64 irq_started;
+ #endif
+   mtlk_hw_t *hw = ihd->hw;
+   uint32 cur_hd, hds_to_process;
+ 
+   MTLK_ASSERT(NULL != hw->ccr);
+-
+-#ifdef MTLK_DEBUG
+-  /* update max interrupt to tasklet statistic */
+-  mtlk_dbg_hres_ts(&time_current);
+-  time_diff = mtlk_dbg_hres_diff_uint64(&time_current, &hw->rx_interrupt_time);
+-  if(hw->rx.max_int_tasklet_time < time_diff) {
+-    hw->rx.max_int_tasklet_time = time_diff;
+-  }
+-#endif
+ 
+   hds_to_process = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->rx.ring.regs);
+   MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_RX_START, hds_to_process);
+@@ -2883,6 +2909,11 @@
+     MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_RX_END, 0);
+     return MTLK_ERR_OK;
+   }
++
++#ifdef MTLK_DEBUG
++  irq_started = wave_hw_data_irq_time(ihd, MTLK_IRQ_RX);
++  wave_hw_update_irq_delay(&hw->rx.max_int_tasklet_time, irq_started);
++#endif
+ 
+   if (hds_to_process > hw->data_rx_lim) {
+     hds_to_process = hw->data_rx_lim;
+@@ -2913,12 +2944,7 @@
+     hw->rx.max_received_pckts = hds_to_process;
+   }
+ 
+-  /* update max interrupt to time statistic */
+-  mtlk_dbg_hres_ts(&time_current);
+-  time_diff = mtlk_dbg_hres_diff_uint64(&time_current, &hw->rx_interrupt_time);
+-  if(hw->rx.max_int_processed_packet < time_diff) {
+-    hw->rx.max_int_processed_packet = time_diff;
+-  }
++  wave_hw_update_irq_delay(&hw->rx.max_int_processed_packet, irq_started);
+ #endif
+ 
+   mtlk_ccr_ring_clear_interrupt(hw->ccr, &hw->rx.ring.regs, hds_to_process);
+@@ -9377,7 +9403,7 @@
+     if (size == sizeof(uint64))
+     {
+       uint64 *val = (uint64 *)buffer;
+-      *val = hw->tx.max_int_tasklet_time;
++      *val = atomic64_read(&hw->tx.max_int_tasklet_time);
+       res  = MTLK_ERR_OK;
+     }
+     break;
+@@ -9385,7 +9411,7 @@
+     if (size == sizeof(uint64))
+     {
+       uint64 *val = (uint64 *)buffer;
+-      *val = hw->tx.max_int_processed_cfm;
++      *val = atomic64_read(&hw->tx.max_int_processed_cfm);
+       res  = MTLK_ERR_OK;
+     }
+     break;
+@@ -9401,7 +9427,7 @@
+     if (size == sizeof(uint64))
+     {
+       uint64 *val = (uint64 *)buffer;
+-      *val = hw->rx.max_int_tasklet_time;
++      *val = atomic64_read(&hw->rx.max_int_tasklet_time);
+       res  = MTLK_ERR_OK;
+     }
+     break;
+@@ -9409,7 +9435,7 @@
+     if (size == sizeof(uint64))
+     {
+       uint64 *val = (uint64 *)buffer;
+-      *val = hw->rx.max_int_processed_packet;
++      *val = atomic64_read(&hw->rx.max_int_processed_packet);
+       res  = MTLK_ERR_OK;
+     }
+     break;
+@@ -9805,6 +9831,14 @@
+ 
+   memset(hw_api, 0, sizeof(*hw_api));
+   memset(hw, 0, sizeof(*hw));
++#ifdef MTLK_DEBUG
++  atomic64_set(&hw->tx_interrupt_time_ns, 0);
++  atomic64_set(&hw->rx_interrupt_time_ns, 0);
++  atomic64_set(&hw->tx.max_int_tasklet_time, 0);
++  atomic64_set(&hw->tx.max_int_processed_cfm, 0);
++  atomic64_set(&hw->rx.max_int_tasklet_time, 0);
++  atomic64_set(&hw->rx.max_int_processed_packet, 0);
++#endif
+ 
+   hw->mmb = &mtlk_mmb_obj;
+ 
+@@ -9993,6 +10027,9 @@
+   MTLK_ASSERT(NULL != hw);
+   MTLK_ASSERT(NULL != hw->ccr);
+ 
++#ifdef MTLK_DEBUG
++  wave_hw_stamp_data_irq(hw, ihd->irq_no);
++#endif
+   hw->perform_isr_action(hw, ihd);
+   return MTLK_ERR_OK;
+ }
+@@ -10042,13 +10079,7 @@
+     }
+     else {
+ #ifdef MTLK_DEBUG
+-      if (ihd->status & MTLK_IRQ_TXOUT) {
+-        mtlk_dbg_hres_ts(&hw->tx_interrupt_time);
+-      }
+-
+-      if (ihd->status & MTLK_IRQ_RX) {
+-        mtlk_dbg_hres_ts(&hw->rx_interrupt_time);
+-      }
++      wave_hw_stamp_data_irq(hw, ihd->status);
+ #endif
+     }
+ 

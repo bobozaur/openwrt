@@ -1,0 +1,152 @@
+Subject: [PATCH] wave: keep TXOP and aggregation queries observational
+
+The matching A0 TXOP handler changes its upper-MAC per-SID policy before
+servicing the lower-MAC GET. The aggregation GET reaches a lower policy
+setter and never fills the returned window size. Do not submit either
+command from the configured-value getters.
+
+Reuse each serialized setter's last acknowledged configuration and its
+existing recovery owner. Unknown tuples return unsupported; window zero
+keeps the native no-change request meaning. These are not independent
+firmware or negotiated-peer state observations. Also propagate the TXOP
+setter result instead of reporting success after a rejected or failed SET.
+
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -5571,49 +5571,25 @@
+   return res;
+ }
+ 
+-/* Returns last STA ID set, if not set then ALL STA ID */
++/* Return only the last acknowledged SID/mode configuration. */
+ int __MTLK_IFUNC
+ mtlk_core_receive_txop_mode (mtlk_core_t *core, mtlk_core_txop_mode_t *txop_mode)
+ {
+-  mtlk_txmm_msg_t        man_msg;
+-  mtlk_txmm_data_t      *man_entry = NULL;
+-  UMI_SET_TXOP_CONFIG_t *txop_config = NULL;
+-  mtlk_vap_handle_t      vap_handle = core->vap_handle;
+-  int                    res;
+-  wave_radio_t          *radio = wave_vap_radio_get(vap_handle);
+-  uint32                 sta_id = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TXOP_SID);
+-
+-  /* Cannot request TXOP mode for ALL STA SID from FW */
+-  if (mtlk_hw_is_sid_all_sta_sid(mtlk_vap_get_hw(vap_handle), sta_id)) {
+-    txop_mode->sid  = sta_id;
+-    txop_mode->mode = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TXOP_MODE);
+-    return MTLK_ERR_OK;
+-  }
+-
+-  man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+-  if (NULL == man_entry) {
+-    ELOG_D("CID-%04x: No man entry available", mtlk_vap_get_oid(vap_handle));
+-    return MTLK_ERR_NO_RESOURCES;
+-  }
+-
+-  man_entry->id = UM_MAN_SET_TXOP_CONFIG_REQ;
+-  man_entry->payload_size = sizeof(UMI_SET_TXOP_CONFIG_t);
+-  txop_config = (UMI_SET_TXOP_CONFIG_t *)(man_entry->payload);
+-  txop_config->getSetOperation = API_GET_OPERATION;
+-  txop_config->staId = HOST_TO_MAC32(sta_id);
+-
+-  res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+-
+-  if (MTLK_ERR_OK == res) {
+-    txop_mode->sid  = sta_id;
+-    txop_mode->mode = txop_config->mode;
+-  }
+-  else {
+-    ELOG_D("CID-%04x: Receive UM_MAN_SET_TXOP_CONFIG_REQ failed", mtlk_vap_get_oid(vap_handle));
+-  }
+-
+-  mtlk_txmm_msg_cleanup(&man_msg);
+-  return res;
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  uint32 sid = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TXOP_SID);
++  uint32 mode = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TXOP_MODE);
++
++  /* The matching A0 handler writes its upper-MAC SID table before the
++   * lower-MAC GET branch. A zeroed query therefore changes the upper mode.
++   * The serialized setter publishes this pair only after confirmation;
++   * recovery replays it. It is not current station-incarnation telemetry. */
++  if (mode > TXOP_LAST_STATE ||
++      !mtlk_hw_is_sid_valid_or_all_sta_sid(mtlk_vap_get_hw(core->vap_handle), sid))
++    return MTLK_ERR_NOT_SUPPORTED;
++
++  txop_mode->sid = sid;
++  txop_mode->mode = mode;
++  return MTLK_ERR_OK;
+ }
+ 
+ int __MTLK_IFUNC
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -5708,8 +5708,8 @@
+       MTLK_CFG_CHECK_ITEM_AND_CALL_VOID(master_cfg, acs_update_timeout, WAVE_RADIO_PDB_SET_INT,
+                                        (radio, PARAM_DB_RADIO_ACS_UPDATE_TO, master_cfg->acs_update_timeout));
+ 
+-      MTLK_CFG_CHECK_ITEM_AND_CALL_VOID(master_cfg, txop_mode_params, mtlk_core_send_txop_mode,
+-                                       (core, master_cfg->txop_mode_params.sid, master_cfg->txop_mode_params.mode));
++      MTLK_CFG_CHECK_ITEM_AND_CALL(master_cfg, txop_mode_params, mtlk_core_send_txop_mode,
++                                       (core, master_cfg->txop_mode_params.sid, master_cfg->txop_mode_params.mode), res);
+ 
+       MTLK_CFG_CHECK_ITEM_AND_CALL(master_cfg, mu_operation, mtlk_core_set_mu_operation,
+                                   (core, !!master_cfg->mu_operation), res);
+@@ -13627,39 +13627,24 @@
+ 
+ /* Aggregation configuration */
+ static int
+-_mtlk_core_receive_agg_rate_cfg (mtlk_core_t *core,  mtlk_core_aggr_cfg_t *aggr_cfg)
+-{
+-  int res;
+-  mtlk_txmm_msg_t       man_msg;
+-  mtlk_txmm_data_t     *man_entry = NULL;
+-  UMI_TS_VAP_CONFIGURE *pAggrConfig = NULL;
+-  mtlk_vap_handle_t     vap_handle = core->vap_handle;
+-
+-  man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+-  if (NULL == man_entry) {
+-    ELOG_D("CID-%04x: No man entry available", mtlk_vap_get_oid(vap_handle));
+-    return MTLK_ERR_NO_RESOURCES;
+-  }
+-
+-  man_entry->id = UM_MAN_TS_VAP_CONFIGURE_REQ;
+-  man_entry->payload_size = sizeof(UMI_TS_VAP_CONFIGURE);
+-
+-  pAggrConfig = (UMI_TS_VAP_CONFIGURE *)(man_entry->payload);
+-  pAggrConfig->vapId = (uint8)mtlk_vap_get_id(vap_handle);
+-  pAggrConfig->getSetOperation = API_GET_OPERATION;
+-
+-  res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+-  if (MTLK_ERR_OK == res) {
+-    aggr_cfg->ba_mode    = pAggrConfig->enableBa;
+-    aggr_cfg->amsdu_mode = pAggrConfig->amsduSupport;
+-    aggr_cfg->windowSize = MAC_TO_HOST32(pAggrConfig->windowSize);
+-  }
+-  else {
+-    ELOG_D("CID-%04x: Failed to receive UM_MAN_TS_VAP_CONFIGURE_REQ", mtlk_vap_get_oid(vap_handle));
+-  }
+-
+-  mtlk_txmm_msg_cleanup(&man_msg);
+-  return res;
++_mtlk_core_receive_agg_rate_cfg (mtlk_core_t *core, mtlk_core_aggr_cfg_t *aggr_cfg)
++{
++  uint32 amsdu_mode = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_AMSDU_MODE);
++  uint32 ba_mode = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_BA_MODE);
++  uint32 window_size = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_WINDOW_SIZE);
++
++  /* The A0 GET returns no window size and still applies a lower-MAC policy.
++   * Report the per-core request saved after a successful native SET instead.
++   * Recovery uses this same tuple. Window zero retains its SET meaning of
++   * no change; it is not an observation of the negotiated BA window. */
++  if (amsdu_mode > 1 || ba_mode > 1 ||
++      MTLK_PARAM_DB_VALUE_IS_INVALID(window_size))
++    return MTLK_ERR_NOT_SUPPORTED;
++
++  aggr_cfg->amsdu_mode = (uint8)amsdu_mode;
++  aggr_cfg->ba_mode = (uint8)ba_mode;
++  aggr_cfg->windowSize = window_size;
++  return MTLK_ERR_OK;
+ }
+ 
+ static int _mtlk_core_get_aggr_cfg (mtlk_handle_t hcore, const void* data, uint32 data_size)

@@ -1,0 +1,50 @@
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -2046,6 +2046,8 @@
+ wv_cfg80211_register (
+   wv_cfg80211_t *cfg80211)
+ {
++  int res;
++
+   MTLK_ASSERT(cfg80211 != NULL);
+   if (cfg80211 == NULL) {
+     return MTLK_ERR_PARAMS;
+@@ -2057,8 +2059,9 @@
+ 
+   /* register hardware */
+   SLOG0(0, 0, wiphy, cfg80211->wiphy);
+-  if (0 != wiphy_register(cfg80211->wiphy)) {
+-    ELOG_V("Couldn't register WIPHY device");
++  res = wiphy_register(cfg80211->wiphy);
++  if (res) {
++    ELOG_D("Couldn't register WIPHY device: %d", res);
+     return MTLK_ERR_PARAMS;
+   }
+ 
+@@ -2224,9 +2227,9 @@
+   if_comb->limits = if_limits;
+   if_comb->n_limits = CFG80211_AP_MAX_IF_LIMIT; /*APs only*/
+   if_comb->max_interfaces = wave_radio_max_vaps_get(radio);
+-  /* During CSA with multiple VAPs, VAPs are switched one by one,
+-   * therefore during switch time they appear to be on two different channels */
+-  if_comb->num_different_channels = 2;
++  /* One physical radio has one channel context. Sequential VAP channel
++   * switches do not provide concurrent channels, including during DFS. */
++  if_comb->num_different_channels = 1;
+   if_comb->beacon_int_infra_match = 0;
+   if_comb->radar_detect_widths = (1 << NL80211_CHAN_WIDTH_20_NOHT) | (1 << NL80211_CHAN_WIDTH_20)
+                                  | (1 << NL80211_CHAN_WIDTH_40) | (1 << NL80211_CHAN_WIDTH_80)
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -2498,6 +2498,11 @@
+ 
+ const struct ieee80211_ops wv_ieee80211_ops = {
+   .tx                       = _wv_ieee80211_op_tx,
++  .wake_tx_queue            = ieee80211_handle_wake_tx_queue,
++  /* Native adapters drive the existing single-channel .config callback. */
++  .add_chanctx              = ieee80211_emulate_add_chanctx,
++  .remove_chanctx           = ieee80211_emulate_remove_chanctx,
++  .change_chanctx           = ieee80211_emulate_change_chanctx,
+   .start                    = _wv_ieee80211_op_start,
+   .stop                     = _wv_ieee80211_op_stop,
+   .config                   = _wv_ieee80211_op_config,

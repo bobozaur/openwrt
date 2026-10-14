@@ -1,0 +1,40 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+. /lib/functions.sh
+
+[ "$(board_name)" = "tplink,archer-ax50-v1" ] || exit 0
+
+wlan2g_configured=0
+wlan5g_configured=0
+
+check_wifi_led() {
+	local sysfs
+
+	config_get sysfs "$1" sysfs
+	case "$sysfs" in
+		blue:wlan-2g) wlan2g_configured=1 ;;
+		blue:wlan-5g) wlan5g_configured=1 ;;
+	esac
+}
+
+add_wifi_led() {
+	local section
+
+	section="$(uci add system led)" || return 1
+	uci set "system.$section.name=$1" &&
+		uci set "system.$section.sysfs=$2" &&
+		uci set "system.$section.trigger=$3"
+}
+
+# Older installations have only the DT triggers. The LED service needs UCI
+# entries to restore them after lights_toggle; preserve custom LED mappings.
+config_load system
+config_foreach check_wifi_led led
+
+[ "$wlan2g_configured" = "1" ] ||
+	add_wifi_led "Wi-Fi 2.4 GHz" "blue:wlan-2g" "wave-0000:01:00.0-0-radio" || exit 1
+[ "$wlan5g_configured" = "1" ] ||
+	add_wifi_led "Wi-Fi 5 GHz" "blue:wlan-5g" "wave-0000:01:00.0-1-radio" || exit 1
+
+uci commit system

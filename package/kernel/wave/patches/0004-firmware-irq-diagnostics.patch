@@ -1,0 +1,21 @@
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -4345,6 +4345,8 @@
+ 
+   ELOG_DD("Wait for CHI Magic failed: res %d, Magic 0x%08x",
+           wait_res, hw->chi_area.sBasic.u32Magic);
++  /* Capture the source before rollback masks and resets the device. */
++  mtlk_ccr_print_irq_regs(hw->ccr);
+ 
+   if (_hw_type_is_gen5(hw)) {
+     ELOG_DD("Core info: LM 0x%08X, UM 0x%08X",
+@@ -12481,6 +12483,9 @@
+ static void _mtlk_hw_debug_print_ring_regs(mtlk_ring_regs *ring_regs, const char *reg_name)
+ {
+     uint32 reg_OUT_status, reg_OUT_counter, reg_IN_counter;
++    /* Firmware readiness can fail before any ring registers are assigned. */
++    if (!ring_regs->p_OUT_status || !ring_regs->p_OUT_cntr || !ring_regs->p_IN_cntr)
++      return;
+     reg_OUT_status  = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_OUT_status));
+     reg_OUT_counter = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_OUT_cntr));
+     reg_IN_counter  = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_IN_cntr));

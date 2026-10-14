@@ -1,0 +1,126 @@
+Subject: [PATCH] wave: count accepted data RX for ordinary peer statistics
+
+Keep firmware RD_COUNT separate from the host delivery count. The retained
+firmware leaves RD_COUNT zero during both AP and STA data traffic.
+
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -4104,6 +4104,7 @@
+         return MTLK_ERR_OK;
+       }
+     }
++    mtlk_sta_record_data_rx(sta);
+     mtlk_sta_on_rx_packet_802_1x(sta);  /* Count 802_1x RX packets */
+     mtlk_sta_decref(sta);               /* De-reference of find */
+   }
+@@ -7947,7 +7948,7 @@
+   if (sta) {
+     do {
+       WE_GEN_DATAEX_DEVICE_STATUS dataex_dev_status;
+-      dataex_dev_status.u32RxCount    = mtlk_sta_get_stat_cntr_rx_frames(sta);
++      dataex_dev_status.u32RxCount    = mtlk_sta_get_rx_packets(sta);
+       dataex_dev_status.u32TxCount    = mtlk_sta_get_stat_cntr_tx_frames(sta);
+ 
+       resp.datalen += sizeof(WE_GEN_DATAEX_DEVICE_STATUS);
+@@ -8344,7 +8345,7 @@
+     }
+   }
+ 
+-  mtlk_sta_record_activity(src_sta);
++  mtlk_sta_record_data_rx(src_sta);
+   ILOG5_YD("STA %Y found by SID %d", src_sta->info.addr.au8Addr, data->sid);
+ 
+   qos = data->priority;
+--- a/wireless/driver/shared/stadb.c
++++ b/wireless/driver/shared/stadb.c
+@@ -282,12 +282,24 @@
+ 
+ /******************************************************************************************/
+ 
+-/* Record observed data RX or activity confirmed by the existing firmware
+- * poll. Data-buffer completion does not contain a TX ACK result. */
++/* Activity confirmed by the existing firmware poll. Data-buffer completion
++ * does not contain a TX ACK result. */
+ void __MTLK_IFUNC
+ mtlk_sta_record_activity(sta_entry *sta)
+ {
+   mtlk_osal_lock_acquire(&sta->lock);
++  WRITE_ONCE(sta->activity_timestamp, mtlk_osal_timestamp());
++  mtlk_osal_lock_release(&sta->lock);
++}
++
++/* Called once per reassembled, SID-resolved Ethernet frame or validated
++ * EAPOL frame after the peer filter accepts it, before forwarding/delivery.
++ * Firmware RD_COUNT can stay zero on this ABI; retain it as a raw diagnostic. */
++void __MTLK_IFUNC
++mtlk_sta_record_data_rx(sta_entry *sta)
++{
++  mtlk_osal_lock_acquire(&sta->lock);
++  WRITE_ONCE(sta->rx_packets, sta->rx_packets + 1);
+   WRITE_ONCE(sta->activity_timestamp, mtlk_osal_timestamp());
+   mtlk_osal_lock_release(&sta->lock);
+ }
+@@ -311,7 +323,7 @@
+     mhi_sta_cntr_t *stat_cntrs = mtlk_sta_get_mhi_stat_array(sta);
+ 
+     stats->PacketsSent      = stat_cntrs[STAT_STA_CNTR_TX_FRAMES];
+-    stats->PacketsReceived  = stat_cntrs[STAT_STA_CNTR_RX_FRAMES];
++    stats->PacketsReceived  = mtlk_sta_get_rx_packets(sta);
+     stats->BytesSent        = stat_cntrs[STAT_STA_CNTR_TX_BYTES];
+     stats->BytesReceived    = stat_cntrs[STAT_STA_CNTR_RX_BYTES];
+ }
+@@ -1526,8 +1538,9 @@
+   return res;
+ }
+ 
+-/* The caller holds a peer reference. Statistics use the existing periodic
+- * firmware cache, not a new firmware request on each station query. */
++/* The caller holds a peer reference. TX counters and RX bytes use the
++ * existing firmware cache; accepted RX packets are counted by the host.
++ * Station queries do not issue a new firmware request. */
+ void __MTLK_IFUNC
+ mtlk_sta_fill_station_info(const sta_entry *sta, struct station_info *sinfo)
+ {
+@@ -1539,7 +1552,7 @@
+   sinfo->tx_bytes = mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_TX_BYTES);
+   sinfo->rx_bytes = mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_RX_BYTES);
+   sinfo->tx_packets = mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_TX_FRAMES);
+-  sinfo->rx_packets = mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_RX_FRAMES);
++  sinfo->rx_packets = mtlk_sta_get_rx_packets(sta);
+   sinfo->connected_time = mtlk_sta_get_age(sta);
+   sinfo->inactive_time = mtlk_sta_get_inactive_time(sta);
+ 
+--- a/wireless/driver/shared/stadb.h
++++ b/wireless/driver/shared/stadb.h
+@@ -282,6 +282,7 @@
+   u8                           hw_key_mask; /* ACK-owned pairwise slots */
+   mtlk_osal_spinlock_t         lock;
+   mtlk_osal_timestamp_t        activity_timestamp;
++  uint32                      rx_packets; /* Accepted Ethernet frames; protected by lock. */
+   mtlk_osal_timestamp_t        connection_timestamp;
+   mtlk_osal_timer_t            keepalive_timer;      // Timer for polling station
+   uint8                        peer_ap;              // Is peer AP?
+@@ -341,6 +342,14 @@
+     return mtlk_sta_get_mhi_stat_cntr(sta, STAT_STA_CNTR_RX_FRAMES);
+ }
+ 
++/* Host data RX owns this count. Firmware RD_COUNT is retained separately for
++ * raw hardware diagnostics and unassociated RSSI measurement. */
++static __INLINE uint32
++mtlk_sta_get_rx_packets(const sta_entry *sta)
++{
++    return READ_ONCE(sta->rx_packets);
++}
++
+ static __INLINE mhi_sta_cntr_t
+ mtlk_sta_get_stat_cntr_tx_bytes(const sta_entry  *sta)
+ {
+@@ -906,6 +915,8 @@
+ mtlk_stadb_get_stat(sta_db *stadb, struct _hst_db *hstdb, mtlk_clpb_t *clpb, uint8 group_cipher);
+ void __MTLK_IFUNC
+ mtlk_sta_record_activity(sta_entry *sta);
++void __MTLK_IFUNC
++mtlk_sta_record_data_rx(sta_entry *sta);
+ 
+ void __MTLK_IFUNC
+ mtlk_sta_fill_station_info(const sta_entry *sta, struct station_info *sinfo);

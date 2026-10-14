@@ -1,0 +1,620 @@
+Subject: [PATCH] wave: initialize native station BSS before admitting its peer
+
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -2493,6 +2493,12 @@
+         (res = wave_radio_ap_tx_check(radio, generation, false)) != MTLK_ERR_OK)
+       return res;
+ 
++    /* Firmware cannot change a station BSS color after adding its peer. */
++    if (!mtlk_vap_is_ap(core->vap_handle) &&
++        !mtlk_stadb_is_empty(&core->slow_ctx->stadb) &&
++        fw_params->u8HE_Bss_Color != MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_HE_BSS_COLOR))
++      return MTLK_ERR_NOT_SUPPORTED;
++
+     /* prepare msg for the FW */
+     if (!(man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(core->vap_handle), &res))) {
+       ELOG_DD("CID-%04x: UM_BSS_SET_BSS_REQ init failed, err=%i",
+@@ -2552,7 +2558,8 @@
+ 
+ /* This function should be called from master serializer context */
+ static int
+-_core_change_bss_by_params(mtlk_core_t *master_core, struct mtlk_bss_parameters *params)
++_core_change_bss_by_params(mtlk_core_t *master_core, struct mtlk_bss_parameters *params,
++                           const struct wave_sta_bss_parameters *sta_bss)
+ {
+   mtlk_core_t *core = NULL;
+   UMI_SET_BSS fw_request;
+@@ -2604,8 +2611,20 @@
+ 
+   /* Fill UMI_SET_BSS FW request */
+   _mtlk_core_fill_set_bss_request(core, &fw_request, params);
+-  if (!mtlk_vap_is_ap(core->vap_handle))
++  if (!mtlk_vap_is_ap(core->vap_handle)) {
+     fw_request.u8HE_Bss_Color = params->he_bss_color;
++    fw_request.beaconInterval = HOST_TO_MAC16(params->beacon_interval);
++    fw_request.dtimInterval = HOST_TO_MAC16(params->dtim_period);
++  }
++  if (sta_bss) {
++    BUILD_BUG_ON(sizeof(sta_bss->ht_mcs) != sizeof(fw_request.u8TX_MCS_Bitmask));
++    BUILD_BUG_ON(sizeof(sta_bss->vht_mcs) != sizeof(fw_request.u8VHT_Mcs_Nss));
++    BUILD_BUG_ON(sizeof(sta_bss->he_mcs) != sizeof(fw_request.u8HE_Mcs_Nss));
++    fw_request.flags = sta_bss->flags;
++    memcpy(fw_request.u8TX_MCS_Bitmask, sta_bss->ht_mcs, sizeof(sta_bss->ht_mcs));
++    memcpy(fw_request.u8VHT_Mcs_Nss, sta_bss->vht_mcs, sizeof(sta_bss->vht_mcs));
++    memcpy(fw_request.u8HE_Mcs_Nss, sta_bss->he_mcs, sizeof(sta_bss->he_mcs));
++  }
+ 
+   /* Process UM_BSS_SET_BSS_REQ */
+   res = mtlk_core_set_bss(core, master_core, &fw_request);
+@@ -2623,6 +2642,21 @@
+                        mtlk_vap_is_ap(core->vap_handle) && !params->ap_isolate);
+     _mtlk_core_update_bss_params(core, &fw_request, params);
+     wave_pdb_set_int(param_db_core, PARAM_DB_CORE_HE_BSS_COLOR, fw_request.u8HE_Bss_Color);
++    if (!mtlk_vap_is_ap(core->vap_handle))
++      wave_pdb_set_int(param_db_core, PARAM_DB_CORE_DTIM_PERIOD, params->dtim_period);
++    if (sta_bss) {
++      wave_pdb_set_int(param_db_core, PARAM_DB_CORE_SET_BSS_FLAGS, fw_request.flags);
++      res = wave_pdb_set_binary(param_db_core, PARAM_DB_CORE_RX_MCS_BITMASK,
++                                sta_bss->ht_mcs, sizeof(sta_bss->ht_mcs));
++      if (res == MTLK_ERR_OK)
++        res = wave_pdb_set_binary(param_db_core, PARAM_DB_CORE_VHT_MCS_NSS,
++                                  sta_bss->vht_mcs, sizeof(sta_bss->vht_mcs));
++      if (res == MTLK_ERR_OK)
++        res = wave_pdb_set_binary(param_db_core, PARAM_DB_CORE_HE_MCS_NSS,
++                                  sta_bss->he_mcs, sizeof(sta_bss->he_mcs));
++      if (res != MTLK_ERR_OK)
++        wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++    }
+   }
+ 
+ end:
+@@ -2643,7 +2677,7 @@
+ 
+   params = mtlk_clpb_enum_get_next(clpb, &params_size);
+   MTLK_CLPB_TRY(params, params_size)
+-    res = _core_change_bss_by_params(master_core, params);
++    res = _core_change_bss_by_params(master_core, params, NULL);
+   MTLK_CLPB_FINALLY(res)
+     return mtlk_clpb_push_res(clpb, res);
+   MTLK_CLPB_END;
+@@ -9675,12 +9709,10 @@
+ 
+   res = _mtlk_core_ap_add_sta_req(core, info, &add_result_known);
+   if (MTLK_ERR_OK != res) {
+-    if (info->native_sid_owned) {
+-      if (add_result_known)
+-        wave_core_release_native_sid(core, info);
+-      else
+-        wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
+-    }
++    if (!add_result_known)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++    else if (info->native_sid_owned)
++      wave_core_release_native_sid(core, info);
+     goto FINISH;
+   }
+ 
+@@ -9691,7 +9723,7 @@
+   sta = _mtlk_core_add_sta(core, addr, info);
+ 
+   if (sta == NULL) {
+-    if (core_ap_remove_sta(core, info) != MTLK_ERR_OK && info->native_sid_owned)
++    if (core_ap_remove_sta(core, info) != MTLK_ERR_OK)
+       wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
+     res = MTLK_ERR_UNKNOWN;
+     goto FINISH;
+@@ -9811,27 +9843,44 @@
+ 
+ static int _mtlk_core_ap_connect_sta (mtlk_handle_t hcore, const void* data, uint32 data_size)
+ {
+-  int res = MTLK_ERR_OK;
++  int res, *reply;
+   mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
+   mtlk_clpb_t *clpb = *(mtlk_clpb_t **) data;
+-  sta_info *info = NULL;
+-  uint32 info_size;
++  struct wave_peer_connect_request *request;
++  sta_info *info;
++  uint32 request_size;
+ 
+   MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
+-
+-  info = mtlk_clpb_enum_get_next(clpb, &info_size);
+-  MTLK_CLPB_TRY(info, info_size)
+-    if (mtlk_vap_is_ap(core->vap_handle) && !mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(core->vap_handle))) {
+-      ILOG1_D("CID-%04x: HOSTAPD STA database is not synced", mtlk_vap_get_oid(core->vap_handle));
++  request = mtlk_clpb_enum_get_next(clpb, &request_size);
++  if (!request || request_size != sizeof(*request))
++    return MTLK_ERR_PARAMS;
++
++  /* Admission cannot fail to allocate its reply after firmware owns a peer. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++
++  info = &request->peer;
++  if (mtlk_vap_is_ap(core->vap_handle)) {
++    if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(core->vap_handle)))
+       res = MTLK_ERR_NOT_READY;
+-    }
+-    else {
+-      res = _mtlk_core_ap_connect_sta_by_info(core, info);
+-    }
+-    _mtlk_core_on_peer_connect(core, info, res ? FM_STATUSCODE_FAILURE : FM_STATUSCODE_SUCCESSFUL);
+-  MTLK_CLPB_FINALLY(res)
+-    return mtlk_clpb_push_res(clpb, res);
+-  MTLK_CLPB_END
++  } else {
++    /* mac80211 publishes association BSS changes after sta_state(ASSOC).
++     * Initialize the local VAP here, before STA_ADD makes its color immutable. */
++    request->bss.params.vap_id = mtlk_vap_get_id(core->vap_handle);
++    res = _core_change_bss_by_params(mtlk_core_get_master(core),
++                                    &request->bss.params, &request->bss);
++  }
++  if (res == MTLK_ERR_OK)
++    res = _mtlk_core_ap_connect_sta_by_info(core, info);
++  _mtlk_core_on_peer_connect(core, info, res ? FM_STATUSCODE_FAILURE : FM_STATUSCODE_SUCCESSFUL);
++  *reply = res;
++  return MTLK_ERR_OK;
+ }
+ 
+ int _mtlk_send_filter_req(mtlk_core_t *core, sta_entry *sta, BOOL authorizing)
+@@ -11587,37 +11636,6 @@
+   return MTLK_ERR_OK;
+ }
+ 
+-static int
+-_mtlk_core_sta_req_bss_change (mtlk_core_t *master_core, struct mtlk_sta_bss_change_parameters *bss_change_params)
+-{
+-  struct cfg80211_chan_def *chandef = &bss_change_params->info->chanreq.oper;
+-  struct ieee80211_channel *channel = chandef->chan;
+-  struct mtlk_bss_parameters bp;
+-  unsigned long basic_rates = bss_change_params->info->basic_rates;
+-  int i, res;
+-
+-  memset(&bp, 0, sizeof(bp));
+-  bp.protection_mode = -1;
+-  bp.vap_id = bss_change_params->vap_index;
+-  bp.use_cts_prot = bss_change_params->info->use_cts_prot;
+-  bp.use_short_preamble = bss_change_params->info->use_short_preamble;
+-  bp.use_short_slot_time = bss_change_params->info->use_short_slot;
+-  bp.ap_isolate = 0;
+-  bp.ht_opmode = bss_change_params->info->ht_operation_mode;
+-  bp.p2p_ctwindow = bss_change_params->info->p2p_noa_attr.oppps_ctwindow;
+-  bp.p2p_opp_ps = 0;
+-  bp.he_bss_color = bss_change_params->info->he_bss_color.enabled ?
+-                     bss_change_params->info->he_bss_color.color : 0;
+-
+-  for_each_set_bit(i, &basic_rates, BITS_PER_LONG) {
+-    bp.basic_rates[bp.basic_rates_len++] =
+-        bss_change_params->bands[channel->band]->bitrates[i].bitrate / 5;
+-  }
+-
+-  res = _core_change_bss_by_params(master_core, &bp);
+-
+-  return res;
+-}
+ 
+ /* This function should be called from master serializer context */
+ static int
+@@ -11642,26 +11660,27 @@
+     }
+ 
+     if ((bss_change_params->changed & BSS_CHANGED_HE_BSS_COLOR) ||
++        (bss_change_params->changed & BSS_CHANGED_BEACON_INFO) ||
+         (bss_change_params->changed & BSS_CHANGED_HT) ||
+         (bss_change_params->changed & BSS_CHANGED_BASIC_RATES) ||
+         (bss_change_params->changed & BSS_CHANGED_ERP_PREAMBLE) ||
+         (bss_change_params->changed & BSS_CHANGED_ERP_SLOT) ||
+         (bss_change_params->changed & BSS_CHANGED_ERP_CTS_PROT)) {
+-      res = _mtlk_core_sta_req_bss_change(master_core, bss_change_params);
++      res = _core_change_bss_by_params(master_core, &bss_change_params->params, NULL);
+       if (res) {
+         ELOG_V("_mtlk_core_sta_change_bss failed");
+         MTLK_CLPB_EXIT(res);
+       }
+-      wv_mac80211_iface_set_initialized(mac80211, bss_change_params->vap_index);
+-    }
+-
+-    if (!wv_mac80211_iface_get_is_initialized(mac80211, bss_change_params->vap_index)) {
+-      res = _mtlk_core_sta_req_bss_change(master_core, bss_change_params);
++      wv_mac80211_iface_set_initialized(mac80211, bss_change_params->params.vap_id);
++    }
++
++    if (!wv_mac80211_iface_get_is_initialized(mac80211, bss_change_params->params.vap_id)) {
++      res = _core_change_bss_by_params(master_core, &bss_change_params->params, NULL);
+       if (res) {
+         ELOG_V("_mtlk_core_sta_change_bss failed");
+         MTLK_CLPB_EXIT(res);
+       }
+-      wv_mac80211_iface_set_initialized(mac80211, bss_change_params->vap_index);
++      wv_mac80211_iface_set_initialized(mac80211, bss_change_params->params.vap_id);
+     }
+ 
+     if (bss_change_params->changed & BSS_CHANGED_BEACON_INT) {
+@@ -11675,16 +11694,16 @@
+        * in case we have low rate, many retries, lack of PDs, etc...
+        */
+ 
+-      ILOG1_DD("Peer AP Beacon interval (Sta idx %d) has updated to: %d", bss_change_params->vap_index, bss_change_params->info->beacon_int);
++      ILOG1_DD("Peer AP Beacon interval (Sta idx %d) has updated to: %d", bss_change_params->params.vap_id, bss_change_params->beacon_interval);
+       /* store interval to be used when we get CSA from peer AP*/
+-      wv_mac80211_iface_set_beacon_interval(mac80211, bss_change_params->vap_index, bss_change_params->info->beacon_int);
+-
+-      mtlk_beacon_interval.beacon_interval = bss_change_params->info->beacon_int;
+-      mtlk_beacon_interval.vap_id = bss_change_params->vap_index;
++      wv_mac80211_iface_set_beacon_interval(mac80211, bss_change_params->params.vap_id, bss_change_params->beacon_interval);
++
++      mtlk_beacon_interval.beacon_interval = bss_change_params->beacon_interval;
++      mtlk_beacon_interval.vap_id = bss_change_params->params.vap_id;
+ 
+       res = _mtlk_beacon_man_set_beacon_interval_by_params(bss_change_params->core, &mtlk_beacon_interval);
+       if (res != MTLK_ERR_OK)
+-        ELOG_DD("Error setting peer AP beacon interval %d for VAP ID: %d ", bss_change_params->info->beacon_int, bss_change_params->vap_index);
++        ELOG_DD("Error setting peer AP beacon interval %d for VAP ID: %d ", bss_change_params->beacon_interval, bss_change_params->params.vap_id);
+     }
+ 
+     /* mac80211 recomputes its aggregate constraint before this notification. */
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -1062,6 +1062,7 @@
+   struct net_device_ops *ops;
+   mtlk_core_t *master_core;
+   struct net_device *netdev_p = NULL;
++  IEEE_ADDR master_mac;
+ 
+   ILOG1_SSD("%s: Invoked from %s (%i)", ieee80211_vif_to_wdev(vif)->netdev->name, current->comm, current->pid);
+   ILOG0_SY("Adding sta interface %s, mac addr: %Y. ",
+@@ -1091,6 +1092,12 @@
+     ELOG_V("Recovery is running, can't change configuration");
+     return -EBUSY;
+   }
++
++  /* The paired AP wiphy owns an active firmware master even in STA mode.
++   * mac80211 cannot detect that address collision across the two wiphys. */
++  MTLK_CORE_PDB_GET_MAC(master_core, PARAM_DB_CORE_MAC_ADDR, &master_mac);
++  if (ether_addr_equal(vif->addr, master_mac.au8Addr))
++    return -EADDRINUSE;
+ 
+   mbss_cfg.added_vap_name = ieee80211_vif_to_wdev(vif)->netdev->name;
+   mbss_cfg.wiphy = hw->wiphy;
+@@ -1248,31 +1255,109 @@
+   *total_flags &= FIF_OTHER_BSS | FIF_ALLMULTI;
+ }
+ 
++/* Capture the native BSS while mac80211 holds the wiphy mutex. */
++static int wv_sta_bss_params(struct ieee80211_hw *hw,
++                            const struct ieee80211_bss_conf *info, u8 vap_index,
++                            struct mtlk_bss_parameters *bp)
++{
++  struct ieee80211_supported_band *sband = NULL;
++  unsigned long basic_rates = info->basic_rates;
++  int i;
++
++  if (info->chanreq.oper.chan) {
++    if (!cfg80211_chandef_valid(&info->chanreq.oper))
++      return MTLK_ERR_PARAMS;
++    sband = hw->wiphy->bands[info->chanreq.oper.chan->band];
++  }
++  /* Initial ERP setup precedes channel selection and enables probe TX.
++   * A concrete peer channel is required only to interpret its rate bitmap. */
++  if (basic_rates && !sband)
++    return MTLK_ERR_NOT_READY;
++  memset(bp, 0, sizeof(*bp));
++  bp->protection_mode = -1;
++  bp->vap_id = vap_index;
++  bp->use_cts_prot = info->use_cts_prot;
++  bp->use_short_preamble = info->use_short_preamble;
++  bp->use_short_slot_time = info->use_short_slot;
++  bp->ht_opmode = info->ht_operation_mode;
++  bp->beacon_interval = info->beacon_int ?: DEFAULT_BEACON_INTERVAL;
++  bp->dtim_period = info->dtim_period ?: 1;
++  bp->p2p_ctwindow = info->p2p_noa_attr.oppps_ctwindow;
++  /* mac80211 can retain the last HE color on a later non-HE association. */
++  bp->he_bss_color = info->he_support && info->he_bss_color.enabled ?
++                      info->he_bss_color.color : 0;
++  for_each_set_bit(i, &basic_rates, BITS_PER_LONG) {
++    if (i >= sband->n_bitrates || bp->basic_rates_len >= ARRAY_SIZE(bp->basic_rates))
++      return MTLK_ERR_PARAMS;
++    bp->basic_rates[bp->basic_rates_len++] = sband->bitrates[i].bitrate / 5;
++  }
++  return MTLK_ERR_OK;
++}
++
+ static int wv_request_sta_connect_ap(mtlk_df_user_t *df_user,
+     struct ieee80211_hw *hw, struct ieee80211_vif *vif,
+     struct ieee80211_sta *sta, struct station_info *sinfo)
+ {
+   struct wv_vif_priv *wv_iface_inf = (struct wv_vif_priv *)vif->drv_priv;
+-  sta_info sta_info;
++  struct wave_peer_connect_request request = {0};
++  sta_info *info = &request.peer;
++  struct ieee80211_supported_band *sband;
++  const struct ieee80211_sta_he_cap *local_he;
+   mtlk_clpb_t *clpb = NULL;
+   int i = 0, band = 0, res = 0;
+ 
+   ILOG2_V("wv_request_sta_connect_ap");
+ 
+-  memset(&sta_info, 0, sizeof(sta_info));
++  if (!cfg80211_chandef_valid(&vif->bss_conf.chanreq.oper))
++    return MTLK_ERR_NOT_READY;
++  res = wv_sta_bss_params(hw, &vif->bss_conf, wv_iface_inf->vap_index,
++                          &request.bss.params);
++  if (res != MTLK_ERR_OK)
++    return res;
++  sband = hw->wiphy->bands[vif->bss_conf.chanreq.oper.chan->band];
++  if (!sband)
++    return MTLK_ERR_PARAMS;
++  memset(request.bss.vht_mcs, 0xff, sizeof(request.bss.vht_mcs));
++  memset(request.bss.he_mcs, 0xff, sizeof(request.bss.he_mcs));
++  if (sta->deflink.ht_cap.ht_supported) {
++    request.bss.flags |= MTLK_BFIELD_VALUE(VAP_ADD_FLAGS_HT, 1, uint8);
++    /* SET_BSS encodes static SMPS as 1, unlike the native enum. */
++    if (hw->conf.smps_mode == IEEE80211_SMPS_STATIC)
++      request.bss.flags |= MTLK_BFIELD_VALUE(VAP_ADD_FLAGS_SMPS, 1, uint8);
++    memcpy(request.bss.ht_mcs, sband->ht_cap.mcs.rx_mask, sizeof(request.bss.ht_mcs));
++  }
++  if (sta->deflink.vht_cap.vht_supported) {
++    BUILD_BUG_ON(sizeof(sband->vht_cap.vht_mcs) != sizeof(request.bss.vht_mcs));
++    request.bss.flags |= MTLK_BFIELD_VALUE(VAP_ADD_FLAGS_VHT, 1, uint8);
++    memcpy(request.bss.vht_mcs, &sband->vht_cap.vht_mcs, sizeof(request.bss.vht_mcs));
++  }
++  if (sta->deflink.he_cap.has_he) {
++    local_he = ieee80211_get_he_iftype_cap(sband, NL80211_IFTYPE_STATION);
++    if (!local_he || !local_he->has_he)
++      return MTLK_ERR_PARAMS;
++    request.bss.flags |= MTLK_BFIELD_VALUE(VAP_ADD_FLAGS_HE, 1, uint8);
++    memcpy(request.bss.he_mcs, &local_he->he_mcs_nss_supp.rx_mcs_80, 2);
++    memcpy(request.bss.he_mcs + 2, &local_he->he_mcs_nss_supp.tx_mcs_80, 2);
++  }
+ 
+   for (band = 0; band < NUM_SUPPORTED_BANDS; band++) {
+     unsigned long basic_rates = sta->deflink.supp_rates[band];
++    struct ieee80211_supported_band *rates_band = hw->wiphy->bands[band];
+     for_each_set_bit(i, &basic_rates, BITS_PER_LONG) {
+-      int bitrate = hw->wiphy->bands[band]->bitrates[i].bitrate / 5;
+-      sta_info.rates[sta_info.supported_rates_len++] = bitrate;
++      int bitrate;
++
++      if (!rates_band || i >= rates_band->n_bitrates ||
++          info->supported_rates_len >= ARRAY_SIZE(info->rates))
++        return MTLK_ERR_PARAMS;
++      bitrate = rates_band->bitrates[i].bitrate / 5;
++      info->rates[info->supported_rates_len++] = bitrate;
+       if (band == NL80211_BAND_5GHZ && wave_radio_is_rate_80211ag(bitrate)) {
+-        MTLK_BIT_SET(sta_info.sta_net_modes, MTLK_WSSA_11A_SUPPORTED, 1);
++        MTLK_BIT_SET(info->sta_net_modes, MTLK_WSSA_11A_SUPPORTED, 1);
+       } else if (band == NL80211_BAND_2GHZ) {
+         if (wave_radio_is_rate_80211ag(bitrate))
+-          MTLK_BIT_SET(sta_info.sta_net_modes, MTLK_WSSA_11G_SUPPORTED, 1);
++          MTLK_BIT_SET(info->sta_net_modes, MTLK_WSSA_11G_SUPPORTED, 1);
+         if (wave_radio_is_rate_80211b(bitrate)) {
+-          MTLK_BIT_SET(sta_info.sta_net_modes, MTLK_WSSA_11B_SUPPORTED, 1);
++          MTLK_BIT_SET(info->sta_net_modes, MTLK_WSSA_11B_SUPPORTED, 1);
+         }
+       }
+     }
+@@ -1280,50 +1365,50 @@
+ 
+   wv_iface_inf->latest_rx_and_tx_packets = 0;
+   wv_iface_inf->ndp_counter = 0;
+-  sta_info.sid = wv_iface_inf->vif_sid;
+-  sta_info.listen_interval = hw->max_listen_interval;
+-  sta_info.uapsd_queues = sta->uapsd_queues;
+-  sta_info.max_sp = sta->max_sp;
+-  sta_info.aid = sta->aid;
++  info->sid = wv_iface_inf->vif_sid;
++  info->listen_interval = hw->max_listen_interval;
++  info->uapsd_queues = sta->uapsd_queues;
++  info->max_sp = sta->max_sp;
++  info->aid = sta->aid;
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+   if (sinfo  && (sinfo->filled & STATION_INFO_SIGNAL)) {
+ #else
+   if (sinfo  && (sinfo->filled & BIT(NL80211_STA_INFO_SIGNAL))) {
+ #endif
+-    sta_info.rssi_dbm = sinfo->signal;
+-    mtlk_stadb_stats_set_mgmt_rssi(&sta_info, sta_info.rssi_dbm);
++    info->rssi_dbm = sinfo->signal;
++    mtlk_stadb_stats_set_mgmt_rssi(info, info->rssi_dbm);
+   } else
+-    mtlk_stadb_stats_set_mgmt_rssi(&sta_info, MIN_RSSI);
+-  mtlk_osal_copy_eth_addresses(sta_info.addr.au8Addr, sta->addr);
+-  MTLK_BFIELD_SET(sta_info.flags, STA_FLAGS_MFP, sta->mfp ? 1 : 0);
+-  MTLK_BFIELD_SET(sta_info.flags, STA_FLAGS_WMM, sta->wme ? 1 : 0);
++    mtlk_stadb_stats_set_mgmt_rssi(info, MIN_RSSI);
++  mtlk_osal_copy_eth_addresses(info->addr.au8Addr, sta->addr);
++  MTLK_BFIELD_SET(info->flags, STA_FLAGS_MFP, sta->mfp ? 1 : 0);
++  MTLK_BFIELD_SET(info->flags, STA_FLAGS_WMM, sta->wme ? 1 : 0);
+ 
+   if (sta->deflink.ht_cap.ht_supported) {
+-    if(memcmp(sta_info.rx_mcs_bitmask, sta->deflink.ht_cap.mcs.rx_mask,
+-        sizeof(sta_info.rx_mcs_bitmask)) != 0) {
+-      sta_info.ht_cap_info = MAC_TO_HOST16(sta->deflink.ht_cap.cap);
+-      sta_info.ampdu_param =
++    if(memcmp(info->rx_mcs_bitmask, sta->deflink.ht_cap.mcs.rx_mask,
++        sizeof(info->rx_mcs_bitmask)) != 0) {
++      info->ht_cap_info = HOST_TO_MAC16(sta->deflink.ht_cap.cap);
++      info->ampdu_param =
+           sta->deflink.ht_cap.ampdu_density << 2 | sta->deflink.ht_cap.ampdu_factor;
+-      MTLK_BFIELD_SET(sta_info.flags, STA_FLAGS_11n, 1);
+-      MTLK_BIT_SET(sta_info.sta_net_modes, MTLK_WSSA_11N_SUPPORTED, 1);
+-      wave_memcpy(sta_info.rx_mcs_bitmask, sizeof(sta_info.rx_mcs_bitmask),
++      MTLK_BFIELD_SET(info->flags, STA_FLAGS_11n, 1);
++      MTLK_BIT_SET(info->sta_net_modes, MTLK_WSSA_11N_SUPPORTED, 1);
++      wave_memcpy(info->rx_mcs_bitmask, sizeof(info->rx_mcs_bitmask),
+                   sta->deflink.ht_cap.mcs.rx_mask, sizeof(sta->deflink.ht_cap.mcs.rx_mask));
+     }
+   }
+ 
+   if (sta->deflink.vht_cap.vht_supported) {
+-    if(memcmp(&sta_info.vht_mcs_info, &sta->deflink.vht_cap.vht_mcs,
+-        sizeof(sta_info.vht_mcs_info)) != 0) {
+-      sta_info.vht_cap_info = MAC_TO_HOST32(sta->deflink.vht_cap.cap);
+-      MTLK_BFIELD_SET(sta_info.flags, STA_FLAGS_11ac, 1);
+-      MTLK_BIT_SET(sta_info.sta_net_modes, MTLK_WSSA_11AC_SUPPORTED, 1);
+-      wave_memcpy(&sta_info.vht_mcs_info, sizeof(sta_info.vht_mcs_info),
++    if(memcmp(&info->vht_mcs_info, &sta->deflink.vht_cap.vht_mcs,
++        sizeof(info->vht_mcs_info)) != 0) {
++      info->vht_cap_info = HOST_TO_MAC32(sta->deflink.vht_cap.cap);
++      MTLK_BFIELD_SET(info->flags, STA_FLAGS_11ac, 1);
++      MTLK_BIT_SET(info->sta_net_modes, MTLK_WSSA_11AC_SUPPORTED, 1);
++      wave_memcpy(&info->vht_mcs_info, sizeof(info->vht_mcs_info),
+                   &sta->deflink.vht_cap.vht_mcs,  sizeof(sta->deflink.vht_cap.vht_mcs));
+     }
+   }
+ 
+   if (ieee80211_vif_to_wdev(vif)->use_4addr)
+-    sta_info.WDS_client_type = FOUR_ADDRESSES_STATION;
++    info->WDS_client_type = FOUR_ADDRESSES_STATION;
+ 
+   if (sta->deflink.he_cap.has_he) {
+     const struct ieee80211_sta_he_cap *he = &sta->deflink.he_cap;
+@@ -1333,9 +1418,9 @@
+     unsigned int width;
+ 
+     BUILD_BUG_ON(sizeof(he->he_cap_elem) != 17);
+-    BUILD_BUG_ON(sizeof(peer.mac_phy) != sizeof(sta_info.he_mac_phy_cap_info));
+-    BUILD_BUG_ON(sizeof(peer.mcs) != sizeof(sta_info.he_mcs_nss_info));
+-    BUILD_BUG_ON(sizeof(peer.ppe) != sizeof(sta_info.he_ppe_th_info));
++    BUILD_BUG_ON(sizeof(peer.mac_phy) != sizeof(info->he_mac_phy_cap_info));
++    BUILD_BUG_ON(sizeof(peer.mcs) != sizeof(info->he_mcs_nss_info));
++    BUILD_BUG_ON(sizeof(peer.ppe) != sizeof(info->he_ppe_th_info));
+     memcpy(mcs, &he->he_mcs_nss_supp.rx_mcs_80, 2);
+     memcpy(mcs + 2, &he->he_mcs_nss_supp.tx_mcs_80, 2);
+     if (!vif->bss_conf.chanreq.oper.chan)
+@@ -1348,15 +1433,15 @@
+       ELOG_V("HE peer cannot be represented by retained firmware");
+       return MTLK_ERR_PARAMS;
+     }
+-    memcpy(sta_info.he_mac_phy_cap_info, peer.mac_phy, sizeof(peer.mac_phy));
+-    memcpy(sta_info.he_mcs_nss_info, peer.mcs, sizeof(peer.mcs));
+-    memcpy(sta_info.he_ppe_th_info, peer.ppe, sizeof(peer.ppe));
+-    MTLK_BFIELD_SET(sta_info.flags, STA_FLAGS_11ax, 1);
+-    MTLK_BIT_SET(sta_info.sta_net_modes, MTLK_WSSA_11AX_SUPPORTED, 1);
++    memcpy(info->he_mac_phy_cap_info, peer.mac_phy, sizeof(peer.mac_phy));
++    memcpy(info->he_mcs_nss_info, peer.mcs, sizeof(peer.mcs));
++    memcpy(info->he_ppe_th_info, peer.ppe, sizeof(peer.ppe));
++    MTLK_BFIELD_SET(info->flags, STA_FLAGS_11ax, 1);
++    MTLK_BIT_SET(info->sta_net_modes, MTLK_WSSA_11AX_SUPPORTED, 1);
+   }
+ 
+   res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user),
+-      WAVE_CORE_REQ_AP_CONNECT_STA, &clpb, &sta_info, sizeof(sta_info));
++      WAVE_CORE_REQ_AP_CONNECT_STA, &clpb, &request, sizeof(request));
+   res = _mtlk_df_user_process_core_retval(res, clpb,
+       WAVE_CORE_REQ_AP_CONNECT_STA, TRUE);
+ 
+@@ -1912,12 +1997,13 @@
+   }
+ 
+   memset(&bss_change_params, 0, sizeof(bss_change_params));
+-  bss_change_params.vif_name = ieee80211_vif_to_wdev(vif)->netdev->name;
+-  bss_change_params.bands = hw->wiphy->bands;
++  res = wv_sta_bss_params(hw, info, wv_iface_inf->vap_index,
++                          &bss_change_params.params);
++  if (res != MTLK_ERR_OK)
++    goto failed;
+   bss_change_params.core = core;
+-  bss_change_params.info = info;
++  bss_change_params.beacon_interval = info->beacon_int;
+   bss_change_params.changed = changed;
+-  bss_change_params.vap_index = wv_iface_inf->vap_index;
+ 
+   /* Keep trying in case scan is in progress for the current radio */
+   {
+@@ -1938,8 +2024,10 @@
+       ILOG0_SD("%s: Scan waited, number of retries %d", ieee80211_vif_to_wdev(vif)->netdev->name, retry_counter);
+   }
+ 
+-  if (res != MTLK_ERR_OK && (core->is_stopped || !wave_hw_mmb_ready(mtlk_vap_get_hw(vap_handle)))) {
+-    wv_iface_inf->is_initialized = FALSE;
++failed:
++  if (res != MTLK_ERR_OK) {
++    if (core->is_stopped || !wave_hw_mmb_ready(mtlk_vap_get_hw(vap_handle)))
++      wv_iface_inf->is_initialized = FALSE;
+     wv_iface_inf->vap_stopped = core->is_stopped;
+     wv_iface_inf->stop_pending = true;
+     wiphy_work_queue(hw->wiphy, &wv_iface_inf->stop_work);
+--- a/wireless/driver/linux/mac80211.h
++++ b/wireless/driver/linux/mac80211.h
+@@ -15,6 +15,12 @@
+ #include <linux/netdevice.h>
+ #include "mtlk_df_user_priv.h"
+ #include "mtlk_coreui.h"
++#include "stadb.h"
++
++struct wave_peer_connect_request {
++  sta_info peer;
++  struct wave_sta_bss_parameters bss; /* Used only by a station VAP. */
++};
+ 
+ 
+ typedef struct _wv_mac80211_t wv_mac80211_t;
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2590,7 +2590,7 @@
+ {
+   int res = MTLK_ERR_OK;
+   mtlk_clpb_t *clpb = NULL;
+-  sta_info info;
++  struct wave_peer_connect_request request = {0};
+   mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
+ 
+   MTLK_ASSERT(NULL != radio);
+@@ -2604,13 +2604,13 @@
+     goto finish;
+   }
+ 
+-  res = _wave_radio_sta_param_process(ndev, mac, params, &info);
++  res = _wave_radio_sta_param_process(ndev, mac, params, &request.peer);
+   if (MTLK_ERR_OK != res) {
+     ELOG_SD("%s: Station parameters unavailable or invalid (%d)", ndev->name, res);
+     goto finish;
+   }
+ 
+-  res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user), WAVE_CORE_REQ_AP_CONNECT_STA, &clpb, &info, sizeof(info));
++  res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user), WAVE_CORE_REQ_AP_CONNECT_STA, &clpb, &request, sizeof(request));
+   res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_AP_CONNECT_STA, TRUE);
+ 
+ finish:
+--- a/wireless/driver/shared/mtlk_coreui.h
++++ b/wireless/driver/shared/mtlk_coreui.h
+@@ -1708,16 +1708,26 @@
+   u8 basic_rates_len;
+   s8 p2p_ctwindow, p2p_opp_ps;
+   u8 he_bss_color;
++  u16 beacon_interval;
++  u8 dtim_period;
++};
++
++/* Local VAP capabilities, distinct from the remote peer in STA_ADD. */
++struct wave_sta_bss_parameters
++{
++  struct mtlk_bss_parameters params;
++  u8 flags;
++  u8 ht_mcs[10];
++  u8 vht_mcs[8];
++  u8 he_mcs[8];
+ };
+ 
+ struct mtlk_sta_bss_change_parameters
+ {
+-  const char *vif_name;
+-  struct ieee80211_supported_band **bands;
+   mtlk_core_t *core;
+-  struct ieee80211_bss_conf *info;
++  struct mtlk_bss_parameters params;
+   u64 changed;
+-  u8 vap_index;
++  u16 beacon_interval;
+ };
+ 
+ /* mimic cfg80211_match_set with ours */

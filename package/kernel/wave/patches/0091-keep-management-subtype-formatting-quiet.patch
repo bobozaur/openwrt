@@ -1,0 +1,23 @@
+Subject: [PATCH] wave: keep management subtype formatting free of logging
+
+cfg80211 supplies a complete registration bitmap, including clear bits for
+unnamed subtypes. The formatter emitted four level-zero diagnostics on each
+normal bitmap update. Return its fallback name without that side effect.
+Keep all registration/filter updates and existing level-one tracing intact.
+
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -3008,9 +3008,10 @@
+     case IEEE80211_STYPE_ACTION:
+       return "ACTION";
+     default:
+-      ILOG0_D("Unknown type 0x%04X", (uint32)frame_type);
+-  }
+-  return "Unknown type";
++      /* Full registration bitmaps also clear unnamed subtypes. Formatting
++       * those routine updates must not emit a level-zero diagnostic. */
++      return "Unknown type";
++  }
+ }
+ 
+ void wave_radio_mgmt_frame_register(

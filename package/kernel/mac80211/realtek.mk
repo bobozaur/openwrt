@@ -234,8 +234,10 @@ define KernelPackage/rtw88
   $(call KernelPackage/mac80211/Default)
   TITLE:=Realtek RTW88 common part
   DEPENDS+= +kmod-mac80211
+  ABI_VERSION:=$(PKG_VERSION)-$(PKG_RELEASE)
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/realtek/rtw88/rtw88_core.ko
   AUTOLOAD:=$(call AutoProbe,rtw88_core)
+  MODPARAMS:=usb_sw_crypto=1
   HIDDEN:=1
 endef
 

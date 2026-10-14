@@ -1,0 +1,42 @@
+Subject: [PATCH] use current Kbuild source paths and compiler flags
+
+--- a/Makefile.am.module_helper
++++ b/Makefile.am.module_helper
+@@ -1,11 +1,5 @@
+ # $Id$
+ 
+-.PRECIOUS: $(abs_builddir)%.c
+-
+-# Rule for repository sources
+-$(abs_builddir)%.c:: $(abs_top_srcdir)%.c
+-	@mkdir -p `dirname $@`
+-	@ln -s $< $@
+ 
+ ifeq ($(mtlk_build_kernel_library),y)
+  binary_name := driver_lib
+@@ -24,11 +18,23 @@
+ rebased_list := $(abspath $(addprefix $(abs_srcdir)/, $(orig_list)))
+ rebased_list := $(subst $(abspath $(abs_top_srcdir))/,, $(rebased_list) )
+ 
++# Kbuild 6.18 names external-module objects relative to the module directory.
++# Use static source prerequisites: a generic %.c pattern would strip the
++# target directory before substituting the absolute source path.
++source_links := $(filter-out %drv_info.c,$(rebased_list:.o=.c))
++$(source_links): %.c: $(abs_top_srcdir)%.c
++	@mkdir -p $(dir $@)
++	@ln -sf $< $@
++.PRECIOUS: $(source_links)
++
+ $(orig_list_var) := $(rebased_list) $($(binary_name)-libs)
+ 
+ 
+-$(abs_builddir)$(filter %logmacro_database.o, $($(orig_list_var))): \
+-    $(addprefix $(abs_builddir), $(filter-out %logmacro_database.o, $(filter-out /%, $($(orig_list_var))))) \
++$(filter %logmacro_database.o, $($(orig_list_var))): \
++    $(filter-out %logmacro_database.o, $(filter-out /%, $($(orig_list_var)))) \
+     $(filter-out %logmacro_database.o, $(filter /%, $($(orig_list_var))))
+ 
+ EXTRA_CFLAGS := -I$(abs_builddir) -I$(abs_srcdir) $(EXTRA_CFLAGS) $(MTLK_KERNEL_CFLAGS)
++
++# EXTRA_CFLAGS is no longer consumed by current Kbuild.
++ccflags-y += $(EXTRA_CFLAGS)

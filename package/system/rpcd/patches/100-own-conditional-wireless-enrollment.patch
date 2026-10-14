@@ -1,0 +1,341 @@
+--- a/uci.c
++++ b/uci.c
+@@ -18,6 +18,9 @@
+ 
+ #include <libgen.h>
+ #include <glob.h>
++#include <ctype.h>
++#include <errno.h>
++#include <sys/stat.h>
+ 
+ #include <libubox/blobmsg.h>
+ #include <libubox/blobmsg_json.h>
+@@ -1320,6 +1323,320 @@
+ 	free(pkg);
+ }
+ 
++/* WPS persists one selected native credential. This local-only operation owns
++ * the entire pending-edit/Apply/snapshot check and commit; callers must never
++ * emulate it with separate get/set/commit calls. */
++enum {
++	WPS_SECTION, WPS_DEVICE, WPS_EXPECTED, WPS_EXPECTED_DEVICE,
++	WPS_VALUES, WPS_SESSION, __WPS_MAX,
++};
++
++static const struct blobmsg_policy rpc_wps_policy[__WPS_MAX] = {
++	[WPS_SECTION] = { .name = "section", .type = BLOBMSG_TYPE_STRING },
++	[WPS_DEVICE] = { .name = "device", .type = BLOBMSG_TYPE_STRING },
++	[WPS_EXPECTED] = { .name = "expected", .type = BLOBMSG_TYPE_TABLE },
++	[WPS_EXPECTED_DEVICE] = { .name = "expected_device", .type = BLOBMSG_TYPE_TABLE },
++	[WPS_VALUES] = { .name = "values", .type = BLOBMSG_TYPE_TABLE },
++	[WPS_SESSION] = { .name = "ubus_rpc_session", .type = BLOBMSG_TYPE_STRING },
++};
++
++static struct blob_attr *rpc_wps_field(struct blob_attr *table, const char *name)
++{
++	struct blob_attr *a;
++	int rem;
++	if (!table)
++		return NULL;
++	blobmsg_for_each_attr(a, table, rem)
++		if (!strcmp(blobmsg_name(a), name))
++			return a;
++	return NULL;
++}
++
++static bool rpc_wps_string(struct blob_attr *a)
++{
++	return a && blobmsg_type(a) == BLOBMSG_TYPE_STRING &&
++		blobmsg_data_len(a) == strlen(blobmsg_get_string(a)) + 1;
++}
++
++static bool rpc_wps_option(struct uci_context *c, struct uci_section *s,
++			   const char *name, struct blob_attr *value)
++{
++	struct uci_option *o = uci_lookup_option(c, s, name);
++	struct uci_element *e;
++	struct blob_attr *a;
++	int rem;
++	if (!value || blobmsg_type(value) == BLOBMSG_TYPE_UNSPEC)
++		return !o;
++	if (!o)
++		return false;
++	if (o->type == UCI_TYPE_STRING)
++		return rpc_wps_string(value) && !strcmp(o->v.string, blobmsg_get_string(value));
++	if (blobmsg_type(value) != BLOBMSG_TYPE_ARRAY)
++		return false;
++	e = list_to_element(o->v.list.next);
++	blobmsg_for_each_attr(a, value, rem) {
++		if (&e->list == &o->v.list || !rpc_wps_string(a) || strcmp(e->name, blobmsg_get_string(a)))
++			return false;
++		e = list_to_element(e->list.next);
++	}
++	return &e->list == &o->v.list;
++}
++
++static bool rpc_wps_section(struct uci_context *c, struct uci_section *s,
++			    struct blob_attr *expected, struct blob_attr *values)
++{
++	struct uci_element *e;
++	struct blob_attr *a, *want;
++	int rem;
++	if (!s)
++		return false;
++	a = rpc_wps_field(expected, ".type");
++	if (!rpc_wps_string(a) || strcmp(s->type, blobmsg_get_string(a)))
++		return false;
++	uci_foreach_element(&s->options, e) {
++		want = rpc_wps_field(values, e->name);
++		if (!want)
++			want = rpc_wps_field(expected, e->name);
++		if (!rpc_wps_option(c, s, e->name, want))
++			return false;
++	}
++	blobmsg_for_each_attr(a, expected, rem) {
++		if (blobmsg_name(a)[0] == '.')
++			continue;
++		want = rpc_wps_field(values, blobmsg_name(a));
++		if (!rpc_wps_option(c, s, blobmsg_name(a), want ? want : a))
++			return false;
++	}
++	if (values)
++		blobmsg_for_each_attr(a, values, rem)
++			if (!rpc_wps_option(c, s, blobmsg_name(a), a))
++				return false;
++	return true;
++}
++
++static bool rpc_wps_pending(void)
++{
++	glob_t gl = { 0 };
++	struct stat st;
++	size_t i;
++	int rv;
++	/* Package save/commit ownership is held, and rpcd session mutations cannot
++	 * interleave with this synchronous handler. Unknown errors fail closed. */
++	/* A secondary configuration is owned by its runtime producer. Persisting
++	 * /etc/config while that override is active would not update running UCI. */
++	if (!lstat(UCI_CONF2DIR "/wireless", &st) || errno != ENOENT)
++		return true;
++	if (!stat("/tmp/.uci/wireless", &st)) {
++		if (st.st_size)
++			return true;
++	} else if (errno != ENOENT) {
++		return true;
++	}
++	rv = glob(RPC_UCI_SAVEDIR_PREFIX "*/wireless", 0, NULL, &gl);
++	if (rv != 0 && rv != GLOB_NOMATCH) {
++		globfree(&gl);
++		return true;
++	}
++	for (i = 0; i < gl.gl_pathc; i++) {
++		if (stat(gl.gl_pathv[i], &st) || st.st_size) {
++			globfree(&gl);
++			return true;
++		}
++	}
++	globfree(&gl);
++	return false;
++}
++
++static bool rpc_wps_device(struct uci_context *c, struct uci_section *s,
++			   const char *device)
++{
++	struct uci_option *o = uci_lookup_option(c, s, "device");
++	struct uci_element *e;
++
++	if (!o)
++		return false;
++	if (o->type == UCI_TYPE_STRING)
++		return !strcmp(o->v.string, device);
++	if (o->type != UCI_TYPE_LIST || uci_list_empty(&o->v.list))
++		return false;
++	/* netifd accepts a radio list. This operation owns exactly one radio;
++	 * multi-radio interfaces need a different owner and are unsupported. */
++	e = list_to_element(o->v.list.next);
++	return e->list.next == &o->v.list && !strcmp(e->name, device);
++}
++
++static bool rpc_wps_encryption(const char *encryption)
++{
++	static const char * const modes[] = {
++		"psk", "psk2", "psk-mixed", "sae", "sae-mixed",
++	};
++	static const char * const ciphers[] = {
++		"tkip", "ccmp", "gcmp", "ccmp256", "gcmp256", "tkip+ccmp",
++	};
++	const char *cipher = strchr(encryption, '+');
++	size_t len;
++	int i;
++
++	if (!strcmp(encryption, "none"))
++		return true;
++	if (!cipher)
++		return false;
++	len = cipher++ - encryption;
++	for (i = 0; i < ARRAY_SIZE(modes); i++)
++		if (strlen(modes[i]) == len && !strncmp(encryption, modes[i], len))
++			break;
++	if (i == ARRAY_SIZE(modes) ||
++	    (!strncmp(encryption, "sae", 3) && !strncmp(cipher, "tkip", 4)))
++		return false;
++	for (i = 0; i < ARRAY_SIZE(ciphers); i++)
++		if (!strcmp(cipher, ciphers[i]))
++			return true;
++	return false;
++}
++
++static bool rpc_wps_values(struct blob_attr *values)
++{
++	struct blob_attr *a, *ssid, *enc, *key, *pmf;
++	const char *encryption, *secret;
++	int rem, i;
++	ssid = rpc_wps_field(values, "ssid");
++	enc = rpc_wps_field(values, "encryption");
++	key = rpc_wps_field(values, "key");
++	pmf = rpc_wps_field(values, "ieee80211w");
++	if (!rpc_wps_string(ssid) || strlen(blobmsg_get_string(ssid)) < 1 ||
++	    strlen(blobmsg_get_string(ssid)) > 32 || !rpc_wps_string(enc) ||
++	    !rpc_wps_string(pmf))
++		return false;
++	encryption = blobmsg_get_string(enc);
++	if (!rpc_wps_encryption(encryption) || strlen(blobmsg_get_string(pmf)) != 1 ||
++	    blobmsg_get_string(pmf)[0] < '0' || blobmsg_get_string(pmf)[0] > '2')
++		return false;
++	if (!strcmp(encryption, "none")) {
++		if (!key || blobmsg_type(key) != BLOBMSG_TYPE_UNSPEC)
++			return false;
++	} else {
++		if (!rpc_wps_string(key))
++			return false;
++		secret = blobmsg_get_string(key);
++		if (strlen(secret) < 8 || strlen(secret) > 64)
++			return false;
++		if (strlen(secret) == 64)
++			for (i = 0; i < 64; i++)
++				if (!isxdigit((unsigned char)secret[i]))
++					return false;
++	}
++	blobmsg_for_each_attr(a, values, rem) {
++		const char *name = blobmsg_name(a);
++		if (!strcmp(name, "sae_password")) {
++			if (blobmsg_type(a) != BLOBMSG_TYPE_UNSPEC)
++				return false;
++		} else if (strcmp(name, "ssid") && strcmp(name, "encryption") &&
++			   strcmp(name, "key") && strcmp(name, "ieee80211w")) {
++			return false;
++		}
++	}
++	return true;
++}
++
++static int rpc_uci_wireless_enroll(struct ubus_context *bus, struct ubus_object *obj,
++		struct ubus_request_data *req, const char *method, struct blob_attr *msg)
++{
++	struct blob_attr *tb[__WPS_MAX], *a;
++	struct uci_context *c = NULL;
++	struct uci_package *p = NULL;
++	struct uci_section *s, *device;
++	struct uci_element *e, *tmp;
++	const char *status = "conflict";
++	int rv = UBUS_STATUS_UNKNOWN_ERROR, rem, err;
++	bool saved = false;
++
++	blobmsg_parse(rpc_wps_policy, __WPS_MAX, tb, blob_data(msg), blob_len(msg));
++	/* Native local owners use the socket's authority. Do not expose a bypass
++	 * of session delta/rollback semantics through the HTTP RPC interface. */
++	if (tb[WPS_SESSION])
++		return UBUS_STATUS_PERMISSION_DENIED;
++	if (!rpc_wps_string(tb[WPS_SECTION]) || !rpc_wps_string(tb[WPS_DEVICE]) ||
++	    !tb[WPS_EXPECTED] || !tb[WPS_EXPECTED_DEVICE] || !tb[WPS_VALUES] ||
++	    !rpc_wps_values(tb[WPS_VALUES]))
++		return UBUS_STATUS_INVALID_ARGUMENT;
++	if (apply_sid[0]) {
++		status = "busy";
++		goto reply;
++	}
++	c = uci_alloc_context();
++	if (!c)
++		return UBUS_STATUS_UNKNOWN_ERROR;
++	/* Committed-only cursor: never import or consume another writer's deltas. */
++	uci_foreach_element_safe(&c->delta_path, tmp, e) {
++		free(e->name);
++		free(e);
++	}
++	c->delta_path.next = c->delta_path.prev = &c->delta_path;
++	if (uci_set_conf2dir(c, NULL))
++		goto out;
++	/* Acquire before the first load: a normal load itself takes a shared flock.
++	 * This one-attempt operation cannot stall rpcd behind another owner. */
++	err = uci_trylock(c, "wireless");
++	if (err == UCI_ERR_BUSY) {
++		status = "busy";
++		goto reply;
++	}
++	if (err)
++		goto out;
++	if (rpc_wps_pending()) {
++		status = "busy";
++		goto reply;
++	}
++	if (uci_load(c, "wireless", &p))
++		goto out;
++	s = uci_lookup_section(c, p, blobmsg_get_string(tb[WPS_SECTION]));
++	device = uci_lookup_section(c, p, blobmsg_get_string(tb[WPS_DEVICE]));
++	if (!s || strcmp(s->type, "wifi-iface") || !device ||
++	    strcmp(device->type, "wifi-device") ||
++	    !uci_lookup_option_string(c, s, "mode") ||
++	    strcmp(uci_lookup_option_string(c, s, "mode"), "sta") ||
++	    !rpc_wps_device(c, s, device->e.name) ||
++	    !rpc_wps_section(c, device, tb[WPS_EXPECTED_DEVICE], NULL))
++		goto reply;
++	/* Exact desired state may follow a lost reply or post-rename sync failure.
++	 * Rewrite it durably and notify the normal reload owner before saved. */
++	if (!rpc_wps_section(c, s, tb[WPS_EXPECTED], tb[WPS_VALUES]) &&
++	    !rpc_wps_section(c, s, tb[WPS_EXPECTED], NULL))
++		goto reply;
++	p->has_delta = false;
++	blobmsg_for_each_attr(a, tb[WPS_VALUES], rem) {
++		struct uci_ptr ptr = { .p = p, .s = s, .package = p->e.name,
++			.section = s->e.name, .option = blobmsg_name(a) };
++		if (blobmsg_type(a) == BLOBMSG_TYPE_UNSPEC) {
++			if (uci_lookup_option(c, s, ptr.option) && uci_delete(c, &ptr))
++				goto out;
++		} else {
++			ptr.value = blobmsg_get_string(a);
++			if (uci_set(c, &ptr))
++				goto out;
++		}
++	}
++	if (uci_commit(c, &p, true))
++		goto out;
++	status = "saved";
++	saved = true;
++reply:
++	if (c) {
++		uci_free_context(c);
++		c = NULL;
++	}
++	if (saved)
++		rpc_uci_trigger_event(bus, "wireless");
++	blob_buf_init(&buf, 0);
++	blobmsg_add_string(&buf, "status", status);
++	ubus_send_reply(bus, req, buf.head);
++	rv = 0;
++out:
++	if (c)
++		uci_free_context(c);
++	return rv;
++}
++
+ static int
+ rpc_uci_revert_commit(struct ubus_context *ctx, struct blob_attr *msg, bool commit)
+ {
+@@ -1777,6 +2094,7 @@
+ 		UBUS_METHOD("changes",  rpc_uci_changes,  rpc_uci_config_policy),
+ 		UBUS_METHOD("revert",   rpc_uci_revert,   rpc_uci_config_policy),
+ 		UBUS_METHOD("commit",   rpc_uci_commit,   rpc_uci_config_policy),
++		UBUS_METHOD("wireless_enroll", rpc_uci_wireless_enroll, rpc_wps_policy),
+ 		UBUS_METHOD("apply",    rpc_uci_apply,    rpc_uci_apply_policy),
+ 		UBUS_METHOD("confirm",  rpc_uci_confirm,  rpc_uci_rollback_policy),
+ 		UBUS_METHOD("rollback", rpc_uci_rollback, rpc_uci_rollback_policy),

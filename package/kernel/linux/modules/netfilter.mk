@@ -206,6 +206,7 @@ $(eval $(call KernelPackage,nf-nat6))
 
 
 define KernelPackage/nf-flow
+  VERSION:=$(subst -rc,_rc,$(LINUX_VERSION))-r4
   SUBMENU:=$(NF_MENU)
   TITLE:=Netfilter flowtable support
   KCONFIG:= \
@@ -1379,6 +1380,7 @@ $(eval $(call KernelPackage,nft-nat))
 
 
 define KernelPackage/nft-offload
+  VERSION:=$(subst -rc,_rc,$(LINUX_VERSION))-r4
   SUBMENU:=$(NF_MENU)
   TITLE:=Netfilter nf_tables routing/NAT offload support
   DEPENDS:=@IPV6 +kmod-nf-flow +kmod-nft-nat

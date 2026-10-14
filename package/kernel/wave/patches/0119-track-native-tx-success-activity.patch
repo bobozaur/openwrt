@@ -1,0 +1,188 @@
+From: OpenWrt WAVE maintainers
+Subject: [PATCH] wave: account native TX success in station inactivity
+
+Use the optional A0 per-client success counter from confirmed MHI snapshots
+as an activity source for stations that only receive DATA. Reuse the existing
+SID incarnation and DMA publication fence, and timestamp each successful
+snapshot once so a cached getter cannot make an idle station appear active.
+
+Each station establishes a first-snapshot baseline after admission or recovery.
+Failed refreshes, repeated samples and decreasing/reset counters never refresh
+activity. Keep newer RX or explicit poll activity. Counter wrap is handled
+conservatively by rebaselining for that interval.
+
+This adds poll-resolution inactivity accounting only. It does not convert
+retried frames into retry attempts, add per-packet ACK status, or change the
+NO_DATA_TX_STATUS capability.
+
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -237,6 +237,10 @@
+   uint16                db_size;    /* data size */
+   uint16                tab_size;   /* table size in bytes or entries */
+   uint64                sta_generation; /* Last confirmed snapshot incarnation. */
++  uint64                sample_serial; /* Successful MAC snapshots only. */
++  mtlk_osal_timestamp_t  sample_time; /* Request time, not cache-consumption time. */
++  mhi_stats_offs_t       tx_success_offs;
++  uint16                tx_success_sids; /* Zero if this optional A0 table is absent. */
+ 
+   mtlk_hw_tx_power_t    tx_power[WAVE_CARD_RADIO_NUM_MAX];   /* min/max Tx power per BW and pw_size */
+ 
+@@ -6214,6 +6218,7 @@
+     UMI_GET_STATISTICS_DATA *req;
+     hw_mhi_stats_t          *mhi_stats;
+     uint32                   dma_addr;
++    mtlk_osal_timestamp_t     sample_time;
+     int                      res = MTLK_ERR_UNKNOWN;
+ 
+     /* prepare msg for the FW */
+@@ -6225,6 +6230,7 @@
+     mhi_stats = &hw->hw_mhi_stats;
+     /* Serialize the shared DMA buffer and peer incarnation publication. */
+     mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
++    sample_time = mtlk_osal_timestamp();
+ 
+     dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+                                           mhi_stats->db_data,
+@@ -6260,6 +6266,9 @@
+         mtlk_dump(3, mhi_stats->db_copy, MIN(32, mhi_stats->db_size), "dump of MHI statistics");
+ 
+         mhi_stats->sta_generation = hw->stats_generation;
++        if (++mhi_stats->sample_serial == 0)
++            ++mhi_stats->sample_serial;
++        mhi_stats->sample_time = sample_time;
+ 
+         /* Update HW related statistics */
+         _mtlk_hw_mhi_update_hw_stats(hw, mhi_stats);
+@@ -6331,6 +6340,7 @@
+     int                  res = MTLK_ERR_NOT_SUPPORTED;
+ 
+     mhi_stats = &hw->hw_mhi_stats;
++    mhi_stats->tx_success_sids = 0;
+     total = mhi_stats->db_size; /* total data size */
+     num   = mhi_stats->tab_size / sizeof(StatsEntryDecoded_t);
+     if (mhi_stats->tab_size != (num * sizeof(StatsEntryDecoded_t))) {
+@@ -6370,12 +6380,27 @@
+             entry->nextIdxOffset,
+             size);
+ 
+-        subtype++;
+         next = entry->offset + size;
+         if (next > total) {
+             ELOG_DDDDD("[%4d: %3d] (offs %d + size %d) > (total %d)", entry_offs, i, entry->offset, size, total);
+             goto finish; /* error */
+         }
++
++        /* Use the native success counter only with the matched A0 layout.
++         * Do not make this optional activity source a requirement for other
++         * firmware statistics ABIs or derive it from ordinary DATA CFM. */
++        if (_chipid_is_gen6_a0(hw->ccr->chip_info->id) &&
++            entry->type == STATISTIC_TYPE_PER_CLIENT_TRANSMIT_COUNT &&
++            subtype == PCT_STATISTICS_SUCCESS_COUNT &&
++            entry->unitSize == sizeof(uint32) && entry->numOfDimensions == 1 &&
++            entry->dimension1 && entry->dimension2 == 1 &&
++            !(entry->offset & (sizeof(uint32) - 1)) &&
++            (!entry->nextIdxOffset || entry->nextIdxOffset == sizeof(uint32))) {
++            mhi_stats->tx_success_offs.start_offset = entry->offset;
++            mhi_stats->tx_success_offs.next_idx_offs = sizeof(uint32);
++            mhi_stats->tx_success_sids = entry->dimension1;
++        }
++        subtype++;
+     }
+ 
+     /* Check for HW power table sizes and fill offset's table */
+@@ -6675,6 +6700,7 @@
+   uint8             *db_data = hw->hw_mhi_stats.db_copy;
+   mhi_stats_offs_t  *offsets = hw->hw_mhi_stats.stats_sta_offs_table;
+   mhi_stats_offs_t  *tx_time_offs = &hw->hw_mhi_stats.tx_time_offs;
++  hw_mhi_stats_t    *mhi_stats = &hw->hw_mhi_stats;
+ 
+   sta_sid = mtlk_sta_get_sid(sta);
+ 
+@@ -6702,6 +6728,17 @@
+     hw_cntr = (void *)hw->hw_mhi_stats.db_copy + db_offs;
+     WRITE_ONCE(values[i], MHI_STATS_STA_CNTR_TO_HOST(*hw_cntr));
+     ILOG3_DDD("[%2d] offs %4d, val %d", i, db_offs, values[i]);
++  }
++
++  /* Caller holds the statistics mutex and has admitted this exact SID
++   * incarnation against the successfully published MAC snapshot. */
++  if (sta_sid < mhi_stats->tx_success_sids) {
++    db_offs = mhi_stats->tx_success_offs.start_offset +
++              sta_sid * mhi_stats->tx_success_offs.next_idx_offs;
++    hw_cntr = (void *)db_data + db_offs;
++    mtlk_sta_record_tx_success(sta, sta->info.stats_generation,
++                              mhi_stats->sample_serial, MAC_TO_HOST32(*hw_cntr),
++                              mhi_stats->sample_time);
+   }
+ 
+   delta_bytes = (values[STAT_STA_CNTR_RX_BYTES] - rx_bytes) + (values[STAT_STA_CNTR_TX_BYTES] - tx_bytes);
+@@ -7090,6 +7127,7 @@
+     mtlk_osal_lock_acquire(&hw->hw_mhi_stats.lock);
+     memset(hw->sta_stats_generation, 0, sizeof(hw->sta_stats_generation));
+     hw->hw_mhi_stats.sta_generation = 0;
++    hw->hw_mhi_stats.sample_time = 0; /* Keep serial monotonic across recovery. */
+     memset(hw->hw_mhi_stats.db_copy, 0, hw->hw_mhi_stats.db_size);
+     hw->phy_rx_status.sta_generation = 0;
+     hw->phy_rx_status.valid = FALSE;
+--- a/wireless/driver/shared/stadb.c
++++ b/wireless/driver/shared/stadb.c
+@@ -302,6 +302,35 @@
+   mtlk_osal_lock_acquire(&sta->lock);
+   WRITE_ONCE(sta->rx_packets, sta->rx_packets + 1);
+   WRITE_ONCE(sta->activity_timestamp, mtlk_osal_timestamp());
++  mtlk_osal_lock_release(&sta->lock);
++}
++
++/* A successful native counter sample may confirm TX-only activity. The first
++ * sample of each confirmed SID incarnation establishes a baseline; cached
++ * rereads, failures and counter decreases cannot manufacture activity. A
++ * decrease (including wrap) is conservatively rebaselined for one interval.
++ * This is a poll-resolution activity observation, not per-packet TX status. */
++void __MTLK_IFUNC
++mtlk_sta_record_tx_success(sta_entry *sta, uint64 generation, uint64 sample,
++                          uint32 count, mtlk_osal_timestamp_t sample_time)
++{
++  if (!generation || !sample)
++    return;
++
++  mtlk_osal_lock_acquire(&sta->lock);
++  if (sta->tx_success_generation == generation &&
++      sta->tx_success_sample == sample)
++    goto out;
++
++  if (sta->tx_success_generation == generation &&
++      count > sta->tx_success_count &&
++      mtlk_osal_time_after(sample_time, sta->activity_timestamp))
++    WRITE_ONCE(sta->activity_timestamp, sample_time);
++
++  sta->tx_success_generation = generation;
++  sta->tx_success_sample = sample;
++  sta->tx_success_count = count;
++out:
+   mtlk_osal_lock_release(&sta->lock);
+ }
+ 
+--- a/wireless/driver/shared/stadb.h
++++ b/wireless/driver/shared/stadb.h
+@@ -288,6 +288,10 @@
+   u8                           hw_key_mask; /* ACK-owned pairwise slots */
+   mtlk_osal_spinlock_t         lock;
+   mtlk_osal_timestamp_t        activity_timestamp;
++  /* Native TX-success baseline; all three fields are protected by lock. */
++  uint64                      tx_success_generation;
++  uint64                      tx_success_sample;
++  uint32                      tx_success_count;
+   uint32                      rx_packets; /* Accepted Ethernet frames; protected by lock. */
+   mtlk_osal_timestamp_t        connection_timestamp;
+   mtlk_osal_timer_t            keepalive_timer;      // Timer for polling station
+@@ -923,6 +927,9 @@
+ mtlk_sta_record_activity(sta_entry *sta);
+ void __MTLK_IFUNC
+ mtlk_sta_record_data_rx(sta_entry *sta);
++void __MTLK_IFUNC
++mtlk_sta_record_tx_success(sta_entry *sta, uint64 generation, uint64 sample,
++                          uint32 count, mtlk_osal_timestamp_t sample_time);
+ 
+ void __MTLK_IFUNC
+ mtlk_sta_fill_station_info(const sta_entry *sta, struct station_info *sinfo);

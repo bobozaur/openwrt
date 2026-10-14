@@ -1,0 +1,42 @@
+--- a/drivers/mtd/nand/raw/Makefile
++++ b/drivers/mtd/nand/raw/Makefile
+@@ -71,3 +71,5 @@
+ nand-objs += nand_sandisk.o
+ nand-objs += nand_samsung.o
+ nand-objs += nand_toshiba.o
++
++obj-$(CONFIG_MTD_NAND_GRX500) += grx500-nand.o
+--- a/drivers/mtd/nand/raw/Kconfig
++++ b/drivers/mtd/nand/raw/Kconfig
+@@ -538,3 +538,10 @@
+ 	  parameter "inftl_bbt_write=1".
+ 
+ endif # MTD_RAW_NAND
++
++config MTD_NAND_GRX500
++	bool "Lantiq GRX500 EBU NAND controller"
++	depends on MTD_RAW_NAND && MACH_GRX500 && OF
++	select MTD_NAND_ECC_SW_BCH
++	help
++	  GRX500 EBU NAND with the factory BCH4/512 OOB layout.
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -217,3 +217,5 @@
+ obj-$(CONFIG_GPIO_ZEVIO)		+= gpio-zevio.o
+ obj-$(CONFIG_GPIO_ZYNQ)			+= gpio-zynq.o
+ obj-$(CONFIG_GPIO_ZYNQMP_MODEPIN)	+= gpio-zynqmp-modepin.o
++
++obj-$(CONFIG_GPIO_GRX500) += gpio-grx500.o
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -2053,3 +2053,10 @@
+ 
+ config DEV_SYNC_PROBE
+ 	tristate
++
++config GPIO_GRX500
++	bool "Lantiq GRX500 GPIO banks"
++	depends on GPIOLIB && MACH_GRX500 && OF
++	help
++	  GPIO data, direction and pad configuration on GRX500. Buttons
++	  without an interrupt line use the polled GPIO button driver.

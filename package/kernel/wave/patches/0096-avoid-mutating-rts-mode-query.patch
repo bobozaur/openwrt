@@ -1,0 +1,66 @@
+Subject: [PATCH] wave: avoid applying zero RTS bandwidth flags on a query
+
+The matching A0 RTS_MODE handler applies its two flag bytes even when
+getSetOperation requests a read. The native getter's zeroed message can
+therefore disable bandwidth signalling and leave the last configured policy
+inconsistent with firmware.
+
+Read the existing last-acknowledged radio configuration instead. Leave the
+unknown initial pair unsupported; do not infer a default from firmware and
+do not submit a command from an observational getter. The serialized setter
+and recovery remain its owners. This does not implement byte-length RTS.
+
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -4956,36 +4956,21 @@
+ int __MTLK_IFUNC
+ mtlk_core_receive_rts_mode (mtlk_core_t *core, mtlk_core_rts_mode_t *rts_params)
+ {
+-  mtlk_txmm_msg_t      man_msg;
+-  mtlk_txmm_data_t    *man_entry = NULL;
+-  UMI_RTS_MODE_CONFIG *rts_mode_config = NULL;
+-  mtlk_vap_handle_t    vap_handle = core->vap_handle;
+-  int                  res;
+-
+-  man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+-  if (NULL == man_entry) {
+-    ELOG_D("CID-%04x: No man entry available", mtlk_vap_get_oid(vap_handle));
+-    return MTLK_ERR_NO_RESOURCES;
+-  }
+-
+-  man_entry->id = UM_MAN_RTS_MODE_CONFIG_REQ;
+-  man_entry->payload_size = sizeof(UMI_RTS_MODE_CONFIG);
+-
+-  rts_mode_config = (UMI_RTS_MODE_CONFIG *)(man_entry->payload);
+-  rts_mode_config->getSetOperation = API_GET_OPERATION;
+-
+-  res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+-
+-  if (MTLK_ERR_OK == res) {
+-    rts_params->dynamic_bw = rts_mode_config->dynamicBw;
+-    rts_params->static_bw  = rts_mode_config->staticBw;
+-  }
+-  else {
+-    ELOG_D("CID-%04x: Receive UMI_RTS_MODE_CONFIG failed", mtlk_vap_get_oid(vap_handle));
+-  }
+-
+-  mtlk_txmm_msg_cleanup(&man_msg);
+-  return res;
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  uint32 dynamic_bw = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_RTS_DYNAMIC_BW);
++  uint32 static_bw = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_RTS_STATIC_BW);
++
++  /* The matching A0 RTS_MODE handler ignores getSetOperation and applies
++   * both payload flags. A zeroed GET request therefore disables signalling.
++   * Report only the last acknowledged host configuration. The setter
++   * publishes this pair after its confirmation and recovery replays it;
++   * this is not an independent observation of current firmware state. */
++  if (dynamic_bw > 1 || static_bw > 1)
++    return MTLK_ERR_NOT_SUPPORTED;
++
++  rts_params->dynamic_bw = (uint8)dynamic_bw;
++  rts_params->static_bw = (uint8)static_bw;
++  return MTLK_ERR_OK;
+ }
+ 
+ int __MTLK_IFUNC

@@ -1,0 +1,41 @@
+Subject: [PATCH] rtw88: retain RF state in bounded RTL8822B FT TX observations
+
+Decode only the documented HALMAC V1 RF channel and bandwidth fields.
+Keep absent or unsupported metadata unknown and preserve the existing
+matched-frame filter, status handling and shared 16-line budget.
+
+---
+
+diff --git a/drivers/net/wireless/realtek/rtw88/tx.c b/drivers/net/wireless/realtek/rtw88/tx.c
+--- a/drivers/net/wireless/realtek/rtw88/tx.c
++++ b/drivers/net/wireless/realtek/rtw88/tx.c
+@@ -284,12 +284,26 @@
+ 	spin_unlock_irqrestore(&tx_report->q_lock, flags);
+ 
+ 	/* No printk under the report-queue lock; never more than 16 per load. */
+-	if (ft_report && atomic_add_unless(&ft_report_budget, -1, 0))
++	if (ft_report && atomic_add_unless(&ft_report_budget, -1, 0)) {
++		u32 offset = *((u32 *)skb->cb);
++		int rf_ch = -1, rf_bw = -1;
++		u8 rf[2];
++
++		/* RTL8822B HALMAC V1: full-report bytes 14 and 15. */
++		if (rtwdev->chip->id == RTW_CHIP_TYPE_8822B &&
++		    src == C2H_CCX_RPT && offset <= skb->len &&
++		    skb->len - offset >= 16 &&
++		    !skb_copy_bits(skb, offset + 14, rf, sizeof(rf))) {
++			rf_ch = rf[0] | ((rf[1] & 0x03) << 8);
++			rf_bw = rf[1] >> 6;
++		}
+ 		rtw_warn(rtwdev,
+-			 "FT TX report: src=%#x sn=%#x status=%#x subtype=%u seq_ctrl=%#x receiver=%pM\n",
++			 "FT TX report: src=%#x sn=%#x status=%#x subtype=%u seq_ctrl=%#x receiver=%pM rf_ch_raw=%d bw_raw=%d\n",
+ 			 src, sn, st,
+ 			 (le16_to_cpu(report_hdr.frame_control) & IEEE80211_FCTL_STYPE) >> 4,
+-			 le16_to_cpu(report_hdr.seq_ctrl), report_hdr.addr1);
++			 le16_to_cpu(report_hdr.seq_ctrl), report_hdr.addr1,
++			 rf_ch, rf_bw);
++	}
+ }
+ 
+ static u8 rtw_get_mgmt_rate(struct rtw_dev *rtwdev, struct sk_buff *skb,

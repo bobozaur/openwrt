@@ -1,0 +1,58 @@
+From: Jo-Philipp Wich <jo@mein.io>
+Subject: [PATCH] register resource prototypes and release their refs before final GC
+
+Backport the paired upstream resource-prototype lifetime corrections. A type
+prototype can reference GC-managed values, including cycles. Register it with
+the VM so the whole graph participates in the final sweep, and release the type
+reference before that sweep. Keep type descriptors alive for resource free
+callbacks until collection has completed.
+
+Upstream commits:
+343ebc2b82fdfeba845ee27daa6f63127b7822f4
+19ffa8aa3218f57f8bc52ce6b49db66dbcbebf4e
+
+Signed-off-by: Jo-Philipp Wich <jo@mein.io>
+---
+
+--- a/include/ucode/lib.h
++++ b/include/ucode/lib.h
+@@ -86,7 +86,7 @@
+ static inline uc_resource_type_t *
+ _uc_type_declare(uc_vm_t *vm, const char *name, const uc_function_list_t *list, size_t len, void (*freefn)(void *))
+ {
+-	uc_value_t *proto = ucv_object_new(NULL);
++	uc_value_t *proto = ucv_object_new(vm);
+ 
+ 	while (len-- > 0)
+ 		ucv_object_add(proto, list[len].name,
+--- a/vm.c
++++ b/vm.c
+@@ -274,6 +274,12 @@
+ 		vm->open_upvals = ref;
+ 	}
+ 
++	/* Resource type prototypes are part of the VM value pool, so release the
++	 * restype refs before the final GC; any references still held by
++	 * GC-managed values are dropped by ucv_freeall() itself. */
++	for (i = 0; i < vm->restypes.count; i++)
++		ucv_put(vm->restypes.entries[i]->proto);
++
+ 	uc_vm_reset_callframes(vm);
+ 	uc_vm_reset_stack(vm);
+ 	uc_vector_clear(&vm->stack);
+@@ -283,14 +289,8 @@
+ 
+ 	ucv_freeall(vm);
+ 
+-	/* Type prototypes are not on the GC value list, so a ucv_put() during
+-	 * ucv_freeall()'s retain phase would only mark them UC_NULL and leak
+-	 * them. Release them here, after the final GC, so the last reference a
+-	 * GC value may hold (e.g. via proto()) is already gone. */
+-	for (i = 0; i < vm->restypes.count; i++) {
+-		ucv_put(vm->restypes.entries[i]->proto);
++	for (i = 0; i < vm->restypes.count; i++)
+ 		free(vm->restypes.entries[i]);
+-	}
+ 
+ 	uc_vector_clear(&vm->restypes);
+ 

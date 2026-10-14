@@ -1,0 +1,61 @@
+From: OpenWrt WAVE maintainers
+Subject: [PATCH] wave: propagate firmware statistics refresh failures
+
+Do not publish a successful GET_STATUS response from the previous MAC/PHY
+snapshot after its refresh failed. Return the existing firmware error through
+the serializer completion; the polling callback already handles failure and
+releases its pending request, while the periodic timer owns rearm.
+
+The other MAC-statistics refresh caller must likewise clean up its temporary
+station and return the refresh error without emitting a stale unconnected-STA
+measurement event. Preserve native cache reads and all successful responses.
+
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -14046,9 +14046,9 @@
+     }
+ 
+     /* Get MHI Statistics which is per HW card */
+-    if (wave_radio_is_first(radio))
+-      _mtlk_core_mac_get_mhi_stats(nic, hw);
+-
++    if (wave_radio_is_first(radio) &&
++        (res = _mtlk_core_mac_get_mhi_stats(nic, hw)) != MTLK_ERR_OK)
++      goto FINISH;
+     /* Update all VAPs Statistics */
+     if (MTLK_ERR_OK == res) {
+       _mtlk_core_update_vaps_mhi_stats(nic, radio, hw);
+@@ -14061,8 +14061,8 @@
+       iwpriv_cca_adapt_t cca_adapt_params;
+       mtlk_pdb_size_t cca_adapt_size = sizeof(cca_adapt_params);
+ 
+-      _mtlk_core_mac_get_phy_status(nic, hw, general_stats);
+-
++      if ((res = _mtlk_core_mac_get_phy_status(nic, hw, general_stats)) != MTLK_ERR_OK)
++        goto FINISH;
+       /* if beacons were blocked due to CCA, need to poll CWI */
+       if (nic->slow_ctx->cca_adapt.cwi_poll) {
+         if (MTLK_ERR_OK != WAVE_RADIO_PDB_GET_BINARY(radio, PARAM_DB_RADIO_CCA_ADAPT, &cca_adapt_params, &cca_adapt_size))
+@@ -16284,9 +16284,9 @@
+     for(i = 0; i < ARRAY_SIZE(cpd.rssi); i++) {
+       cpd.rssi[i] = mtlk_stadb_apply_rssi_offset(cpd.rssi[i], _mtlk_core_get_rrsi_offs(core));
+     }
+-
+     /* Get MHI Statistics */
+-    _mtlk_core_mac_get_mhi_stats(caller_core, mtlk_vap_get_hw(caller_core->vap_handle));
++    res = _mtlk_core_mac_get_mhi_stats(caller_core, mtlk_vap_get_hw(caller_core->vap_handle));
++    if (res != MTLK_ERR_OK) goto remove_sta;
+     _mtlk_core_mac_update_peers_stats(caller_core);
+ 
+     sta_res_data.rx_bytes = mtlk_sta_get_stat_cntr_rx_bytes(sta);
+@@ -16326,8 +16326,8 @@
+       mtlk_df_nbuf_free(nbuf_ndp);
+     if (sta)
+       mtlk_sta_decref(sta); /* De-reference by creator */
+-    res2 = wv_cfg80211_handle_get_unconnected_sta(sta_req_data->wdev,
+-      &sta_res_data, sizeof(sta_res_data));
++    res2 = res == MTLK_ERR_OK ? wv_cfg80211_handle_get_unconnected_sta(sta_req_data->wdev,
++      &sta_res_data, sizeof(sta_res_data)) : res;
+   MTLK_CLPB_FINALLY(res)
+     return res != MTLK_ERR_OK ? res : res2;
+   MTLK_CLPB_END

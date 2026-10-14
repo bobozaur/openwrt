@@ -1,0 +1,24 @@
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -4285,6 +4285,8 @@
+ }
+ 
+ static const u8 wave_monitor_fw_span[] = { 0x00, 0x42, 0x0c, 0x12, 0x84, 0x00, 0x8a, 0x20, 0xc9, 0x06, 0x2c, 0x74, 0x85, 0x01, 0x6f, 0xf5, 0x6c, 0x70, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78 };
++#include "fixed_data_fw.h"
++
+ 
+ static int
+ _mtlk_mmb_load_firmware(mtlk_hw_t* hw)
+@@ -4343,6 +4345,12 @@
+           !mtlk_hw_type_is_gen6_b0(hw) && fb.size >= 0x63d0c + sizeof(wave_monitor_fw_span) &&
+           !memcmp((const u8 *)fb.buffer + 0x63d0c, wave_monitor_fw_span, sizeof(wave_monitor_fw_span)))
+         hw->fw_features |= WAVE_FW_FEATURE_RX_STREAM;
++      /* New eight-byte FixedPower policy is paired with both lower copies.
++       * A package/version string or an ACK-only OEM handler is insufficient. */
++      if (cpu == CHI_CPU_NUM_UM && mtlk_hw_type_is_gen6(hw) &&
++          !mtlk_hw_type_is_gen6_b0(hw) &&
++          wave_fixed_data_fw_matches(fb.buffer, fb.size))
++        hw->fw_features |= WAVE_FW_FEATURE_FIXED_DATA;
+     }
+ 
+     /* WAVE600: TODO: do it for the first radio now, but rework later! */

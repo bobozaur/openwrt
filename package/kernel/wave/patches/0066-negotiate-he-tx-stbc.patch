@@ -1,0 +1,103 @@
+--- a/wireless/driver/linux/wave_he_caps.h
++++ b/wireless/driver/linux/wave_he_caps.h
+@@ -32,6 +32,12 @@
+   if (has_160)
+     he->he_cap_elem.phy_cap_info[0] |= WAVE_HE_WIDTH_160;
+   he->he_cap_elem.phy_cap_info[1] = WAVE_HE_LDPC;
++  /* The retained AX profile supports TX STBC with two transmit chains.
++   * Both roles derive nss from the radio's TX antenna mask. PHY2 advertises
++   * only <=80 MHz STBC; PHY7 RX/TX STBC above 80 MHz remain clear.
++   */
++  if (nss >= 2)
++    he->he_cap_elem.phy_cap_info[2] = WAVE_HE_STBC_TX_80;
+   he->he_cap_elem.phy_cap_info[7] = WAVE_HE_4XLTF_08GI;
+   /* Request conservative receive padding on air; the peer encoder separately
+    * translates the upstream AP's receive requirements into the old ABI. */
+--- a/wireless/driver/linux/wave_he_compat.h
++++ b/wireless/driver/linux/wave_he_compat.h
+@@ -22,22 +22,27 @@
+ #define WAVE_HE_AMPDU_EXT_MASK 0x18
+ #define WAVE_HE_AMPDU_EXT_2 0x10
+ #define WAVE_HE_LDPC 0x20
++#define WAVE_HE_STBC_TX_80 0x04
++#define WAVE_HE_STBC_RX_80 0x08
+ #define WAVE_HE_PPE_PRESENT 0x80
+ #define WAVE_HE_4XLTF_08GI 0x04
+ 
+ /* Inputs are the validated native 17-byte HE MAC/PHY element and the LE16
+  * RX/TX MCS maps for <=80 and, when advertised, 160 MHz. The width mask is
+  * this radio's capability; the peer determines which maps are present.
++ * local_phy2 is our advertised PHY2, not the peer's transmit capability.
+  * Return -1 for malformed/unrepresentable input; never downgrade a station
+  * that mac80211 has already negotiated as HE. Output is published on success.
+- * This profile deliberately omits TWT, DCM, STBC, beamforming, MU and ER.
++ * Only local TX STBC <=80 MHz is supported. TWT, DCM, beamforming, MU and ER
++ * remain omitted; local RX STBC and >80 MHz STBC are not advertised.
+  */
+ static inline int
+ wave_he_encode_peer(struct wave_he_peer *out,
+                     const unsigned char cap[17],
+                     const unsigned char *mcs,
+                     const unsigned char *ppe, unsigned int ppe_len,
+-                    unsigned int nss, unsigned int width)
++                    unsigned int nss, unsigned int width,
++                    unsigned int local_phy2)
+ {
+   struct wave_he_peer result = { 0 };
+   unsigned int i, bit, mask, rx, tx, rx_nss = 0, ppe_nss, ru_count, bits;
+@@ -79,6 +84,13 @@
+                        extension : WAVE_HE_AMPDU_EXT_2;
+   result.mac_phy[7] = width;
+   result.mac_phy[8] = cap[7] & WAVE_HE_LDPC;
++  /* STA_ADD describes the peer: its RX STBC permits our two-chain TX STBC.
++   * A one-stream peer may receive STBC; nss is our hardware-derived limit.
++   * PHY2 applies only to <=80 MHz PPDUs even on a 160-capable link. Leave
++   * peer TX STBC and both >80 MHz STBC bits in PHY7 clear.
++   */
++  if (nss >= 2 && (local_phy2 & WAVE_HE_STBC_TX_80))
++    result.mac_phy[9] = cap[8] & WAVE_HE_STBC_RX_80;
+   result.mac_phy[14] = cap[13] & WAVE_HE_4XLTF_08GI;
+ 
+   /* Peer padding is a receive requirement, independent of our optional PHY
+@@ -134,7 +146,7 @@
+ static inline int
+ wave_he_encode_raw_peer(struct wave_he_peer *out, const unsigned char *cap,
+                         unsigned int length, unsigned int nss,
+-                        unsigned int width)
++                        unsigned int width, unsigned int local_phy2)
+ {
+   unsigned int offset = 21;
+ 
+@@ -147,7 +159,7 @@
+   if (length < offset)
+     return -1;
+   return wave_he_encode_peer(out, cap, cap + 17, cap + offset,
+-                             length - offset, nss, width);
++                             length - offset, nss, width, local_phy2);
+ }
+ 
+ struct wave_he_ap_beacon {
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -1390,7 +1390,8 @@
+     if (wave_he_encode_peer(&peer, (const u8 *)&he->he_cap_elem, mcs,
+                             he->ppe_thres, sizeof(he->ppe_thres),
+                             mac80211->he_nss,
+-                            local_he->he_cap_elem.phy_cap_info[0])) {
++                            local_he->he_cap_elem.phy_cap_info[0],
++                            local_he->he_cap_elem.phy_cap_info[2])) {
+       ELOG_V("HE peer cannot be represented by retained firmware");
+       return MTLK_ERR_PARAMS;
+     }
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2593,7 +2593,8 @@
+     while (nss < WAVE_HE_MAX_NSS && ((rx >> (2 * nss)) & 3) != 3)
+       nss++;
+     if (wave_he_encode_raw_peer(&peer, raw, len, nss,
+-                               local->he_cap_elem.phy_cap_info[0]))
++                               local->he_cap_elem.phy_cap_info[0],
++                               local->he_cap_elem.phy_cap_info[2]))
+       return MTLK_ERR_PARAMS;
+     BUILD_BUG_ON(sizeof(peer.mac_phy) != sizeof(info->he_mac_phy_cap_info));
+     BUILD_BUG_ON(sizeof(peer.mcs) != sizeof(info->he_mcs_nss_info));

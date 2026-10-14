@@ -1,0 +1,103 @@
+--- a/pppd/ccp.c
++++ b/pppd/ccp.c
+@@ -205,6 +205,10 @@
+ ccp_options ccp_gotoptions[NUM_PPP];	/* what the peer agreed to do */
+ ccp_options ccp_allowoptions[NUM_PPP];	/* what we'll agree to do */
+ ccp_options ccp_hisoptions[NUM_PPP];	/* what we agreed to do */
++#ifdef PPP_WITH_MPPE
++/* Absolute padded MTU for this LCP link, retained across CCP retries. */
++static int mppe_mtu[NUM_PPP];
++#endif
+ 
+ /*
+  * Callbacks for fsm code.
+@@ -367,6 +371,9 @@
+     f->protocol = PPP_CCP;
+     f->callbacks = &ccp_callbacks;
+     fsm_init(f);
++#ifdef PPP_WITH_MPPE
++    mppe_mtu[unit] = 0;
++#endif
+ 
+     memset(&ccp_wantoptions[unit],  0, sizeof(ccp_options));
+     memset(&ccp_gotoptions[unit],   0, sizeof(ccp_options));
+@@ -438,6 +445,9 @@
+ ccp_lowerdown(int unit)
+ {
+     fsm_lowerdown(&ccp_fsm[unit]);
++#ifdef PPP_WITH_MPPE
++    mppe_mtu[unit] = 0;
++#endif
+ }
+ 
+ /*
+@@ -1061,6 +1071,30 @@
+ 
+     return 1;
+ }
++
++#ifdef PPP_WITH_MPPE
++/* Reserve MPPE padding once per LCP link, after authentication and plugins
++ * have established the MTU.  Rejected requests must not change the MTU. */
++static bool
++ccp_mppe_set_mtu(int unit)
++{
++    int mtu = ppp_get_mtu(unit);
++
++    if (mtu <= MPPE_PAD)
++        return 0;
++    if (!mppe_mtu[unit])
++        mppe_mtu[unit] = mtu - MPPE_PAD;
++
++    if (mtu != mppe_mtu[unit]) {
++        ppp_set_mtu(unit, mppe_mtu[unit]);
++        /* The setter has no return value.  Do not ACK a failed adjustment,
++         * or recapture an already padded MTU after a failed readback. */
++        if (ppp_get_mtu(unit) != mppe_mtu[unit])
++            return 0;
++    }
++    return 1;
++}
++#endif
+ 
+ /*
+  * ccp_reqci - processed a received configure-request.
+@@ -1168,7 +1202,6 @@
+ 		MPPE_OPTS_TO_CI(ho->mppe, &p[2]);
+ 		if (newret == CONFACK) {
+ 		    u_char opt_buf[CILEN_MPPE + MPPE_MAX_KEY_LEN];
+-		    int mtu;
+ 
+ 		    BCOPY(p, opt_buf, CILEN_MPPE);
+ 		    mppe_get_send_key(&opt_buf[CILEN_MPPE], MPPE_MAX_KEY_LEN);
+@@ -1180,16 +1213,7 @@
+ 			newret = CONFREJ;
+ 			break;
+ 		    }
+-		    /*
+-		     * We need to decrease the interface MTU by MPPE_PAD
+-		     * because MPPE frames **grow**.  The kernel [must]
+-		     * allocate MPPE_PAD extra bytes in xmit buffers.
+-		     */
+-		    mtu = ppp_get_mtu(f->unit);
+-		    if (mtu)
+-			ppp_set_mtu(f->unit, mtu - MPPE_PAD);
+-		    else
+-			newret = CONFREJ;
++
+ 		}
+ 
+ 		/*
+@@ -1342,6 +1366,12 @@
+ 	    *lenp = retp - p0;
+     }
+ #ifdef PPP_WITH_MPPE
++    if (ret == CONFACK && ho->mppe && !ccp_mppe_set_mtu(f->unit)) {
++        error("Cannot reserve MPPE padding in the interface MTU");
++        ho->mppe = 0;
++        lcp_close(f->unit, "MPPE MTU adjustment failed");
++        return CONFREJ;
++    }
+     if (ret == CONFREJ && ao->mppe && rej_for_ci_mppe) {
+ 	error("MPPE required but peer negotiation failed");
+ 	lcp_close(f->unit, "MPPE required but peer negotiation failed");

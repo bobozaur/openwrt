@@ -1,0 +1,50 @@
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -1515,6 +1515,7 @@
+   struct cfg80211_ap_settings *info)
+ {
+   int res = MTLK_ERR_PARAMS;
++  int linux_error = 0;
+   mtlk_clpb_t *clpb = NULL;
+   mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
+   struct mtlk_ap_settings aps;
+@@ -1558,12 +1559,15 @@
+       ELOG_S("%s: Sta vifs exists but channel is uncertain", ndev->name);
+     }
+   } else {
+-    /* start by setting the required channel, unless it's already right, ignore errors */
+-    wave_radio_ap_chanwidth_set(wiphy, radio, ndev, &info->chandef);
+-  }
+-
+-  if (NULL == info->ssid || MIB_ESSID_LENGTH < info->ssid_len)
++    linux_error = wave_radio_ap_chanwidth_set(wiphy, radio, ndev, &info->chandef);
++    if (linux_error)
++      goto finish;
++  }
++
++  if (NULL == info->ssid || MIB_ESSID_LENGTH < info->ssid_len) {
++    res = MTLK_ERR_PARAMS;
+     goto finish;
++  }
+ 
+   aps.beacon_interval = info->beacon_interval;
+   aps.dtim_period = info->dtim_period;
+@@ -1571,7 +1575,8 @@
+   aps.essid_len = info->ssid_len;
+   wave_strncopy(aps.essid, info->ssid, sizeof(aps.essid), aps.essid_len);
+ 
+-  if ((res = wave_radio_beacon_change(radio, ndev, &info->beacon)) != MTLK_ERR_OK)
++  linux_error = wave_radio_beacon_change(radio, ndev, &info->beacon);
++  if (linux_error)
+     goto finish;
+ 
+   /* Set security */
+@@ -1661,7 +1666,7 @@
+   if (scan_paused == 1 && _wave_radio_allow_or_resume_scan(radio) != MTLK_ERR_OK)
+     WLOG_V("Could not resume scanning after AP start");
+ 
+-  return _mtlk_df_mtlk_to_linux_error_code(res);
++  return linux_error ? linux_error : _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+ 
+ int wave_radio_ap_stop(

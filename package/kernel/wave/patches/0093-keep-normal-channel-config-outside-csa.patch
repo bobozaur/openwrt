@@ -1,0 +1,51 @@
+Subject: [PATCH] wave: keep ordinary channel configuration outside CSA
+
+The normal mac80211 configuration callback also runs for station activation
+and emulated channel-context commits. It must not initiate a second timed CSA
+merely because an AP VAP is connected. The shared-radio serializer already
+requires ordinary requests to match the active home channel; real upstream
+changes use channel_switch with station_csa ownership.
+
+Keep the existing scan excursion and scan-return command selection. Ordinary
+configuration uses ST_NORMAL, including the commit after the acknowledged CSA.
+This preserves the native firmware channel owner without manufacturing a
+same-channel countdown during station reconnect.
+
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -580,7 +580,6 @@
+   mtlk_core_t       *master_core;
+   int res = 0;
+   mtlk_scan_support_t *scan_support;
+-  int beacon_period;
+ 
+   if (radio_idx >= 0)
+     return -EOPNOTSUPP;
+@@ -618,12 +617,12 @@
+     cpd.dont_notify_kernel = TRUE;
+ 
+ 
+-    beacon_period = WAVE_RADIO_PDB_GET_INT(wave_vap_radio_get(master_core->vap_handle), PARAM_DB_RADIO_BEACON_PERIOD);
+     scan_support =
+         mtlk_core_get_scan_support(mtlk_vap_get_core(master_vap_handle));
+ 
+-    /* In case AP master VAP is active allow time for AP mode VAP(s)
+-     * to send CSAs to associated stations */
++    /* Ordinary configuration and emulated context commits are not CSA
++     * requests. The shared-radio serializer admits only the home channel
++     * here; the channel_switch callback owns an actual timed transition. */
+     if (is_mac_scan_running(scan_support)) {
+       if (mtlk_core_is_chandef_identical(&cpd.chandef, &scan_support->orig_chandef)) {
+         cpd.switch_type = ST_NORMAL;
+@@ -632,11 +631,6 @@
+         cpd.switch_type = ST_SCAN;
+         ILOG1_V("While mac scan - setting SCAN switch type");
+       }
+-    } else if (mtlk_core_get_net_state(mtlk_vap_get_core(master_vap_handle)) == NET_STATE_CONNECTED) {
+-      cpd.switch_type = ST_CSA;
+-      cpd.chan_switch_time = DEFAULT_CSA_COUNT * beacon_period;
+-      ILOG1_D("Setting CSA switch type, switch time: %dms",
+-          DEFAULT_CSA_COUNT * beacon_period);
+     } else {
+       cpd.switch_type = ST_NORMAL;
+       ILOG1_V("Not using CSA in channel switch");

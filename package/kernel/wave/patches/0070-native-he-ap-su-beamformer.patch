@@ -1,0 +1,362 @@
+Subject: wave: negotiate AP HE SU beamforming with accepted BSS capabilities
+
+--- a/wireless/driver/linux/wave_he_caps.h
++++ b/wireless/driver/linux/wave_he_caps.h
+@@ -7,7 +7,7 @@
+ 
+ static inline void
+ wave_he_cap_init(struct ieee80211_sband_iftype_data *data,
+-                 enum nl80211_band band, unsigned int nss,
++                 enum nl80211_band band, unsigned int nss, unsigned int rx_chains,
+                  enum nl80211_iftype type, bool has_160)
+ {
+   struct ieee80211_sta_he_cap *he = &data->he_cap;
+@@ -38,6 +38,16 @@
+    */
+   if (nss >= 2)
+     he->he_cap_elem.phy_cap_info[2] = WAVE_HE_STBC_TX_80;
++  if (type == NL80211_IFTYPE_AP && nss >= 2 && rx_chains) {
++    he->he_cap_elem.phy_cap_info[3] = WAVE_HE_SU_BEAMFORMER;
++    /* Donor AP: two sounding dimensions <=80 MHz, one above 80 MHz.
++     * Both fields encode count minus one. HE160 keeps its two data streams;
++     * the zero >80 sounding field does not mean beamforming is disabled.
++     * Native STA sounding and Ng16 feedback are not advertised.
++     */
++    he->he_cap_elem.phy_cap_info[5] = 1;
++    he->he_cap_elem.phy_cap_info[6] = WAVE_HE_SU_FEEDBACK;
++  }
+   he->he_cap_elem.phy_cap_info[7] = WAVE_HE_4XLTF_08GI;
+   /* Request conservative receive padding on air; the peer encoder separately
+    * translates the upstream AP's receive requirements into the old ABI. */
+--- a/wireless/driver/linux/wave_he_compat.h
++++ b/wireless/driver/linux/wave_he_compat.h
+@@ -24,8 +24,37 @@
+ #define WAVE_HE_LDPC 0x20
+ #define WAVE_HE_STBC_TX_80 0x04
+ #define WAVE_HE_STBC_RX_80 0x08
++#define WAVE_HE_NDP_4XLTF_32GI 0x02
++#define WAVE_HE_SU_BEAMFORMER 0x80
++#define WAVE_HE_SU_BEAMFORMEE 0x01
++#define WAVE_HE_SU_CODEBOOK_42 0x01
++#define WAVE_HE_TRIG_SU_FEEDBACK 0x04
++#define WAVE_HE_TRIG_CQI_FEEDBACK 0x10
++#define WAVE_HE_SU_FEEDBACK (WAVE_HE_TRIG_SU_FEEDBACK | WAVE_HE_TRIG_CQI_FEEDBACK)
+ #define WAVE_HE_PPE_PRESENT 0x80
+ #define WAVE_HE_4XLTF_08GI 0x04
++
++/* Effective AP profile from the accepted beacon, not the radio capability.
++ * Dimension fields retain their on-air encoding: zero means one dimension.
++ */
++struct wave_he_bf_profile {
++  unsigned char enabled;
++  unsigned char dimensions; /* PHY5 bits 0..2 (<=80), 3..5 (>80). */
++  unsigned char feedback;   /* PHY6 triggered SU/CQI, no MU or Ng16. */
++};
++
++static inline int
++wave_he_bf_valid(const struct wave_he_bf_profile *bf,
++                 unsigned int tx_chains, unsigned int rx_chains)
++{
++  if (!bf->enabled)
++    return !bf->dimensions && !bf->feedback;
++  /* Retained AP sounding uses at most two dimensions <=80 MHz and one
++   * above 80 MHz. Feedback reception requires an available RX chain.
++   */
++  return bf->enabled == 1 && tx_chains >= 2 && rx_chains &&
++         bf->dimensions <= 1 && !(bf->feedback & ~WAVE_HE_SU_FEEDBACK);
++}
+ 
+ /* Inputs are the validated native 17-byte HE MAC/PHY element and the LE16
+  * RX/TX MCS maps for <=80 and, when advertised, 160 MHz. The width mask is
+@@ -162,10 +191,55 @@
+                              length - offset, nss, width, local_phy2);
+ }
+ 
++/* The donor's AP SU beamformer consumes the peer's beamformee capability.
++ * Keep the STA-role encoder above unchanged until STA sounding is supported.
++ */
++static inline int
++wave_he_encode_ap_peer(struct wave_he_peer *out, const unsigned char *cap,
++                       unsigned int length, unsigned int nss,
++                       unsigned int width, unsigned int local_phy2,
++                       const struct wave_he_bf_profile *bf)
++{
++  struct wave_he_peer result;
++  unsigned int local_sts, peer_sts, nc;
++
++  if (!wave_he_bf_valid(bf, nss, 1) ||
++      wave_he_encode_raw_peer(&result, cap, length, nss, width, local_phy2))
++    return -1;
++  if (bf->enabled && (cap[10] & WAVE_HE_SU_BEAMFORMEE)) {
++    local_sts = bf->dimensions & 7;
++    peer_sts = (cap[10] >> 2) & 7;
++    if (peer_sts > local_sts)
++      peer_sts = local_sts;
++    result.mac_phy[11] = WAVE_HE_SU_BEAMFORMEE | (peer_sts << 2);
++    if (result.mac_phy[7] & WAVE_HE_WIDTH_160) {
++      local_sts = (bf->dimensions >> 3) & 7;
++      peer_sts = cap[10] >> 5;
++      if (peer_sts > local_sts)
++        peer_sts = local_sts;
++      result.mac_phy[11] |= peer_sts << 5;
++    }
++    /* The retained non-advertised transmit profile supports this NDP and
++     * SU codebook. Ng16 changed subcarrier indices after D3; keep it clear.
++     * No local beamformee or peer beamformer capability is implied.
++     */
++    result.mac_phy[9] |= cap[8] & WAVE_HE_NDP_4XLTF_32GI;
++    result.mac_phy[13] |= cap[12] & (WAVE_HE_SU_CODEBOOK_42 | bf->feedback);
++    nc = (cap[13] >> 3) & 7;
++    local_sts = bf->dimensions & 7;
++    if (nc > local_sts)
++      nc = local_sts;
++    result.mac_phy[14] |= nc << 3;
++  }
++  *out = result;
++  return 0;
++}
++
+ struct wave_he_ap_beacon {
+   unsigned char enabled;
+   unsigned char color; /* Zero disables coloring in SET_BSS. */
+   unsigned char mcs[8];
++  struct wave_he_bf_profile bf;
+ };
+ 
+ /* Decode the native SU operation profile for SET_BSS. The requested color
+@@ -207,8 +281,10 @@
+   if (cap || op) {
+     if (!cap || !op || cap_len < 21 || op_len < 6)
+       return -1;
+-    /* Contiguous widths, no AP PPE/TWT/partial color/6GHz operation, PE16us. */
++    /* Contiguous widths, no AP PPE/TWT/partial color/6GHz operation, PE16us.
++     * SU beamformee, MU feedback and Ng16 remain unsupported locally. */
+     if ((cap[6] & WAVE_HE_WIDTH_80P80) || (cap[12] & WAVE_HE_PPE_PRESENT) ||
++        (cap[10] & 0x03) || (cap[11] & 0xc0) || (cap[12] & 0x0b) ||
+         (cap[0] & 0x06) || (op[0] & 0x0f) != 4 ||
+         (op[1] & 0x80) || (op[2] & 0x02) || (op[3] & 0x40) ||
+         (!(op[3] & 0x80) && !(op[3] & 0x3f)) ||
+@@ -222,6 +298,13 @@
+       result.mcs[i] = cap[17 + i];
+     result.enabled = 1;
+     result.color = (op[3] & 0x80) ? 0 : (op[3] & 0x3f);
++    if (cap[9] & WAVE_HE_SU_BEAMFORMER) {
++      result.bf.enabled = 1;
++      result.bf.dimensions = cap[11] & 0x3f;
++      result.bf.feedback = cap[12] & WAVE_HE_SU_FEEDBACK;
++      if (!wave_he_bf_valid(&result.bf, WAVE_HE_MAX_NSS, 1))
++        return -1;
++    }
+   }
+   *out = result;
+   return 0;
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -64,6 +64,7 @@
+ #include "mtlk_hs20.h"
+ #include "eth_parser.h"
+ #include "wave_bss_color.h"
++#include "wave_he_bf_mode.h"
+ 
+ #define DEFAULT_NUM_TX_ANTENNAS NUM_TX_ANTENNAS_GEN3
+ #define DEFAULT_NUM_RX_ANTENNAS (3)
+@@ -5535,6 +5536,10 @@
+            bf_mode, BF_FIRST_STATE, BF_LAST_STATE, BF_STATE_AUTO_MODE);
+     return MTLK_ERR_PARAMS;
+   }
++
++  res = wave_he_bf_mode_check(core, bf_mode);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   ILOG2_V("Sending UM_MAN_BF_MODE_CONFIG_REQ");
+ 
+@@ -16668,6 +16673,12 @@
+     if (MTLK_ERR_OK != res) goto end;
+ 
+     res = mtlk_core_cfg_init_cca_threshold(core);
++    if (MTLK_ERR_OK != res) goto end;
++
++    /* The PDB default is explicit BF, not an acknowledged firmware state.
++     * Match the retained pre-up owner and recovery before publishing a BSS.
++     */
++    res = _mtlk_core_send_bf_mode(core, WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_BF_MODE));
+   }
+ 
+ end:
+--- a/wireless/driver/linux/core_pdb_def.h
++++ b/wireless/driver/linux/core_pdb_def.h
+@@ -28,6 +28,7 @@
+ #include "mtlk_coreui.h"
+ #include "mtlk_psdb.h"
+ #include "scan_support.h"
++#include "wave_he_compat.h"
+ 
+ #define MTLK_IDEFS_ON
+ #include "mtlkidefs.h"
+@@ -125,6 +126,7 @@
+ /* 802.11AX support */
+ static const uint8 mtlk_core_initial_he_mcs_nss[8] = { 0 };
+ static const uint32 mtlk_core_initial_he_bss_color = 0;
++static const struct wave_he_bf_profile mtlk_core_initial_he_bf = { 0 };
+ 
+ static const mtlk_pdb_initial_value mtlk_core_parameters[] =
+ {
+@@ -153,6 +155,7 @@
+   {PARAM_DB_CORE_VHT_MCS_NSS, PARAM_DB_TYPE_BINARY, PARAM_DB_VALUE_FLAG_NO_FLAG,  sizeof(mtlk_core_initial_vht_mcs_nss), &mtlk_core_initial_vht_mcs_nss},
+   {PARAM_DB_CORE_HE_MCS_NSS, PARAM_DB_TYPE_BINARY, PARAM_DB_VALUE_FLAG_NO_FLAG, sizeof(mtlk_core_initial_he_mcs_nss), &mtlk_core_initial_he_mcs_nss},
+   {PARAM_DB_CORE_HE_BSS_COLOR, PARAM_DB_TYPE_INT, PARAM_DB_VALUE_FLAG_NO_FLAG, sizeof(mtlk_core_initial_he_bss_color), &mtlk_core_initial_he_bss_color},
++  {PARAM_DB_CORE_HE_BF, PARAM_DB_TYPE_BINARY, PARAM_DB_VALUE_FLAG_NO_FLAG, sizeof(mtlk_core_initial_he_bf), &mtlk_core_initial_he_bf},
+   {PARAM_DB_CORE_SET_BSS_FLAGS, PARAM_DB_TYPE_INT, PARAM_DB_VALUE_FLAG_NO_FLAG,  sizeof(mtlk_core_initial_set_bss_flags), &mtlk_core_initial_set_bss_flags},
+   {PARAM_DB_CORE_WMM_PARAMS_BE, PARAM_DB_TYPE_BINARY, PARAM_DB_VALUE_FLAG_NO_FLAG, sizeof(mtlk_core_initial_wmm_params_be), &mtlk_core_initial_wmm_params_be},
+   {PARAM_DB_CORE_WMM_PARAMS_BK, PARAM_DB_TYPE_BINARY, PARAM_DB_VALUE_FLAG_NO_FLAG, sizeof(mtlk_core_initial_wmm_params_bk), &mtlk_core_initial_wmm_params_bk},
+--- a/wireless/driver/linux/beacon_manager.c
++++ b/wireless/driver/linux/beacon_manager.c
+@@ -494,6 +494,10 @@
+   wave_pdb_set_int(param_db_core, PARAM_DB_CORE_HE_BSS_COLOR, he->color);
+   wave_pdb_set_binary(param_db_core, PARAM_DB_CORE_HE_MCS_NSS,
+                       he->mcs, sizeof(he->mcs));
++  /* This fixed-size PDB entry is allocated at core creation. Publishing the
++   * accepted profile cannot allocate after queue ownership is transferred.
++   */
++  wave_pdb_set_binary(param_db_core, PARAM_DB_CORE_HE_BF, &he->bf, sizeof(he->bf));
+   if (he->enabled)
+     set_bss_flags |= MTLK_BFIELD_VALUE(VAP_ADD_FLAGS_HE, 1, uint8);
+ 
+@@ -693,6 +697,14 @@
+     if (wave_he_parse_ap_beacon(&he, merged.tail, merged.tail_len) ||
+         mtlk_mgmt_parse_elems(merged.tail, merged.tail_len, &elems) != MTLK_ERR_OK)
+       MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
++    if (!wave_he_bf_valid(&he.bf, wave_radio_max_tx_antennas_get(radio),
++                          wave_radio_max_rx_antennas_get(radio)))
++      MTLK_CLPB_EXIT(MTLK_ERR_NOT_SUPPORTED);
++    if (he.bf.enabled) {
++      unsigned int mode = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_BF_MODE);
++      if (mode != BF_STATE_EXPLICIT && mode != BF_STATE_AUTO_MODE)
++        MTLK_CLPB_EXIT(MTLK_ERR_NOT_SUPPORTED);
++    }
+     ie = cfg80211_find_ie(IE_HT_CAPABILITIES, merged.tail, merged.tail_len);
+     if (ie && ie[1] < 26)
+       MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
+@@ -706,12 +718,16 @@
+       mtlk_pdb_t *pdb = mtlk_vap_get_param_db(vap);
+       unsigned char mcs[8];
+       mtlk_pdb_size_t mcs_len = sizeof(mcs);
++      struct wave_he_bf_profile bf;
++      mtlk_pdb_size_t bf_len = sizeof(bf);
+       unsigned int flags = wave_pdb_get_int(pdb, PARAM_DB_CORE_SET_BSS_FLAGS);
+       bool mfpc = elems.rsne_capab && (get_unaligned_le16(elems.rsne_capab) & BIT(7));
+ 
+       if (wave_beacon_cap_changed(&merged, cached, IE_HT_CAPABILITIES) ||
+           wave_beacon_cap_changed(&merged, cached, IE_VHT_CAPABILITIES) ||
+           wave_pdb_get_binary(pdb, PARAM_DB_CORE_HE_MCS_NSS, mcs, &mcs_len) ||
++          wave_pdb_get_binary(pdb, PARAM_DB_CORE_HE_BF, &bf, &bf_len) ||
++          bf_len != sizeof(bf) || memcmp(&he.bf, &bf, sizeof(bf)) ||
+           he.enabled != MTLK_BFIELD_GET(flags, VAP_ADD_FLAGS_HE) ||
+           he.color != wave_pdb_get_int(pdb, PARAM_DB_CORE_HE_BSS_COLOR) ||
+           memcmp(he.mcs, mcs, sizeof(mcs)) || mfpc != READ_ONCE(core->slow_ctx->pmf.enabled))
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2581,6 +2581,8 @@
+                               NL80211_BAND_2GHZ : NL80211_BAND_5GHZ;
+     const struct ieee80211_sta_he_cap *local;
+     struct wave_he_peer peer;
++    struct wave_he_bf_profile bf;
++    mtlk_pdb_size_t bf_len = sizeof(bf);
+     u16 rx;
+     unsigned int nss = 0;
+ 
+@@ -2592,9 +2594,11 @@
+     rx = le16_to_cpu(local->he_mcs_nss_supp.rx_mcs_80);
+     while (nss < WAVE_HE_MAX_NSS && ((rx >> (2 * nss)) & 3) != 3)
+       nss++;
+-    if (wave_he_encode_raw_peer(&peer, raw, len, nss,
++    if (wave_pdb_get_binary(param_db_core, PARAM_DB_CORE_HE_BF, &bf, &bf_len) != MTLK_ERR_OK ||
++        bf_len != sizeof(bf) ||
++        wave_he_encode_ap_peer(&peer, raw, len, nss,
+                                local->he_cap_elem.phy_cap_info[0],
+-                               local->he_cap_elem.phy_cap_info[2]))
++                               local->he_cap_elem.phy_cap_info[2], &bf))
+       return MTLK_ERR_PARAMS;
+     BUILD_BUG_ON(sizeof(peer.mac_phy) != sizeof(info->he_mac_phy_cap_info));
+     BUILD_BUG_ON(sizeof(peer.mcs) != sizeof(info->he_mcs_nss_info));
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -2453,7 +2453,8 @@
+       sband->ht_cap.mcs.tx_params |= IEEE80211_HT_MCS_TX_DEFINED;
+     if (sband) {
+       wave_he_cap_init(&mac80211->he_iftype[band], band,
+-                       mac80211->he_nss, NL80211_IFTYPE_STATION,
++                       mac80211->he_nss, hweight32(hw->wiphy->available_antennas_rx),
++                       NL80211_IFTYPE_STATION,
+                        sband->vht_cap.cap & IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ);
+       _ieee80211_set_sband_iftype_data(sband, &mac80211->he_iftype[band], 1);
+     }
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -2137,7 +2137,8 @@
+       if (!wiphy->bands[band])
+         continue;
+       wave_he_cap_init(&cfg80211->he_iftype[band], band,
+-                       min_t(u32, num_sts, WAVE_HE_MAX_NSS), NL80211_IFTYPE_AP,
++                       min_t(u32, num_sts, WAVE_HE_MAX_NSS),
++                       hweight32(wiphy->available_antennas_rx), NL80211_IFTYPE_AP,
+                        wiphy->bands[band]->vht_cap.cap &
+                          IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ);
+       _ieee80211_set_sband_iftype_data(wiphy->bands[band],
+--- a/wireless/driver/shared/mtlk_param_db.h
++++ b/wireless/driver/shared/mtlk_param_db.h
+@@ -77,6 +77,7 @@
+   PARAM_DB_CORE_VHT_MCS_NSS,    /*!< VHT_MCS_NSS from the beacon */
+   PARAM_DB_CORE_HE_MCS_NSS,     /*!< HE_MCS_NSS from the beacon */
+   PARAM_DB_CORE_HE_BSS_COLOR,   /*!< HE_BSS_COLOR from the beacon */
++  PARAM_DB_CORE_HE_BF,          /*!< Accepted AP SU beamformer profile */
+   PARAM_DB_CORE_SET_BSS_FLAGS,  /*!< additional flags to set at SET_BSS time */
+   /* Note---these have to come in the same order as AC queue defines in enum UMI_AC */
+   PARAM_DB_CORE_WMM_PARAMS_BE,  /*!< WMM parameters for AC BE from hostapd */
+--- /dev/null
++++ b/wireless/driver/linux/wave_he_bf_mode.h
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef WAVE_HE_BF_MODE_H
++#define WAVE_HE_BF_MODE_H
++
++#include "wave_he_compat.h"
++
++/* Radio master serializer. A global mode change must not invalidate an
++ * accepted AP profile. Explicit and auto permit SU BF; stopping the last
++ * such BSS releases the restriction without changing another VAP's mode.
++ */
++static inline int
++wave_he_bf_mode_check(mtlk_core_t *core, BeamformingMode_e mode)
++{
++  mtlk_vap_manager_t *mgr;
++  unsigned int i, count;
++
++  if (mode == BF_STATE_EXPLICIT || mode == BF_STATE_AUTO_MODE)
++    return MTLK_ERR_OK;
++
++  mgr = mtlk_vap_get_manager(core->vap_handle);
++  count = mtlk_vap_manager_get_max_vaps_count(mgr);
++  for (i = 0; i < count; i++) {
++    mtlk_vap_handle_t vap;
++    mtlk_core_t *ap;
++    struct wave_he_bf_profile bf;
++    mtlk_pdb_size_t size = sizeof(bf);
++
++    if (mtlk_vap_manager_get_vap_handle(mgr, i, &vap) != MTLK_ERR_OK ||
++        !mtlk_vap_is_ap(vap))
++      continue;
++    ap = mtlk_vap_get_core(vap);
++    if (!ap->slow_ctx->ap_started && !ap->slow_ctx->ap_preparing)
++      continue;
++    if (MTLK_CORE_PDB_GET_BINARY(ap, PARAM_DB_CORE_HE_BF, &bf, &size) != MTLK_ERR_OK ||
++        size != sizeof(bf))
++      return MTLK_ERR_NOT_READY;
++    if (bf.enabled)
++      return MTLK_ERR_BUSY;
++  }
++  return MTLK_ERR_OK;
++}
++
++#endif /* WAVE_HE_BF_MODE_H */

@@ -24,8 +24,8 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
 ---
  arch/mips/Makefile             |  10 ++
  arch/mips/include/asm/module.h |   5 +
- arch/mips/kernel/module.c      | 281 ++++++++++++++++++++++++++++++++-
- 3 files changed, 292 insertions(+), 4 deletions(-)
+ arch/mips/kernel/module.c      | 285 ++++++++++++++++++++++++++++++++-
+ 3 files changed, 296 insertions(+), 4 deletions(-)
 
 --- a/arch/mips/Makefile
 +++ b/arch/mips/Makefile
@@ -80,7 +80,7 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
  #include <asm/jump_label.h>
  
  struct mips_hi16 {
-@@ -30,14 +32,254 @@ struct mips_hi16 {
+@@ -30,14 +32,258 @@ struct mips_hi16 {
  static LIST_HEAD(dbe_list);
  static DEFINE_SPINLOCK(dbe_lock);
  
@@ -228,6 +228,10 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
 +/* Free memory returned from module_alloc */
 +void arch_execmem_free(void *ptr)
 +{
++	/* Absent module init regions must be a no-op, before address decoding. */
++	if (!ptr)
++		return;
++
 +	if (is_phys_addr(ptr))
 +		free_phys(ptr);
 +	else
@@ -335,7 +339,7 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
  	if (v % 4) {
  		pr_err("module %s: dangerous R_MIPS_26 relocation\n",
  		       me->name);
-@@ -45,13 +287,17 @@ static int apply_r_mips_26(struct module
+@@ -45,13 +291,17 @@ static int apply_r_mips_26(struct module
  	}
  
  	if ((v & 0xf0000000) != (((unsigned long)location + 4) & 0xf0000000)) {
@@ -357,7 +361,7 @@ Signed-off-by: Christian Marangi <ansuelsmth@gmail.com>
  
  	return 0;
  }
-@@ -431,9 +677,36 @@ int module_finalize(const Elf_Ehdr *hdr,
+@@ -431,9 +681,36 @@ int module_finalize(const Elf_Ehdr *hdr,
  		list_add(&me->arch.dbe_list, &dbe_list);
  		spin_unlock_irq(&dbe_lock);
  	}

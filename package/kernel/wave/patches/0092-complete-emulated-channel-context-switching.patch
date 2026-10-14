@@ -1,0 +1,18 @@
+Subject: [PATCH] wave: complete native emulated channel-context switching
+
+mac80211 requires switch_vif_chanctx before reserving a replacement channel
+context for CSA. Complete the existing single-channel emulation with its
+matching native switch adapter. Reservation, shared-VIF readiness and context
+publication remain owned by mac80211; WAVE keeps its existing firmware CSA
+completion and .config channel owner.
+
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -2804,6 +2804,7 @@
+   .add_chanctx              = ieee80211_emulate_add_chanctx,
+   .remove_chanctx           = ieee80211_emulate_remove_chanctx,
+   .change_chanctx           = ieee80211_emulate_change_chanctx,
++  .switch_vif_chanctx       = ieee80211_emulate_switch_vif_chanctx,
+   .start                    = _wv_ieee80211_op_start,
+   .stop                     = _wv_ieee80211_op_stop,
+   .config                   = _wv_ieee80211_op_config,

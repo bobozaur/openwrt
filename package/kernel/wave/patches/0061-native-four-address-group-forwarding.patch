@@ -1,0 +1,281 @@
+Subject: [PATCH] wave: replicate group traffic for four-address peers
+
+Use established four-address peer state to select AP group replication even
+when legacy WDS bridge mode is disabled. Preserve ordinary BSS group traffic
+for ordinary receivers and exclude the incoming peer. Classify the complete
+referenced snapshot even when one clone allocation fails.
+
+Recover a referenced source peer for packets which the bridge returns to the
+same AP ingress interface, including multicast-to-unicast copies. Do not use
+stale source host mappings for packets arriving from another interface. Keep
+host-to-station updates locked against reference lookup and removal.
+
+On the native software path, let a hairpin-capable bridge own AP forwarding
+instead of forwarding a second copy inside the driver. Keep direct intra-BSS
+forwarding when hairpin is off, including standalone APs.
+
+A four-address peer copy selects a SID with MCF clear. It does not require a
+firmware multicast group index for IPv4 or IPv6; retain that lookup for the
+ordinary group path.
+
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -18,6 +18,7 @@
+  */
+ #include "mtlkinc.h"
+ #include <crypto/arc4.h>
++#include <linux/if_bridge.h>
+ #include <linux/unaligned.h>
+ 
+ #include "core_priv.h"
+@@ -1225,6 +1226,7 @@
+   struct ethhdr *ether_header = (struct ethhdr *)nbuf->data;
+   bridge_mode_t  bridge_mode;
+   sta_entry     *sta = NULL; /* destination STA in AP mode or destination BSS in STA mode */
++  sta_entry     *src_sta = NULL; /* owned source reference for a bridge return */
+   uint32         nbuf_flags = 0;
+   sta_db        *stadb;
+   mtlk_core_handle_tx_data_t tx_data = { .msg = msg };
+@@ -1267,6 +1269,16 @@
+         goto tx_error;
+       }
+       goto send_tx_data;
++    }
++
++    /* The bridge preserves skb_iif while hairpinning onto this AP. Its control
++     * buffer is not ours, and a hostdb entry alone can be stale after a host
++     * moves to Ethernet. Recover a source peer only for this ingress port.
++     * Do this before destination handling, which may replace the skb with ARP. */
++    if (nbuf->skb_iif == nbuf->dev->ifindex) {
++      src_sta = mtlk_stadb_find_sta(stadb, ether_header->h_source);
++      if (!src_sta)
++        src_sta = mtlk_hstdb_find_sta(&nic->slow_ctx->hstdb, ether_header->h_source);
+     }
+ 
+     /* check frame destination */
+@@ -1300,6 +1312,12 @@
+     }
+ 
+     if (sta) {
++      /* Bridge multicast-to-unicast can target another host behind the same
++       * peer. Apply the same split horizon as direct RX forwarding. */
++      if (sta == src_sta) {
++        ILOG3_V("Don't send bridge return back to its source peer");
++        goto tx_error;
++      }
+       nbuf_flags |= MTLK_NBUFF_UNICAST;
+     } else {
+       ILOG3_Y("Unknown destination (%Y)", ether_header->h_dest);
+@@ -1340,13 +1358,14 @@
+ send_tx_data:
+   tx_data.nbuf = nbuf;
+   tx_data.dst_sta = sta;
+-  mtlk_mc_transmit(nic, &tx_data, nbuf_flags, bridge_mode, NULL);
++  mtlk_mc_transmit(nic, &tx_data, nbuf_flags, bridge_mode, src_sta);
+   goto out;
+ 
+ tx_error:
+   mtlk_df_nbuf_free(nbuf);
+   if (sta) mtlk_sta_decref(sta); /* De-reference of find or get_ap */
+ out:
++  if (src_sta) mtlk_sta_decref(src_sta);
+   /* Early discards and WDS clone-only transmission leave this unused. */
+   if (tx_data.msg)
+     mtlk_hw_release_msg_to_send(mtlk_vap_get_hwapi(vap_handle), tx_data.msg);
+@@ -1404,21 +1423,36 @@
+     sta_entry *dst_sta = NULL;
+     sta_db *stadb = &nic->slow_ctx->stadb;
+     bridge_mode_t bridge_mode = MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_BRIDGE_MODE);
++    BOOL ap_forwarding = MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_AP_FORWARDING);
++
++#if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
++    /* A hairpin-capable bridge owns delivery to this AP's other peers. Direct
++     * RX forwarding as well would duplicate its return traffic and bypass
++     * bridge policy. Without hairpin, preserve standalone/intra-BSS forwarding. */
++    if (ap_forwarding) {
++      struct net_device *ndev = mtlk_df_user_get_ndev(mtlk_df_get_user(mtlk_vap_get_df(nic->vap_handle)));
++
++      rcu_read_lock();
++      if (br_port_flag_is_set(ndev, BR_HAIRPIN_MODE))
++        ap_forwarding = FALSE;
++      rcu_read_unlock();
++    }
++#endif
+ 
+     if (mtlk_osal_eth_is_broadcast(ether_header->h_dest)) {
+       /* Broadcast packet */
+       nbuf_flags |= MTLK_NBUFF_BROADCAST | MTLK_NBUFF_CONSUME;
+-      if (MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_AP_FORWARDING))
++      if (ap_forwarding)
+         nbuf_flags |= MTLK_NBUFF_FORWARD;
+     } else if (mtlk_osal_eth_is_multicast(ether_header->h_dest)) {
+       /* Multicast packet */
+       nbuf_flags |= MTLK_NBUFF_MULTICAST | MTLK_NBUFF_CONSUME;
+-      if (MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_AP_FORWARDING))
++      if (ap_forwarding)
+         nbuf_flags |= MTLK_NBUFF_FORWARD;
+     } else {
+       /* Unicast packet */
+       nbuf_flags |= MTLK_NBUFF_UNICAST;
+-      if (MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_AP_FORWARDING)) {
++      if (ap_forwarding) {
+         /* Search of DESTINATION MAC ADDRESS of RECEIVED packet */
+         dst_sta = mtlk_stadb_find_sta(stadb, ether_header->h_dest);
+         if ((dst_sta == NULL) && ((BR_MODE_WDS == bridge_mode) || mtlk_stadb_get_four_addr_sta_cnt(stadb))) {
+@@ -1832,17 +1866,6 @@
+   }
+   else
+   {
+-    /* Determine multicast group index */
+-    if (nbuf_flags & MTLK_NBUFF_MULTICAST) {
+-      mc_index = mtlk_mc_get_grid(nic, data->nbuf);
+-      if (MCAST_GROUP_UNDEF == mc_index) {
+-        ILOG2_V("Drop due to undefined MC index.");
+-        nic->pstats.txerr_undef_mc_index++;
+-        goto tx_skip;
+-      }
+-    }
+-    ILOG3_DD("CID-%04x: multicast group: %d", mtlk_vap_get_oid(nic->vap_handle), mc_index);
+-
+     if (sta) {
+       /* Use 4 address for peer APs and 4 address stations */
+       if (sta->peer_ap || mtlk_sta_is_4addr(sta)) {
+@@ -1852,6 +1875,19 @@
+       }
+       sta_sid = mtlk_sta_get_sid(sta);
+     }
++
++    /* Four-address copies select a peer SID (MCF=0), so firmware multicast
++     * membership is irrelevant even for non-link-local IPv4/IPv6 payloads. */
++    if (!wds && (nbuf_flags & MTLK_NBUFF_MULTICAST)) {
++      mc_index = mtlk_mc_get_grid(nic, data->nbuf);
++      if (MCAST_GROUP_UNDEF == mc_index) {
++        ILOG2_V("Drop due to undefined MC index.");
++        nic->pstats.txerr_undef_mc_index++;
++        goto tx_skip;
++      }
++    }
++    ILOG3_DD("CID-%04x: multicast group: %d", mtlk_vap_get_oid(nic->vap_handle), mc_index);
++
+   }
+   ILOG3_D("SID: %d", sta_sid);
+ 
+--- a/wireless/driver/linux/mcast.c
++++ b/wireless/driver/linux/mcast.c
+@@ -513,60 +513,56 @@
+   /* analyze and adjust packet's priority */
+   qos_adjust_priority(nic->vap_handle, nic->dscp_table, tx_data->nbuf);
+ 
+-  /* for WDS bridge on AP, clone broadcast packets to all peer APs */
+-  if ((BR_MODE_WDS == bridge_mode) && (nbuf_flags & (MTLK_NBUFF_BROADCAST | MTLK_NBUFF_MULTICAST)))
++  /* Four-address peers cannot consume the BSS's three-address group frames.
++   * Replicate according to peer state, independently of legacy bridge mode. */
++  if (mtlk_vap_is_ap(nic->vap_handle) &&
++      (nbuf_flags & (MTLK_NBUFF_BROADCAST | MTLK_NBUFF_MULTICAST)) &&
++      (BR_MODE_WDS == bridge_mode ||
++       mtlk_stadb_get_four_addr_sta_cnt(&nic->slow_ctx->stadb)))
+   {
+-    int wds_sta_num;
++    bool send_group = true;
+     mtlk_core_handle_tx_data_t clone_data = {0};
+ 
+     /* copy rx_if's into cloned buffer tx_data */
+     clone_data.rx_if = tx_data->rx_if;
+     clone_data.rx_subif = tx_data->rx_subif;
+ 
+-    wds_sta_num = 0;
+-
+-    /*
+-     * When repeater bridge sends b-cast/m-cast frames to AP via VSTA AP will
+-     * distribute frames as 3addr mode. VSTA will get the frame again after header conversion
+-     * in 802.3 with source addr of its bridge or a PC behind the bridge. Therefore driver
+-     * does not know it needs to drop the packet.
+-     *
+-     * Therefore, FW drops 3addr b-cast and multicast frames for 4addr VSTA interfaces.
+-     *
+-     * Clone broadcast packets to all 4addr stations (does not include WDS peer APs) aside from the
+-     * station, which sent the frame so 4addr VSTA does not lose b-cat/m-cast frames it needs to get.
+-     */
++    /* Each copy targets the peer SID. Preserve an ordinary BSS group copy only
++     * for ordinary receivers, and never send a peer copy back to its source. */
+     sta = mtlk_stadb_iterate_first(&nic->slow_ctx->stadb, &iter);
+     if (sta) {
+-      do {
+-        /* ignore sending to itself or to non-4addr clients */
+-        if ((sta->peer_ap || mtlk_sta_is_4addr(sta)) && (sta != src_sta)){
+-          clone_data.dst_sta = (sta_entry *)sta;
+-          wds_sta_num++;
+-
+-          /* STA is other than source STA*/
+-          clone_data.nbuf = mtlk_df_nbuf_clone_no_priv(tx_data->nbuf);
+-
+-          if (!clone_data.nbuf) {
+-            mtlk_sta_on_packet_dropped(clone_data.dst_sta, MTLK_TX_DISCARDED_DRV_NO_RESOURCES);
+-            res = MTLK_ERR_NO_MEM;
+-            break;
+-          }
+-          /* Adjust cloned packet's priority */
+-          mtlk_df_nbuf_set_priority(clone_data.nbuf, mtlk_df_nbuf_get_priority(tx_data->nbuf));
+-
+-          mtlk_sta_incref(clone_data.dst_sta);
+-
+-          ILOG3_Y("Broadcast packet sending to 4addr sta %Y", mtlk_sta_get_addr(clone_data.dst_sta));
+-          res = _mtlk_do_send_data_to_sta(nic, &clone_data, nbuf_flags);
++      /* If the referenced snapshot could not be allocated, leave the ordinary
++       * group path available. Only a complete snapshot can rule out receivers. */
++      send_group = false;
++      for (; sta; sta = mtlk_stadb_iterate_next(&iter)) {
++        if (sta == src_sta)
++          continue;
++        if (!sta->peer_ap && !mtlk_sta_is_4addr(sta)) {
++          send_group = true;
++          continue;
+         }
+-        sta = mtlk_stadb_iterate_next(&iter);
+-      } while (sta);
++        clone_data.dst_sta = (sta_entry *)sta;
++
++        clone_data.nbuf = mtlk_df_nbuf_clone_no_priv(tx_data->nbuf);
++
++        if (!clone_data.nbuf) {
++          mtlk_sta_on_packet_dropped(clone_data.dst_sta, MTLK_TX_DISCARDED_DRV_NO_RESOURCES);
++          /* One failed recipient must not hide later ordinary/group peers. */
++          continue;
++        }
++        /* Adjust cloned packet's priority */
++        mtlk_df_nbuf_set_priority(clone_data.nbuf, mtlk_df_nbuf_get_priority(tx_data->nbuf));
++
++        mtlk_sta_incref(clone_data.dst_sta);
++
++        ILOG3_Y("Broadcast packet sending to 4addr sta %Y", mtlk_sta_get_addr(clone_data.dst_sta));
++        res = _mtlk_do_send_data_to_sta(nic, &clone_data, nbuf_flags);
++      }
+       mtlk_stadb_iterate_done(&iter);
+     } /* End of "for each 4addr client" */
+ 
+-    /* Check is any non-wds stations to send broadcast */
+-    if (0 == (mtlk_stadb_get_sta_cnt(&nic->slow_ctx->stadb) - wds_sta_num)){
++    /* Count receivers, not clones: the source is not a group destination. */
++    if (!send_group) {
+       /* drop original buffer*/
+       mtlk_df_nbuf_free(tx_data->nbuf);
+       return MTLK_ERR_OK;
+--- a/wireless/driver/shared/stadb.c
++++ b/wireless/driver/shared/stadb.c
+@@ -1850,13 +1850,14 @@
+ 
+   mtlk_osal_lock_acquire(&hstdb->lock);
+   h = mtlk_hash_find_ieee_addr(&hstdb->hash, (IEEE_ADDR *)mac);
+-  mtlk_osal_lock_release(&hstdb->lock);
+   if (h) {
+     host_entry *host = MTLK_CONTAINER_OF(h, host_entry, hentry);
+-    /* Station already associated with HOST - just update timestamp */
++    /* Keep the entry and its station reference stable against lookup/removal. */
+     _mtlk_hst_update(host, sta);
++    mtlk_osal_lock_release(&hstdb->lock);
+   }
+   else {
++    mtlk_osal_lock_release(&hstdb->lock);
+ 
+     ILOG2_V("Can't find peer (HOST), adding...");
+     _mtlk_hstdb_add_host(hstdb, mac, sta);

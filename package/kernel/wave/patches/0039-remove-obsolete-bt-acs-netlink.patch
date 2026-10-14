@@ -1,0 +1,221 @@
+Subject: [PATCH] wave: Drop obsolete BT ACS raw netlink transport
+
+The legacy BT ACS socket reserves protocol 21, which Linux owns as
+NETLINK_CRYPTO. Depending on module load order, this prevents either
+mtlkroot or crypto_user from loading.
+
+Stock hostapd ACS uses NL80211_CMD_GET_SURVEY through the existing WAVE
+survey callback. Remove the unused raw transport and its interference
+notification producer. Keep CCA processing, channel data reporting and
+WAVE generic-netlink registration unchanged.
+
+--- a/tools/mtlkroot/linux/nlmsgs.c
++++ b/tools/mtlkroot/linux/nlmsgs.c
+@@ -31,23 +31,11 @@
+ #include "nlmsgs.h"
+ #include "mtlk_rtlog_app_comm.h"
+ 
+-#include "bt_acs.h"
+-
+ #define LOG_LOCAL_GID   GID_NLMSGS
+ #define LOG_LOCAL_FID   1
+ 
+ /* Configuration structure */
+ static wave_nl_socket_t wave_nl_socket;
+-
+-struct sock *bt_acs_nl_sock = NULL;
+-static void bt_acs_nl_input (struct sk_buff *inskb) {}
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,19,0)
+-static int bt_acs_nl_bind (struct net *net, int group) { return 0; }
+-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3,16,0)
+-static int bt_acs_nl_bind (int group) { return 0; }
+-#else
+-static void bt_acs_nl_bind (int group) {}
+-#endif
+ 
+ #ifdef MTCFG_USE_GENL
+ 
+@@ -99,63 +87,6 @@
+ 
+ #endif /* MTCFG_USE_GENL */
+ 
+-int mtlk_nl_bt_acs_send_brd_msg(void *data, int length)
+-{
+-  struct sk_buff *skb = NULL;
+-  struct nlmsghdr *nlh;
+-
+-  /* no socket - no messages */
+-  if (!bt_acs_nl_sock)
+-    return MTLK_ERR_UNKNOWN;
+-
+-  skb = alloc_skb(NLMSG_SPACE(length), GFP_ATOMIC);
+-  if (skb == NULL)
+-    return MTLK_ERR_NO_MEM;
+-
+-  nlh = (struct nlmsghdr*) skb->data;
+-  nlh->nlmsg_len = NLMSG_SPACE(length);
+-  nlh->nlmsg_pid = 0;
+-  nlh->nlmsg_flags = 0;
+-
+-  /* fill the message header */
+-  skb_put(skb, NLMSG_SPACE(length));
+-
+-  memcpy(NLMSG_DATA(nlh), data, length);
+-  NETLINK_CB(skb).portid = 0;  /* from kernel */
+-  
+-  if (netlink_broadcast(bt_acs_nl_sock, skb, 0, NETLINK_BT_ACS_GROUP, GFP_ATOMIC))
+-    return MTLK_ERR_UNKNOWN;
+-  
+-  return MTLK_ERR_OK;
+-}
+-
+-int mtlk_nl_bt_acs_init(void)
+-{
+-  struct netlink_kernel_cfg bt_acs_nl_cfg;
+-
+-  memset(&bt_acs_nl_cfg, 0, sizeof(bt_acs_nl_cfg));
+-  bt_acs_nl_cfg.groups = NETLINK_BT_ACS_GROUP_LAST;
+-  bt_acs_nl_cfg.flags = 0;
+-  bt_acs_nl_cfg.input = &bt_acs_nl_input;
+-  bt_acs_nl_cfg.bind = &bt_acs_nl_bind;
+-
+-  bt_acs_nl_sock = netlink_kernel_create(&init_net, NETLINK_BT_ACS, &bt_acs_nl_cfg);
+-  if (!bt_acs_nl_sock) {
+-    return MTLK_ERR_UNKNOWN;
+-  }
+-  return MTLK_ERR_OK;
+-
+-}
+-
+-void mtlk_nl_bt_acs_cleanup(void)
+-{
+-
+-  if(bt_acs_nl_sock){
+-    sock_release(bt_acs_nl_sock->sk_socket);
+-  }
+-
+-}
+-
+ BOOL wave_nl_is_active (void)
+ {
+   return wave_nl_socket.is_active;
+@@ -246,10 +177,6 @@
+     return MTLK_ERR_UNKNOWN;
+   }
+ 
+-  if (mtlk_nl_bt_acs_init() != MTLK_ERR_OK){
+-    return MTLK_ERR_UNKNOWN;
+-  }
+-
+   nl_socket->is_active = TRUE;
+ 
+   return MTLK_ERR_OK;
+@@ -262,7 +189,6 @@
+ 
+   memset(&wave_nl_socket, 0, sizeof(wave_nl_socket));
+ 
+-  mtlk_nl_bt_acs_cleanup();
+ }
+ 
+ 
+@@ -483,22 +409,15 @@
+    * to be readable via sysfs and iwpriv */
+   mtlk_genl_family_id = mtlk_genl_family.id;
+ 
+-  if (mtlk_nl_bt_acs_init() != MTLK_ERR_OK) {
+-    mtlk_osal_emergency_print("Failed to create Netlink socket for ACS-algo");
+-    goto unreg_ops;
+-  }
+-
+   nl_socket->is_active = TRUE;
+   return MTLK_ERR_OK;
+ 
+-unreg_ops:
+ #if !defined(MTCFG_LINUX_BACKPORT) && LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
+-  genl_unregister_ops(&mtlk_genl_family, wave_genl_ops);
+ unreg_family:
+-#endif
+   genl_unregister_family(&mtlk_genl_family);
+   memset(nl_socket, 0, sizeof(*nl_socket));
+   return MTLK_ERR_UNKNOWN;
++#endif
+ }
+ 
+ void mtlk_nl_cleanup (void)
+@@ -509,7 +428,6 @@
+   genl_unregister_family(&mtlk_genl_family);
+   memset(&wave_nl_socket, 0, sizeof(wave_nl_socket));
+ 
+-  mtlk_nl_bt_acs_cleanup();
+   ILOG1_V("Netlink module cleanup done");
+ }
+ 
+@@ -518,4 +436,3 @@
+ EXPORT_SYMBOL(wave_nl_is_active);
+ EXPORT_SYMBOL(wave_nl_update_receive_callback);
+ EXPORT_SYMBOL(mtlk_nl_send_brd_msg);
+-EXPORT_SYMBOL(mtlk_nl_bt_acs_send_brd_msg);
+--- a/tools/mtlkroot/linux/nlmsgs.h
++++ b/tools/mtlkroot/linux/nlmsgs.h
+@@ -49,11 +49,6 @@
+ int wave_nl_update_receive_callback(wave_nl_callback_t rx_clb_fn, void *rx_clb_fn_params, u8 cmd);
+ BOOL wave_nl_is_active(void);
+ 
+-int mtlk_nl_bt_acs_init(void);
+-void mtlk_nl_bt_acs_cleanup(void);
+-int mtlk_nl_bt_acs_send_brd_msg(void *data, int length);
+-
+-
+ #undef LOG_LOCAL_GID
+ #undef LOG_LOCAL_FID
+ 
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -46,7 +46,6 @@
+ #include "ta.h"
+ #include "core_common.h"
+ #include "mtlk_df_nbuf.h"
+-#include "bt_acs.h"
+ #include "mtlk_coc.h"
+ #include "vendor_cmds.h"
+ 
+@@ -1943,30 +1942,6 @@
+ static char test_wps_ie1[] = {0xdd, 7, 0x00, 0x50, 0xf2, 0x04, 4, 5, 6};
+ static char test_wps_ie2[] = {0xdd, 7, 0x00, 0x50, 0xf2, 0x04, 7, 8, 9};
+ #endif
+-
+-static int bt_acs_send_interf_event(uint8 channel, int8 maximumValue)
+-{
+-  int rc;
+-  struct bt_acs_interf_event_t *interf_event;
+-
+-  rc = MTLK_ERR_OK;
+-
+-  /* allocate memory for notification event */
+-  interf_event = mtlk_osal_mem_alloc(sizeof(*interf_event), MTLK_MEM_TAG_CORE);
+-  if (!interf_event){
+-    return MTLK_ERR_NO_MEM;
+-  }
+-
+-  interf_event->event_id = BT_ACS_EVNT_ID_INTERF_DET;
+-  interf_event->channel = channel;
+-  interf_event->floor_noise = maximumValue;
+-
+-  mtlk_nl_bt_acs_send_brd_msg(interf_event, sizeof(*interf_event));
+-
+-  mtlk_osal_mem_free(interf_event);
+-
+-  return rc;
+-}
+ 
+ /*
+ +----+-------++-----------------++------------------- -----------------------------------------+
+@@ -11421,8 +11396,6 @@
+       if (is_interf_det_switch_needed(interferer_ind->channel)) {
+         ILOG0_DDD("CID-%04x: Interference is detected on channel %d with Metric %d", mtlk_vap_get_oid(core->vap_handle),
+                    interferer_ind->channel, interferer_ind->maximumValue);
+-
+-        bt_acs_send_interf_event(interferer_ind->channel, interferer_ind->maximumValue);
+ 
+         res = fill_channel_data(core, &ch_data);
+         if (res == MTLK_ERR_OK) mtlk_send_chan_data(core->vap_handle, &ch_data, sizeof(ch_data));

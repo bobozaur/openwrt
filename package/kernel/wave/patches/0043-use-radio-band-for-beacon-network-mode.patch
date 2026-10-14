@@ -1,0 +1,82 @@
+Subject: [PATCH] derive beacon network mode from the physical radio band
+
+--- a/wireless/driver/shared/frame.c
++++ b/wireless/driver/shared/frame.c
+@@ -165,24 +165,27 @@
+ }
+ 
+ uint32
+-mtlk_frame_oper_rateset_to_net_mode(uint32 oper_rateset,
++mtlk_frame_oper_rateset_to_net_mode(uint32 oper_rateset, uint8 band,
+                                     BOOL is_ht,
+                                     BOOL is_vht,
+                                     BOOL is_he)
+ {
+     uint32  mode;
+ 
+-    if (oper_rateset & BASIC_RATE_SET_2DOT4_OPERATIONAL_RATE) {
+-        /* MTLK_HW_BAND_2_4_GHZ */
+-        mode = MTLK_NETWORK_11B_ONLY;
+-        if (oper_rateset & ~BASIC_RATE_SET_11B_RATES) {
+-            if(is_he)
+-                mode = MTLK_NETWORK_11BGNAX_MIXED;
+-            else if (is_ht)
+-                mode = MTLK_NETWORK_11BGN_MIXED;
+-            else
+-                mode = MTLK_NETWORK_11BG_MIXED;
+-        }
++    /* OFDM-only 2.4 GHz beacons have no CCK rates. The radio's actual band,
++     * not the legacy rate set, determines the operating network mode.
++     */
++    if (band == MTLK_HW_BAND_2_4_GHZ) {
++        BOOL cck = !!(oper_rateset & BASIC_RATE_SET_2DOT4_OPERATIONAL_RATE);
++
++        if (is_he)
++            mode = MTLK_NETWORK_11BGNAX_MIXED;
++        else if (is_ht)
++            mode = cck ? MTLK_NETWORK_11BGN_MIXED : MTLK_NETWORK_11GN_MIXED;
++        else if (!(oper_rateset & ~BASIC_RATE_SET_11B_RATES))
++            mode = MTLK_NETWORK_11B_ONLY;
++        else
++            mode = cck ? MTLK_NETWORK_11BG_MIXED : MTLK_NETWORK_11G_ONLY;
+     } else {
+         /* MTLK_HW_BAND_5_2_GHZ */
+         if (is_he)
+--- a/wireless/driver/shared/frame.h
++++ b/wireless/driver/shared/frame.h
+@@ -517,7 +517,7 @@
+                                        wv_ie80211_elems *elems);
+ 
+ int     mtlk_frame_ie_extract_phy_rates(uint8 *ie_data, int32 length, bss_data_t *bss_data);
+-uint32  mtlk_frame_oper_rateset_to_net_mode(uint32 oper_rateset, BOOL is_ht, BOOL is_vht, BOOL is_he);
++uint32  mtlk_frame_oper_rateset_to_net_mode(uint32 oper_rateset, uint8 band, BOOL is_ht, BOOL is_vht, BOOL is_he);
+ 
+ #define   MTLK_IDEFS_OFF
+ #include "mtlkidefs.h"
+--- a/wireless/driver/linux/beacon_manager.c
++++ b/wireless/driver/linux/beacon_manager.c
+@@ -543,6 +543,7 @@
+ 
+       mtlk_core_update_network_mode(core,
+           mtlk_frame_oper_rateset_to_net_mode(bss_data.operational_rate_set,
++              wave_radio_band_get(wave_vap_radio_get(core->vap_handle)),
+               MTLK_BFIELD_GET(set_bss_flags, VAP_ADD_FLAGS_HT),
+               MTLK_BFIELD_GET(set_bss_flags, VAP_ADD_FLAGS_VHT),
+               MTLK_BFIELD_GET(set_bss_flags, VAP_ADD_FLAGS_HE)));
+--- a/wireless/driver/shared/mtlkaux.c
++++ b/wireless/driver/shared/mtlkaux.c
+@@ -158,13 +158,13 @@
+   case MTLK_NETWORK_11BG_MIXED: /* walk through */
+   case MTLK_NETWORK_11B_ONLY: /* walk through */
+   case MTLK_NETWORK_11G_ONLY:
+-  case MTLK_NETWORK_11BGNAX_MIXED:
+     return FALSE;
+   case MTLK_NETWORK_11ABGN_MIXED: /* walk through */
+   case MTLK_NETWORK_11ANAC_MIXED: /* walk through */
+   case MTLK_NETWORK_11ANACAX_MIXED: /* walk through */
+   case MTLK_NETWORK_11AN_MIXED: /* walk through */
+   case MTLK_NETWORK_11BGN_MIXED: /* walk through */
++  case MTLK_NETWORK_11BGNAX_MIXED: /* walk through */
+   case MTLK_NETWORK_11GN_MIXED: /* walk through */
+   case MTLK_NETWORK_11N_2_4_ONLY: /* walk through */
+   case MTLK_NETWORK_11N_5_ONLY:

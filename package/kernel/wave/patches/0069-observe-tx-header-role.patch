@@ -1,0 +1,83 @@
+Subject: sample fixed Gen6 A0 TX HC VSTA role bitmaps
+
+Read two fixed configuration words through existing General statistics, under
+the READY/quiesce register fence and both mac80211 object-presence guards.
+No register or firmware state writes. Restricted to Gen6 A0 ASIC dual-2x2
+cards with recovery disabled.
+
+--- a/wireless/driver/shared/hw_mmb.h
++++ b/wireless/driver/shared/hw_mmb.h
+@@ -244,6 +244,9 @@
+   u32 pending_cfm;
+   u32 completed_cfm;
+   u32 irq_status;
++  u32 tx_hc_vsta_b0;
++  u32 tx_hc_vsta_b1;
++  bool tx_hc_vsta_valid;
+ };
+ bool wave_hw_get_tx_stats(mtlk_hw_t *hw, struct wave_tx_stats *stats);
+ 
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -7068,6 +7068,15 @@
+ bool wave_hw_get_tx_stats(mtlk_hw_t *hw, struct wave_tx_stats *stats)
+ {
+   mtlk_handle_t flags;
++  bool read_tx_hc;
++
++  /* Gen6 A0 role snapshot. Recovery may reset MAC blocks outside
++   * reg_lock, so expose these words only with recovery disabled. */
++  read_tx_hc = _chipid_is_gen6_a0(hw->ccr->chip_info->id) &&
++               hw->card_info.is_asic &&
++               hw->radio_band_cfg == WAVE_HW_RADIO_BAND_CFG_DB_2x2 &&
++               !wave_rcvry_enabled_get(hw->mmb_base);
++  stats->tx_hc_vsta_valid = false;
+ 
+   mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
+   stats->free_desc = hw->tx.nof_free_bds;
+@@ -7085,6 +7094,19 @@
+   stats->pending_cfm = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->tx.ring.regs);
+   stats->completed_cfm = READ_ONCE(hw->tx.ring.regs.int_OUT_cntr);
+   stats->irq_status = mtlk_ccr_is_interrupt_pending(hw->ccr);
++  /* READY precedes mac80211 setup. Once both objects exist, every init
++   * failure and normal removal quiesces before either is freed/reset.
++   * Only test presence; do not dereference either object here. */
++  if (read_tx_hc && hw->radio_descr->num_radios == 2 &&
++      wave_radio_mac80211_get(wave_radio_descr_wave_radio_get(hw->radio_descr, 0)) &&
++      wave_radio_mac80211_get(wave_radio_descr_wave_radio_get(hw->radio_descr, 1))) {
++    /* BAR0-relative TX_HC +0x3c. Firmware uses ordinary read/modify/write
++     * for these role bitmaps; neither read clears state. Both banks are
++     * present in dual-2x2 mode. This is not an atomic firmware snapshot. */
++    stats->tx_hc_vsta_b0 = LE32_TO_CPU(mtlk_raw_readl(hw->mmb_base + 0x0094783c));
++    stats->tx_hc_vsta_b1 = LE32_TO_CPU(mtlk_raw_readl(hw->mmb_base + 0x00d4783c));
++    stats->tx_hc_vsta_valid = true;
++  }
+   mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
+   return true;
+ }
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -6457,6 +6457,12 @@
+     mtlk_aux_seq_printf(s, "%10u TX confirmations pending\n", tx.pending_cfm);
+     mtlk_aux_seq_printf(s, "%10u TX confirmations consumed\n", tx.completed_cfm);
+     mtlk_aux_seq_printf(s, "%08x HW interrupt status\n", tx.irq_status);
++    if (tx.tx_hc_vsta_valid) {
++      mtlk_aux_seq_printf(s, "%08x TX HC B0 VSTA bitmap\n", tx.tx_hc_vsta_b0);
++      mtlk_aux_seq_printf(s, "%08x TX HC B1 VSTA bitmap\n", tx.tx_hc_vsta_b1);
++    } else {
++      mtlk_aux_seq_printf(s, "TX HC VSTA bitmaps unavailable\n");
++    }
+   }
+ 
+ #if MTLK_USE_DIRECTCONNECT_DP_API
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -4900,7 +4900,7 @@
+ wave_radio_mac80211_get (wave_radio_t *radio)
+ {
+   MTLK_ASSERT(NULL != radio);
+-  return radio->mac80211;
++  return READ_ONCE(radio->mac80211);
+ }
+ 
+ void __MTLK_IFUNC

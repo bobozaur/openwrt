@@ -1,0 +1,2623 @@
+Subject: [PATCH] wave: native physical-radio, DFS and beacon ownership
+
+--- a/wireless/driver/linux/beacon_manager.c
++++ b/wireless/driver/linux/beacon_manager.c
+@@ -17,6 +17,7 @@
+  *
+  */
+ #include "mtlkinc.h"
++#include <linux/math64.h>
+ #include "mtlkbfield.h"
+ #include "core.h"
+ #include "core_config.h"
+@@ -78,9 +79,38 @@
+ 
+ #define MTLK_BEACON_MAN_RCVRY_WAIT_TIME 250 /* recovery: timeout for beacon template indication from FW in ms */
+ 
++static void wave_beacon_command(mtlk_handle_t handle)
++{
++  beacon_manager_priv_t *priv = HANDLE_T_PTR(beacon_manager_priv_t, handle);
++  struct wave_beacon_indication event;
++  mtlk_core_t *core;
++  unsigned long flags;
++
++  spin_lock_irqsave(&priv->indication_lock, flags);
++  event = priv->indication;
++  core = priv->receiver;
++  spin_unlock_irqrestore(&priv->indication_lock, flags);
++  wave_beacon_man_template_ind_handle(HANDLE_T(core), &event, sizeof(event));
++}
++
++static void wave_beacon_command_complete(serializer_result_t res,
++                                         mtlk_command_t *command, mtlk_handle_t ctx)
++{
++  MTLK_UNREFERENCED_PARAM(res);
++  MTLK_UNREFERENCED_PARAM(command);
++  MTLK_UNREFERENCED_PARAM(ctx);
++}
++
+ int wave_beacon_man_private_init(beacon_manager_priv_t *bmgr_priv)
+ {
++  int res = mtlk_command_init(&bmgr_priv->indication_command, wave_beacon_command,
++                              HANDLE_T(bmgr_priv), MTLK_SLID);
++  if (res != MTLK_ERR_OK)
++    return res;
++  spin_lock_init(&bmgr_priv->indication_lock);
+   bmgr_priv->for_vap_idx = BMGR_NO_VAP;
++  atomic_set(&bmgr_priv->submission_epoch, 0);
++  init_waitqueue_head(&bmgr_priv->indication_wait);
+   mtlk_osal_event_init(&bmgr_priv->rcvry_beacon_ind_event);
+   return MTLK_ERR_OK;
+ }
+@@ -97,15 +127,10 @@
+   MTLK_ASSERT(NULL != hw);
+ 
+   mtlk_osal_event_cleanup(&bmgr_priv->rcvry_beacon_ind_event);
+-
+-  if (bmgr_priv->tmpl.dma_addr) {
+-    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(mtlk_hw_mmb_get_ccr(hw)),
+-                              bmgr_priv->tmpl.dma_addr, bmgr_priv->tmpl.alloced_size, MTLK_DATA_TO_DEVICE);
+-    bmgr_priv->tmpl.dma_addr = 0;
+-  }
+-
+-  if (bmgr_priv->tmpl.ptr)
+-    mtlk_osal_mem_free(bmgr_priv->tmpl.ptr);
++  /* The radio outlives the joined master serializer. */
++  mtlk_command_cleanup(&bmgr_priv->indication_command);
++
++
+ }
+ 
+ void wave_beacon_man_cleanup(beacon_manager_t *bmgr, mtlk_vap_handle_t vap_handle)
+@@ -124,28 +149,24 @@
+ 
+ static int _wave_beacon_man_template_save(beacon_template_t *tmpl, mtlk_beacon_data_t *data)
+ {
+-  unsigned new_len = data->head_len + data->tail_len;
+-
+-  if (new_len > tmpl->alloced_size) { /* need to reallocate */
+-    if (tmpl->ptr)
+-      mtlk_osal_mem_free(tmpl->ptr);
+-
+-    tmpl->ptr = mtlk_osal_mem_dma_alloc(new_len, MTLK_MEM_TAG_BEACON_DATA);
+-
+-    if (!tmpl->ptr) {
+-      ELOG_D("Malloc %u bytes for beacon data failed", new_len);
+-      tmpl->alloced_size = 0;
+-      return MTLK_ERR_NO_MEM;
+-    }
+-
+-    tmpl->alloced_size = new_len;
+-
+-    ILOG2_PD("allocated beacon data for beacon template at 0x%p, len %d", tmpl,
+-      new_len);
+-  }
+-
+-  wave_memcpy(tmpl->ptr, new_len, data->head, data->head_len);
+-  wave_memcpy(tmpl->ptr + data->head_len, new_len - data->head_len, data->tail, data->tail_len);
++  unsigned int len = data->head_len + data->tail_len;
++  uint8 *buf;
++
++  if (len > 65535 || !len || tmpl->dma_addr ||
++      (!data->head && data->head_len) || (!data->tail && data->tail_len))
++    return MTLK_ERR_PARAMS;
++  /* Copy before freeing: an unchanged piece may point into this template. */
++  buf = mtlk_osal_mem_dma_alloc(len, MTLK_MEM_TAG_BEACON_DATA);
++  if (!buf)
++    return MTLK_ERR_NO_MEM;
++  if (data->head_len)
++    memcpy(buf, data->head, data->head_len);
++  if (data->tail_len)
++    memcpy(buf + data->head_len, data->tail, data->tail_len);
++  if (tmpl->ptr)
++    mtlk_osal_mem_free(tmpl->ptr);
++  tmpl->ptr = buf;
++  tmpl->alloced_size = len;
+   tmpl->head_len = data->head_len;
+   tmpl->tail_len = data->tail_len;
+   return MTLK_ERR_OK;
+@@ -373,11 +394,22 @@
+ __wave_beacon_man_template_push_wrap(mtlk_core_t *core, beacon_template_t *tmpl,
+                               beacon_manager_t *bmgr, beacon_manager_priv_t *bmgr_priv)
+ {
+-  int res = _wave_beacon_man_template_push(core, tmpl);
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  u32 generation = wave_radio_dfs_generation(radio);
++  int res = wave_radio_ap_tx_check(radio, generation, false);
++
++  if (res != MTLK_ERR_OK)
++    return res;
++  WRITE_ONCE(bmgr_priv->for_vap_idx, mtlk_vap_get_id(core->vap_handle));
++  atomic_inc(&bmgr_priv->submission_epoch);
++  res = _wave_beacon_man_template_push(core, tmpl);
+   if (res == MTLK_ERR_OK) {
+     bmgr->updated = FALSE;
+     bmgr->switch_pending = TRUE;
+     bmgr_priv->fw_is_busy = TRUE;
++    bmgr_priv->for_vap_idx = mtlk_vap_get_id(core->vap_handle);
++    /* Preserve DMA ownership even if the acknowledged update was invalidated. */
++    res = wave_radio_ap_tx_check(radio, generation, true);
+   }
+   return res;
+ }
+@@ -526,13 +558,12 @@
+   beacon_template_t *tmpl;
+   int res;
+ 
+-  /* if both buffers belong to fw in current VAP */
+-  if (bmgr->switch_pending) {
+-    ILOG2_V("switch pending, saving tmpl to emergency buffer");
+-    res = _wave_beacon_man_template_save(&bmgr_priv->tmpl, beacon_data);
+-    if (MTLK_ERR_OK == res)
+-      bmgr_priv->for_vap_idx = vap_idx;
+-    return res;
++  MTLK_UNREFERENCED_PARAM(vap_idx);
++  /* The complete accepted candidate lives in this VAP's own cache. A single
++   * radio emergency buffer cannot retain updates for multiple pending VAPs. */
++  if (bmgr->switch_pending || !core->slow_ctx->ap_started) {
++    bmgr->updated = TRUE;
++    return MTLK_ERR_OK;
+   }
+ 
+   /* driver owns free buffer */
+@@ -543,8 +574,12 @@
+ 
+   bmgr->updated = TRUE;
+ 
+-  if (!bmgr_priv->fw_is_busy)
+-    return __wave_beacon_man_template_push_wrap(core, tmpl, bmgr, bmgr_priv);
++  if (!bmgr_priv->fw_is_busy) {
++    res = __wave_beacon_man_template_push_wrap(core, tmpl, bmgr, bmgr_priv);
++    if (res != MTLK_ERR_OK)
++      bmgr->updated = FALSE;
++    return res;
++  }
+ 
+   return MTLK_ERR_OK;
+ }
+@@ -553,195 +588,313 @@
+  * Entry point for setting beacon template.
+  * It has to be called from master VAP serializer context.
+  */
++static bool wave_beacon_frame_valid(const void *data, unsigned int len, u8 subtype)
++{
++  const u8 *frame = data;
++  unsigned int pos = sizeof(frame_head_t) + sizeof(frame_beacon_head_t);
++
++  if (!frame || len < pos || frame[0] != subtype)
++    return false;
++  while (pos < len) {
++    if (len - pos < 2 || frame[pos + 1] > len - pos - 2)
++      return false;
++    pos += 2 + frame[pos + 1];
++  }
++  return true;
++}
++
++static bool wave_beacon_cap_changed(const mtlk_beacon_data_t *data,
++                                    const beacon_template_t *old, int id)
++{
++  const u8 *a = cfg80211_find_ie(id, data->tail, data->tail_len);
++  const u8 *b = cfg80211_find_ie(id, old->ptr + old->head_len, old->tail_len);
++
++  return (!!a != !!b) || (a && (a[1] != b[1] || memcmp(a, b, a[1] + 2)));
++}
++
+ int wave_beacon_man_beacon_set(mtlk_handle_t hcore, const void* data, uint32 data_size)
+ {
+-  mtlk_core_t           *mcore = HANDLE_T_PTR(mtlk_core_t, hcore); /* master core, we're running on it */
+-  mtlk_core_t           *core; /* core of the VAP the beacon is changed for */
+-  beacon_manager_priv_t *bmgr_priv;
+-  mtlk_clpb_t           *clpb = *(mtlk_clpb_t **) data;
+-  mtlk_beacon_data_t    *beacon_data;
++  mtlk_core_t *mcore = HANDLE_T_PTR(mtlk_core_t, hcore), *core;
++  mtlk_clpb_t *clpb = *(mtlk_clpb_t **)data;
++  mtlk_beacon_data_t *input, merged;
++  beacon_template_t candidate = {0}, *cached;
++  beacon_manager_t *bmgr;
+   struct wave_he_ap_beacon he;
+-  beacon_manager_t      *bmgr;
+-  mtlk_vap_handle_t     vap_handle;
+-  unsigned              beacon_data_size;
+-  int                   res = MTLK_ERR_OK;
+-  uint32                vap_idx;
+-
+-  MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
+-  beacon_data = mtlk_clpb_enum_get_next(clpb, &beacon_data_size);
+-
+-  MTLK_CLPB_TRY(beacon_data, beacon_data_size)
+-  {
+-    vap_idx = beacon_data->vap_idx;
+-    bmgr_priv = beacon_data->bmgr_priv;
+-    ILOG2_D("vap_idx %d", vap_idx);
+-
+-    /* find vap, referenced by vap index */
+-    res = mtlk_vap_manager_get_vap_handle(mtlk_vap_get_manager(mcore->vap_handle), vap_idx, &vap_handle);
+-    if (MTLK_ERR_OK != res) {
+-      ELOG_D("VAP#%d doesn't exist", vap_idx);
++  wv_ie80211_elems elems = {0};
++  mtlk_vap_handle_t vap;
++  wave_radio_t *radio = wave_vap_radio_get(mcore->vap_handle);
++  u8 *probe = NULL;
++  const u8 *ie;
++  uint32 size;
++  int res = MTLK_ERR_OK;
++  int *reply;
++
++  MTLK_ASSERT(sizeof(mtlk_clpb_t *) == data_size);
++  input = mtlk_clpb_enum_get_next(clpb, &size);
++  /* Reserve the reply before accepting a staged AP or changing a live queue.
++   * A later reply allocation failure must not orphan an AP reservation. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++  MTLK_CLPB_TRY(input, size)
++    res = mtlk_vap_manager_get_vap_handle(mtlk_vap_get_manager(mcore->vap_handle), input->vap_idx, &vap);
++    if (res != MTLK_ERR_OK)
+       MTLK_CLPB_EXIT(res);
+-    }
+-
+-    core = mtlk_vap_get_core(vap_handle);
+-    if (wave_he_parse_ap_beacon(&he, beacon_data->tail, beacon_data->tail_len))
++    core = mtlk_vap_get_core(vap);
++    if (!mtlk_vap_is_ap(vap))
+       MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
+-
+-    /* Live color transitions are not advertised. Normal configuration changes
+-     * restart the BSS. Reject before publishing probe responses or changing
+-     * PDB state, since the beacon queue can defer its firmware submission.
+-     */
+-    if (beacon_data->tail &&
+-        mtlk_core_get_net_state(core) == NET_STATE_CONNECTED) {
+-      mtlk_pdb_t *pdb = mtlk_vap_get_param_db(core->vap_handle);
++    res = wave_radio_role_check(radio, false);
++    if (res != MTLK_ERR_OK)
++      MTLK_CLPB_EXIT(res);
++    res = wave_radio_ap_tx_check(radio, wave_radio_dfs_generation(radio), false);
++    if (res != MTLK_ERR_OK)
++      MTLK_CLPB_EXIT(res);
++    bmgr = &core->slow_ctx->beacon_man_data;
++    cached = &bmgr->tmpl[MTLK_BEACON_MAN_RCVRY_TMPL_IDX];
++    merged = *input;
++    if (!input->head) {
++      merged.head = cached->ptr;
++      merged.head_len = cached->head_len;
++    }
++    if (!input->tail) {
++      merged.tail = cached->ptr ? cached->ptr + cached->head_len : NULL;
++      merged.tail_len = cached->tail_len;
++    }
++    if (!wave_beacon_frame_valid(merged.head, merged.head_len, IEEE80211_STYPE_BEACON) ||
++        (input->probe_resp_len &&
++         !wave_beacon_frame_valid(input->probe_resp, input->probe_resp_len, IEEE80211_STYPE_PROBE_RESP)))
++      MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
++    res = _wave_beacon_man_template_save(&candidate, &merged);
++    if (res != MTLK_ERR_OK)
++      MTLK_CLPB_EXIT(res);
++    merged.head = candidate.ptr;
++    merged.tail = candidate.ptr + candidate.head_len;
++    if (wave_he_parse_ap_beacon(&he, merged.tail, merged.tail_len) ||
++        mtlk_mgmt_parse_elems(merged.tail, merged.tail_len, &elems) != MTLK_ERR_OK)
++      MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
++    ie = cfg80211_find_ie(IE_HT_CAPABILITIES, merged.tail, merged.tail_len);
++    if (ie && ie[1] < 26)
++      MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
++    ie = cfg80211_find_ie(IE_VHT_CAPABILITIES, merged.tail, merged.tail_len);
++    if (ie && ie[1] < 12)
++      MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
++    ie = cfg80211_find_vendor_ie(OUI_WFA, OUI_TYPE_HS20, merged.tail, merged.tail_len);
++    if (ie && ie[1] < 5)
++      MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
++    if (core->slow_ctx->ap_started) {
++      mtlk_pdb_t *pdb = mtlk_vap_get_param_db(vap);
+       unsigned char mcs[8];
+       mtlk_pdb_size_t mcs_len = sizeof(mcs);
+       unsigned int flags = wave_pdb_get_int(pdb, PARAM_DB_CORE_SET_BSS_FLAGS);
+-
+-      if (wave_pdb_get_binary(pdb, PARAM_DB_CORE_HE_MCS_NSS, mcs, &mcs_len) ||
++      bool mfpc = elems.rsne_capab && (get_unaligned_le16(elems.rsne_capab) & BIT(7));
++
++      if (wave_beacon_cap_changed(&merged, cached, IE_HT_CAPABILITIES) ||
++          wave_beacon_cap_changed(&merged, cached, IE_VHT_CAPABILITIES) ||
++          wave_pdb_get_binary(pdb, PARAM_DB_CORE_HE_MCS_NSS, mcs, &mcs_len) ||
+           he.enabled != MTLK_BFIELD_GET(flags, VAP_ADD_FLAGS_HE) ||
+           he.color != wave_pdb_get_int(pdb, PARAM_DB_CORE_HE_BSS_COLOR) ||
+-          memcmp(he.mcs, mcs, sizeof(mcs)))
++          memcmp(he.mcs, mcs, sizeof(mcs)) || mfpc != READ_ONCE(core->slow_ctx->pmf.enabled))
+         MTLK_CLPB_EXIT(MTLK_ERR_NOT_SUPPORTED);
+     }
+-
+-    if (beacon_data->probe_resp && beacon_data->probe_resp_len) /* if a new probe resp template is provided */
+-    {
+-      u8 *probe_resp_templ = mtlk_osal_mem_alloc(beacon_data->probe_resp_len, MTLK_MEM_TAG_BEACON_MNGR);
+-
+-      if (!probe_resp_templ)
+-      {
+-        ELOG_D("Cannot allocate %hu bytes for a new Probe Response template", beacon_data->probe_resp_len);
++    if (input->probe_resp && input->probe_resp_len) {
++      probe = mtlk_osal_mem_alloc(input->probe_resp_len, MTLK_MEM_TAG_BEACON_MNGR);
++      if (!probe)
+         MTLK_CLPB_EXIT(MTLK_ERR_NO_MEM);
+-      }
+-
+-      wave_memcpy(probe_resp_templ, beacon_data->probe_resp_len, beacon_data->probe_resp, beacon_data->probe_resp_len);
+-
+-      /* protect from the old one from being used when we're switching to the new one */
++      memcpy(probe, input->probe_resp, input->probe_resp_len);
++    }
++    res = _wave_beacon_man_push_ctrl(core, bmgr, input->bmgr_priv, &merged, input->vap_idx);
++    if (res != MTLK_ERR_OK)
++      MTLK_CLPB_EXIT(res);
++    /* Queue ownership was accepted. No further allocation can fail publication. */
++    if (cached->ptr)
++      mtlk_osal_mem_free(cached->ptr);
++    *cached = candidate;
++    memset(&candidate, 0, sizeof(candidate));
++    _wave_beacon_template_parsing_ies(core, &merged, &he);
++    if (!core->slow_ctx->ap_started)
++      core->slow_ctx->ap_preparing = true;
++    if (input->probe_resp) {
+       mtlk_osal_lock_acquire(&core->slow_ctx->probe_resp_lock);
+-
+       if (core->slow_ctx->probe_resp_templ)
+         mtlk_osal_mem_free(core->slow_ctx->probe_resp_templ);
+-
+-      core->slow_ctx->probe_resp_templ = probe_resp_templ;
+-      core->slow_ctx->probe_resp_templ_len = beacon_data->probe_resp_len;
+-
+-      mtlk_osal_lock_release(&core->slow_ctx->probe_resp_lock); /* all set, now we have the new one in place */
+-    }
+-
+-    /* head or tail can be NULL if not changed? */
+-    if ((NULL == beacon_data->head) || (NULL == beacon_data->tail)) {
+-      /* nothing to update, keep old template */
+-      ELOG_DPP("CID-%04x: No update for beacon template: head = %p, tail = %p",
+-               mtlk_vap_get_oid(mcore->vap_handle), beacon_data->head, beacon_data->tail);
+-      MTLK_CLPB_EXIT(res);
+-    }
+-
+-    /* We need to fish some things out of the beacon and save until the set_bss time */
+-    _wave_beacon_template_parsing_ies(core, beacon_data, &he);
+-
+-    bmgr = &(core->slow_ctx->beacon_man_data);
+-
+-    /* Save template for recovery */
+-    res = _wave_beacon_man_template_save(&bmgr->tmpl[MTLK_BEACON_MAN_RCVRY_TMPL_IDX], beacon_data);
+-    if (MTLK_ERR_OK != res)
+-      MTLK_CLPB_EXIT(res);
+-
+-    res = _wave_beacon_man_push_ctrl(core, bmgr, bmgr_priv, beacon_data, vap_idx);
+-
+-  }
++      core->slow_ctx->probe_resp_templ = probe;
++      core->slow_ctx->probe_resp_templ_len = input->probe_resp_len;
++      probe = NULL;
++      mtlk_osal_lock_release(&core->slow_ctx->probe_resp_lock);
++    }
+   MTLK_CLPB_FINALLY(res)
+-    return mtlk_clpb_push_res(clpb, res);
++    if (candidate.ptr)
++      mtlk_osal_mem_free(candidate.ptr);
++    if (probe)
++      mtlk_osal_mem_free(probe);
++    if (res == MTLK_ERR_CLPB_DATA)
++      return MTLK_ERR_UNKNOWN;
++    *reply = res;
++    return MTLK_ERR_OK;
+   MTLK_CLPB_END;
++}
++
++/* Master serializer, one native firmware submission at a time. */
++static int wave_beacon_man_schedule(mtlk_core_t *core, unsigned int after)
++{
++  mtlk_vap_manager_t *mgr = mtlk_vap_get_manager(core->vap_handle);
++  beacon_manager_priv_t *priv = wave_radio_beacon_man_private_get(wave_vap_radio_get(core->vap_handle));
++  unsigned int i, count = mtlk_vap_manager_get_max_vaps_count(mgr);
++  mtlk_vap_handle_t vap;
++
++  if (priv->fw_is_busy || !wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))
++    return MTLK_ERR_OK;
++  for (i = 0; i < count; i++) {
++    unsigned int idx = (after + 1 + i) % count;
++    beacon_manager_t *bmgr;
++    beacon_template_t *cache;
++    mtlk_beacon_data_t data = {0};
++    int res;
++
++    if (mtlk_vap_manager_get_vap_handle(mgr, idx, &vap) != MTLK_ERR_OK)
++      continue;
++    core = mtlk_vap_get_core(vap);
++    bmgr = &core->slow_ctx->beacon_man_data;
++    if (!bmgr->updated || bmgr->switch_pending || !core->slow_ctx->ap_started)
++      continue;
++    cache = &bmgr->tmpl[MTLK_BEACON_MAN_RCVRY_TMPL_IDX];
++    data.head = cache->ptr;
++    data.head_len = cache->head_len;
++    data.tail = cache->ptr + cache->head_len;
++    data.tail_len = cache->tail_len;
++    res = _wave_beacon_man_template_save(&bmgr->tmpl[bmgr->drv_idx], &data);
++    if (res == MTLK_ERR_OK)
++      res = __wave_beacon_man_template_push_wrap(core, &bmgr->tmpl[bmgr->drv_idx], bmgr, priv);
++    if (res != MTLK_ERR_OK) {
++      bmgr->updated = FALSE;
++      /* Radar interrupts an accepted update through the ordinary radar event.
++       * Other asynchronous failures cannot silently strand accepted state. */
++      if (!wave_radio_dfs_tx_blocked(wave_vap_radio_get(vap)))
++        wave_hw_mmb_quiesce(mtlk_vap_get_hw(vap));
++    }
++    return res;
++  }
++  return MTLK_ERR_OK;
++}
++
++/* RX wakes a drain independently of queued master work. A REMOVE acknowledgement
++ * alone says nothing about an earlier indication still waiting in that queue. */
++void wave_beacon_man_indication_receive(mtlk_core_t *core, const UMI_BEACON_SET *ind)
++{
++  beacon_manager_priv_t *priv = wave_radio_beacon_man_private_get(wave_vap_radio_get(core->vap_handle));
++  unsigned long flags;
++  int res;
++
++  spin_lock_irqsave(&priv->indication_lock, flags);
++  if (ind->u8vapIndex != READ_ONCE(priv->for_vap_idx)) {
++    spin_unlock_irqrestore(&priv->indication_lock, flags);
++    return;
++  }
++  priv->indication.ind = *ind;
++  priv->indication.epoch = atomic_read(&priv->submission_epoch);
++  priv->receiver = core;
++  if (ind->u8vapIndex == READ_ONCE(priv->for_vap_idx))
++    WRITE_ONCE(priv->received_epoch, priv->indication.epoch);
++  spin_unlock_irqrestore(&priv->indication_lock, flags);
++  wake_up_all(&priv->indication_wait);
++
++  res = mtlk_core_schedule_hw_command(core, &priv->indication_command,
++                                     wave_beacon_command_complete, HANDLE_T(priv));
++  /* BUSY means this same queued command will consume the latest snapshot.
++   * NOT_READY is terminal serializer teardown; there is no RX allocation. */
++  if (res != MTLK_ERR_OK && res != MTLK_ERR_BUSY && res != MTLK_ERR_NOT_READY)
++    ELOG_D("Beacon indication command enqueue failed: %d", res);
++}
++
++/* Master serializer, before STOP/REMOVE can suppress a pending indication.
++ * No new submission can start while this owner waits. Once RX observed it,
++ * resetting the epoch safely rejects all queued work for the old submission. */
++int wave_beacon_man_drain(mtlk_core_t *core)
++{
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  beacon_manager_priv_t *priv = wave_radio_beacon_man_private_get(radio);
++  u32 epoch = atomic_read(&priv->submission_epoch);
++  unsigned int period = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_BEACON_PERIOD);
++
++  if (!wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)) ||
++      !priv->fw_is_busy || priv->for_vap_idx != mtlk_vap_get_id(core->vap_handle))
++    return MTLK_ERR_OK;
++  if (!wait_event_timeout(priv->indication_wait,
++        READ_ONCE(priv->received_epoch) == epoch,
++        msecs_to_jiffies(250 + div_u64((u64)period * 1024 + 999, 1000)))) {
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++    return MTLK_ERR_NOT_READY;
++  }
++  return MTLK_ERR_OK;
+ }
+ 
+ /* indication processing always called from master VAP serializer context */
+ int wave_beacon_man_template_ind_handle(mtlk_handle_t hcore, const void *data, unsigned data_size)
+ {
+-  mtlk_core_t           *core = HANDLE_T_PTR(mtlk_core_t, hcore);
+-  beacon_manager_priv_t *bmgr_priv;
+-  mtlk_vap_manager_t    *vap_mgr = mtlk_vap_get_manager(core->vap_handle);
+-  beacon_manager_t      *bmgr;
+-  beacon_template_t     *tmpl;
+-  mtlk_vap_handle_t     vap_handle;
+-  int                   res;
+-  uint32                vap_idx, i, max_vaps_count;
+-
+-  MTLK_UNREFERENCED_PARAM(data_size);
+-  MTLK_ASSERT(NULL != data);
+-
+-  /* get VAP index from indication message */
+-  vap_idx = ((UMI_BEACON_SET *)data)->u8vapIndex;
+-  ILOG2_D("vap_idx %d", vap_idx);
+-
+-  /* get beacon manager private */
+-  bmgr_priv = wave_radio_beacon_man_private_get(wave_vap_radio_get(core->vap_handle));
+-  MTLK_ASSERT(NULL != bmgr_priv);
+-
+-  /* mark fw as free, because we've got an indication */
+-  bmgr_priv->fw_is_busy = FALSE;
+-
+-  /* find vap, referenced by vap index */
+-  res = mtlk_vap_manager_get_vap_handle(vap_mgr, vap_idx, &vap_handle);
+-  if (MTLK_ERR_OK != res) {
+-    /* It can be a late arriving message sent before the VAP has been removed */
+-    ILOG0_D("Cannot process MC_MAN_BEACON_TEMPLATE_WAS_SET_IND, VAP #%d doesn't exist.", vap_idx);
+-    return res;
+-  }
+-
+-  /* beacon manager from VAP referenced by index */
+-  bmgr = &(mtlk_vap_get_core(vap_handle)->slow_ctx->beacon_man_data);
+-
+-  /* swap buffer index */
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  beacon_manager_priv_t *priv = wave_radio_beacon_man_private_get(wave_vap_radio_get(core->vap_handle));
++  const struct wave_beacon_indication *event = data;
++  const UMI_BEACON_SET *ind = &event->ind;
++  mtlk_vap_handle_t vap;
++  beacon_manager_t *bmgr;
++  beacon_template_t *tmpl;
++  unsigned int idx;
++
++  if (data_size != sizeof(*event))
++    return MTLK_ERR_PARAMS;
++  idx = ind->u8vapIndex;
++  if (event->epoch != atomic_read(&priv->submission_epoch) ||
++      !priv->fw_is_busy || priv->for_vap_idx != idx ||
++      mtlk_vap_manager_get_vap_handle(mtlk_vap_get_manager(core->vap_handle), idx, &vap) != MTLK_ERR_OK)
++    return MTLK_ERR_OK; /* late indication for a stopped/removed VAP */
++  bmgr = &mtlk_vap_get_core(vap)->slow_ctx->beacon_man_data;
++  if (!bmgr->switch_pending)
++    return MTLK_ERR_OK;
++  if (ind->u8Status != UMI_OK) {
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(vap));
++    return MTLK_ERR_MAC;
++  }
++  priv->fw_is_busy = FALSE;
++  priv->for_vap_idx = BMGR_NO_VAP;
+   bmgr->drv_idx ^= 1;
+-  /* clear switch pending flag */
+   bmgr->switch_pending = FALSE;
+-
+   tmpl = &bmgr->tmpl[bmgr->drv_idx];
+-  /* DMA unmap */
+   if (tmpl->dma_addr) {
+-    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(mtlk_hw_mmb_get_ccr(mtlk_vap_get_hw(vap_handle))),
+-                              tmpl->dma_addr, tmpl->alloced_size, MTLK_DATA_TO_DEVICE);
++    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(mtlk_hw_mmb_get_ccr(mtlk_vap_get_hw(vap))),
++                             tmpl->dma_addr, tmpl->alloced_size, MTLK_DATA_TO_DEVICE);
+     tmpl->dma_addr = 0;
+   }
+-
+-  /* if emergency buffer was used in radio module for current VAP */
+-  if (vap_idx == bmgr_priv->for_vap_idx) {
+-    /* put emergency template to the current one */
+-    beacon_template_t tswitch = *tmpl;
+-    *tmpl = bmgr_priv->tmpl;
+-    bmgr_priv->tmpl = tswitch;
+-    /* mark emergency buffer as free */
+-    bmgr_priv->for_vap_idx = BMGR_NO_VAP;
+-    /* template was updated */
+-    bmgr->updated = TRUE;
+-    ILOG2_V("emergency buffer --> vap ctx");
+-  }
+-
+-  /* go over all vaps and find the next template to push */
+-  max_vaps_count = mtlk_vap_manager_get_max_vaps_count(vap_mgr);
+-  for( i= 0; i < max_vaps_count; i++) {
+-    /* start with next round-robin vap */
+-    if (++vap_idx >= max_vaps_count)
+-      vap_idx = 0;
+-    /* find vap, referenced by vap index */
+-    res = mtlk_vap_manager_get_vap_handle(vap_mgr, vap_idx, &vap_handle);
+-    if (MTLK_ERR_OK != res) {
+-      ILOG3_D("VAP#%d doesn't exist, goto next", vap_idx);
+-      continue;
+-    }
+-    /* check if template was updated */
+-    core = mtlk_vap_get_core(vap_handle);
+-    bmgr = &(core->slow_ctx->beacon_man_data);
+-    if (bmgr->updated) {
+-      ILOG2_D("vap %d to push template from", vap_idx);
+-      tmpl = &bmgr->tmpl[bmgr->drv_idx];
+-      __wave_beacon_man_template_push_wrap(core, tmpl, bmgr, bmgr_priv);
+-      break; /*exit loop */
+-    }
+-  } /* for */
+-
+-  return MTLK_ERR_OK;
++  return wave_beacon_man_schedule(core, idx);
++}
++
++/* Called only after acknowledged VAP removal or terminal hardware quiesce.
++ * Unsubmitted initial candidates have no DMA ownership and use the same reset. */
++void wave_beacon_man_stop(mtlk_core_t *core)
++{
++  beacon_manager_t *bmgr = &core->slow_ctx->beacon_man_data;
++  beacon_manager_priv_t *priv = wave_radio_beacon_man_private_get(wave_vap_radio_get(core->vap_handle));
++  unsigned int idx = mtlk_vap_get_id(core->vap_handle);
++
++  if (priv->fw_is_busy && priv->for_vap_idx == idx) {
++    atomic_inc(&priv->submission_epoch);
++    priv->fw_is_busy = FALSE;
++    priv->for_vap_idx = BMGR_NO_VAP;
++  }
++  wave_beacon_man_cleanup(bmgr, core->vap_handle);
++  mtlk_osal_lock_acquire(&core->slow_ctx->probe_resp_lock);
++  if (core->slow_ctx->probe_resp_templ)
++    mtlk_osal_mem_free(core->slow_ctx->probe_resp_templ);
++  core->slow_ctx->probe_resp_templ = NULL;
++  core->slow_ctx->probe_resp_templ_len = 0;
++  mtlk_osal_lock_release(&core->slow_ctx->probe_resp_lock);
++  memset(bmgr, 0, sizeof(*bmgr));
++  bmgr->drv_idx = 1;
++  wave_beacon_man_schedule(core, idx);
+ }
+ 
+ /* beacon template update initiated by driver always called from master VAP serializer context */
+@@ -828,14 +981,7 @@
+     bmgr_priv->for_vap_idx = BMGR_NO_VAP;
+     bmgr_priv->fw_is_busy = 0;
+ 
+-    if (bmgr_priv->tmpl.dma_addr)
+-      mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(mtlk_hw_mmb_get_ccr(mtlk_vap_get_hw(core->vap_handle))),
+-                                bmgr_priv->tmpl.dma_addr, bmgr_priv->tmpl.alloced_size, MTLK_DATA_TO_DEVICE);
+-
+-    if (bmgr_priv->tmpl.ptr)
+-      mtlk_osal_mem_free(bmgr_priv->tmpl.ptr);
+-
+-    memset(&bmgr_priv->tmpl, 0, sizeof(beacon_template_t));
++
+   }
+ 
+   return MTLK_ERR_OK;
+@@ -894,4 +1040,3 @@
+   }
+ 
+ }
+-
+--- a/wireless/driver/linux/beacon_manager.h
++++ b/wireless/driver/linux/beacon_manager.h
+@@ -31,11 +31,22 @@
+   uint16     tail_len;
+ } beacon_template_t;
+ 
++struct wave_beacon_indication {
++  UMI_BEACON_SET ind;
++  u32 epoch;
++};
++
+ /* beacon manager private structure per radio module */
+ typedef struct {
+-  beacon_template_t                   tmpl;   /* emergency buffer */
++  mtlk_command_t                indication_command;
++  spinlock_t                    indication_lock;
++  struct wave_beacon_indication  indication;
++  mtlk_core_t                   *receiver;
++  atomic_t                      submission_epoch;
++  u32                           received_epoch;
++  wait_queue_head_t             indication_wait;
+   BOOL                          fw_is_busy;   /* indicates if fw is busy with previous buffer */
+-  uint8                        for_vap_idx;   /* vap index for emergency buffer */
++  uint8                        for_vap_idx;   /* VAP owning the outstanding firmware submission */
+   mtlk_osal_event_t rcvry_beacon_ind_event;   /* rcvry case: event to wait beacon template set finish ind from FW */
+ } beacon_manager_priv_t;
+ 
+@@ -51,6 +62,9 @@
+ void wave_beacon_man_private_cleanup(beacon_manager_priv_t *bmgr_priv_ctx, void *hw);
+ int  wave_beacon_man_init(beacon_manager_t *bmgr, mtlk_vap_handle_t vap_handle);
+ void wave_beacon_man_cleanup(beacon_manager_t *bmgr, mtlk_vap_handle_t vap_handle);
++void wave_beacon_man_indication_receive(mtlk_core_t *core, const UMI_BEACON_SET *ind);
++int wave_beacon_man_drain(mtlk_core_t *core);
++void wave_beacon_man_stop(mtlk_core_t *core);
+ int  wave_beacon_man_beacon_set(mtlk_handle_t hcore, const void *data, uint32 data_size);
+ int  wave_beacon_man_template_ind_handle(mtlk_handle_t object, const void *data, unsigned data_size);
+ int wave_beacon_man_beacon_update(mtlk_handle_t hcore, const void *data, unsigned data_size);
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -520,6 +520,11 @@
+         (beacon->he_bss_color.partial ||
+          he.color != (beacon->he_bss_color.enabled ? beacon->he_bss_color.color : 0)))))
+     return -EINVAL;
++  if (!beacon->tail && beacon->he_bss_color_valid &&
++      (beacon->he_bss_color.partial ||
++       (beacon->he_bss_color.enabled ? beacon->he_bss_color.color : 0) !=
++        MTLK_CORE_PDB_GET_INT(wave_cfg_core(ndev), PARAM_DB_CORE_HE_BSS_COLOR)))
++    return -EOPNOTSUPP;
+   if (wave_df_keys_blocked_locked(mtlk_df_user_from_ndev(ndev)))
+     return -EBUSY;
+   if (beacon->tail) {
+@@ -824,6 +829,8 @@
+ {
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   MTLK_ASSERT(NULL != cfg80211);
++  if (!ndev->ieee80211_ptr->links[0].ap.beacon_interval)
++    return -ENOTCONN;
+   return wave_radio_bss_change(cfg80211->radio, ndev, params);
+ }
+ 
+@@ -1669,6 +1676,15 @@
+   if (radio_idx >= 0 || link_id)
+     return -EOPNOTSUPP;
+   return wave_radio_tx_power_get(cfg->radio, dbm);
++}
++
++static void wave_cfg80211_end_cac(struct wiphy *wiphy, struct net_device *ndev,
++                                 unsigned int link_id)
++{
++  wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
++
++  if (!link_id)
++    wave_radio_end_cac(cfg80211->radio, ndev);
+ }
+ 
+ static struct cfg80211_ops wv_cfg80211_ops = {
+@@ -1706,6 +1722,7 @@
+   .set_ap_chanwidth = API_WRAPPER(_wave_cfg80211_op_set_ap_chanwidth),
+   .dump_survey = API_WRAPPER(_wave_cfg80211_op_dump_survey),
+   .start_radar_detection = API_WRAPPER(_wave_cfg80211_op_start_radar_detection),
++  .end_cac = wave_cfg80211_end_cac,
+   .channel_switch = API_WRAPPER(_wave_cfg80211_op_channel_switch),
+   .set_qos_map = API_WRAPPER(_wave_cfg80211_op_set_qos_map),
+   .set_antenna = API_WRAPPER(_wave_cfg80211_op_set_antenna),
+@@ -2098,6 +2115,10 @@
+   /* set device pointer for WIPHY */
+   set_wiphy_dev(wiphy, dev);
+ 
++  wiphy->bss_param_support = WIPHY_BSS_PARAM_CTS_PROT |
++    WIPHY_BSS_PARAM_SHORT_PREAMBLE | WIPHY_BSS_PARAM_SHORT_SLOT_TIME |
++    WIPHY_BSS_PARAM_BASIC_RATES | WIPHY_BSS_PARAM_AP_ISOLATE |
++    WIPHY_BSS_PARAM_HT_OPMODE;
+   wiphy->interface_modes = BIT(NL80211_IFTYPE_AP);
+   wv_cfg80211_sysfs_init(wiphy);
+ 
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -548,6 +548,14 @@
+   return _mtlk_core_execute_async_ex(nic, MTLK_ABILITY_NONE, object, func, data, size,
+                                      _MTLK_CORE_PRIORITY_NETWORK, NULL, issuer_slid);
+ }
++/* Preallocated radio command: the serializer owns queueing and teardown. */
++int mtlk_core_schedule_hw_command(mtlk_core_t *core, mtlk_command_t *command,
++                                  mtlk_cmd_completion_clb_t done, mtlk_handle_t ctx)
++{
++  return mtlk_serializer_enqueue(&core->slow_ctx->serializer,
++                                 _MTLK_CORE_PRIORITY_NETWORK, command, done, ctx);
++}
++
+ /* ======================================================*/
+ 
+ /* ======================================================*/
+@@ -2353,10 +2361,16 @@
+     MTLK_ASSERT(params);
+     memset(req, 0, sizeof(*req));
+ 
+-    /* Dealing w/ cts protection */
+-    if (params->use_cts_prot == -1)
+-        params->use_cts_prot = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_HT_PROTECTION);
+-    req->protectionMode = params->use_cts_prot;
++    /* RTS/CTS protects both ERP and mixed/nonmember/20 MHz HT operation.
++     * The firmware enum is not the cfg80211 CTS boolean or HT bitmask. */
++    {
++      unsigned int cts = params->use_cts_prot < 0 ? core->slow_ctx->bss_use_cts_prot : params->use_cts_prot;
++      unsigned int ht = params->ht_opmode < 0 ? core->slow_ctx->bss_ht_opmode : params->ht_opmode;
++
++      req->protectionMode = params->protection_mode >= 0 ? params->protection_mode :
++        (cts || (ht & IEEE80211_HT_OP_MODE_PROTECTION)) ?
++        PROTECTION_MODE_FORCE_RTS_CTS : PROTECTION_MODE_NO_FORCE_PROTECTION;
++    }
+ 
+     /* Dealing w/ short slot time */
+     if (params->use_short_slot_time == -1)
+@@ -2444,9 +2458,11 @@
+     struct mtlk_chan_def *current_chandef = __wave_core_chandef_get(master_core);
+     wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
+ 
+-    /* Dealing w/ cts protection */
+-    if (params->use_cts_prot != -1)
+-      MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_HT_PROTECTION, req->protectionMode);
++    if (params->use_cts_prot >= 0)
++      core->slow_ctx->bss_use_cts_prot = params->use_cts_prot;
++    if (params->ht_opmode >= 0)
++      core->slow_ctx->bss_ht_opmode = params->ht_opmode;
++    MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_HT_PROTECTION, req->protectionMode);
+ 
+     /* Dealing w/ short slot time */
+     if (params->use_short_slot_time != -1)
+@@ -2480,11 +2496,22 @@
+     mtlk_txmm_data_t *man_entry;
+     UMI_SET_BSS *req;
+     int res = MTLK_ERR_OK;
++    wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++    u32 generation = wave_radio_dfs_generation(radio);
+     int vap_id = mtlk_vap_get_id(core->vap_handle);
+     mtlk_pdb_t *param_db_core = mtlk_vap_get_param_db(core->vap_handle);
+     int twt_operation_mode = wave_pdb_get_int(param_db_core, PARAM_DB_CORE_TWT_OPERATION_MODE);
+     MTLK_ASSERT(fw_params);
+     MTLK_ASSERT(TRUE >= twt_operation_mode);
++
++    res = wave_radio_role_check(wave_vap_radio_get(core->vap_handle),
++                                !mtlk_vap_is_ap(core->vap_handle));
++    if (res != MTLK_ERR_OK)
++      return res;
++
++    if (mtlk_vap_is_ap(core->vap_handle) &&
++        (res = wave_radio_ap_tx_check(radio, generation, false)) != MTLK_ERR_OK)
++      return res;
+ 
+     /* prepare msg for the FW */
+     if (!(man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(core->vap_handle), &res))) {
+@@ -2509,12 +2536,19 @@
+ #endif
+     ILOG1_D("UMI_SET_BSS->u8HE_Bss_Color:%d", req->u8HE_Bss_Color);
+ 
+-    finish_and_prevent_fw_set_chan(context_core, TRUE); /* set_bss is a "process", so need this; core is the core on which we're running */
++    res = finish_and_prevent_fw_set_chan(context_core, TRUE);
++    if (res != MTLK_ERR_OK) {
++      mtlk_txmm_msg_cleanup(&man_msg);
++      goto end;
++    }
+ 
+     mtlk_dump(2, req, sizeof(*req), "dump of UMI_SET_BSS:");
+ 
+     /* send message to FW */
+     res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++
++    if (res == MTLK_ERR_OK && mtlk_vap_is_ap(core->vap_handle))
++      res = wave_radio_ap_tx_check(radio, generation, true);
+ 
+     /* process result */
+     if (res != MTLK_ERR_OK)
+@@ -2567,8 +2601,10 @@
+   radio = wave_vap_radio_get(core->vap_handle);
+ 
+   if (core->net_state != NET_STATE_ACTIVATING &&
+-      core->net_state != NET_STATE_CONNECTED)
++      core->net_state != NET_STATE_CONNECTED) {
++    res = MTLK_ERR_NOT_READY;
+     goto end;
++  }
+ 
+   if (mtlk_vap_is_ap(core->vap_handle)) {
+     if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(core->vap_handle))) {
+@@ -2577,15 +2613,10 @@
+       goto end;
+     }
+ 
+-    /* Update ap_isolate parameter */
+-    wave_pdb_set_int(param_db_core, PARAM_DB_CORE_AP_FORWARDING, !params->ap_isolate);
+-
+     /* Update ht_protection value if it was changed earlier by iwpriv */
+     if (MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_IWPRIV_FORCED) & PARAM_DB_CORE_IWPRIV_FORCED_HT_PROTECTION_FLAG) {
+-        params->use_cts_prot = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_HT_PROTECTION);
+-    }
+-  } else {
+-    wave_pdb_set_int(param_db_core, PARAM_DB_CORE_AP_FORWARDING, FALSE);
++        params->protection_mode = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_HT_PROTECTION);
++    }
+   }
+ 
+   /* Fill UMI_SET_BSS FW request */
+@@ -2598,6 +2629,9 @@
+ 
+   /* Update params db */
+   if (MTLK_ERR_OK == res) {
++    if (!mtlk_vap_is_ap(core->vap_handle) || params->ap_isolate >= 0)
++      wave_pdb_set_int(param_db_core, PARAM_DB_CORE_AP_FORWARDING,
++                       mtlk_vap_is_ap(core->vap_handle) && !params->ap_isolate);
+     _mtlk_core_update_bss_params(core, &fw_request, params);
+     wave_pdb_set_int(param_db_core, PARAM_DB_CORE_HE_BSS_COLOR, fw_request.u8HE_Bss_Color);
+   }
+@@ -2863,6 +2897,10 @@
+     wave_hw_mmb_quiesce(mtlk_vap_get_hw(nic->vap_handle));
+     return res;
+   }
++
++  res = wave_beacon_man_drain(nic);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   if (net_state == NET_STATE_HALTED) {
+     goto CORE_HALTED;
+@@ -3449,6 +3487,7 @@
+   struct mtlk_ap_settings *aps;
+   unsigned aps_size;
+   int res;
++  u32 generation = wave_radio_dfs_generation(radio);
+   sta_db_cfg_t sta_db_cfg;
+ 
+   MTLK_ASSERT(sizeof(mtlk_clpb_t *) == data_size);
+@@ -3464,6 +3503,14 @@
+   MTLK_CLPB_TRY(aps, aps_size)
+   {
+     if (mtlk_vap_is_ap(nic->vap_handle)) {
++      res = wave_radio_role_check(radio, false);
++      if (res != MTLK_ERR_OK)
++        MTLK_CLPB_EXIT(res);
++      if (!mtlk_core_is_chandef_identical(&aps->chandef, __wave_core_chandef_get(mcore)))
++        MTLK_CLPB_EXIT(MTLK_ERR_BUSY);
++      res = wave_radio_ap_tx_check(radio, generation, false);
++      if (res != MTLK_ERR_OK)
++        MTLK_CLPB_EXIT(res);
+       /* save these away for later restores, etc. */
+       MTLK_CORE_PDB_SET_BINARY(nic, PARAM_DB_CORE_ESSID, aps->essid, aps->essid_len);
+       wave_pdb_set_int(param_db_core, PARAM_DB_CORE_HIDDEN_SSID, aps->hidden_ssid);
+@@ -3525,6 +3572,16 @@
+ 
+     mtlk_stadb_configure(&nic->slow_ctx->stadb, &sta_db_cfg);
+     mtlk_stadb_start(&nic->slow_ctx->stadb);
++    if (mtlk_vap_is_ap(nic->vap_handle)) {
++      res = wave_radio_ap_tx_check(radio, generation, true);
++      if (res != MTLK_ERR_OK)
++        MTLK_CLPB_EXIT(res);
++      nic->slow_ctx->ap_started = true;
++      nic->slow_ctx->ap_preparing = false;
++      /* Initial template was validated and cached before ADD_VAP. Submit only
++       * now, so a failed admission never gives firmware an unowned DMA buffer. */
++      res = wave_beacon_man_beacon_update(hcore, NULL, 0);
++    }
+   }
+   MTLK_CLPB_FINALLY(res) {
+     return mtlk_clpb_push_res(clpb, res);
+@@ -3567,30 +3624,12 @@
+ 
+   if (mtlk_vap_is_master(nic->vap_handle))
+   {
+-    mtlk_df_t *df = mtlk_vap_get_df(nic->vap_handle);
+-    mtlk_df_user_t *df_user = mtlk_df_get_user(df);
+     mtlk_scan_support_t *ss = mtlk_core_get_scan_support(running_core);
+     struct mtlk_chan_def *ccd = __wave_core_chandef_get(nic);
+ 
+     ccd->sb_dfs.sb_dfs_bw = MTLK_SB_DFS_BW_NORMAL;
+ 
+     mtlk_core_cfg_set_block_tx(nic, 0);
+-
+-    if (!mtlk_osal_timer_is_stopped(&nic->slow_ctx->cac_timer))
+-    {
+-      mtlk_osal_timer_cancel_sync(&nic->slow_ctx->cac_timer);
+-
+-      if ((RCVRY_TYPE_FAST == rcvry_type) || (RCVRY_TYPE_FULL == rcvry_type)) {
+-        ILOG1_D("CID-%04x: Cancel CAC-timer due to Recovery w/o Kernel and hostapd notification",
+-                mtlk_vap_get_oid(nic->vap_handle));
+-        wave_rcvry_restart_cac_set(hw, vap_manager, TRUE);
+-      }
+-      else {
+-        struct net_device *ndev = mtlk_df_user_get_ndev(df_user);
+-        ILOG1_D("CID-%04x: Aborting the CAC", mtlk_vap_get_oid(nic->vap_handle));
+-        wv_cfg80211_cac_event(ndev, ccd, 0); /* 0 means it didn't finish, i.e., was aborted */
+-      }
+-    }
+ 
+     if (ss->dfs_debug_params.debug_chan)
+       ss->dfs_debug_params.switch_in_progress = FALSE;
+@@ -3686,6 +3725,12 @@
+   */
+   if (MTLK_ERR_OK != deactivate_res)
+     res = deactivate_res;
++  if (nic->is_stopped || !wave_hw_mmb_ready(mtlk_vap_get_hw(nic->vap_handle))) {
++    nic->slow_ctx->ap_started = false;
++    nic->slow_ctx->ap_preparing = false;
++    nic->slow_ctx->sta_connecting = false;
++    wave_beacon_man_stop(nic);
++  }
+   return res;
+ }
+ 
+@@ -4198,9 +4243,6 @@
+ 
+ void mtlk_set_dbg_channel_availability_check_time(mtlk_scan_support_t* obj, int channel_availability_check_time)
+ {
+-  /* wait for Radar Detection end */
+-  wave_radio_radar_detect_end_wait(wave_vap_radio_get(obj->master_core->vap_handle));
+-
+   obj->dfs_debug_params.cac_time = channel_availability_check_time;
+ }
+ 
+@@ -5212,8 +5254,8 @@
+   return res;
+ }
+ 
+-static int
+-_mtlk_core_set_radio_mode_req (mtlk_core_t *core, uint32 enable_radio)
++int
++wave_core_radio_set_mode (mtlk_core_t *core, uint32 enable_radio)
+ {
+   mtlk_txmm_msg_t           man_msg;
+   mtlk_txmm_data_t          *man_entry = NULL;
+@@ -5247,6 +5289,13 @@
+ 
+   mtlk_txmm_msg_cleanup(&man_msg);
+   return res;
++}
++
++static int _mtlk_core_set_radio_mode_req(mtlk_core_t *core, uint32 enable_radio)
++{
++  if (enable_radio && wave_radio_dfs_tx_blocked(wave_vap_radio_get(core->vap_handle)))
++    return MTLK_ERR_BUSY;
++  return wave_core_radio_set_mode(core, enable_radio);
+ }
+ 
+ static int
+@@ -6659,7 +6708,7 @@
+     _mtlk_core_fill_set_bss_request(core, &fw_request, params);
+ 
+     /* Process UM_BSS_SET_BSS_REQ */
+-    res = mtlk_core_set_bss(core, core, &fw_request);
++    res = mtlk_core_set_bss(core, mtlk_core_get_master(core), &fw_request);
+ 
+ end:
+     return res;
+@@ -6670,6 +6719,7 @@
+ {
+     memset(bss_parameters, 0, sizeof(*bss_parameters));
+     bss_parameters->use_cts_prot = -1;
++    bss_parameters->protection_mode = -1;
+     bss_parameters->use_short_preamble = -1;
+     bss_parameters->use_short_slot_time = -1;
+     bss_parameters->ht_opmode = -1;
+@@ -6685,7 +6735,7 @@
+ 
+     /* reset structure and set protection mode */
+     _mtlk_core_reset_bss_params_internal(&bss_parameters);
+-    bss_parameters.use_cts_prot = protection_mode;
++    bss_parameters.protection_mode = protection_mode;
+ 
+     /* set bss */
+     return _mtlk_core_set_bss_internal(core, &bss_parameters);
+@@ -8601,6 +8651,8 @@
+   cpd.switch_type = ST_NORMAL;
+   cpd.block_tx_pre = FALSE;
+   cpd.block_tx_post = FALSE; /* TRUE means waiting for radars */
++  cpd.station = true;
++  cpd.dont_notify_kernel = TRUE;
+   cpd.radar_required = FALSE; /* we have a station up so we don't need radar checks */
+ 
+   _mtlk_df_user_invoke_core_async(master_df,
+@@ -8723,7 +8775,7 @@
+ static BOOL _wave_core_cac_in_progress(mtlk_core_t *master_core)
+ {
+   MTLK_ASSERT(NULL != master_core);
+-  return !mtlk_osal_timer_is_stopped(&master_core->slow_ctx->cac_timer);
++  return wave_radio_cac_active(wave_vap_radio_get(master_core->vap_handle));
+ }
+ 
+ static int
+@@ -9014,12 +9066,7 @@
+   struct mtlk_chan_def ccd;
+   UMI_RADAR_DETECTION *radar_det;
+   mtlk_scan_support_t *ss;
+-  mtlk_df_t *df;
+-  mtlk_df_user_t *df_user;
+-  struct wireless_dev *wdev;
+-  struct net_device *ndev;
+   int cur_channel;
+-  uint32 cac_started;
+   BOOL radar_det_enabled;
+   struct nic *nic = HANDLE_T_PTR(struct nic, core_object);
+   wave_radio_t *radio = wave_vap_radio_get(nic->vap_handle);
+@@ -9028,14 +9075,7 @@
+ 
+   MTLK_ASSERT(nic == mtlk_core_get_master(nic));
+ 
+-  /* wait for Radar Detection end */
+-  wave_radio_radar_detect_end_wait(radio);
+-
+   ss = mtlk_core_get_scan_support(nic);
+-  df = mtlk_vap_get_df(nic->vap_handle);
+-  df_user = mtlk_df_get_user(df);
+-  wdev = mtlk_df_user_get_wdev(df_user);
+-  ndev = mtlk_df_user_get_ndev(df_user);
+   radar_det_enabled = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_DFS_RADAR_DETECTION);
+ 
+   ccd = *__wave_core_chandef_get(nic);
+@@ -9065,7 +9105,6 @@
+   ILOG0_DDDD("RADAR detected on channel: %u, radar_type: %u, radar bit map 0x%02x, emulated %d",
+              radar_det->channel, radar_det->radarType, rbm, emulating);
+ 
+-  cac_started = !mtlk_osal_timer_is_stopped(&nic->slow_ctx->cac_timer);
+   mtlk_hw_inc_radar_cntr(mtlk_vap_get_hw(nic->vap_handle));
+ 
+   if (!radar_det_enabled) {
+@@ -9103,24 +9142,12 @@
+       ss->dfs_debug_params.switch_in_progress = TRUE;
+   }
+ 
+-  MTLK_ASSERT(wdev);
+-  mtlk_osal_timer_cancel_sync(&nic->slow_ctx->cac_timer);
+-  mtlk_core_cfg_set_block_tx(nic, 0);
+-
+-  if (wave_radio_get_sta_vifs_exist(radio)) {
+-    ILOG0_V("STA vif exist: ignoring radar event");
+-    return MTLK_ERR_OK;
+-  }
+-
+-  if (cac_started)
+-    wv_cfg80211_cac_event(ndev, &ccd, 0); /* 0 means it didn't finish, i.e., was aborted */
+-
+   if (__mtlk_is_sb_dfs_switch(ccd.sb_dfs.sb_dfs_bw)) {
+     ccd.center_freq1 = ccd.sb_dfs.center_freq;
+     ccd.width = ccd.sb_dfs.width;
+   }
+ 
+-  mtlk_df_user_handle_radar_event(df_user, wdev, &ccd, cac_started, rbm);
++  wave_radio_radar_event(radio, &ccd);
+ 
+   return MTLK_ERR_OK;
+ }
+@@ -10166,7 +10193,6 @@
+   MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, BEACON_DATA)
+   MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, MGMT_FRAME_FILTER)
+   MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, SCHED_SCAN_TIMER_INIT)
+-  MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, CAC_TIMER_INIT)
+   MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, CCA_TIMER_INIT)
+   MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, SCHED_SCAN_REQ_INIT)
+   MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, PROBE_RESP_LOCK)
+@@ -10200,8 +10226,6 @@
+                       mem_free_nullsafe, ((void **) &slow_ctx->sched_scan_req));
+     MTLK_CLEANUP_STEP(core_slow_ctx, CCA_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
+                       mtlk_osal_timer_cleanup, (&slow_ctx->cca_step_down_timer));
+-    MTLK_CLEANUP_STEP(core_slow_ctx, CAC_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
+-                      mtlk_osal_timer_cleanup, (&slow_ctx->cac_timer));
+     MTLK_CLEANUP_STEP(core_slow_ctx, SCHED_SCAN_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
+                       mtlk_osal_timer_cleanup, (&slow_ctx->sched_scan_timer));
+     MTLK_CLEANUP_STEP(core_slow_ctx, MGMT_FRAME_FILTER, MTLK_OBJ_PTR(slow_ctx),
+@@ -10286,8 +10310,6 @@
+     MTLK_INIT_STEP(core_slow_ctx, SCHED_SCAN_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
+                    mtlk_osal_timer_init, (&slow_ctx->sched_scan_timer, sched_scan_timer_clb_func, HANDLE_T(nic)));
+ 
+-    MTLK_INIT_STEP(core_slow_ctx, CAC_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
+-                   mtlk_osal_timer_init, (&slow_ctx->cac_timer, cac_timer_clb_func, HANDLE_T(nic)));
+ 
+     MTLK_INIT_STEP(core_slow_ctx, CCA_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
+                    mtlk_osal_timer_init, (&slow_ctx->cca_step_down_timer, cca_step_down_timer_clb_func, HANDLE_T(nic)));
+@@ -11563,6 +11585,7 @@
+   int i, res;
+ 
+   memset(&bp, 0, sizeof(bp));
++  bp.protection_mode = -1;
+   bp.vap_id = bss_change_params->vap_index;
+   bp.use_cts_prot = bss_change_params->info->use_cts_prot;
+   bp.use_short_preamble = bss_change_params->info->use_short_preamble;
+@@ -11607,6 +11630,7 @@
+     }
+ 
+     if ((bss_change_params->changed & BSS_CHANGED_HE_BSS_COLOR) ||
++        (bss_change_params->changed & BSS_CHANGED_HT) ||
+         (bss_change_params->changed & BSS_CHANGED_BASIC_RATES) ||
+         (bss_change_params->changed & BSS_CHANGED_ERP_PREAMBLE) ||
+         (bss_change_params->changed & BSS_CHANGED_ERP_SLOT) ||
+@@ -11800,8 +11824,9 @@
+       HANDLE_T(nic), payload, sizeof(UMI_Beacon_Block_t));
+     break;
+   case MC_MAN_RADAR_IND:
+-    _mtlk_process_hw_task(master_nic, SERIALIZABLE, _handle_radar_event,
+-                          HANDLE_T(master_nic), payload, sizeof(UMI_RADAR_DETECTION));
++    mtlk_hw_inc_radar_cntr(mtlk_vap_get_hw(master_nic->vap_handle));
++    wave_radio_radar_indication(wave_vap_radio_get(master_nic->vap_handle),
++                                ((UMI_RADAR_DETECTION *)payload)->channel);
+     break;
+   case MC_MAN_BEACON_TEMPLATE_WAS_SET_IND:
+     /* This has to be run in master VAP context */
+@@ -11809,9 +11834,7 @@
+       /* recovery case */
+       wave_beacon_man_rcvry_template_ind_handle(master_nic);
+     } else {
+-      /* operational case */
+-      _mtlk_process_hw_task(master_nic, SERIALIZABLE, wave_beacon_man_template_ind_handle,
+-                            HANDLE_T(master_nic), payload, sizeof(UMI_BEACON_SET));
++      wave_beacon_man_indication_receive(master_nic, payload);
+     }
+     break;
+   case MC_MAN_CLASS3_ERROR_IND:
+@@ -11868,6 +11891,34 @@
+   }
+ 
+   return TRUE;
++}
++
++static int wave_core_sta_role(mtlk_handle_t hcore, const void *data, uint32 data_size)
++{
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  mtlk_clpb_t *clpb = *(mtlk_clpb_t **)data;
++  struct wave_sta_role_request *request;
++  uint32 size;
++  int res = MTLK_ERR_OK;
++
++  request = mtlk_clpb_enum_get_next(clpb, &size);
++  MTLK_CLPB_TRY(request, size)
++    if (mtlk_vap_is_ap(core->vap_handle))
++      MTLK_CLPB_EXIT(MTLK_ERR_PARAMS);
++    if (request->active) {
++      if (!wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))
++        MTLK_CLPB_EXIT(MTLK_ERR_NOT_READY);
++      if (!mtlk_core_is_chandef_identical(&request->chandef,
++                        __wave_core_chandef_get(mtlk_core_get_master(core))))
++        MTLK_CLPB_EXIT(MTLK_ERR_BUSY);
++      res = wave_radio_role_check(wave_vap_radio_get(core->vap_handle), true);
++      if (res != MTLK_ERR_OK)
++        MTLK_CLPB_EXIT(res);
++    }
++    core->slow_ctx->sta_connecting = request->active;
++  MTLK_CLPB_FINALLY(res)
++    return mtlk_clpb_push_res(clpb, res);
++  MTLK_CLPB_END;
+ }
+ 
+ void __MTLK_IFUNC
+@@ -12073,7 +12124,7 @@
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_TX_POWER_LIMIT_OFFSET,  _mtlk_core_get_tx_power_limit_offset);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_TX_POWER_LIMIT_OFFSET,  _mtlk_core_set_tx_power_limit_offset);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_HT_PROTECTION,         _mtlk_core_get_ht_protection)
+-    _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_HT_PROTECTION,         _mtlk_core_set_ht_protection)
++    _MTLK_CORE_HANDLE_REQ_MASTER(WAVE_CORE_REQ_SET_HT_PROTECTION,         _mtlk_core_set_ht_protection)
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_QAMPLUS_MODE,         _mtlk_core_set_qamplus_mode);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_QAMPLUS_MODE,         _mtlk_core_get_qamplus_mode);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_RADIO_MODE,           _mtlk_core_set_radio_mode);
+@@ -12103,10 +12154,11 @@
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_FREQ_JUMP_MODE,       mtlk_core_cfg_set_freq_jump_mode);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_RESTRICTED_AC_MODE,    mtlk_core_cfg_set_restricted_ac_mode_cfg);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_RESTRICTED_AC_MODE,    mtlk_core_cfg_get_restricted_ac_mode_cfg);
++    _MTLK_CORE_HANDLE_REQ_MASTER(WAVE_CORE_REQ_STA_ROLE, wave_core_sta_role);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_STA_CHANGE_BSS,            _mtlk_core_sta_change_bss);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_FIXED_LTF_AND_GI,      mtlk_core_set_fixed_ltf_and_gi);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_FIXED_LTF_AND_GI,      mtlk_core_get_fixed_ltf_and_gi);
+-    _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_CAC_TIMEOUT,               cac_timer_serialized_func);
++    _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_CAC_TIMEOUT,               wave_radio_cac_control);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_CALIBRATION_MASK,      core_cfg_set_calibration_mask);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_CALIBRATION_MASK,      core_cfg_get_calibration_mask);
+ 
+--- a/wireless/driver/linux/core.h
++++ b/wireless/driver/linux/core.h
+@@ -503,7 +503,11 @@
+   scan_cache_t       cache; // FIXME likely unnecessary but too much code wants it
+ 
+   mtlk_osal_timer_t sched_scan_timer;
+-  mtlk_osal_timer_t cac_timer;
++  bool bss_use_cts_prot;
++  u16 bss_ht_opmode;
++  bool ap_preparing;
++  bool ap_started; /* Successful native START_AP through stop_ap. */
++  bool sta_connecting; /* Master serializer: NOTEXIST -> NONE through final removal. */
+   struct mtlk_scan_request *sched_scan_req;
+ 
+   /* actual BSS data */
+@@ -935,9 +939,14 @@
+ void __MTLK_IFUNC mtlk_core_on_bss_tx(mtlk_core_t *nic, uint32 subtype);
+ void __MTLK_IFUNC mtlk_core_on_bss_cfm(mtlk_core_t *nic, IEEE_ADDR *peer, uint32 extra_processing, uint32 subtype, BOOL is_broadcast);
+ void __MTLK_IFUNC mtlk_core_on_bss_res_queued(mtlk_core_t *nic);
++int mtlk_core_schedule_hw_command(mtlk_core_t *core, mtlk_command_t *command,
++                                  mtlk_cmd_completion_clb_t done, mtlk_handle_t ctx);
++int __MTLK_IFUNC mtlk_wait_all_packets_confirmed(mtlk_core_t *nic);
+ void __MTLK_IFUNC mtlk_core_on_bss_res_freed(mtlk_core_t *nic);
+ 
+ int __MTLK_IFUNC mtlk_core_set_coc_actual_power_mode(mtlk_core_t *core);
++/* Master serializer, validated channel transitions and CAC RF-off only. */
++int wave_core_radio_set_mode(mtlk_core_t *core, uint32 enable_radio);
+ int __MTLK_IFUNC mtlk_core_radio_enable_if_needed(mtlk_core_t *core);
+ int __MTLK_IFUNC mtlk_core_radio_disable_if_needed(mtlk_core_t *core);
+ int current_chandef_init(mtlk_core_t *core, struct mtlk_chan_def *ccd);
+--- a/wireless/driver/linux/core_ab.c
++++ b/wireless/driver/linux/core_ab.c
+@@ -73,6 +73,7 @@
+ };
+ 
+ static const mtlk_ability_id_t _core_ap_general_abilities[] = {
++  WAVE_CORE_REQ_STA_ROLE,
+   WAVE_CORE_REQ_AP_CONNECT_STA,
+   WAVE_CORE_REQ_AP_DISCONNECT_STA,
+   WAVE_CORE_REQ_AP_DISCONNECT_ALL,
+@@ -118,6 +119,7 @@
+ };
+ 
+ static const mtlk_ability_id_t _core_sta_connect_abilities[] = {
++  WAVE_CORE_REQ_STA_ROLE,
+   WAVE_CORE_REQ_AP_CONNECT_STA,
+   WAVE_CORE_REQ_AP_DISCONNECT_STA,
+   WAVE_CORE_REQ_AP_DISCONNECT_ALL,
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -395,7 +395,7 @@
+   return res;
+ }
+ 
+-int core_cfg_send_set_chan_by_msg(mtlk_txmm_msg_t *man_msg)
++int core_cfg_send_set_chan_by_msg(mtlk_core_t *core, mtlk_txmm_msg_t *man_msg, bool station)
+ {
+   mtlk_txmm_data_t *man_entry = man_msg->data;
+   UM_SET_CHAN_PARAMS *req = (UM_SET_CHAN_PARAMS *) man_entry->payload;
+@@ -414,6 +414,11 @@
+               req->bg_scan);
+   mtlk_dump(2, req, sizeof(*req), "dump of UM_SET_CHAN_PARAMS:");
+ 
++  res = wave_radio_dfs_record_channel(wave_vap_radio_get(core->vap_handle),
++          req->low_chan_num, req->chan_width, req->primary_chan_idx,
++          req->isRadarDetectionNeeded);
++  if (res != MTLK_ERR_OK)
++    return res;
+   res = mtlk_txmm_msg_send_blocked(man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+ 
+   if (res != MTLK_ERR_OK)
+@@ -426,6 +431,8 @@
+     res = MTLK_ERR_MAC;
+   }
+ 
++  if (res == MTLK_ERR_OK)
++    wave_radio_channel_station_set(wave_vap_radio_get(core->vap_handle), station);
+   return res;
+ }
+ 
+@@ -510,6 +517,7 @@
+   struct mtlk_chan_def   destination = *cd;
+   wave_radio_t          *radio = wave_vap_radio_get(core->vap_handle);
+   unsigned              primary_chan_num, old_freq1;
++  u32                   radar_generation = wave_radio_dfs_generation(radio);
+   mtlk_country_code_t    country;
+   int                   res = MTLK_ERR_OK;
+ 
+@@ -517,6 +525,10 @@
+   cd = &destination;
+   ILOG2_DDDD("band=%u, center_freq=%hu, flags=0x%08x, nl_width=%u",
+              cd->chan.band, cd->chan.center_freq, cd->chan.flags, cd->width);
++
++  res = wave_radio_dfs_channel_check(radio, cd, cpd);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   /* prepare msg for the FW */
+   if (!(man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(core->vap_handle), &res)))
+@@ -561,7 +573,7 @@
+   primary_chan_num = ieee80211_frequency_to_channel(cd->chan.center_freq);
+   req->primary_chan_idx = (primary_chan_num - req->low_chan_num) / CHANNUMS_PER_20MHZ;
+ 
+-  if (!wave_radio_get_sta_vifs_exist(radio) && _is_radar_det_needed(radio, cd)) {
++  if (!(cpd ? cpd->station : wave_radio_channel_is_station(radio)) && _is_radar_det_needed(radio, cd)) {
+     req->isRadarDetectionNeeded = 1;
+   } else {
+     req->isRadarDetectionNeeded = 0;
+@@ -602,9 +614,16 @@
+ 
+   wmb(); /* so that channel gets marked uncertain well before we start switching it */
+ 
+-  (void)mtlk_core_radio_enable_if_needed(core);
+-
+-  res = core_cfg_send_set_chan_by_msg(&man_msg);
++  if (WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MODE_CURRENT) == WAVE_RADIO_OFF) {
++    res = wave_core_radio_set_mode(core, WAVE_RADIO_ON);
++    if (res != MTLK_ERR_OK) {
++      ccd->center_freq1 = old_freq1;
++      goto end;
++    }
++  }
++
++  res = core_cfg_send_set_chan_by_msg(core, &man_msg,
++              cpd ? cpd->station : wave_radio_channel_is_station(radio));
+   if (res == MTLK_ERR_OK)
+     res = core_cfg_set_tx_power_limit(core, cd->center_freq1, cd->width,
+                                        cd->chan.center_freq, country, FALSE);
+@@ -658,6 +677,15 @@
+     ccd->center_freq1 = ccd != cd ? cd->center_freq1 : old_freq1;
+   }
+ 
++  res = wave_radio_dfs_channel_done(radio, cd, cpd, req->switch_type, radar_generation);
++  if (res != MTLK_ERR_OK) {
++    /* The channel command was acknowledged, but a newer radar/NOP invalidated
++     * its permission to transmit. RF-off must be acknowledged before returning
++     * failure; a host data fence does not stop autonomous beacon transmission. */
++    if (wave_core_radio_set_mode(core, WAVE_RADIO_OFF) != MTLK_ERR_OK)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++    goto end;
++  }
+   mtlk_core_cfg_update_antenna_mask(core, req->antennaMask);
+ 
+   /* Set these params after setting operating channel */
+@@ -711,7 +739,12 @@
+     }
+ 
+     if (MTLK_ERR_OK != mtlk_vap_manager_get_vap_handle(mtlk_df_get_vap_manager(df), cpd->vap_id, &vap_handle)) {
+-      MTLK_CLPB_EXIT(MTLK_ERR_OK);
++      MTLK_CLPB_EXIT(MTLK_ERR_NO_ENTRY);
++    }
++    if (!cpd->cac_transition) {
++      res = wave_radio_role_check(radio, cpd->station);
++      if (res != MTLK_ERR_OK)
++        MTLK_CLPB_EXIT(res);
+     }
+ 
+     if (cpd->cac_time)
+@@ -719,8 +752,15 @@
+     else if (cpd->chan_switch_time) /* ditto */
+       cpd->switch_type = ST_CSA;
+ 
++    res = wave_radio_dfs_channel_check(radio, &cpd->chandef, cpd);
++    if (res != MTLK_ERR_OK)
++      MTLK_CLPB_EXIT(res);
++
+     if (!mtlk_core_get_scan_support(core)->dfs_debug_params.debug_chan /* Skip this already set channel check if dfs_debug_chan used */
+         && ccd->chan.center_freq /* we already have a channel set */
++        && cpd->station == wave_radio_channel_is_station(radio)
++        && !cpd->cac_time && !wave_radio_dfs_tx_blocked(radio)
++        && WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MODE_CURRENT) != WAVE_RADIO_OFF
+         && cpd->switch_type == __wave_core_chan_switch_type_get(core) /* with the same switch type as the new request */
+         && mtlk_core_is_chandef_identical(&cpd->chandef, ccd)) /* and all the channel params match */
+     {
+@@ -736,10 +776,7 @@
+       /* Notify cfg80211, AP mode VAP. MAC80211 will call cfg80211_ch_switch_notify
+        * for Station role interfaces */
+       if (!cpd->dont_notify_kernel) {
+-        if (wave_radio_get_sta_vifs_exist(radio) && is_channel_certain(ccd))
+-          wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, TRUE);
+-        else
+-          wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, FALSE);
++        wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, FALSE);
+       }
+ 
+       ILOG1_DDDD("Avoiding setting channel %u--%u (width %u, primary at %u) that is already set",
+@@ -779,9 +816,16 @@
+ 
+     /* don't allow to set 2.4GHz channel's width to 40 MHz if Multi-Radio Co-Existence is enabled */
+     core_cfg_change_chan_width_if_coex_en(core, &cpd->chandef);
++    if (cpd->cac_time) {
++      res = wave_radio_cac_begin(radio, cpd);
++      if (res != MTLK_ERR_OK)
++        MTLK_CLPB_EXIT(res);
++    }
+     /* set channel */
+     res = core_cfg_set_chan(core, &cpd->chandef, cpd);
+ 
++    if (cpd->cac_time)
++      wave_radio_cac_arm(radio, cpd->cac_time, res != MTLK_ERR_OK);
+     if (res != MTLK_ERR_OK) {
+       ccd->wait_for_beacon = TRUE;
+       MTLK_CLPB_EXIT(res);
+@@ -804,10 +848,7 @@
+       ILOG0_DD("Notifying the kernel about the channel switch (width %u, primary at %u)",
+                MHZS_PER_20MHZ << cpd->chandef.width, ieee80211_frequency_to_channel(cpd->chandef.chan.center_freq));
+ 
+-      if (wave_radio_get_sta_vifs_exist(radio) && is_channel_certain(ccd))
+-        wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, TRUE);
+-      else
+-        wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, FALSE);
++      wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, FALSE);
+     }
+   MTLK_CLPB_FINALLY(res)
+     if (paused_scan)
+@@ -839,7 +880,6 @@
+ /* cpd may be NULL for normal and scan switches; only needed for CSA */
+ int __MTLK_IFUNC core_cfg_set_chan (mtlk_core_t *core, const struct mtlk_chan_def *cd, struct set_chan_param_data *cpd)
+ {
+-  struct scan_support *ss = __wave_core_scan_support_get(core);
+   wave_radio_t  *radio;
+   uint32 param_algomask;
+   uint32 param_oalgomask;
+@@ -875,18 +915,6 @@
+   if (res == MTLK_ERR_OK && cpd) {
+     wave_rcvry_chanparam_set(mtlk_vap_get_hw(core->vap_handle),
+                              mtlk_vap_get_manager(core->vap_handle), (mtlk_handle_t*)cpd);
+-  }
+-
+-  if (res == MTLK_ERR_OK && cpd && cpd->switch_type == ST_SCAN && cpd->cac_time)
+-  {
+-    ILOG0_D("Setting the CAC timer for %i ms", cpd->cac_time);
+-    mtlk_osal_timer_set(&core->slow_ctx->cac_timer, cpd->cac_time);
+-
+-    if (ss->dfs_debug_params.debug_chan)
+-      ss->dfs_debug_params.switch_in_progress = FALSE;
+-  } else {
+-    mtlk_osal_timer_cancel_sync(&core->slow_ctx->cac_timer);
+-    mtlk_core_cfg_set_block_tx(core, 0);
+   }
+ 
+   /* PHY_RX_STATUS */
+--- a/wireless/driver/linux/core_config.h
++++ b/wireless/driver/linux/core_config.h
+@@ -59,7 +59,7 @@
+ int core_cfg_set_calibration_mask(mtlk_handle_t hcore, const void* data, uint32 data_size);
+ int core_cfg_get_calibration_mask(mtlk_handle_t hcore, const void* data, uint32 data_size);
+ 
+-int core_cfg_send_set_chan_by_msg(mtlk_txmm_msg_t *man_msg);
++int core_cfg_send_set_chan_by_msg(mtlk_core_t *core, mtlk_txmm_msg_t *man_msg, bool station);
+ int poll_client_req(mtlk_vap_handle_t vap_handle, sta_entry *sta, int *status);
+ 
+ uint32 __MTLK_IFUNC wave_regd_code_to_regd_region(uint32 regd_code);
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -604,6 +604,8 @@
+     /* master ndev ptr will be used to notify hostapd of AP VAP channel switch via cfg80211 API */
+     cpd.ndev = mtlk_df_user_get_ndev(mtlk_df_get_user(master_df));
+     cpd.vap_id = mtlk_vap_get_id(master_vap_handle);
++    cpd.station = true;
++    cpd.dont_notify_kernel = TRUE;
+ 
+ 
+     beacon_period = WAVE_RADIO_PDB_GET_INT(wave_vap_radio_get(master_core->vap_handle), PARAM_DB_RADIO_BEACON_PERIOD);
+@@ -739,6 +741,8 @@
+   /* master ndev ptr will be used to notify hostapd of AP VAP channel switch via cfg80211 API */
+   cpd.ndev = mtlk_df_user_get_ndev(mtlk_df_get_user(master_df));
+   cpd.vap_id = mtlk_vap_get_id(master_vap_handle);
++    cpd.station = true;
++    cpd.dont_notify_kernel = TRUE;
+ 
+   /* Update beacon period */
+   beacon_period = DEFAULT_BEACON_INTERVAL;
+@@ -1412,6 +1416,20 @@
+   return res;
+ }
+ 
++static int wv_sta_role(struct ieee80211_hw *hw, mtlk_df_user_t *df_user, bool active)
++{
++  struct wave_sta_role_request request = { .active = active };
++  mtlk_clpb_t *clpb = NULL;
++  int res;
++
++  if (active)
++    wave_radio_chandef_copy(&request.chandef, &hw->conf.chandef);
++  res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user),
++                WAVE_CORE_REQ_STA_ROLE, &clpb, &request, sizeof(request));
++  return _mtlk_df_user_process_core_retval(res, clpb,
++                                          WAVE_CORE_REQ_STA_ROLE, TRUE);
++}
++
+ static int _wv_ieee80211_op_sta_state (struct ieee80211_hw *hw,
+     struct ieee80211_vif *vif,
+     struct ieee80211_sta *sta,
+@@ -1432,6 +1450,12 @@
+   }
+   vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
+   core = mtlk_vap_get_core(vap_handle);
++
++  if (old_state == IEEE80211_STA_NONE && new_state == IEEE80211_STA_NOTEXIST) {
++    ret = wv_sta_role(hw, df_user, false);
++    if (ret && wave_hw_mmb_ready(mtlk_vap_get_hw(vap_handle)))
++      return _mtlk_df_mtlk_to_linux_error_code(ret);
++  }
+ 
+   /* In case sta state has changed as a result of connection loss caused by FW reset
+    * AP the sta is connected to is no longer in sta DB and there is no need to update
+@@ -1461,8 +1485,12 @@
+   }
+ 
+   if (old_state == IEEE80211_STA_NOTEXIST && new_state == IEEE80211_STA_NONE) {
++    ret = wv_sta_role(hw, df_user, true);
++    if (ret)
++      goto out;
+     ret = wv_request_sid_if_needed(vif, sta);
+     if (ret) {
++      wv_sta_role(hw, df_user, false);
+       ELOG_V("wv_request_sid_if_needed failed");
+       goto out;
+     }
+@@ -1940,6 +1968,8 @@
+   cpd.chandef = *ccd; /* struct copy */
+   cpd.ndev = mtlk_df_user_get_ndev(mtlk_df_get_user(master_df));;
+   cpd.vap_id = mtlk_vap_get_id(mtlk_df_get_vap_handle(master_df));
++  cpd.station = true;
++  cpd.dont_notify_kernel = TRUE;
+ 
+ 
+   res = _mtlk_df_user_invoke_core(master_df,
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -138,7 +138,22 @@
+ };
+ 
+ struct _wave_radio_radar_ctx_t {
+-  mtlk_osal_event_t radar_detect_end_evt; /* object for waiting of Radar Detection process end */
++  /* Firmware commands stay on the master serializer; native work owns the
++   * cfg80211 callback lifetime. The lock orders radar against CAC publication. */
++  spinlock_t lock;
++  struct wiphy_delayed_work work;
++  struct net_device *ndev;
++  struct mtlk_chan_def chandef;
++  unsigned long deadline;
++  u32 session;
++  u32 radar_generation;
++  /* The ABI reports a primary channel, but no command generation or maximum
++   * indication delay. Retain every possible DFS subchannel for this hardware
++   * epoch, including attempted commands with a lost acknowledgement. */
++  unsigned long radar_history[256][BITS_TO_LONGS(256)];
++  bool aborted;
++  bool tx_blocked;
++  bool stopping;
+ };
+ 
+ /**************************************************************
+@@ -254,6 +269,7 @@
+   g52_80_ch_tab_t       g52_80_ch_tab;
+   g52_160_ch_tab_t      g52_160_ch_tab;
+   uint8                 calib_done_mask[1 + NUM_TOTAL_CHANS]; /* 0th entry not used */
++  bool channel_station; /* Master-owned origin of the acknowledged channel. */
+   struct _wave_radio_radar_ctx_t radar_ctx; /* Radar Detection context */
+   MTLK_DECLARE_INIT_STATUS;
+   MTLK_DECLARE_START_STATUS;
+@@ -677,44 +693,468 @@
+   return res;
+ }
+ 
+-static int _wave_radio_radar_ctx_init (wave_radio_t *radio)
+-{
+-  struct _wave_radio_radar_ctx_t *pradar_ctx = &radio->radar_ctx;
+-
+-  mtlk_osal_event_init(&pradar_ctx->radar_detect_end_evt);
+-  mtlk_osal_event_set(&pradar_ctx->radar_detect_end_evt);   /* allow to execute Radar events */
++enum { WAVE_CAC_FINISH = 1, WAVE_CAC_ABORT = 2 };
++struct wave_cac_request { u32 session; bool abort; };
++
++static bool wave_radio_native_chandef(wave_radio_t *radio,
++    const struct mtlk_chan_def *mcd, struct cfg80211_chan_def *cd)
++{
++  memset(cd, 0, sizeof(*cd));
++  cd->chan = ieee80211_get_channel(wv_cfg80211_wiphy_get(radio->cfg80211),
++                                  mcd->chan.center_freq);
++  cd->width = mtlkcw2nlcw(mcd->width, mcd->is_noht);
++  cd->center_freq1 = mcd->center_freq1;
++  cd->center_freq2 = mcd->center_freq2;
++  return cd->chan && cfg80211_chandef_valid(cd);
++}
++
++bool wave_radio_cac_active(wave_radio_t *radio)
++{
++  return READ_ONCE(radio->radar_ctx.ndev) != NULL;
++}
++
++bool wave_radio_dfs_tx_blocked(wave_radio_t *radio)
++{
++  return READ_ONCE(radio->radar_ctx.tx_blocked);
++}
++
++/* Called only by the master before SET_CHAN. The completion exception is
++ * internal and tied to the current session, never a user-supplied override. */
++int wave_radio_dfs_channel_check(wave_radio_t *radio,
++    const struct mtlk_chan_def *mcd, const struct set_chan_param_data *cpd)
++{
++  struct cfg80211_chan_def cd;
++  struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
++
++  if (cpd && cpd->cac_transition)
++    return wave_radio_cac_active(radio) ? MTLK_ERR_OK : MTLK_ERR_NOT_READY;
++  if (wave_radio_cac_active(radio) && !(cpd && cpd->cac_time))
++    return MTLK_ERR_BUSY;
++  if (!wave_radio_dfs_tx_blocked(radio))
++    return MTLK_ERR_OK;
++  if (!wave_radio_native_chandef(radio, mcd, &cd))
++    return MTLK_ERR_PARAMS;
++  if (cpd && cpd->cac_time)
++    return cfg80211_chandef_dfs_usable(wiphy, &cd) ? MTLK_ERR_OK : MTLK_ERR_NOT_READY;
++  if (cpd ? cpd->station : wave_radio_channel_is_station(radio))
++    return cfg80211_chandef_usable(wiphy, &cd, IEEE80211_CHAN_DISABLED) ?
++      MTLK_ERR_OK : MTLK_ERR_NOT_READY;
++  return cfg80211_reg_can_beacon(wiphy, &cd, NL80211_IFTYPE_AP) ?
++    MTLK_ERR_OK : MTLK_ERR_NOT_READY;
++}
++
++bool wave_radio_channel_is_station(wave_radio_t *radio)
++{
++  return radio->channel_station;
++}
++
++void wave_radio_channel_station_set(wave_radio_t *radio, bool station)
++{
++  radio->channel_station = station;
++}
++
++u32 wave_radio_dfs_generation(wave_radio_t *radio)
++{
++  return READ_ONCE(radio->radar_ctx.radar_generation);
++}
++
++int wave_radio_dfs_channel_done(wave_radio_t *radio,
++    const struct mtlk_chan_def *mcd, const struct set_chan_param_data *cpd,
++    u8 switch_type, u32 generation)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
++  struct cfg80211_chan_def cd;
++  unsigned long flags;
++  int res = MTLK_ERR_OK;
++
++  spin_lock_irqsave(&ctx->lock, flags);
++  /* CAC has its own firmware fence and native publication below. Scans never
++   * authorize ordinary traffic. CSA-to-CAC leaves the host fence in place. */
++  if (ctx->ndev || (switch_type != ST_NORMAL && switch_type != ST_CSA) ||
++      (switch_type == ST_CSA && cpd && cpd->block_tx_post))
++    goto out;
++  if (ctx->stopping || ctx->radar_generation != generation ||
++      !wave_radio_native_chandef(radio, mcd, &cd) ||
++      ((cpd ? cpd->station : wave_radio_channel_is_station(radio)) ?
++       !cfg80211_chandef_usable(wiphy, &cd, IEEE80211_CHAN_DISABLED) :
++       !cfg80211_reg_can_beacon(wiphy, &cd, NL80211_IFTYPE_AP))) {
++    ctx->tx_blocked = true;
++    res = MTLK_ERR_CANCELED;
++  } else {
++    ctx->tx_blocked = false;
++  }
++out:
++  spin_unlock_irqrestore(&ctx->lock, flags);
++  return res;
++}
++
++/* Master-owned AP operations recheck the native channel at their own firmware
++ * boundary; an earlier successful SET_CHAN does not reserve DFS permission. */
++int wave_radio_ap_tx_check(wave_radio_t *radio, u32 generation, bool acknowledged)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  mtlk_core_t *core = mtlk_vap_manager_get_master_core(radio->vap_manager);
++  struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
++  struct cfg80211_chan_def cd;
++  unsigned long flags;
++  bool invalid;
++
++  spin_lock_irqsave(&ctx->lock, flags);
++  invalid = ctx->stopping || ctx->ndev || ctx->tx_blocked ||
++    ctx->radar_generation != generation ||
++    !wave_radio_native_chandef(radio, __wave_core_chandef_get(core), &cd) ||
++    !cfg80211_reg_can_beacon(wiphy, &cd, NL80211_IFTYPE_AP);
++  if (invalid && acknowledged)
++    ctx->tx_blocked = true;
++  spin_unlock_irqrestore(&ctx->lock, flags);
++  if (invalid && acknowledged && wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)) &&
++      wave_core_radio_set_mode(core, WAVE_RADIO_OFF) != MTLK_ERR_OK)
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++  return invalid ? MTLK_ERR_NOT_READY : MTLK_ERR_OK;
++}
++
++int wave_radio_dfs_record_channel(wave_radio_t *radio, u8 low, u8 width,
++                                  u8 primary_idx, bool radar)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  unsigned int primary, count, i;
++  unsigned long flags;
++
++  if (!radar)
++    return MTLK_ERR_OK;
++  if (width > CW_160)
++    return MTLK_ERR_PARAMS;
++  count = 1U << width;
++  primary = low + CHANNUMS_PER_20MHZ * primary_idx;
++  if (primary_idx >= count || low + CHANNUMS_PER_20MHZ * (count - 1) >= 256)
++    return MTLK_ERR_PARAMS;
++  spin_lock_irqsave(&ctx->lock, flags);
++  for (i = 0; i < count; i++)
++    __set_bit(low + CHANNUMS_PER_20MHZ * i, ctx->radar_history[primary]);
++  spin_unlock_irqrestore(&ctx->lock, flags);
+   return MTLK_ERR_OK;
+ }
+ 
+-static void _wave_radio_radar_ctx_cleanup (wave_radio_t *radio)
+-{
+-  mtlk_osal_event_cleanup(&radio->radar_ctx.radar_detect_end_evt);
+-}
+-
+-static void _wave_radio_radar_detect_end_reset (wave_radio_t *radio)
+-{
+-  /* postpone to execute Radar events */
+-  mtlk_osal_event_reset(&radio->radar_ctx.radar_detect_end_evt);
+-}
+-
+-static void _wave_radio_radar_detect_end_set (wave_radio_t *radio)
+-{
+-  /* allow to execute Radar events */
+-  mtlk_osal_event_set(&radio->radar_ctx.radar_detect_end_evt);
+-}
+-
+-void wave_radio_radar_detect_end_wait (wave_radio_t *radio)
+-{
+-  /* wait for Radar Detection end */
+-  int res = mtlk_osal_event_wait(&radio->radar_ctx.radar_detect_end_evt, MTLK_OSAL_EVENT_INFINITE);
+-  MTLK_ASSERT(MTLK_ERR_OK == res);
+-  MTLK_UNREFERENCED_PARAM(res);
+-}
+-
+-void wave_radio_on_rcvry_isolate (wave_radio_t *radio)
+-{
+-  MTLK_ASSERT(radio);
+-  mtlk_osal_event_set(&radio->radar_ctx.radar_detect_end_evt);
++/* Called at real firmware RX ingress, never queued behind SET_CHAN/RF_OFF.
++ * Gen6's subBandBitmap is undefined, so mark every possible DFS subchannel.
++ * cfg80211 retains each report until its ordinary propagation work runs. */
++void wave_radio_radar_indication(wave_radio_t *radio, u8 primary)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
++  struct ieee80211_supported_band *band;
++  struct cfg80211_chan_def cd;
++  unsigned long flags;
++  unsigned int i;
++  bool unknown;
++
++  spin_lock_irqsave(&ctx->lock, flags);
++  if (ctx->stopping) {
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return;
++  }
++  ctx->radar_generation++;
++  ctx->tx_blocked = true;
++  ctx->aborted = true;
++  unknown = bitmap_empty(ctx->radar_history[primary], 256);
++  band = wiphy->bands[NL80211_BAND_5GHZ];
++  if (band) {
++    for (i = 0; i < band->n_channels; i++) {
++      struct ieee80211_channel *chan = &band->channels[i];
++      unsigned int num = ieee80211_frequency_to_channel(chan->center_freq);
++
++      /* Unknown history cannot justify dropping a real radar indication. */
++      if (!(chan->flags & IEEE80211_CHAN_RADAR) || num >= 256 ||
++          (!unknown && !test_bit(num, ctx->radar_history[primary])))
++        continue;
++      cfg80211_chandef_create(&cd, chan, NL80211_CHAN_NO_HT);
++      cfg80211_radar_event(wiphy, &cd, GFP_ATOMIC);
++    }
++  }
++  if (ctx->ndev)
++    wiphy_delayed_work_queue(wiphy, &ctx->work, 0);
++  spin_unlock_irqrestore(&ctx->lock, flags);
++}
++
++int wave_radio_cac_control(mtlk_handle_t hcore, const void *data, uint32 data_size)
++{
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  mtlk_clpb_t *clpb = *(mtlk_clpb_t **)data;
++  struct wave_cac_request *request;
++  struct set_chan_param_data cpd = {0};
++  unsigned long flags;
++  uint32 size;
++  int res = MTLK_ERR_OK;
++
++  request = mtlk_clpb_enum_get_next(clpb, &size);
++  MTLK_CLPB_TRY(request, size)
++    spin_lock_irqsave(&ctx->lock, flags);
++    if (!ctx->ndev || ctx->session != request->session || ctx->stopping) {
++      spin_unlock_irqrestore(&ctx->lock, flags);
++      MTLK_CLPB_EXIT(MTLK_ERR_NOT_READY);
++    }
++    if (ctx->aborted && !request->abort) {
++      spin_unlock_irqrestore(&ctx->lock, flags);
++      MTLK_CLPB_EXIT(MTLK_ERR_CANCELED);
++    }
++    cpd.chandef = ctx->chandef;
++    cpd.ndev = ctx->ndev;
++    cpd.dont_notify_kernel = TRUE;
++    cpd.cac_transition = request->abort ? WAVE_CAC_ABORT : WAVE_CAC_FINISH;
++    if (request->abort)
++      ctx->aborted = true;
++    spin_unlock_irqrestore(&ctx->lock, flags);
++
++    if (!wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))
++      MTLK_CLPB_EXIT(MTLK_ERR_NOT_READY);
++    /* CAC admitted no BSS/STA or queued traffic on this physical radio.
++     * Close the firmware scan process before RF-off; NORMAL has no valid
++     * block_tx flags. Host TX remains fenced until native CAC publication. */
++    res = core_cfg_set_chan(core, &cpd.chandef, &cpd);
++    if (res == MTLK_ERR_OK && request->abort)
++      res = wave_core_radio_set_mode(core, WAVE_RADIO_OFF);
++    if (res != MTLK_ERR_OK)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++  MTLK_CLPB_FINALLY(res)
++    return mtlk_clpb_push_res(clpb, res);
++  MTLK_CLPB_END;
++}
++
++static int wave_radio_cac_request(wave_radio_t *radio, u32 session, bool abort)
++{
++  struct wave_cac_request request = { .session = session, .abort = abort };
++  mtlk_clpb_t *clpb = NULL;
++  mtlk_df_t *df = mtlk_vap_manager_get_master_df(radio->vap_manager);
++  int res = _mtlk_df_user_invoke_core(df, WAVE_RADIO_REQ_CAC_TIMEOUT,
++                                     &clpb, &request, sizeof(request));
++
++  return _mtlk_df_user_process_core_retval(res, clpb, WAVE_RADIO_REQ_CAC_TIMEOUT, TRUE);
++}
++
++static void wave_radio_cac_work(struct wiphy *wiphy, struct wiphy_work *work)
++{
++  struct _wave_radio_radar_ctx_t *ctx = container_of(work,
++                                struct _wave_radio_radar_ctx_t, work.work);
++  wave_radio_t *radio = container_of(ctx, wave_radio_t, radar_ctx);
++  struct cfg80211_chan_def cd;
++  struct net_device *ndev;
++  struct wireless_dev *wdev;
++  unsigned long flags, deadline;
++  u32 session;
++  bool abort;
++  int res;
++
++  spin_lock_irqsave(&ctx->lock, flags);
++  ndev = ctx->ndev;
++  if (!ndev || ctx->stopping) {
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return;
++  }
++  wdev = ndev->ieee80211_ptr;
++  session = ctx->session;
++  abort = ctx->aborted || !netif_running(ndev) ||
++    ndev->reg_state != NETREG_REGISTERED || !wdev->links[0].cac_started ||
++    !wave_radio_native_chandef(radio, &ctx->chandef, &cd) ||
++    !cfg80211_chandef_identical(&cd, &wdev->links[0].ap.chandef);
++  deadline = wdev->links[0].cac_start_time +
++             msecs_to_jiffies(wdev->links[0].cac_time_ms);
++  if (time_after(ctx->deadline, deadline))
++    deadline = ctx->deadline;
++  if (!abort && time_before(jiffies, deadline)) {
++    wiphy_delayed_work_queue(wiphy, &ctx->work, deadline - jiffies);
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return;
++  }
++  spin_unlock_irqrestore(&ctx->lock, flags);
++
++  res = wave_radio_cac_request(radio, session, abort);
++  if (res == MTLK_ERR_CANCELED && !abort) {
++    abort = true;
++    res = wave_radio_cac_request(radio, session, true);
++  }
++  if (res != MTLK_ERR_OK)
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(mtlk_vap_manager_get_master_core(radio->vap_manager)->vap_handle));
++  /* Radar may have arrived while the command was queued. Its NOP publication
++   * and this completion share the lock, so AVAILABLE can never overwrite it. */
++  spin_lock_irqsave(&ctx->lock, flags);
++  if (ctx->ndev == ndev && ctx->session == session && ctx->aborted && !abort) {
++    /* Radar can arrive after the finish CFM. Fence the firmware before
++     * publishing ABORTED; holding wiphy keeps this requester alive. */
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    abort = true;
++    res = wave_radio_cac_request(radio, session, true);
++    if (res != MTLK_ERR_OK)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(mtlk_vap_manager_get_master_core(radio->vap_manager)->vap_handle));
++    spin_lock_irqsave(&ctx->lock, flags);
++  }
++  if (ctx->ndev == ndev && ctx->session == session) {
++    abort |= ctx->aborted || res != MTLK_ERR_OK;
++    if (wdev->links[0].cac_started) {
++      wave_radio_native_chandef(radio, &ctx->chandef, &cd);
++      cfg80211_cac_event(ndev, &cd, abort ? NL80211_RADAR_CAC_ABORTED :
++                         NL80211_RADAR_CAC_FINISHED, GFP_ATOMIC, 0);
++    }
++    if (!abort)
++      ctx->tx_blocked = false;
++    ctx->ndev = NULL;
++  } else {
++    ndev = NULL;
++  }
++  spin_unlock_irqrestore(&ctx->lock, flags);
++  if (ndev)
++    dev_put(ndev);
++}
++
++/* Begin/arm run in the master serializer. No opposite-role connection or AP
++ * start can pass their final admission while this session owns the radio. */
++int wave_radio_cac_begin(wave_radio_t *radio, const struct set_chan_param_data *cpd)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  mtlk_core_t *core = mtlk_vap_manager_get_master_core(radio->vap_manager);
++  mtlk_vap_handle_t vap;
++  struct cfg80211_chan_def cd;
++  struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
++  unsigned long flags;
++  unsigned int i;
++  int res;
++
++  if (ctx->stopping || wave_radio_cac_active(radio) || wave_radio_ap_active(radio) ||
++      wave_radio_sta_active(radio) || is_mac_scan_running(wave_radio_scan_support_get(radio)))
++    return MTLK_ERR_BUSY;
++  if (!wave_radio_native_chandef(radio, &cpd->chandef, &cd) ||
++      !cfg80211_chandef_dfs_usable(wiphy, &cd))
++    return MTLK_ERR_PARAMS;
++  res = abort_scan_sync(core);
++  if (res != MTLK_ERR_OK)
++    return res;
++  WRITE_ONCE(ctx->tx_blocked, true);
++  synchronize_net();
++  for (i = 0; i < mtlk_vap_manager_get_max_vaps_count(radio->vap_manager); i++) {
++    if (mtlk_vap_manager_get_vap_handle(radio->vap_manager, i, &vap) != MTLK_ERR_OK)
++      continue;
++    res = mtlk_wait_all_packets_confirmed(mtlk_vap_get_core(vap));
++    if (res != MTLK_ERR_OK) {
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++      return res;
++    }
++  }
++  dev_hold(cpd->ndev);
++  spin_lock_irqsave(&ctx->lock, flags);
++  if (ctx->stopping || !cfg80211_chandef_dfs_usable(wiphy, &cd)) {
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    dev_put(cpd->ndev);
++    return MTLK_ERR_NOT_READY;
++  }
++  ctx->ndev = cpd->ndev;
++  ctx->chandef = cpd->chandef;
++  ctx->session++;
++  ctx->aborted = false;
++  spin_unlock_irqrestore(&ctx->lock, flags);
++  return MTLK_ERR_OK;
++}
++
++void wave_radio_cac_arm(wave_radio_t *radio, u32 duration, bool failed)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  unsigned long flags;
++
++  spin_lock_irqsave(&ctx->lock, flags);
++  if (ctx->ndev && !ctx->stopping) {
++    ctx->aborted |= failed;
++    ctx->deadline = jiffies + msecs_to_jiffies(duration);
++    wiphy_delayed_work_queue(wv_cfg80211_wiphy_get(radio->cfg80211), &ctx->work,
++                              ctx->aborted ? 0 : msecs_to_jiffies(duration));
++  }
++  spin_unlock_irqrestore(&ctx->lock, flags);
++}
++
++/* Native end_cac is called with this wiphy locked. Clear before returning so
++ * unregister may destroy df_user/core; a held netdev alone is not sufficient. */
++void wave_radio_end_cac(wave_radio_t *radio, struct net_device *ndev)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
++  unsigned long flags;
++  u32 session;
++  int res;
++
++  lockdep_assert_wiphy(wiphy);
++  spin_lock_irqsave(&ctx->lock, flags);
++  if (ctx->ndev != ndev) {
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return;
++  }
++  session = ctx->session;
++  spin_unlock_irqrestore(&ctx->lock, flags);
++  res = wave_radio_cac_request(radio, session, true);
++  if (res != MTLK_ERR_OK)
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(mtlk_vap_manager_get_master_core(radio->vap_manager)->vap_handle));
++  spin_lock_irqsave(&ctx->lock, flags);
++  ctx->ndev = NULL;
++  ctx->aborted = true;
++  spin_unlock_irqrestore(&ctx->lock, flags);
++  wiphy_delayed_work_cancel(wiphy, &ctx->work);
++  /* Match mac80211 end_cac: cfg80211 owns abort notification and CAC state. */
++  ndev->ieee80211_ptr->links[0].cac_started = false;
++  dev_put(ndev);
++}
++
++void wave_radio_radar_event(wave_radio_t *radio, const struct mtlk_chan_def *mcd)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  struct cfg80211_chan_def cd;
++  struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
++  unsigned long flags;
++
++  if (!wave_radio_native_chandef(radio, mcd, &cd))
++    return;
++  spin_lock_irqsave(&ctx->lock, flags);
++  if (ctx->stopping) {
++    spin_unlock_irqrestore(&ctx->lock, flags);
++    return;
++  }
++  ctx->radar_generation++;
++  ctx->tx_blocked = true;
++  ctx->aborted = true;
++  /* Never defer or cancel the real radar/NOP indication with AP teardown. */
++  cfg80211_radar_event(wiphy, &cd, GFP_ATOMIC);
++  if (ctx->ndev && !ctx->stopping)
++    wiphy_delayed_work_queue(wiphy, &ctx->work, 0);
++  spin_unlock_irqrestore(&ctx->lock, flags);
++}
++
++static int _wave_radio_radar_ctx_init(wave_radio_t *radio)
++{
++  spin_lock_init(&radio->radar_ctx.lock);
++  wiphy_delayed_work_init(&radio->radar_ctx.work, wave_radio_cac_work);
++  return MTLK_ERR_OK;
++}
++
++static void _wave_radio_radar_ctx_cleanup(wave_radio_t *radio)
++{
++  struct _wave_radio_radar_ctx_t *ctx = &radio->radar_ctx;
++  struct wiphy *wiphy = wv_cfg80211_wiphy_get(radio->cfg80211);
++  struct net_device *ndev;
++  unsigned long flags;
++
++  wiphy_lock(wiphy);
++  spin_lock_irqsave(&ctx->lock, flags);
++  ctx->stopping = true;
++  ndev = ctx->ndev;
++  ctx->ndev = NULL;
++  spin_unlock_irqrestore(&ctx->lock, flags);
++  wiphy_delayed_work_cancel(wiphy, &ctx->work);
++  if (ndev)
++    dev_put(ndev);
++  wiphy_unlock(wiphy);
++}
++
++void wave_radio_on_rcvry_isolate(wave_radio_t *radio)
++{
++  wave_radio_cac_arm(radio, 0, true);
+ }
+ 
+ static void _wave_radio_deinit(wave_radio_t *radio)
+@@ -1394,6 +1834,8 @@
+     }
+   }
+ 
++  wave_radio_end_cac(radio, ndev);
++
+   /* All fallible preparation runs before withdrawing the netdevice. */
+   res = _mtlk_df_user_invoke_core(master_df,
+             WAVE_RADIO_REQ_MBSS_DEL_VAP_NAME,
+@@ -1538,6 +1980,9 @@
+ 
+   df_user = mtlk_df_get_user(mtlk_vap_manager_get_master_df(radio->vap_manager));
+ 
++  if (beacon->head_len < 0 || beacon->tail_len < 0 || beacon->probe_resp_len < 0 ||
++      beacon->head_len > 65535 || beacon->tail_len > 65535 || beacon->probe_resp_len > 65535)
++    return -EINVAL;
+   __wave_radio_beacon_data_copy(&beacon_data, beacon);
+   beacon_data.vap_idx = vap_idx;
+   beacon_data.bmgr_priv = &radio->bmgr_priv;
+@@ -1588,7 +2033,6 @@
+   mtlk_clpb_t *clpb = NULL;
+   struct set_chan_param_data cpd;
+   mtlk_df_t *master_df = mtlk_vap_manager_get_master_df(radio->vap_manager);
+-  struct mtlk_chan_def  *ccd = wave_radio_chandef_get(radio);
+   mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
+   mtlk_vap_handle_t vap_handle;
+ 
+@@ -1596,23 +2040,6 @@
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
+-  /*
+-   * Prevent AP role VAP to switch channels in case a station role interface exists
+-   * Just notify kernel the real channel we work on (if it's a certain one) instead
+-   *
+-  */
+-  if (wave_radio_get_sta_vifs_exist(radio)) {
+-    if (is_channel_certain(ccd)) {
+-      ILOG0_V("Cannot switch VAP channels, since there are station role interfaces active");
+-
+-      wv_cfg80211_ch_switch_notify(ndev, ccd, TRUE);
+-
+-      res = MTLK_ERR_OK;
+-      return  _mtlk_df_mtlk_to_linux_error_code(res);
+-    }
+-  }
+-
+-
+   ILOG1_DDDDD("center_freq1=%u, nl_width=%u, chan.nlband=%u, chan.center_freq=%hu, chan.flags=0x%08x, ",
+     chandef->center_freq1, chandef->width, chandef->chan->band, chandef->chan->center_freq, chandef->chan->flags);
+ 
+@@ -1639,56 +2066,35 @@
+   mtlk_clpb_t *clpb = NULL;
+   mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
+   struct mtlk_ap_settings aps;
+-  struct mtlk_chan_def  *ccd;
+-  mtlk_core_t *master_core;
+   int scan_paused = 0;
++  bool beacon_accepted = false;
+ 
+   MTLK_ASSERT(NULL != radio);
+ 
+-  ccd = wave_radio_chandef_get(radio);
+-  master_core = mtlk_vap_manager_get_master_core(radio->vap_manager);
+ 
+   /* FIXCFG80211: add all necessary configuration */
+   ILOG1_SSD("%s: Invoked from %s (%i)", ndev->name, current->comm, current->pid);
+   MTLK_CHECK_DF_USER(df_user);
+ 
+-  if (wave_radio_get_sta_vifs_exist(radio)) {
+-
+-    res = _wave_radio_abort_and_prevent_scan(radio);
+-    if (MTLK_ERR_OK != res)
+-      goto finish;
+-
+-    scan_paused = 1;
+-
+-    if (is_mac_scan_running(wave_radio_scan_support_get(radio))) {
+-      ELOG_V("ERROR, cannot add VAP while MAC scan is running");
+-      res = MTLK_ERR_BUSY;
+-      goto finish;
+-    }
+-
+-    if (is_channel_certain(ccd)) {
+-      struct ieee80211_channel *ch = ieee80211_get_channel(wiphy, ccd->chan.center_freq);
+-      struct mtlk_chan_def *mcd = ccd;
+-      info->chandef.chan = ch;
+-      info->chandef.width = mtlkcw2nlcw(mcd->width, mcd->is_noht);
+-      info->chandef.center_freq1 = mcd->center_freq1;
+-      info->chandef.center_freq2 = mcd->center_freq2;
+-      ILOG0_D("Notify hostapd of current channel %u", ccd->center_freq1);
+-      wv_cfg80211_ch_switch_notify(ndev, ccd, TRUE);
+-    } else {
+-      ELOG_S("%s: Sta vifs exists but channel is uncertain", ndev->name);
+-    }
+-  } else {
+-    linux_error = wave_radio_ap_chanwidth_set(wiphy, radio, ndev, &info->chandef);
+-    if (linux_error)
+-      goto finish;
+-  }
++  res = _wave_radio_abort_and_prevent_scan(radio);
++  if (res != MTLK_ERR_OK)
++    goto finish;
++  scan_paused = 1;
++  if (is_mac_scan_running(wave_radio_scan_support_get(radio))) {
++    res = MTLK_ERR_BUSY;
++    goto finish;
++  }
++  linux_error = wave_radio_ap_chanwidth_set(wiphy, radio, ndev, &info->chandef);
++  if (linux_error)
++    goto finish;
+ 
+   if (NULL == info->ssid || MIB_ESSID_LENGTH < info->ssid_len) {
+     res = MTLK_ERR_PARAMS;
+     goto finish;
+   }
+ 
++  memset(&aps, 0, sizeof(aps));
++  wave_radio_chandef_copy(&aps.chandef, &info->chandef);
+   aps.beacon_interval = info->beacon_interval;
+   aps.dtim_period = info->dtim_period;
+   aps.hidden_ssid = info->hidden_ssid;
+@@ -1699,6 +2105,8 @@
+   if (linux_error)
+     goto finish;
+ 
++  beacon_accepted = true;
++
+   /* Set security */
+   {
+     mtlk_core_ui_auth_cfg_t   auth_cfg;
+@@ -1706,7 +2114,8 @@
+ 
+     ILOG1_D("Authentication type:0x%x", info->auth_type);
+     auth_cfg.wep_enabled = 0;
+-    auth_cfg.rsn_enabled = 0;
++    auth_cfg.rsn_enabled = !!(info->crypto.wpa_versions &
++      (NL80211_WPA_VERSION_1 | NL80211_WPA_VERSION_2 | NL80211_WPA_VERSION_3));
+ 
+     switch (info->auth_type) {
+     case NL80211_AUTHTYPE_OPEN_SYSTEM:
+@@ -1725,25 +2134,6 @@
+       goto finish;
+     }
+ 
+-    ILOG1_D("Number of akm suits:%d", info->crypto.n_akm_suites);
+-    for (i = 0; i < info->crypto.n_akm_suites; i++) {
+-      ILOG1_D("akm_suites:0x%x", info->crypto.akm_suites[i]);
+-      switch (info->crypto.akm_suites[i]) {
+-      case WLAN_AKM_SUITE_8021X:
+-        if (info->crypto.wpa_versions & NL80211_WPA_VERSION_1)
+-          auth_cfg.rsn_enabled = 1;
+-        if (info->crypto.wpa_versions & NL80211_WPA_VERSION_2)
+-          auth_cfg.rsn_enabled = 1;
+-        break;
+-      case WLAN_AKM_SUITE_PSK:
+-        if (info->crypto.wpa_versions & NL80211_WPA_VERSION_1)
+-          auth_cfg.rsn_enabled = 1;
+-        if (info->crypto.wpa_versions & NL80211_WPA_VERSION_2)
+-          auth_cfg.rsn_enabled = 1;
+-        break;
+-      }
+-    }
+-
+     ILOG1_D("Number of ciphers pairwise:%d", info->crypto.n_ciphers_pairwise);
+     for (i = 0; i < info->crypto.n_ciphers_pairwise; i++) {
+       ILOG1_D("ciphers pairwise:0x%x", info->crypto.ciphers_pairwise[i]);
+@@ -1783,6 +2173,16 @@
+ #endif
+ 
+ finish:
++  if (beacon_accepted && (linux_error || res != MTLK_ERR_OK)) {
++    int stop_res;
++
++    clpb = NULL;
++    stop_res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user),
++                                        WAVE_CORE_REQ_DEACTIVATE, &clpb, NULL, 0);
++    stop_res = _mtlk_df_user_process_core_retval(stop_res, clpb, WAVE_CORE_REQ_DEACTIVATE, TRUE);
++    if (stop_res != MTLK_ERR_OK)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user))));
++  }
+   if (scan_paused == 1 && _wave_radio_allow_or_resume_scan(radio) != MTLK_ERR_OK)
+     WLOG_V("Could not resume scanning after AP start");
+ 
+@@ -1803,6 +2203,8 @@
+ 
+   ILOG1_SSD("%s: Invoked from %s (%i)", ndev->name, current->comm, current->pid);
+   MTLK_CHECK_DF_USER(df_user);
++
++  wave_radio_end_cac(radio, ndev);
+ 
+   if (wave_radio_get_sta_vifs_exist(radio)) {
+     res = _wave_radio_abort_and_prevent_scan(radio);
+@@ -2305,6 +2707,7 @@
+   df = mtlk_df_user_get_df(df_user);
+ 
+   memset(&bp, 0, sizeof(bp));
++  bp.protection_mode = -1;
+   bp.vap_id = mtlk_vap_get_id(mtlk_df_get_vap_handle(df));
+   bp.use_cts_prot = params->use_cts_prot;
+   bp.use_short_preamble = params->use_short_preamble;
+@@ -3258,28 +3661,22 @@
+   struct set_chan_param_data cpd;
+   mtlk_df_t *master_df;
+   mtlk_core_t *core;
+-  mtlk_scan_support_t *scan_support;
+   mtlk_df_user_t *df_user;
+   mtlk_df_t *df;
+   mtlk_vap_handle_t vap_handle;
+-  struct mtlk_chan_def *ccd;
+   u32 cac_time;
+   struct wireless_dev *wdev;
+   uint32 regd_code;
+ 
+-  /* postpone to execute Radar events */
+-  _wave_radio_radar_detect_end_reset(radio);
+ 
+   clpb = NULL;
+   master_df = mtlk_vap_manager_get_master_df(radio->vap_manager);
+   core = mtlk_vap_get_core(mtlk_df_get_vap_handle(master_df));
+-  scan_support = mtlk_core_get_scan_support(core);
+   df_user = mtlk_df_user_from_ndev(ndev);
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   df = mtlk_df_user_get_df(df_user);
+   vap_handle = mtlk_df_get_vap_handle(df);
+-  ccd = wave_radio_chandef_get(radio);
+   cac_time = IEEE80211_DFS_MIN_CAC_TIME_MS;
+   wdev = ndev->ieee80211_ptr;
+ 
+@@ -3315,8 +3712,6 @@
+ 
+   res = _mtlk_df_mtlk_to_linux_error_code(res);
+ 
+-  /* allow to execute Radar events */
+-  _wave_radio_radar_detect_end_set(radio);
+   return res;
+ }
+ 
+@@ -3356,12 +3751,6 @@
+   MTLK_CHECK_DF_USER(df_user);
+   vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
+   scan_support = mtlk_core_get_scan_support(mtlk_vap_get_core(vap_handle));
+-
+-  /* Prevent AP role VAP to switch channels in case a station role interface exists */
+-  if (wave_radio_get_sta_vifs_exist(radio)) {
+-    ILOG0_V("Cannot switch VAP channels, since there are station role interfaces active");
+-    return  -EBUSY;
+-  }
+ 
+   beacon_period = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_BEACON_PERIOD);
+ 
+@@ -4333,6 +4722,40 @@
+ {
+   MTLK_ASSERT(radio != NULL);
+   return radio->sta_vifs_exist;
++}
++
++/* These predicates run on the physical radio's master serializer. */
++bool wave_radio_ap_active(wave_radio_t *radio)
++{
++  unsigned int i, count = mtlk_vap_manager_get_max_vaps_count(radio->vap_manager);
++  mtlk_vap_handle_t vap;
++
++  for (i = 0; i < count; i++)
++    if (mtlk_vap_manager_get_vap_handle(radio->vap_manager, i, &vap) == MTLK_ERR_OK &&
++        mtlk_vap_is_ap(vap) && (mtlk_vap_get_core(vap)->slow_ctx->ap_started ||
++                              mtlk_vap_get_core(vap)->slow_ctx->ap_preparing))
++      return true;
++  return false;
++}
++
++bool wave_radio_sta_active(wave_radio_t *radio)
++{
++  unsigned int i, count = mtlk_vap_manager_get_max_vaps_count(radio->vap_manager);
++  mtlk_vap_handle_t vap;
++
++  for (i = 0; i < count; i++)
++    if (mtlk_vap_manager_get_vap_handle(radio->vap_manager, i, &vap) == MTLK_ERR_OK &&
++        !mtlk_vap_is_ap(vap) && mtlk_vap_get_core(vap)->slow_ctx->sta_connecting)
++      return true;
++  return false;
++}
++
++int wave_radio_role_check(wave_radio_t *radio, bool station)
++{
++  if (wave_radio_cac_active(radio) ||
++      (station ? wave_radio_ap_active(radio) : wave_radio_sta_active(radio)))
++    return MTLK_ERR_BUSY;
++  return MTLK_ERR_OK;
+ }
+ 
+ void wave_radio_sta_cnt_inc (wave_radio_t *radio)
+--- a/wireless/driver/linux/wave_radio.h
++++ b/wireless/driver/linux/wave_radio.h
+@@ -271,6 +271,11 @@
+ 
+ void    __MTLK_IFUNC wave_radio_set_sta_vifs_exist (wave_radio_t *radio, BOOL sta_exists);
+ BOOL    __MTLK_IFUNC wave_radio_get_sta_vifs_exist (wave_radio_t *radio);
++bool wave_radio_ap_active(wave_radio_t *radio);
++bool wave_radio_sta_active(wave_radio_t *radio);
++int wave_radio_role_check(wave_radio_t *radio, bool station);
++bool wave_radio_cac_active(wave_radio_t *radio);
++bool wave_radio_dfs_tx_blocked(wave_radio_t *radio);
+ void    __MTLK_IFUNC wave_radio_recover_sta_vifs (wave_radio_t *radio);
+ 
+ void wave_radio_sta_cnt_inc(wave_radio_t *radio);
+@@ -313,7 +318,23 @@
+ void __MTLK_IFUNC
+ wave_radio_ant_masks_num_sts_get (wave_radio_t *radio, u32 *tx_ant_mask, u32 *rx_ant_mask, u32 *num_sts);
+ 
+-void wave_radio_radar_detect_end_wait(wave_radio_t *radio);
++int wave_radio_dfs_channel_check(wave_radio_t *radio, const struct mtlk_chan_def *mcd,
++                                 const struct set_chan_param_data *cpd);
++int wave_radio_ap_tx_check(wave_radio_t *radio, u32 generation, bool acknowledged);
++bool wave_radio_channel_is_station(wave_radio_t *radio);
++void wave_radio_channel_station_set(wave_radio_t *radio, bool station);
++u32 wave_radio_dfs_generation(wave_radio_t *radio);
++int wave_radio_dfs_channel_done(wave_radio_t *radio,
++    const struct mtlk_chan_def *mcd, const struct set_chan_param_data *cpd,
++    u8 switch_type, u32 generation);
++int wave_radio_dfs_record_channel(wave_radio_t *radio, u8 low, u8 width,
++                                  u8 primary_idx, bool radar);
++void wave_radio_radar_indication(wave_radio_t *radio, u8 primary);
++int wave_radio_cac_begin(wave_radio_t *radio, const struct set_chan_param_data *cpd);
++void wave_radio_cac_arm(wave_radio_t *radio, u32 duration, bool failed);
++int wave_radio_cac_control(mtlk_handle_t hcore, const void *data, uint32 data_size);
++void wave_radio_end_cac(wave_radio_t *radio, struct net_device *ndev);
++void wave_radio_radar_event(wave_radio_t *radio, const struct mtlk_chan_def *mcd);
+ void wave_radio_on_rcvry_isolate(wave_radio_t *radio);
+ 
+ wv_cfg80211_t * __MTLK_IFUNC wave_radio_cfg80211_get(wave_radio_t *radio);
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -8478,7 +8478,8 @@
+   int       res = MTLK_ERR_OK;
+   HOST_DSC  tx_bd;
+ 
+-  if (READ_ONCE(hw->quiescing))
++  if (READ_ONCE(hw->quiescing) ||
++      wave_radio_dfs_tx_blocked(wave_vap_radio_get(vap_handle)))
+     return MTLK_ERR_NOT_READY;
+ 
+ #if (defined MTLK_DEBUG_IPERF_PAYLOAD_RX) || (defined MTLK_DEBUG_IPERF_PAYLOAD_TX)
+@@ -11211,7 +11212,8 @@
+   uint32 packet_length = bss_req->size;
+   BOOL mcf;
+ 
+-  if (READ_ONCE(hw->quiescing))
++  if (READ_ONCE(hw->quiescing) ||
++      wave_radio_dfs_tx_blocked(wave_vap_radio_get(vap_handle)))
+     return MTLK_ERR_NOT_READY;
+ 
+ #ifdef BD_DBG
+--- a/wireless/driver/shared/mtlk_coreui.h
++++ b/wireless/driver/shared/mtlk_coreui.h
+@@ -294,6 +294,7 @@
+   WAVE_RADIO_REQ_GET_SSB_MODE,                  /*!< Get SSB Mode */
+   WAVE_RADIO_REQ_SET_COEX_CFG,                  /*!< Set 2.4 GHz BT, BLE, ZigBee Coex config */
+   WAVE_RADIO_REQ_GET_COEX_CFG,                  /*!< Get 2.4 GHz BT, BLE, ZigBee Coex config */
++  WAVE_CORE_REQ_STA_ROLE,                      /*!< Native STA connection admission */
+   WAVE_RADIO_REQ_STA_CHANGE_BSS,                /*!< STA mode - Change BSS */
+   WAVE_RADIO_REQ_SET_FREQ_JUMP_MODE,            /*!< Set Frequency Jump Mode */
+   WAVE_RADIO_REQ_SET_RESTRICTED_AC_MODE,        /*!< Set Restricted AC Mode */
+@@ -1663,6 +1664,8 @@
+   u32 rate;
+   u8 rf_gain[PHY_STATISTICS_MAX_RX_ANT];
+   BOOL dont_notify_kernel;
++  bool station; /* The paired STA wiphy uses the protected AP master for control. */
++  u8 cac_transition; /* Internal ACK-owned completion/abort, never userspace input. */
+ };
+ 
+ enum mtlk_hidden_ssid
+@@ -1672,8 +1675,14 @@
+   MTLK_HIDDEN_SSID_ZERO_CONTENTS
+ };
+ 
++struct wave_sta_role_request {
++  bool active;
++  struct mtlk_chan_def chandef;
++};
++
+ struct mtlk_ap_settings
+ {
++  struct mtlk_chan_def chandef; /* Requested native AP channel, checked at activation. */
+   int beacon_interval;
+   int dtim_period;
+   int hidden_ssid;
+@@ -1688,6 +1697,7 @@
+ {
+   int vap_id;
+   int use_cts_prot;
++  int protection_mode; /* -1 derives firmware protection from native CTS/HT. */
+   int use_short_preamble;
+   int use_short_slot_time;
+   int ap_isolate;
+--- a/wireless/driver/shared/scan_support.c
++++ b/wireless/driver/shared/scan_support.c
+@@ -239,62 +239,6 @@
+   return res;
+ }
+ 
+-/* the CAC timer calls this one */
+-uint32 cac_timer_clb_func(mtlk_osal_timer_t *timer, mtlk_handle_t nic)
+-{
+-  mtlk_core_t *core = (mtlk_core_t *) nic;
+-
+-  MTLK_ASSERT(timer == &core->slow_ctx->cac_timer);
+-
+-  _mtlk_df_user_invoke_core_async(mtlk_vap_get_df(core->vap_handle),
+-                                  WAVE_RADIO_REQ_CAC_TIMEOUT, NULL, 0, NULL, 0);
+-  return 0;
+-}
+-
+-int cac_timer_serialized_func (mtlk_handle_t hcore, const void* data, uint32 data_size)
+-{
+-  mtlk_df_t *df;
+-  mtlk_df_user_t *df_user;
+-  struct net_device *ndev;
+-  mtlk_scan_support_t *ss;
+-  struct mtlk_chan_def *current_chandef;
+-  struct set_chan_param_data cpd;
+-  mtlk_core_t *core = (mtlk_core_t *) hcore;
+-  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
+-
+-  MTLK_ASSERT(core == mtlk_core_get_master(core));
+-
+-  /* wait for Radar Detection end */
+-  wave_radio_radar_detect_end_wait(radio);
+-
+-  df = mtlk_vap_get_df(core->vap_handle);
+-  df_user = mtlk_df_get_user(df);
+-  ndev = mtlk_df_user_get_ndev(df_user);
+-  ss = mtlk_core_get_scan_support(core);
+-  current_chandef = __wave_core_chandef_get(core);
+-
+-  ILOG0_V("CAC timer expired");
+-
+-  /* If debug switch in progress, it means cac timer has interrupted by _handle_radar_event()
+-     and we shouldn't notify HostAPD as timer will be canceled */
+-  if (!ss->dfs_debug_params.switch_in_progress)
+-    wv_cfg80211_cac_event(ndev, current_chandef, 1); /* 1 means it did finish */
+-
+-  if (mtlk_core_cfg_get_block_tx(core) == 0) {
+-    memset(&cpd, 0, sizeof(cpd));
+-    cpd.chandef = *current_chandef;
+-    cpd.ndev = ndev;
+-    cpd.vap_id = mtlk_vap_get_id(mtlk_df_get_vap_handle(df));
+-    /* Don't notify kernel about channel switch in this specific case to avoid deadlock,
+-     * as cfg80211_cac_event will trigger all interface up and channel switch procedures */
+-    cpd.dont_notify_kernel = TRUE;
+-
+-    _mtlk_df_user_invoke_core_async(df, WAVE_RADIO_REQ_SET_CHAN, &cpd, sizeof(cpd), NULL, 0);
+-  }
+-  mtlk_core_cfg_set_block_tx(core, 0);
+-  return MTLK_ERR_OK;
+-}
+-
+ /* called from radio module */
+ int scan_support_init(mtlk_core_t *core, mtlk_scan_support_t *ss)
+ {
+@@ -1134,7 +1078,8 @@
+   ccd->center_freq1 = 0;
+   wmb();
+ 
+-  res = core_cfg_send_set_chan_by_msg(&ss->set_chan_man_msg);
++  res = core_cfg_send_set_chan_by_msg(core, &ss->set_chan_man_msg,
++              req->type == MTLK_SCAN_STA || req->type == MTLK_SCAN_SCHED_STA);
+   if (res == MTLK_ERR_OK)
+     res = core_cfg_set_tx_power_limit(core, req->channels[i].center_freq, CW_20,
+                                       req->channels[i].center_freq, req->country_code, FALSE);
+@@ -1253,7 +1198,10 @@
+   MTLK_ASSERT(NULL != request);
+   MTLK_ASSERT(sizeof(*request) == r_size);
+ 
+-  res = _scan_do_scan(core, request);
++  res = wave_radio_role_check(wave_vap_radio_get(core->vap_handle),
++              request->type == MTLK_SCAN_STA || request->type == MTLK_SCAN_SCHED_STA);
++  if (res == MTLK_ERR_OK)
++    res = _scan_do_scan(core, request);
+ 
+   return mtlk_clpb_push(clpb, &res, sizeof(res));
+ }
+--- a/wireless/driver/shared/scan_support.h
++++ b/wireless/driver/shared/scan_support.h
+@@ -330,8 +330,6 @@
+ int resume_or_allow_scan(mtlk_core_t *core);
+ int clean_up_after_this_scan(mtlk_core_t *core, struct scan_support *ss);
+ uint32 sched_scan_timer_clb_func(mtlk_osal_timer_t *timer, mtlk_handle_t nic);
+-uint32 cac_timer_clb_func(mtlk_osal_timer_t *timer, mtlk_handle_t nic);
+-int cac_timer_serialized_func(mtlk_handle_t hcore, const void* data, uint32 data_size);
+ 
+ int scan_support_init(mtlk_core_t *core, mtlk_scan_support_t *ss);
+ void scan_support_cleanup(mtlk_scan_support_t *ss);

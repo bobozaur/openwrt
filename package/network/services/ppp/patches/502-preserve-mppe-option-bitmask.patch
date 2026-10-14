@@ -1,0 +1,59 @@
+Subject: [PATCH] pppd: preserve the MPPE strength bitmask when requiring encryption
+
+The require-mppe and +mppe options supply MPPE_OPT_40 | MPPE_OPT_128 through
+o_bool. Since bool is now the C Boolean type, process_option() normalizes
+that value from 3 to 1, enabling only 40-bit MPPE. A subsequent nomppe-40
+then clears the wanted mask entirely while its scratch allow mask remains
+40-bit, resulting in an empty local CCP request and rejection of a peer's
+128-bit offer.
+
+Set the unsigned-char mask through a no-argument option callback instead.
+Keep the Boolean option machinery unchanged: other options use its true
+Boolean semantics. The existing strength-specific OR/clear operations
+already access their secondary masks as unsigned char.
+
+--- a/pppd/ccp.c
++++ b/pppd/ccp.c
+@@ -64,6 +64,9 @@ static int setbsdcomp (char **);
+ static int setdeflate (char **);
+ static char bsd_value[8];
+ static char deflate_value[8];
++#ifdef PPP_WITH_MPPE
++static int setmppe (char **);
++#endif
+ 
+ /*
+  * Option variables.
+@@ -111,12 +114,12 @@ static struct option ccp_option_list[] = {
+ 
+ #ifdef PPP_WITH_MPPE
+     /* MPPE options are symmetrical ... we only set wantoptions here */
+-    { "require-mppe", o_bool, &ccp_wantoptions[0].mppe,
++    { "require-mppe", o_special_noarg, (void *)setmppe,
+       "require MPPE encryption",
+-      OPT_PRIO | MPPE_OPT_40 | MPPE_OPT_128 },
+-    { "+mppe", o_bool, &ccp_wantoptions[0].mppe,
++      OPT_PRIO },
++    { "+mppe", o_special_noarg, (void *)setmppe,
+       "require MPPE encryption",
+-      OPT_ALIAS | OPT_PRIO | MPPE_OPT_40 | MPPE_OPT_128 },
++      OPT_ALIAS | OPT_PRIO },
+     { "nomppe", o_bool, &ccp_wantoptions[0].mppe,
+       "don't allow MPPE encryption", OPT_PRIO },
+     { "-mppe", o_bool, &ccp_wantoptions[0].mppe,
+@@ -258,6 +261,15 @@ static int all_rejected[NUM_PPP];
+ /*
+  * Option parsing.
+  */
++#ifdef PPP_WITH_MPPE
++static int
++setmppe(char **argv)
++{
++    ccp_wantoptions[0].mppe = MPPE_OPT_40 | MPPE_OPT_128;
++    return 1;
++}
++#endif
++
+ static int
+ setbsdcomp(char **argv)
+ {

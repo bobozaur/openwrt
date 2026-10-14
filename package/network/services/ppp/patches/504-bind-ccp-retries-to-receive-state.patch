@@ -1,0 +1,53 @@
+Subject: [PATCH] pppd: use a fresh CCP identifier after receive-state replacement
+
+The CCP addci callback allocates the proposed kernel receive state on each
+Configure-Request, including timer retries.  Reusing the identifier allows
+an Ack already queued for the previous state to open CCP after that state
+was replaced.  Linux then ignores the current Ack because CCP is already
+up, leaving the new decompressor stopped.
+
+Advance the existing FSM request identifier in CCP's retransmit callback,
+before rebuilding and sending the request.  Queued replies for earlier
+allocations fail the normal FSM identifier check.  This applies to all CCP
+compression methods whose first receive option is allocated by addci;
+initial requests, retry limits, peer-request replies and other control
+protocols keep their existing behavior.
+
+--- a/pppd/ccp.c
++++ b/pppd/ccp.c
+@@ -216,6 +216,7 @@
+ static void ccp_resetci (fsm *);
+ static int  ccp_cilen (fsm *);
+ static void ccp_addci (fsm *, u_char *, int *);
++static void ccp_retransmit (fsm *);
+ static int  ccp_ackci (fsm *, u_char *, int);
+ static int  ccp_nakci (fsm *, u_char *, int, int);
+ static int  ccp_rejci (fsm *, u_char *, int);
+@@ -239,7 +240,7 @@
+     NULL,
+     NULL,
+     NULL,
+-    NULL,
++    ccp_retransmit,
+     ccp_extcode,
+     "CCP"
+ };
+@@ -705,6 +706,18 @@
+ 	+ (go->mppe? CILEN_MPPE: 0)
+ #endif
+         ;
++}
++
++/*
++ * A retry rebuilds the kernel receive state in ccp_addci().  Give it a new
++ * identifier so a queued Ack for the retired state cannot open CCP before
++ * the replacement has been initialized by its own Ack.  RFC 1661 permits
++ * changing the identifier on retransmission; the FSM keeps its retry budget.
++ */
++static void
++ccp_retransmit(fsm *f)
++{
++    f->reqid = ++f->id;
+ }
+ 
+ /*

@@ -1,0 +1,101 @@
+Subject: [PATCH] acknowledge key and authorization changes before publishing them
+
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -1532,7 +1532,7 @@
+     case WLAN_CIPHER_SUITE_TKIP:
+       /* Validate key index */
+       if (key->keylen != WLAN_KEY_LEN_TKIP ||
+-          key->keyidx > 2 || (pairwise && key->keyidx != 0)) {
++          key->keyidx > 3 || (pairwise && key->keyidx != 0)) {
+         ELOG_D("Invalid TKIP key index %d", key->keyidx);
+         ret = MTLK_ERR_PARAMS;
+         goto out;
+@@ -1553,7 +1553,7 @@
+     case WLAN_CIPHER_SUITE_CCMP:
+       /* Validate key index */
+       if (key->keylen != WLAN_KEY_LEN_CCMP ||
+-          key->keyidx > 2 || (pairwise && key->keyidx != 0)) {
++          key->keyidx > 3 || (pairwise && key->keyidx != 0)) {
+         ELOG_D("Invalid CCMP key index %d", key->keyidx);
+         ret = MTLK_ERR_PARAMS;
+         goto out;
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2756,7 +2756,7 @@
+     case WLAN_CIPHER_SUITE_TKIP:
+       /* Validate key index */
+       if (params->key_len != WLAN_KEY_LEN_TKIP ||
+-          key_index > 2 || (pairwise && key_index != 0)) {
++          key_index > 3 || (pairwise && key_index != 0)) {
+         ELOG_D("Invalid TKIP key index %d", key_index);
+         res = MTLK_ERR_PARAMS;
+         goto finish;
+@@ -2768,7 +2768,7 @@
+     case WLAN_CIPHER_SUITE_CCMP:
+       /* Validate key index */
+       if (params->key_len != WLAN_KEY_LEN_CCMP ||
+-          key_index > 2 || (pairwise && key_index != 0)) {
++          key_index > 3 || (pairwise && key_index != 0)) {
+         ELOG_D("Invalid CCMP key index %d", key_index);
+         res = MTLK_ERR_PARAMS;
+         goto finish;
+@@ -2790,7 +2790,7 @@
+       }
+       /* Validate key index */
+       else if (params->key_len != WLAN_KEY_LEN_GCMP ||
+-          key_index > 2 || (pairwise && key_index != 0)) {
++          key_index > 3 || (pairwise && key_index != 0)) {
+         ELOG_D("Invalid GCMP key index %d", key_index);
+         res = MTLK_ERR_PARAMS;
+         goto finish;
+@@ -2808,7 +2808,7 @@
+       }
+       /* Validate key index */
+       else if (params->key_len != WLAN_KEY_LEN_GCMP_256 ||
+-          key_index > 2 || (pairwise && key_index != 0)) {
++          key_index > 3 || (pairwise && key_index != 0)) {
+         ELOG_D("Invalid GCMP256 key index %d", key_index);
+         res = MTLK_ERR_PARAMS;
+         goto finish;
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -9871,8 +9871,17 @@
+   ILOG1_DD("CID-%04x: UM_MAN_SET_802_1X_FILTER_REQ u8IsFilterOpen:%d", mtlk_vap_get_oid(core->vap_handle),
+            umi_filter->u8IsFilterOpen);
+ 
++  /* Close the host data path before revoking firmware authorization. */
++  if (!authorizing)
++    mtlk_sta_set_packets_filter(sta, MTLK_PCKT_FLTR_ALLOW_802_1X);
++
+   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  if (res == MTLK_ERR_OK &&
++      MAC_TO_HOST16(umi_filter->u16Status) != UMI_OK)
++    res = MTLK_ERR_MAC;
+   if (MTLK_ERR_OK != res) {
++    mtlk_sta_set_packets_filter(sta, MTLK_PCKT_FLTR_ALLOW_802_1X);
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
+     ELOG_DD("CID-%04x: mtlk_mm_send_blocked failed: %i", mtlk_vap_get_oid(core->vap_handle), res);
+   }
+ 
+@@ -9954,6 +9963,8 @@
+   }
+ 
+   res = _mtlk_send_filter_req(core, sta, authorizing);
++  if (res != MTLK_ERR_OK)
++    goto FINISH;
+ 
+   if(authorizing){
+     mtlk_sta_set_packets_filter(sta, MTLK_PCKT_FLTR_ALLOW_ALL);
+@@ -13268,7 +13279,11 @@
+   ILOG2_D("UMI_SET_DEFAULT_KEY        KeyIndex:%d", MAC_TO_HOST16(umi_default_key->u16KeyIndex));
+ 
+   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  if (res == MTLK_ERR_OK &&
++      MAC_TO_HOST16(umi_default_key->u16Status) != UMI_OK)
++    res = MTLK_ERR_MAC;
+   if (MTLK_ERR_OK != res) {
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
+     ELOG_DD("CID-%04x: mtlk_mm_send_blocked failed: %i", mtlk_vap_get_oid(core->vap_handle), res);
+     goto FINISH;
+   }

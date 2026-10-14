@@ -1,0 +1,411 @@
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -104,13 +104,10 @@
+ 
+ 
+ static const uint32 _cipher_suites[] = {
+-  WLAN_CIPHER_SUITE_USE_GROUP,
+   WLAN_CIPHER_SUITE_WEP40,
+   WLAN_CIPHER_SUITE_TKIP,
+   WLAN_CIPHER_SUITE_CCMP,
+-  WLAN_CIPHER_SUITE_WEP104,
+-  WLAN_CIPHER_SUITE_AES_CMAC,
+-  WLAN_CIPHER_SUITE_SMS4
++  WLAN_CIPHER_SUITE_WEP104
+ };
+ 
+ #define WV_STYPE_ALL              0xFFFF
+@@ -1429,7 +1426,7 @@
+   BOOL pairwise = key->flags & IEEE80211_KEY_FLAG_PAIRWISE;
+   mtlk_clpb_t *clpb = NULL;
+   mtlk_core_ui_encext_cfg_t encext_cfg;
+-  int ret = 0;
++  int ret = MTLK_ERR_OK;
+   mtlk_vap_handle_t vap_handle;
+   mtlk_core_t *core;
+   struct ieee80211_key_seq seq;
+@@ -1443,25 +1440,22 @@
+   vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
+   core = mtlk_vap_get_core(vap_handle);
+   if (mtlk_core_rcvry_is_running(core) ||
+-      wave_rcvry_mac_fatal_pending_get(mtlk_vap_get_hw(core->vap_handle))) {
++      wave_rcvry_mac_fatal_pending_get(mtlk_vap_get_hw(core->vap_handle)) ||
++      mtlk_core_is_stopping(core) || !wv_iface_inf->is_initialized) {
+     ELOG_V("Recovery is running, key should not be set in FW");
+-    return _mtlk_df_mtlk_to_linux_error_code(MTLK_ERR_OK);
+-  }
+-  ieee80211_get_key_rx_seq(key, 0, &seq);
+-
+-  ieee80211_get_key_rx_seq(key, 0, &seq);
++    return -EBUSY;
++  }
+ 
+   switch (cmd) {
+   case SET_KEY:
+     ILOG0_V("SET_KEY");
+     if (key->keyidx >= MIB_WEP_N_DEFAULT_KEYS) {
+-      ILOG2_D("Invalid key index %d ignored", key->keyidx);
+-      ret = MTLK_ERR_OK;
++      ELOG_D("Unsupported key index %d", key->keyidx);
++      ret = MTLK_ERR_NOT_SUPPORTED;
+       goto out;
+     }
+ 
+     memset(&encext_cfg, 0, sizeof(encext_cfg));
+-    key->hw_key_idx = key->keyidx;
+ 
+     ILOG2_DDDDDDD("cipher = %d, icv_len = %d, iv_len = %d, hw_key_idx = %d, flags = %d, keyidx = %d, keylen = %d",
+         key->cipher, key->icv_len, key->iv_len, key->hw_key_idx,
+@@ -1505,11 +1499,13 @@
+ 
+     case WLAN_CIPHER_SUITE_TKIP:
+       /* Validate key index */
+-      if ((key->keyidx > 2) || (pairwise & (key->keyidx != 0))) {
++      if (key->keylen != WLAN_KEY_LEN_TKIP ||
++          key->keyidx > 2 || (pairwise && key->keyidx != 0)) {
+         ELOG_D("Invalid TKIP key index %d", key->keyidx);
+         ret = MTLK_ERR_PARAMS;
+         goto out;
+       }
++      ieee80211_get_key_rx_seq(key, 0, &seq);
+       iv16 = seq.tkip.iv16;
+       iv32 = seq.tkip.iv32;
+       encext_cfg.rx_seq[0] = iv16 & 0xff;
+@@ -1519,25 +1515,18 @@
+       encext_cfg.rx_seq[4] = (iv32 >> 16) & 0xff;
+       encext_cfg.rx_seq[5] = (iv32 >> 24) & 0xff;
+ 
+-      iv16 = seq.tkip.iv16;
+-      iv32 = seq.tkip.iv32;
+-      encext_cfg.rx_seq[0] = iv16 & 0xff;
+-      encext_cfg.rx_seq[1] = (iv16 >> 8) & 0xff;
+-      encext_cfg.rx_seq[2] = iv32 & 0xff;
+-      encext_cfg.rx_seq[3] = (iv32 >> 8) & 0xff;
+-      encext_cfg.rx_seq[4] = (iv32 >> 16) & 0xff;
+-      encext_cfg.rx_seq[5] = (iv32 >> 24) & 0xff;
+-
+       encext_cfg.alg_type = IW_ENCODE_ALG_TKIP;
+       break;
+ 
+     case WLAN_CIPHER_SUITE_CCMP:
+       /* Validate key index */
+-      if ((key->keyidx > 2) || (pairwise & (key->keyidx != 0))) {
++      if (key->keylen != WLAN_KEY_LEN_CCMP ||
++          key->keyidx > 2 || (pairwise && key->keyidx != 0)) {
+         ELOG_D("Invalid CCMP key index %d", key->keyidx);
+         ret = MTLK_ERR_PARAMS;
+         goto out;
+       }
++      ieee80211_get_key_rx_seq(key, 0, &seq);
+       encext_cfg.rx_seq[0] = seq.ccmp.pn[5];
+       encext_cfg.rx_seq[1] = seq.ccmp.pn[4];
+       encext_cfg.rx_seq[2] = seq.ccmp.pn[3];
+@@ -1545,39 +1534,13 @@
+       encext_cfg.rx_seq[4] = seq.ccmp.pn[1];
+       encext_cfg.rx_seq[5] = seq.ccmp.pn[0];
+ 
+-      encext_cfg.rx_seq[0] = seq.ccmp.pn[5];
+-      encext_cfg.rx_seq[1] = seq.ccmp.pn[4];
+-      encext_cfg.rx_seq[2] = seq.ccmp.pn[3];
+-      encext_cfg.rx_seq[3] = seq.ccmp.pn[2];
+-      encext_cfg.rx_seq[4] = seq.ccmp.pn[1];
+-      encext_cfg.rx_seq[5] = seq.ccmp.pn[0];
+-
+       encext_cfg.alg_type = IW_ENCODE_ALG_CCMP;
+       break;
+ 
+     case WLAN_CIPHER_SUITE_AES_CMAC:
+-      /* Validate key index */
+-      if ((key->keyidx > 2) || (pairwise & (key->keyidx != 0))) {
+-        ELOG_D("Invalid AES_CMAC key index %d", key->keyidx);
+-        ret = MTLK_ERR_PARAMS;
+-        goto out;
+-      }
+-      encext_cfg.rx_seq[0] = seq.aes_cmac.pn[5];
+-      encext_cfg.rx_seq[1] = seq.aes_cmac.pn[4];
+-      encext_cfg.rx_seq[2] = seq.aes_cmac.pn[3];
+-      encext_cfg.rx_seq[3] = seq.aes_cmac.pn[2];
+-      encext_cfg.rx_seq[4] = seq.aes_cmac.pn[1];
+-      encext_cfg.rx_seq[5] = seq.aes_cmac.pn[0];
+-
+-      encext_cfg.rx_seq[0] = seq.aes_cmac.pn[5];
+-      encext_cfg.rx_seq[1] = seq.aes_cmac.pn[4];
+-      encext_cfg.rx_seq[2] = seq.aes_cmac.pn[3];
+-      encext_cfg.rx_seq[3] = seq.aes_cmac.pn[2];
+-      encext_cfg.rx_seq[4] = seq.aes_cmac.pn[1];
+-      encext_cfg.rx_seq[5] = seq.aes_cmac.pn[0];
+-
+-      encext_cfg.alg_type = IW_ENCODE_ALG_AES_CMAC;
+-      break;
++      /* IGTK uses a different retained firmware ABI; do not claim install. */
++      ret = MTLK_ERR_NOT_SUPPORTED;
++      goto out;
+ 
+     default:
+       ret = MTLK_ERR_PARAMS;
+@@ -1630,7 +1593,10 @@
+   }
+ 
+ out:
+-  return ret;
++  if (cmd == SET_KEY && ret == MTLK_ERR_OK)
++    key->hw_key_idx = key->keyidx;
++  memzero_explicit(&encext_cfg, sizeof(encext_cfg));
++  return _mtlk_df_mtlk_to_linux_error_code(ret);
+ }
+ 
+ static void _wv_ieee80211_op_set_default_unicast_key (struct ieee80211_hw *hw, struct ieee80211_vif *vif, int idx)
+@@ -2113,13 +2079,14 @@
+   hw->flags |= IEEE80211_HW_SIGNAL_DBM |
+     IEEE80211_HW_SPECTRUM_MGMT |
+     IEEE80211_HW_REPORTS_TX_ACK_STATUS |
+-    IEEE80211_HW_MFP_CAPABLE |
++    IEEE80211_HW_SW_CRYPTO_CONTROL |
+     IEEE80211_HW_AMPDU_AGGREGATION;
+ #else
+   ieee80211_hw_set(hw, SIGNAL_DBM);
+   ieee80211_hw_set(hw, SPECTRUM_MGMT);
+   ieee80211_hw_set(hw, REPORTS_TX_ACK_STATUS);
+-  ieee80211_hw_set(hw, MFP_CAPABLE);
++  /* Data bypasses mac80211 crypto; failed HW installs must fail closed. */
++  ieee80211_hw_set(hw, SW_CRYPTO_CONTROL);
+   ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+ #endif
+ 
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -12997,6 +12997,14 @@
+     goto FINISH;
+   }
+ 
++  /* Bound both host caches before any indexed access or firmware request. */
++  key_indx = encext_cfg->key_idx;
++  if (key_indx >= ARRAY_SIZE(core->slow_ctx->keys) ||
++      key_indx >= ARRAY_SIZE(core->slow_ctx->group_rsc)) {
++    res = MTLK_ERR_PARAMS;
++    goto FINISH;
++  }
++
+   /* Prepare UMI message */
+   man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, txmm, NULL);
+   if (!man_entry) {
+@@ -13017,8 +13025,6 @@
+     res = MTLK_ERR_PARAMS;
+     goto FINISH;
+   }
+-
+-  key_indx = encext_cfg->key_idx;
+ 
+   /* Set Ciper Suite */
+   alg_type = encext_cfg->alg_type;
+@@ -13037,18 +13043,34 @@
+       }
+       break;
+     case IW_ENCODE_ALG_TKIP:
++      if (key_len != WLAN_KEY_LEN_TKIP) {
++        res = MTLK_ERR_PARAMS;
++        goto FINISH;
++      }
+       umi_key->u16CipherSuite = HOST_TO_MAC16(UMI_RSN_CIPHER_SUITE_TKIP);
+       break;
+     case IW_ENCODE_ALG_CCMP:
++      if (key_len != WLAN_KEY_LEN_CCMP) {
++        res = MTLK_ERR_PARAMS;
++        goto FINISH;
++      }
+       umi_key->u16CipherSuite = HOST_TO_MAC16(UMI_RSN_CIPHER_SUITE_CCMP);
+       break;
+     case IW_ENCODE_ALG_AES_CMAC:
+-      umi_key->u16CipherSuite = HOST_TO_MAC16(UMI_RSN_CIPHER_SUITE_BIP);
+-      break;
++      res = MTLK_ERR_NOT_SUPPORTED;
++      goto FINISH;
+     case IW_ENCODE_ALG_GCMP:
++      if (key_len != WLAN_KEY_LEN_GCMP) {
++        res = MTLK_ERR_PARAMS;
++        goto FINISH;
++      }
+       umi_key->u16CipherSuite = HOST_TO_MAC16(UMI_RSN_CIPHER_SUITE_GCMP128);
+       break;
+     case IW_ENCODE_ALG_GCMP_256:
++      if (key_len != WLAN_KEY_LEN_GCMP_256) {
++        res = MTLK_ERR_PARAMS;
++        goto FINISH;
++      }
+       umi_key->u16CipherSuite = HOST_TO_MAC16(UMI_RSN_CIPHER_SUITE_GCMP256);
+       break;
+     default:
+@@ -13060,10 +13082,6 @@
+   /* Set key type */
+   if (mtlk_osal_eth_is_broadcast(encext_cfg->sta_addr.au8Addr)) {
+     umi_key->u16KeyType = HOST_TO_MAC16(UMI_RSN_GROUP_KEY);
+-    core->slow_ctx->group_cipher = alg_type;
+-
+-    /* update group replay counter */
+-    _mtlk_core_set_rx_seq(core, key_indx, encext_cfg->rx_seq);
+     umi_key->u16Sid = HOST_TO_MAC16(TMP_BCAST_DEST_ADDR);
+   }
+   else {
+@@ -13084,10 +13102,6 @@
+    * actually second part of key is copied into au8Tk2 array */
+   wave_memcpy(umi_key->au8Tk, sizeof(umi_key->au8Tk), encext_cfg->key, key_len);
+ 
+-  if(sta){
+-    mtlk_sta_set_cipher(sta, alg_type);
+-  }
+-
+   /* set TX sequence number */
+   umi_key->au8TxSeqNum[0] = 1;
+   umi_key->u16KeyIndex = HOST_TO_MAC16(key_indx);
+@@ -13100,12 +13114,28 @@
+   ILOG1_D("UMI_SET_KEY        KeyIndex:%d", MAC_TO_HOST16(umi_key->u16KeyIndex));
+   mtlk_dump(1, umi_key->au8RxSeqNum, sizeof(umi_key->au8RxSeqNum), "RxSeqNum");
+   mtlk_dump(1, umi_key->au8TxSeqNum, sizeof(umi_key->au8TxSeqNum), "TxSeqNum");
+-  mtlk_dump(1, umi_key->au8Tk1, key_len, "KEY:");
+ 
+   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+   if (MTLK_ERR_OK != res) {
+-    ELOG_DD("CID-%04x: mtlk_mm_send_blocked failed: %i", mtlk_vap_get_oid(core->vap_handle), res);
++    ELOG_DD("CID-%04x: key reply failed: %i", mtlk_vap_get_oid(core->vap_handle), res);
++    /* The firmware may have applied the key before its reply was lost. */
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
+     goto FINISH;
++  }
++
++  if (MAC_TO_HOST16(umi_key->u16Status) != UMI_OK) {
++    ELOG_DD("CID-%04x: firmware rejected key: %u", mtlk_vap_get_oid(core->vap_handle),
++            MAC_TO_HOST16(umi_key->u16Status));
++    res = MTLK_ERR_MAC;
++    goto FINISH;
++  }
++
++  /* Publish host state only after the firmware acknowledges the install. */
++  if (sta) {
++    mtlk_sta_set_cipher(sta, alg_type);
++  } else {
++    core->slow_ctx->group_cipher = alg_type;
++    _mtlk_core_set_rx_seq(core, key_indx, encext_cfg->rx_seq);
+   }
+ 
+   /* Store the key */
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2672,8 +2672,8 @@
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   if (key_index >= MIB_WEP_N_DEFAULT_KEYS) {
+-    ILOG2_D("Invalid key index %d ignored", key_index);
+-    res = MTLK_ERR_OK;
++    ELOG_D("Unsupported key index %d", key_index);
++    res = MTLK_ERR_NOT_SUPPORTED;
+     goto finish;
+   }
+ 
+@@ -2726,7 +2726,8 @@
+ 
+     case WLAN_CIPHER_SUITE_TKIP:
+       /* Validate key index */
+-      if ((key_index > 2) || (pairwise & (key_index !=0))) {
++      if (params->key_len != WLAN_KEY_LEN_TKIP ||
++          key_index > 2 || (pairwise && key_index != 0)) {
+         ELOG_D("Invalid TKIP key index %d", key_index);
+         res = MTLK_ERR_PARAMS;
+         goto finish;
+@@ -2737,7 +2738,8 @@
+ 
+     case WLAN_CIPHER_SUITE_CCMP:
+       /* Validate key index */
+-      if ((key_index > 2) || (pairwise & (key_index !=0))) {
++      if (params->key_len != WLAN_KEY_LEN_CCMP ||
++          key_index > 2 || (pairwise && key_index != 0)) {
+         ELOG_D("Invalid CCMP key index %d", key_index);
+         res = MTLK_ERR_PARAMS;
+         goto finish;
+@@ -2747,15 +2749,8 @@
+       break;
+ 
+     case WLAN_CIPHER_SUITE_AES_CMAC:
+-      /* Validate key index */
+-      if ((key_index > 2) || (pairwise & (key_index !=0))) {
+-        ELOG_D("Invalid AES_CMAC key index %d", key_index);
+-        res = MTLK_ERR_PARAMS;
+-        goto finish;
+-      }
+-
+-      encext_cfg.alg_type = IW_ENCODE_ALG_AES_CMAC;
+-      break;
++      res = MTLK_ERR_NOT_SUPPORTED;
++      goto finish;
+ 
+     case WLAN_CIPHER_SUITE_GCMP:
+       /* Validate platform */
+@@ -2765,7 +2760,8 @@
+         goto finish;
+       }
+       /* Validate key index */
+-      else if ((key_index > 2) || (pairwise & (key_index !=0))) {
++      else if (params->key_len != WLAN_KEY_LEN_GCMP ||
++          key_index > 2 || (pairwise && key_index != 0)) {
+         ELOG_D("Invalid GCMP key index %d", key_index);
+         res = MTLK_ERR_PARAMS;
+         goto finish;
+@@ -2782,7 +2778,8 @@
+         goto finish;
+       }
+       /* Validate key index */
+-      else if ((key_index > 2) || (pairwise & (key_index !=0))) {
++      else if (params->key_len != WLAN_KEY_LEN_GCMP_256 ||
++          key_index > 2 || (pairwise && key_index != 0)) {
+         ELOG_D("Invalid GCMP256 key index %d", key_index);
+         res = MTLK_ERR_PARAMS;
+         goto finish;
+@@ -2797,7 +2794,7 @@
+   }
+ 
+   /* Validate and set the key lenght */
+-  if (((UMI_RSN_TK1_LEN + UMI_RSN_TK2_LEN) < params->key_len) || (params->key_len == 0)) {
++  if (((UMI_RSN_TK1_LEN + UMI_RSN_TK2_LEN) < params->key_len) || (params->key_len <= 0)) {
+     WLOG_SD("%s: Invalid key length %u", ndev->name, params->key_len);
+     res = MTLK_ERR_PARAMS;
+     goto finish;
+@@ -2827,6 +2824,7 @@
+   res = _mtlk_df_user_process_core_retval_void(res, clpb, WAVE_CORE_REQ_SET_ENCEXT_CFG, TRUE);
+ 
+ finish:
++  memzero_explicit(&encext_cfg, sizeof(encext_cfg));
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+ 
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -76,23 +76,17 @@
+ };
+ 
+ static const uint32 _cipher_suites[] = {
+-  WLAN_CIPHER_SUITE_USE_GROUP,
++  WLAN_CIPHER_SUITE_WEP40,
++  WLAN_CIPHER_SUITE_TKIP,
++  WLAN_CIPHER_SUITE_CCMP,
++  WLAN_CIPHER_SUITE_WEP104
++};
++
++static const uint32 _cipher_suites_gcmp[] = {
+   WLAN_CIPHER_SUITE_WEP40,
+   WLAN_CIPHER_SUITE_TKIP,
+   WLAN_CIPHER_SUITE_CCMP,
+   WLAN_CIPHER_SUITE_WEP104,
+-  WLAN_CIPHER_SUITE_AES_CMAC,
+-  WLAN_CIPHER_SUITE_SMS4
+-};
+-
+-static const uint32 _cipher_suites_gcmp[] = {
+-  WLAN_CIPHER_SUITE_USE_GROUP,
+-  WLAN_CIPHER_SUITE_WEP40,
+-  WLAN_CIPHER_SUITE_TKIP,
+-  WLAN_CIPHER_SUITE_CCMP,
+-  WLAN_CIPHER_SUITE_WEP104,
+-  WLAN_CIPHER_SUITE_AES_CMAC,
+-  WLAN_CIPHER_SUITE_SMS4,
+   WLAN_CIPHER_SUITE_GCMP,
+   WLAN_CIPHER_SUITE_GCMP_256
+ };

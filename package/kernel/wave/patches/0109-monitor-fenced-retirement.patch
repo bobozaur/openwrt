@@ -1,0 +1,53 @@
+From: AX50 OpenWrt bring-up <noreply@example.invalid>
+Subject: [PATCH] wave: honor the monitor fence during synchronous VAP retirement
+
+Monitor retune joins the IRQ/tasklet/DMA producers and resets firmware before
+publishing its restartable fence. The HALTED VAP cleanup then calls PMF detach,
+which previously accepted terminal quiesce only and returned with a warning.
+Accept the completed restartable fence at that same reference-release boundary.
+
+Keep synchronous monitor recovery from proceeding over a failed VAP cleanup.
+The ordinary fault-recovery helper intentionally ignores its errors, so the
+monitor owner must check the same native per-VAP operation itself.
+
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -11131,14 +11131,15 @@
+     wave_pmf_complete(pmf, entry->pmf_slot);
+ }
+ 
+-/* Called after terminal DMA fencing, with this AP's process producers excluded
+- * by its native wiphy lifetime. Tasklet producers were drained by quiesce. */
++/* Called after terminal quiesce or the complete restartable monitor fence.
++ * The VAP lifetime excludes process producers; both fences join IRQ/tasklet
++ * producers and reset firmware before any pending PMF reference is detached. */
+ void wave_hw_mmb_detach_pmf(mtlk_hw_t *hw, struct wave_pmf *pmf)
+ {
+   mtlk_mmb_basic_bdr_t *ring = &hw->bss_mgmt.tx_bdr.basic;
+   unsigned int i;
+ 
+-  if (WARN_ON(!READ_ONCE(hw->quiescing)))
++  if (WARN_ON(!READ_ONCE(hw->quiescing) && !wave_hw_monitor_fenced(hw)))
+     return;
+   for (i = 0; i < ring->nof_bds; i++) {
+     struct mtlk_hw_bss_req_mirror *entry =
+--- a/wireless/driver/shared/fw_recovery.c
++++ b/wireless/driver/shared/fw_recovery.c
+@@ -2070,8 +2070,15 @@
+ 
+   oid = mtlk_vap_get_oid(ctx->radio_ctx[0].master_vap_handle);
+   res = wave_hw_monitor_fence(hw);
+-  if (res == MTLK_ERR_OK)
+-    res = _rcvry_step_vap_deactivation(ctx, oid);
++  /* Ordinary fault recovery deliberately ignores this step's errors. A
++   * synchronous monitor transition must not restart over a failed VAP stop. */
++  for (r = 0; r < ctx->max_radios_number && res == MTLK_ERR_OK; r++) {
++    wave_rcvry_radio_ctx_t *radio = &ctx->radio_ctx[r];
++    mtlk_core_t *master = mtlk_vap_get_core(radio->master_vap_handle);
++
++    for (v = 0; radio->vap_info[v] && res == MTLK_ERR_OK; v++)
++      res = core_recovery_deactivate(master, mtlk_vap_get_core(radio->vap_info[v]->vap_handle));
++  }
+   if (res == MTLK_ERR_OK)
+     res = _rcvry_step_fw_isolation(pcard, oid);
+   if (res == MTLK_ERR_OK)

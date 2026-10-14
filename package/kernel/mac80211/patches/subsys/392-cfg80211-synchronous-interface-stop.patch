@@ -1,0 +1,41 @@
+Subject: [PATCH] cfg80211: allow interface leave under the wiphy lock
+
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -10357,6 +10357,18 @@
+ }
+ 
+ /**
++ * cfg80211_stop_iface_locked - synchronously stop an interface
++ * @wiphy: the wiphy whose mutex the caller holds
++ * @wdev: wireless device to stop
++ *
++ * Runs the cfg80211 leave path immediately instead of queueing EVENT_STOPPED.
++ * Driver callbacks retain their existing error and asynchronous completion
++ * semantics. Callers must not infer that a failed AP stop has completed.
++ * NAN interfaces require the ordinary RTNL teardown path and are not supported.
++ */
++void cfg80211_stop_iface_locked(struct wiphy *wiphy, struct wireless_dev *wdev);
++
++/**
+  * cfg80211_shutdown_all_interfaces - shut down all interfaces for a wiphy
+  * @wiphy: the wiphy to shut down
+  *
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -1560,6 +1560,15 @@
+ 	}
+ }
+ 
++void cfg80211_stop_iface_locked(struct wiphy *wiphy, struct wireless_dev *wdev)
++{
++	lockdep_assert_wiphy(wiphy);
++	if (WARN_ON(wdev->wiphy != wiphy || wdev->iftype == NL80211_IFTYPE_NAN))
++		return;
++	cfg80211_leave_locked(wiphy_to_rdev(wiphy), wdev, -1);
++}
++EXPORT_SYMBOL_GPL(cfg80211_stop_iface_locked);
++
+ void cfg80211_leave(struct cfg80211_registered_device *rdev,
+ 		    struct wireless_dev *wdev, int link_id)
+ {

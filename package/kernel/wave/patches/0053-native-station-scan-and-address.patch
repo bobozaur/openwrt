@@ -1,0 +1,33 @@
+Subject: [PATCH] wave: preserve station MAC selection and normal scan dwell
+
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -2315,9 +2315,11 @@
+     ILOG0_V("11d hints are disabled");
+   }
+ 
+-  /* set WIPHY features */
+-  hw->wiphy->features = (NL80211_FEATURE_SK_TX_STATUS |
+-                         NL80211_FEATURE_SCAN_FLUSH);
++  /* Preserve mac80211 capabilities, including MAC_ON_CREATE: cfg80211
++   * otherwise ignores the station address supplied when creating a VIF.
++   */
++  hw->wiphy->features |= NL80211_FEATURE_SK_TX_STATUS |
++                          NL80211_FEATURE_SCAN_FLUSH;
+ 
+   /* This hybrid driver delivers Ethernet EAPOL through AF_PACKET. mac80211
+    * alloc_hw advertises its own control-port path by default, but that path
+--- a/wireless/driver/linux/radio_pdb_def.h
++++ b/wireless/driver/linux/radio_pdb_def.h
+@@ -65,7 +65,10 @@
+ static const uint32 wave_radio_initial_MSDU_lifetime = 512;
+ static const uint32 wave_radio_initial_power_limit = 4;
+ static const uint32 wave_radio_initial_short_preamble = 0;
+-static const uint32 wave_radio_initial_scan_params[6] = { 400, 400, 5, 7, 10, 2 };
++/* The normal foreground profile keeps a full-band scan within the
++ * supplicant initial scan watchdog, including passive DFS channels.
++ */
++static const uint32 wave_radio_initial_scan_params[6] = { 100, 20, 3, 5, 10, 2 };
+ static const uint32 wave_radio_initial_scan_params_bg[6] = { 100, 20, 1, 1, 1, 1000 };
+ static const uint32 wave_radio_scan_modif_flags = SMF_AUTO_ENABLE_BG | SMF_AUTO_PASSIVE_ON_NO_IR;
+ static const uint32 wave_radio_calib_cw_masks[2] = { (1 << CW_20), (1 << CW_20) };

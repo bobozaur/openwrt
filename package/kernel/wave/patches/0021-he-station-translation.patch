@@ -1,0 +1,245 @@
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -35,6 +35,7 @@
+ #include "core_config.h"
+ #include "vendor_cmds.h"
+ #include "wave_radio.h"
++#include "wave_he_compat.h"
+ 
+ #define LOG_LOCAL_GID             GID_MAC80211
+ #define LOG_LOCAL_FID             0
+@@ -74,6 +75,9 @@
+   wave_radio_t        *radio;
+   struct ieee80211_hw *mac80211_hw;
+   struct ieee80211_vif **vif_array;
++  /* Lifetime follows hw->priv; only the station-owned band copies use it. */
++  struct ieee80211_sband_iftype_data he_iftype[NUM_SUPPORTED_BANDS];
++  u8 he_nss;
+ };
+ 
+ /* Per interface driver private date allocated by mac80211 upon interface creation*/
+@@ -1249,6 +1253,36 @@
+   if (ieee80211_vif_to_wdev(vif)->use_4addr)
+     sta_info.WDS_client_type = FOUR_ADDRESSES_STATION;
+ 
++  if (sta->deflink.he_cap.has_he) {
++    const struct ieee80211_sta_he_cap *he = &sta->deflink.he_cap;
++    wv_mac80211_t *mac80211 = __wv_ieee80211_hw_get_mac80211(hw);
++    struct wave_he_peer peer;
++    u8 mcs[4];
++    unsigned int width;
++
++    BUILD_BUG_ON(sizeof(he->he_cap_elem) != 17);
++    BUILD_BUG_ON(sizeof(peer.mac_phy) != sizeof(sta_info.he_mac_phy_cap_info));
++    BUILD_BUG_ON(sizeof(peer.mcs) != sizeof(sta_info.he_mcs_nss_info));
++    BUILD_BUG_ON(sizeof(peer.ppe) != sizeof(sta_info.he_ppe_th_info));
++    memcpy(mcs, &he->he_mcs_nss_supp.rx_mcs_80, 2);
++    memcpy(mcs + 2, &he->he_mcs_nss_supp.tx_mcs_80, 2);
++    if (!vif->bss_conf.chanreq.oper.chan)
++      return MTLK_ERR_NOT_READY;
++    width = vif->bss_conf.chanreq.oper.chan->band == NL80211_BAND_2GHZ ?
++              WAVE_HE_WIDTH_2G : WAVE_HE_WIDTH_5G;
++    if (wave_he_encode_peer(&peer, (const u8 *)&he->he_cap_elem, mcs,
++                            he->ppe_thres, sizeof(he->ppe_thres),
++                            mac80211->he_nss, width)) {
++      ELOG_V("HE peer cannot be represented by retained firmware");
++      return MTLK_ERR_PARAMS;
++    }
++    memcpy(sta_info.he_mac_phy_cap_info, peer.mac_phy, sizeof(peer.mac_phy));
++    memcpy(sta_info.he_mcs_nss_info, peer.mcs, sizeof(peer.mcs));
++    memcpy(sta_info.he_ppe_th_info, peer.ppe, sizeof(peer.ppe));
++    MTLK_BFIELD_SET(sta_info.flags, STA_FLAGS_11ax, 1);
++    MTLK_BIT_SET(sta_info.sta_net_modes, MTLK_WSSA_11AX_SUPPORTED, 1);
++  }
++
+   res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user),
+       WAVE_CORE_REQ_AP_CONNECT_STA, &clpb, &sta_info, sizeof(sta_info));
+   res = _mtlk_df_user_process_core_retval(res, clpb,
+@@ -2061,6 +2095,46 @@
+   wiphy->n_vendor_events = ARRAY_SIZE(vendor_events);
+ }
+ 
++static void
++wv_mac80211_he_cap_init(struct ieee80211_sband_iftype_data *data,
++                       enum nl80211_band band, unsigned int nss)
++{
++  struct ieee80211_sta_he_cap *he = &data->he_cap;
++  u16 mcs = 0xffff;
++  unsigned int i;
++
++  memset(data, 0, sizeof(*data));
++  data->types_mask = BIT(NL80211_IFTYPE_STATION);
++  he->has_he = true;
++  /* Retained AX templates support LDPC, 4xLTF/0.8GI and MCS0..11.
++   * Clamp their generic stream counts to this board. Optional features
++   * requiring additional control/legacy peer fields remain unadvertised.
++   */
++  he->he_cap_elem.mac_cap_info[0] = WAVE_HE_HTC;
++  he->he_cap_elem.mac_cap_info[1] = IEEE80211_HE_MAC_CAP1_TF_MAC_PAD_DUR_16US;
++  he->he_cap_elem.mac_cap_info[2] = WAVE_HE_ACK_EN;
++  he->he_cap_elem.mac_cap_info[3] = WAVE_HE_AMPDU_EXT_2;
++  he->he_cap_elem.phy_cap_info[0] = band == NL80211_BAND_2GHZ ?
++                                   WAVE_HE_WIDTH_2G : WAVE_HE_WIDTH_5G;
++  he->he_cap_elem.phy_cap_info[1] = WAVE_HE_LDPC;
++  he->he_cap_elem.phy_cap_info[7] = WAVE_HE_4XLTF_08GI;
++  /* Request conservative receive padding on air; the peer encoder separately
++   * translates the upstream AP's receive requirements into the old ABI. */
++  he->he_cap_elem.phy_cap_info[9] =
++    IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_16US <<
++    IEEE80211_HE_PHY_CAP9_NOMINAL_PKT_PADDING_POS;
++  for (i = 0; i < nss; i++) {
++    mcs &= ~(3U << (2 * i));
++    mcs |= IEEE80211_HE_MCS_SUPPORT_0_11 << (2 * i);
++  }
++  he->he_mcs_nss_supp.rx_mcs_80 = cpu_to_le16(mcs);
++  he->he_mcs_nss_supp.tx_mcs_80 = cpu_to_le16(mcs);
++  he->he_mcs_nss_supp.rx_mcs_160 = cpu_to_le16(0xffff);
++  he->he_mcs_nss_supp.tx_mcs_160 = cpu_to_le16(0xffff);
++  he->he_mcs_nss_supp.rx_mcs_80p80 = cpu_to_le16(0xffff);
++  he->he_mcs_nss_supp.tx_mcs_80p80 = cpu_to_le16(0xffff);
++}
++
+ 
+ int __MTLK_IFUNC
+ wv_ieee80211_setup_register (struct device *dev, wv_mac80211_t *mac80211, mtlk_handle_t hw_handle)
+@@ -2166,11 +2240,19 @@
+    * These station-only band copies already contain the radio's RX MCS
+    * masks; TX supports the same streams. Do not alter the AP templates.
+    */
++  if (!num_sts)
++    return MTLK_ERR_PARAMS;
++  mac80211->he_nss = min_t(u32, num_sts, WAVE_HE_MAX_NSS);
+   for (band = 0; band < NUM_SUPPORTED_BANDS; band++) {
+     struct ieee80211_supported_band *sband = hw->wiphy->bands[band];
+ 
+     if (sband && sband->ht_cap.ht_supported)
+       sband->ht_cap.mcs.tx_params |= IEEE80211_HT_MCS_TX_DEFINED;
++    if (sband) {
++      wv_mac80211_he_cap_init(&mac80211->he_iftype[band], band,
++                             mac80211->he_nss);
++      _ieee80211_set_sband_iftype_data(sband, &mac80211->he_iftype[band], 1);
++    }
+   }
+ 
+   /* Setting up passive scan on radar channels */
+--- a/wireless/driver/linux/wave_he_compat.h
++++ b/wireless/driver/linux/wave_he_compat.h
+@@ -0,0 +1,118 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef WAVE_HE_COMPAT_H
++#define WAVE_HE_COMPAT_H
++
++/* The retained D3 STA_ADD contract stores extension ID, six MAC bytes and
++ * eight PHY bytes. The remaining three UMI PHY bytes stay zero. Keep this
++ * byte codec independent of native structure packing and host endianness.
++ */
++struct wave_he_peer {
++  unsigned char mac_phy[15];
++  unsigned char mcs[8];
++  unsigned char ppe[13];
++};
++
++#define WAVE_HE_MAX_NSS 2
++#define WAVE_HE_WIDTH_2G 0x02
++#define WAVE_HE_WIDTH_5G 0x04
++#define WAVE_HE_HTC 0x01
++#define WAVE_HE_ACK_EN 0x80
++#define WAVE_HE_AMPDU_EXT_MASK 0x18
++#define WAVE_HE_AMPDU_EXT_2 0x10
++#define WAVE_HE_LDPC 0x20
++#define WAVE_HE_PPE_PRESENT 0x80
++#define WAVE_HE_4XLTF_08GI 0x04
++
++/* Inputs are the validated native 17-byte HE MAC/PHY element and the first
++ * four bytes of mac80211's already-intersected LE16 RX/TX MCS maps.
++ * Return -1 for malformed/unrepresentable input; never downgrade a station
++ * that mac80211 has already negotiated as HE. Output is published on success.
++ * This profile deliberately omits TWT, DCM, STBC, beamforming, MU and ER.
++ */
++static inline int
++wave_he_encode_peer(struct wave_he_peer *out,
++                    const unsigned char cap[17],
++                    const unsigned char mcs[4],
++                    const unsigned char *ppe, unsigned int ppe_len,
++                    unsigned int nss, unsigned int width)
++{
++  struct wave_he_peer result = { 0 };
++  unsigned int i, bit, mask, rx, tx, rx_nss, ppe_nss, ru_count, bits;
++  unsigned int extension, padding, ppet16, ppet8, value;
++
++  if (!nss || nss > WAVE_HE_MAX_NSS ||
++      (width != WAVE_HE_WIDTH_2G && width != WAVE_HE_WIDTH_5G))
++    return -1;
++
++  mask = (1U << (2 * nss)) - 1;
++  rx = ((mcs[0] | (mcs[1] << 8)) & mask) | (0xffffU & ~mask);
++  tx = ((mcs[2] | (mcs[3] << 8)) & mask) | (0xffffU & ~mask);
++  if ((rx & 3) == 3 || (tx & 3) == 3)
++    return -1;
++  rx_nss = nss;
++  while (((rx >> (2 * (rx_nss - 1))) & 3) == 3)
++    rx_nss--;
++  result.mcs[0] = rx;
++  result.mcs[1] = rx >> 8;
++  result.mcs[2] = tx;
++  result.mcs[3] = tx >> 8;
++  for (i = 4; i < sizeof(result.mcs); i++)
++    result.mcs[i] = 0xff; /* No 160 MHz support. */
++
++  result.mac_phy[0] = 35; /* WLAN_EID_EXT_HE_CAPABILITY */
++  result.mac_phy[1] = cap[0] & WAVE_HE_HTC;
++  result.mac_phy[3] = cap[2] & WAVE_HE_ACK_EN;
++  /* This numeric field must be minimized, not bitwise intersected. */
++  extension = cap[3] & WAVE_HE_AMPDU_EXT_MASK;
++  result.mac_phy[4] = extension < WAVE_HE_AMPDU_EXT_2 ?
++                       extension : WAVE_HE_AMPDU_EXT_2;
++  result.mac_phy[7] = cap[6] & width;
++  result.mac_phy[8] = cap[7] & WAVE_HE_LDPC;
++  result.mac_phy[14] = cap[13] & WAVE_HE_4XLTF_08GI;
++
++  /* Peer padding is a receive requirement, independent of our optional PHY
++   * features. Modern PHY9 is outside the retained prefix: encode its nominal
++   * padding as equivalent PPE thresholds instead of silently dropping it.
++   */
++  if (cap[12] & WAVE_HE_PPE_PRESENT) {
++    if (!ppe || !ppe_len)
++      return -1;
++    ppe_nss = (ppe[0] & 7) + 1;
++    ru_count = 0;
++    for (i = 3; i < 7; i++)
++      ru_count += (ppe[0] >> i) & 1;
++    if (!ru_count || (7 + 6 * ppe_nss * ru_count + 7) / 8 > ppe_len)
++      return -1;
++    if (ppe_nss > rx_nss)
++      ppe_nss = rx_nss;
++    bits = 7 + 6 * ppe_nss * ru_count;
++    /* Entries are NSS-major. Retaining the RU bitmap means the supported
++     * streams are a bounded prefix; no RU reordering/repacking is needed.
++     * Bit 7 of byte 0 already belongs to the first PPET16 value.
++     */
++    for (i = 0; i < (bits + 7) / 8; i++)
++      result.ppe[i] = ppe[i];
++    result.ppe[0] = (result.ppe[0] & ~7U) | (ppe_nss - 1);
++    if (bits & 7)
++      result.ppe[bits / 8] &= (1U << (bits & 7)) - 1;
++  } else {
++    padding = cap[15] >> 6;
++    if (padding == 3) /* Reserved, no standards-defined equivalent. */
++      return -1;
++    ppet16 = padding == 2 ? 0 : 7;
++    ppet8 = padding == 1 ? 0 : 7;
++    result.ppe[0] = (rx_nss - 1) | (15U << 3);
++    value = ppet16 | (ppet8 << 3);
++    for (i = 0; i < 4 * rx_nss; i++) {
++      for (bit = 0; bit < 6; bit++) {
++        unsigned int offset = 7 + 6 * i + bit;
++        result.ppe[offset / 8] |= ((value >> bit) & 1) << (offset & 7);
++      }
++    }
++  }
++  result.mac_phy[13] = WAVE_HE_PPE_PRESENT;
++  *out = result;
++  return 0;
++}
++
++#endif /* WAVE_HE_COMPAT_H */

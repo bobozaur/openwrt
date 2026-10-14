@@ -1,0 +1,13 @@
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -4844,8 +4844,8 @@
+ 
+ int wave_radio_role_check(wave_radio_t *radio, bool station)
+ {
+-  if (wave_radio_cac_active(radio) ||
+-      (station ? wave_radio_ap_active(radio) : wave_radio_sta_active(radio)))
++  MTLK_UNREFERENCED_PARAM(station);
++  if (wave_radio_cac_active(radio))
+     return MTLK_ERR_BUSY;
+   return MTLK_ERR_OK;
+ }

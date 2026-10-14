@@ -1,0 +1,61 @@
+Subject: [PATCH] update timer API names for Linux 6.18
+
+--- a/wireless/driver/linux/osal_defs.c
++++ b/wireless/driver/linux/osal_defs.c
+@@ -16,7 +16,7 @@
+ static void
+ __mtlk_osal_timer_clb (struct timer_list *os_timer)
+ {
+-  mtlk_osal_timer_t *timer = from_timer(timer, os_timer, os_timer);
++  mtlk_osal_timer_t *timer = timer_container_of(timer, os_timer, os_timer);
+   uint32             msec  = 0;
+ 
+   if (__LIKELY(!timer->stop)) {
+@@ -93,10 +93,10 @@
+ {
+   timer->stop = TRUE; /* Mark timer stopped */
+   timer->cancelled = TRUE;
+-  if (del_timer(&timer->os_timer)) {
++  if (timer_delete(&timer->os_timer)) {
+     /* del_timer_sync (and del_timer) returns whether it has 
+-     * deactivated a pending timer or not. (ie. del_timer() 
+-     * of an inactive timer returns 0, del_timer() of an
++     * deactivated a pending timer or not. (ie. timer_delete() 
++     * of an inactive timer returns 0, timer_delete() of an
+      * active timer returns 1.)
+      * So, we're releasing RMLock for active (set) timers only.
+      */
+@@ -110,10 +110,10 @@
+ {
+   timer->stop = TRUE; /* Mark timer stopped */
+   timer->cancelled = TRUE;
+-  if (del_timer_sync(&timer->os_timer)) {
++  if (timer_delete_sync(&timer->os_timer)) {
+     /* del_timer_sync (and del_timer) returns whether it has 
+-     * deactivated a pending timer or not. (ie. del_timer() 
+-     * of an inactive timer returns 0, del_timer() of an
++     * deactivated a pending timer or not. (ie. timer_delete() 
++     * of an inactive timer returns 0, timer_delete() of an
+      * active timer returns 1.)
+      * So, we're releasing RMLock for active (set) timers only.
+      */
+--- a/wireless/driver/linux/l2nat.c
++++ b/wireless/driver/linux/l2nat.c
+@@ -213,7 +213,7 @@
+   dent = &l2nat->l2nat_hash_entries[del_ind];
+ 
+   dent->flags |= L2NAT_ENTRY_STOP_AGING_TIMER;
+-  del_timer(&dent->timer);
++  timer_delete(&dent->timer);
+ 
+   if (!(dent->flags & L2NAT_ENTRY_ACTIVE))
+     return;
+@@ -390,7 +390,7 @@
+ 
+ static void entry_aging_timer_function(struct timer_list *timer)
+ {
+-  struct l2nat_hash_entry *ent = from_timer(ent, timer, timer);
++  struct l2nat_hash_entry *ent = timer_container_of(ent, timer, timer);
+   unsigned long delta, next_time_offset, send_arp_timeout, get_info_timeout;
+   struct nic *nic = ent->nic;
+   mtlk_l2nat_t *l2nat = &nic->l2nat;

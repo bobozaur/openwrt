@@ -1,0 +1,542 @@
+Subject: [PATCH] SME: rebuild target-dependent association metadata for FT
+
+FT over the DS bypasses the authentication setup that builds association
+metadata. Reusing those IEs advertises the previous AP operating class and
+capabilities after a cross-band transition. Reuse the existing auxiliary IE
+builders against the selected target. Supply the target RSNXE to the existing
+FT response owner before PTK/MIC construction so its cryptographic decision
+and the transmitted metadata agree. Ordinary over-air authentication retains
+its current target cache and the original FT key/state owners.
+
+--- a/wpa_supplicant/sme.c
++++ b/wpa_supplicant/sme.c
+@@ -1194,6 +1194,174 @@
+ #endif /* CONFIG_ENC_ASSOC */
+ 
+ 
++/* Rebuild only association metadata. FT IEs, nonces and installed keys
++ * remain owned by the FT state machine; this helper does not authenticate.
++ */
++static int sme_add_assoc_req_extras(struct wpa_supplicant *wpa_s,
++				  struct wpa_bss *bss, struct wpa_ssid *ssid,
++				  const struct wpa_driver_auth_params *params,
++				  int omit_rsnxe, u8 *wpa_ie, size_t wpa_ie_len)
++{
++	u8 ext_capab[18];
++	int ext_capab_len;
++#ifdef CONFIG_MBO
++	const u8 *mbo_ie;
++#endif /* CONFIG_MBO */
++
++#ifdef CONFIG_P2P
++	if (wpa_s->global->p2p) {
++		u8 *pos;
++		size_t len;
++		int res;
++		pos = wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len;
++		len = sizeof(wpa_s->sme.assoc_req_ie) -
++			wpa_s->sme.assoc_req_ie_len;
++		res = wpas_p2p_assoc_req_ie(wpa_s, bss, pos, len,
++					    ssid->p2p_group);
++		if (res >= 0)
++			wpa_s->sme.assoc_req_ie_len += res;
++	}
++#endif /* CONFIG_P2P */
++
++#ifdef CONFIG_FST
++	sme_add_assoc_req_ie(wpa_s, wpa_s->fst_ies);
++#endif /* CONFIG_FST */
++
++	sme_auth_handle_rrm(wpa_s, bss);
++
++#ifndef CONFIG_NO_RRM
++	wpa_s->sme.assoc_req_ie_len += wpas_supp_op_class_ie(
++		wpa_s, ssid, bss,
++		wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len,
++		sizeof(wpa_s->sme.assoc_req_ie) - wpa_s->sme.assoc_req_ie_len);
++#endif /* CONFIG_NO_RRM */
++
++	if (params->p2p)
++		wpa_drv_get_ext_capa(wpa_s, WPA_IF_P2P_CLIENT);
++	else
++		wpa_drv_get_ext_capa(wpa_s, WPA_IF_STATION);
++
++	ext_capab_len = wpas_build_ext_capab(wpa_s, ext_capab,
++					     sizeof(ext_capab), bss);
++	if (ext_capab_len > 0 &&
++	    wpa_s->sme.assoc_req_ie_len + ext_capab_len >
++	    sizeof(wpa_s->sme.assoc_req_ie)) {
++		os_free(wpa_ie);
++		return -1;
++	}
++	if (ext_capab_len > 0) {
++		u8 *pos = wpa_s->sme.assoc_req_ie;
++		if (wpa_s->sme.assoc_req_ie_len > 0 && pos[0] == WLAN_EID_RSN)
++			pos += 2 + pos[1];
++		os_memmove(pos + ext_capab_len, pos,
++			   wpa_s->sme.assoc_req_ie_len -
++			   (pos - wpa_s->sme.assoc_req_ie));
++		wpa_s->sme.assoc_req_ie_len += ext_capab_len;
++		os_memcpy(pos, ext_capab, ext_capab_len);
++	}
++
++	if (ssid->max_idle && wpa_s->sme.assoc_req_ie_len + 5 <=
++	    sizeof(wpa_s->sme.assoc_req_ie)) {
++		u8 *pos = wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len;
++
++		*pos++ = WLAN_EID_BSS_MAX_IDLE_PERIOD;
++		*pos++ = 3;
++		WPA_PUT_LE16(pos, ssid->max_idle);
++		pos += 2;
++		*pos = 0; /* Idle Options */
++		wpa_s->sme.assoc_req_ie_len += 5;
++	}
++
++#ifdef CONFIG_TESTING_OPTIONS
++	if (wpa_s->rsnxe_override_assoc) {
++		wpa_printf(MSG_DEBUG, "TESTING: RSNXE AssocReq override");
++		sme_add_assoc_req_ie(wpa_s, wpa_s->rsnxe_override_assoc);
++	} else
++#endif /* CONFIG_TESTING_OPTIONS */
++	if (wpa_s->rsnxe_len > 0 &&
++	    wpa_s->rsnxe_len <=
++	    sizeof(wpa_s->sme.assoc_req_ie) - wpa_s->sme.assoc_req_ie_len &&
++	    !omit_rsnxe) {
++		os_memcpy(wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len,
++			  wpa_s->rsnxe, wpa_s->rsnxe_len);
++		wpa_s->sme.assoc_req_ie_len += wpa_s->rsnxe_len;
++	}
++
++	if (wpa_s->sme.mfp != NO_MGMT_FRAME_PROTECTION &&
++	    wpa_bss_ext_capab(bss, WLAN_EXT_CAPAB_KNOWN_STA_IDENTIFICATION)) {
++		struct wpabuf *e;
++
++		e = wpa_sm_known_sta_identification(
++			wpa_s->wpa,
++			params->mld ? params->ap_mld_addr : bss->bssid,
++			bss->tsf);
++		if (e) {
++			wpa_printf(MSG_DEBUG,
++				   "SME: Add Known STA Identification element");
++			sme_add_assoc_req_ie(wpa_s, e);
++			wpabuf_free(e);
++		}
++	}
++
++#ifdef CONFIG_HS20
++	if (is_hs20_network(wpa_s, ssid, bss)) {
++		struct wpabuf *hs20;
++
++		hs20 = wpabuf_alloc(20 + MAX_ROAMING_CONS_OI_LEN);
++		if (hs20) {
++			int pps_mo_id = hs20_get_pps_mo_id(wpa_s, ssid);
++
++			wpas_hs20_add_indication(hs20, pps_mo_id,
++						 get_hs20_version(bss));
++			wpas_hs20_add_roam_cons_sel(hs20, ssid);
++			sme_add_assoc_req_ie(wpa_s, hs20);
++			wpabuf_free(hs20);
++		}
++	}
++#endif /* CONFIG_HS20 */
++
++	if (wpa_ie) {
++		size_t len;
++
++		wpa_dbg(wpa_s, MSG_DEBUG, "WPA: Reinsert WPA IE");
++
++		len = sizeof(wpa_s->sme.assoc_req_ie) -
++			wpa_s->sme.assoc_req_ie_len;
++
++		if (len > wpa_ie_len) {
++			os_memcpy(wpa_s->sme.assoc_req_ie +
++				  wpa_s->sme.assoc_req_ie_len,
++				  wpa_ie, wpa_ie_len);
++			wpa_s->sme.assoc_req_ie_len += wpa_ie_len;
++		} else {
++			wpa_dbg(wpa_s, MSG_DEBUG, "WPA: Failed to add WPA IE");
++		}
++
++		os_free(wpa_ie);
++	}
++
++	sme_add_assoc_req_ie(wpa_s, wpa_s->vendor_elem[VENDOR_ELEM_ASSOC_REQ]);
++
++#ifdef CONFIG_MBO
++	mbo_ie = wpa_bss_get_vendor_ie(bss, MBO_IE_VENDOR_TYPE);
++	if (!wpa_s->disable_mbo_oce && mbo_ie) {
++		int len;
++
++		len = wpas_mbo_ie(wpa_s, wpa_s->sme.assoc_req_ie +
++				  wpa_s->sme.assoc_req_ie_len,
++				  sizeof(wpa_s->sme.assoc_req_ie) -
++				  wpa_s->sme.assoc_req_ie_len,
++				  !!mbo_attr_from_mbo_ie(mbo_ie,
++							 OCE_ATTR_ID_CAPA_IND));
++		if (len >= 0)
++			wpa_s->sme.assoc_req_ie_len += len;
++	}
++#endif /* CONFIG_MBO */
++
++	return 0;
++}
++
++
+ static void sme_send_authentication(struct wpa_supplicant *wpa_s,
+ 				    struct wpa_bss *bss, struct wpa_ssid *ssid,
+ 				    int start)
+@@ -1208,14 +1376,9 @@
+ #endif /* CONFIG_IEEE80211R || CONFIG_FILS */
+ 	int bssid_changed;
+ 	struct wpabuf *resp = NULL;
+-	u8 ext_capab[18];
+-	int ext_capab_len;
+ 	int skip_auth;
+ 	u8 *wpa_ie;
+ 	size_t wpa_ie_len;
+-#ifdef CONFIG_MBO
+-	const u8 *mbo_ie;
+-#endif /* CONFIG_MBO */
+ 	int omit_rsnxe = 0;
+ 	unsigned int keys_to_clear = 0;
+ 
+@@ -1563,149 +1726,13 @@
+ 
+ 	wpa_s->sme.spp_amsdu = wpa_sm_uses_spp_amsdu(wpa_s->wpa);
+ 
+-#ifdef CONFIG_P2P
+-	if (wpa_s->global->p2p) {
+-		u8 *pos;
+-		size_t len;
+-		int res;
+-		pos = wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len;
+-		len = sizeof(wpa_s->sme.assoc_req_ie) -
+-			wpa_s->sme.assoc_req_ie_len;
+-		res = wpas_p2p_assoc_req_ie(wpa_s, bss, pos, len,
+-					    ssid->p2p_group);
+-		if (res >= 0)
+-			wpa_s->sme.assoc_req_ie_len += res;
+-	}
+-#endif /* CONFIG_P2P */
+-
+-#ifdef CONFIG_FST
+-	sme_add_assoc_req_ie(wpa_s, wpa_s->fst_ies);
+-#endif /* CONFIG_FST */
+-
+-	sme_auth_handle_rrm(wpa_s, bss);
+-
+-#ifndef CONFIG_NO_RRM
+-	wpa_s->sme.assoc_req_ie_len += wpas_supp_op_class_ie(
+-		wpa_s, ssid, bss,
+-		wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len,
+-		sizeof(wpa_s->sme.assoc_req_ie) - wpa_s->sme.assoc_req_ie_len);
+-#endif /* CONFIG_NO_RRM */
+-
+-	if (params.p2p)
+-		wpa_drv_get_ext_capa(wpa_s, WPA_IF_P2P_CLIENT);
+-	else
+-		wpa_drv_get_ext_capa(wpa_s, WPA_IF_STATION);
+-
+-	ext_capab_len = wpas_build_ext_capab(wpa_s, ext_capab,
+-					     sizeof(ext_capab), bss);
+-	if (ext_capab_len > 0) {
+-		u8 *pos = wpa_s->sme.assoc_req_ie;
+-		if (wpa_s->sme.assoc_req_ie_len > 0 && pos[0] == WLAN_EID_RSN)
+-			pos += 2 + pos[1];
+-		os_memmove(pos + ext_capab_len, pos,
+-			   wpa_s->sme.assoc_req_ie_len -
+-			   (pos - wpa_s->sme.assoc_req_ie));
+-		wpa_s->sme.assoc_req_ie_len += ext_capab_len;
+-		os_memcpy(pos, ext_capab, ext_capab_len);
+-	}
+-
+-	if (ssid->max_idle && wpa_s->sme.assoc_req_ie_len + 5 <=
+-	    sizeof(wpa_s->sme.assoc_req_ie)) {
+-		u8 *pos = wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len;
+-
+-		*pos++ = WLAN_EID_BSS_MAX_IDLE_PERIOD;
+-		*pos++ = 3;
+-		WPA_PUT_LE16(pos, ssid->max_idle);
+-		pos += 2;
+-		*pos = 0; /* Idle Options */
+-		wpa_s->sme.assoc_req_ie_len += 5;
+-	}
+-
+-#ifdef CONFIG_TESTING_OPTIONS
+-	if (wpa_s->rsnxe_override_assoc) {
+-		wpa_printf(MSG_DEBUG, "TESTING: RSNXE AssocReq override");
+-		sme_add_assoc_req_ie(wpa_s, wpa_s->rsnxe_override_assoc);
+-	} else
+-#endif /* CONFIG_TESTING_OPTIONS */
+-	if (wpa_s->rsnxe_len > 0 &&
+-	    wpa_s->rsnxe_len <=
+-	    sizeof(wpa_s->sme.assoc_req_ie) - wpa_s->sme.assoc_req_ie_len &&
+-	    !omit_rsnxe) {
+-		os_memcpy(wpa_s->sme.assoc_req_ie + wpa_s->sme.assoc_req_ie_len,
+-			  wpa_s->rsnxe, wpa_s->rsnxe_len);
+-		wpa_s->sme.assoc_req_ie_len += wpa_s->rsnxe_len;
+-	}
+-
+-	if (wpa_s->sme.mfp != NO_MGMT_FRAME_PROTECTION &&
+-	    wpa_bss_ext_capab(bss, WLAN_EXT_CAPAB_KNOWN_STA_IDENTIFICATION)) {
+-		struct wpabuf *e;
+-
+-		e = wpa_sm_known_sta_identification(
+-			wpa_s->wpa,
+-			params.mld ? params.ap_mld_addr : bss->bssid,
+-			bss->tsf);
+-		if (e) {
+-			wpa_printf(MSG_DEBUG,
+-				   "SME: Add Known STA Identification element");
+-			sme_add_assoc_req_ie(wpa_s, e);
+-			wpabuf_free(e);
+-		}
+-	}
+-
+-#ifdef CONFIG_HS20
+-	if (is_hs20_network(wpa_s, ssid, bss)) {
+-		struct wpabuf *hs20;
+-
+-		hs20 = wpabuf_alloc(20 + MAX_ROAMING_CONS_OI_LEN);
+-		if (hs20) {
+-			int pps_mo_id = hs20_get_pps_mo_id(wpa_s, ssid);
+-
+-			wpas_hs20_add_indication(hs20, pps_mo_id,
+-						 get_hs20_version(bss));
+-			wpas_hs20_add_roam_cons_sel(hs20, ssid);
+-			sme_add_assoc_req_ie(wpa_s, hs20);
+-			wpabuf_free(hs20);
+-		}
+-	}
+-#endif /* CONFIG_HS20 */
+-
+-	if (wpa_ie) {
+-		size_t len;
+-
+-		wpa_dbg(wpa_s, MSG_DEBUG, "WPA: Reinsert WPA IE");
+-
+-		len = sizeof(wpa_s->sme.assoc_req_ie) -
+-			wpa_s->sme.assoc_req_ie_len;
+-
+-		if (len > wpa_ie_len) {
+-			os_memcpy(wpa_s->sme.assoc_req_ie +
+-				  wpa_s->sme.assoc_req_ie_len,
+-				  wpa_ie, wpa_ie_len);
+-			wpa_s->sme.assoc_req_ie_len += wpa_ie_len;
+-		} else {
+-			wpa_dbg(wpa_s, MSG_DEBUG, "WPA: Failed to add WPA IE");
+-		}
+-
+-		os_free(wpa_ie);
+-	}
+-
+-	sme_add_assoc_req_ie(wpa_s, wpa_s->vendor_elem[VENDOR_ELEM_ASSOC_REQ]);
+-
+-#ifdef CONFIG_MBO
+-	mbo_ie = wpa_bss_get_vendor_ie(bss, MBO_IE_VENDOR_TYPE);
+-	if (!wpa_s->disable_mbo_oce && mbo_ie) {
+-		int len;
+-
+-		len = wpas_mbo_ie(wpa_s, wpa_s->sme.assoc_req_ie +
+-				  wpa_s->sme.assoc_req_ie_len,
+-				  sizeof(wpa_s->sme.assoc_req_ie) -
+-				  wpa_s->sme.assoc_req_ie_len,
+-				  !!mbo_attr_from_mbo_ie(mbo_ie,
+-							 OCE_ATTR_ID_CAPA_IND));
+-		if (len >= 0)
+-			wpa_s->sme.assoc_req_ie_len += len;
+-	}
+-#endif /* CONFIG_MBO */
++	if (sme_add_assoc_req_extras(wpa_s, bss, ssid, &params,
++				   omit_rsnxe, wpa_ie, wpa_ie_len) < 0) {
++		wpa_msg(wpa_s, MSG_WARNING,
++			"SME: Association metadata does not fit");
++		wpas_connect_work_done(wpa_s);
++		return;
++	}
+ 
+ skip_setup:
+ #ifdef CONFIG_ENC_ASSOC
+@@ -4063,7 +4090,7 @@
+ 		if (wpa_ft_process_response(wpa_s->wpa, data->auth.ies,
+ 					    data->auth.ies_len, 0,
+ 					    data->auth.peer,
+-					    ric_ies, ric_ies_len) < 0) {
++					    ric_ies, ric_ies_len, NULL) < 0) {
+ 			wpa_dbg(wpa_s, MSG_DEBUG,
+ 				"SME: FT Authentication response processing failed");
+ 			wpa_msg(wpa_s, MSG_INFO, WPA_EVENT_DISCONNECTED "bssid="
+@@ -4179,6 +4206,39 @@
+ #ifdef CONFIG_PMKSA_PRIVACY
+ 	const u8 *ap_rsnxe;
+ #endif /* CONFIG_PMKSA_PRIVACY */
++
++#ifdef CONFIG_IEEE80211R
++	if (auth_type == WLAN_AUTH_FT && wpa_s->sme.ft_ies) {
++		struct wpa_bss *target = wpa_bss_get_bssid(wpa_s, bssid);
++		struct wpa_driver_auth_params extras = { 0 };
++		int omit_rsnxe;
++
++		if (!target || !ssid) {
++			wpa_msg(wpa_s, MSG_WARNING,
++				"FT: Target BSS unavailable for reassociation");
++			return;
++		}
++		/* Over-DS skips sme_send_authentication(). Discard metadata
++		 * derived from the previous AP and use the selected target for
++		 * both these builders and the later association predicates.
++		 * The FT-specific RSNE/MDE/FTE are merged below unchanged.
++		 */
++		wpa_s->current_bss = target;
++		wpa_s->sme.freq = target->freq;
++		wpa_s->sme.assoc_req_ie_len = 0;
++		extras.p2p = ssid->p2p_group;
++		extras.mld = !!wpa_s->valid_links;
++		extras.ap_mld_addr = wpa_s->ap_mld_addr;
++		omit_rsnxe = wpa_key_mgmt_wpa_psk_no_sae(wpa_s->key_mgmt) &&
++			!wpa_bss_get_rsnxe(wpa_s, target, ssid, false);
++		if (sme_add_assoc_req_extras(wpa_s, target, ssid, &extras,
++					   omit_rsnxe, NULL, 0) < 0) {
++			wpa_msg(wpa_s, MSG_WARNING,
++				"FT: Target association metadata does not fit");
++			return;
++		}
++	}
++#endif /* CONFIG_IEEE80211R */
+ 
+ 	os_memset(&params, 0, sizeof(params));
+ 
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -5524,15 +5524,28 @@
+ wpa_supplicant_event_ft_response(struct wpa_supplicant *wpa_s,
+ 				 union wpa_event_data *data)
+ {
++	const u8 *target_rsnxe = NULL;
++	struct wpa_bss *target;
++
+ 	if (data == NULL)
+ 		return;
++
++	if (data->ft_ies.ft_action) {
++		target = wpa_bss_get_bssid(wpa_s, data->ft_ies.target_ap);
++		if (!target) {
++			wpa_printf(MSG_INFO, "FT: No target BSS for over-DS response");
++			return;
++		}
++		target_rsnxe = wpa_bss_get_rsnxe(wpa_s, target,
++					      wpa_s->current_ssid, false);
++	}
+ 
+ 	if (wpa_ft_process_response(wpa_s->wpa, data->ft_ies.ies,
+ 				    data->ft_ies.ies_len,
+ 				    data->ft_ies.ft_action,
+ 				    data->ft_ies.target_ap,
+ 				    data->ft_ies.ric_ies,
+-				    data->ft_ies.ric_ies_len) < 0) {
++				    data->ft_ies.ric_ies_len, target_rsnxe) < 0) {
+ 		/* TODO: prevent MLME/driver from trying to associate? */
+ 	}
+ }
+@@ -5582,6 +5595,8 @@
+ {
+ 	const u8 *sta_addr, *target_ap_addr;
+ 	u16 status;
++	struct wpa_bss *target;
++	const u8 *target_rsnxe;
+ 
+ 	wpa_hexdump(MSG_MSGDUMP, "FT: RX Action", data, len);
+ 	if (is_multicast_ether_addr(da)) {
+@@ -5616,9 +5631,17 @@
+ 		return;
+ 	}
+ 
++	target = wpa_bss_get_bssid(wpa_s, target_ap_addr);
++	if (!target) {
++		wpa_printf(MSG_INFO, "FT: No target BSS for over-DS response");
++		return;
++	}
++	target_rsnxe = wpa_bss_get_rsnxe(wpa_s, target,
++					  wpa_s->current_ssid, false);
++
+ 	if (wpa_ft_process_response(wpa_s->wpa, data + 1 + 2 * ETH_ALEN + 2,
+ 				    len - (1 + 2 * ETH_ALEN + 2), 1,
+-				    target_ap_addr, NULL, 0) < 0)
++				    target_ap_addr, NULL, 0, target_rsnxe) < 0)
+ 		return;
+ 
+ #ifdef CONFIG_SME
+--- a/src/rsn_supp/wpa_ft.c
++++ b/src/rsn_supp/wpa_ft.c
+@@ -583,7 +583,8 @@
+ 
+ int wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
+ 			    int ft_action, const u8 *target_ap,
+-			    const u8 *ric_ies, size_t ric_ies_len)
++			    const u8 *ric_ies, size_t ric_ies_len,
++			    const u8 *target_rsnxe)
+ {
+ 	u8 *ft_ies;
+ 	size_t ft_ies_len;
+@@ -592,6 +593,11 @@
+ 	u8 ptk_name[WPA_PMK_NAME_LEN];
+ 	int ret = -1, res;
+ 	const u8 *bssid;
++	/* Over-DS still has the current AP's beacon cache. Select the target's
++	 * capabilities before deriving PTK and the reassociation MIC, without
++	 * replacing the associated AP cache or changing FT validation.
++	 */
++	const u8 *ap_rsnxe = ft_action ? target_rsnxe : sm->ap_rsnxe;
+ 	const u8 *kck;
+ 	size_t kck_len, kdk_len;
+ 
+@@ -708,7 +714,7 @@
+ 
+ 	if (sm->force_kdk_derivation ||
+ 	    (sm->secure_ltf &&
+-	     ieee802_11_rsnx_capab(sm->ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF)))
++	     ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF)))
+ 		kdk_len = WPA_KDK_MAX_LEN;
+ 	else
+ 		kdk_len = 0;
+@@ -726,7 +732,7 @@
+ 
+ #ifdef CONFIG_PASN
+ 	if (sm->secure_ltf &&
+-	    ieee802_11_rsnx_capab(sm->ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF) &&
++	    ieee802_11_rsnx_capab(ap_rsnxe, WLAN_RSNX_CAPAB_SECURE_LTF) &&
+ 	    wpa_ltf_keyseed(&sm->ptk, sm->key_mgmt, sm->pairwise_cipher)) {
+ 		wpa_printf(MSG_DEBUG, "FT: Failed to derive LTF keyseed");
+ 		goto fail;
+@@ -745,7 +751,7 @@
+ 				    kck, kck_len, bssid,
+ 				    ric_ies, ric_ies_len,
+ 				    parse.mdie ? parse.mdie - 2 : NULL,
+-				    !sm->ap_rsnxe);
++				    !ap_rsnxe);
+ 	if (ft_ies) {
+ 		wpa_sm_update_ft_ies(sm, sm->mobility_domain,
+ 				     ft_ies, ft_ies_len);
+--- a/src/rsn_supp/wpa.h
++++ b/src/rsn_supp/wpa.h
+@@ -573,7 +573,8 @@
+ const u8 * wpa_sm_get_ft_md(struct wpa_sm *sm);
+ int wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
+ 			    int ft_action, const u8 *target_ap,
+-			    const u8 *ric_ies, size_t ric_ies_len);
++			    const u8 *ric_ies, size_t ric_ies_len,
++			    const u8 *target_rsnxe);
+ int wpa_ft_is_completed(struct wpa_sm *sm);
+ void wpa_reset_ft_completed(struct wpa_sm *sm);
+ int wpa_ft_validate_reassoc_resp(struct wpa_sm *sm, const u8 *ies,
+@@ -610,7 +611,9 @@
+ 
+ static inline int
+ wpa_ft_process_response(struct wpa_sm *sm, const u8 *ies, size_t ies_len,
+-			int ft_action, const u8 *target_ap)
++			int ft_action, const u8 *target_ap,
++			const u8 *ric_ies, size_t ric_ies_len,
++			const u8 *target_rsnxe)
+ {
+ 	return 0;
+ }

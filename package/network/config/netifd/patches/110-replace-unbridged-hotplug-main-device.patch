@@ -1,0 +1,23 @@
+Subject: [PATCH] Replace an unbridged hotplug main device before attaching its successor
+
+A wireless interface can move between radios before the previous device is
+removed. Clearing its hotplug main device invalidates the cached master.
+Refresh that pointer before testing for bridge operations, otherwise the old
+non-bridge device rejects the replacement and leaves the interface unavailable.
+Configured masters and removal of a different device retain their existing
+ownership checks.
+
+--- a/interface.c
++++ b/interface.c
+@@ -1285,8 +1285,10 @@
+ 		return 0;
+ 	}
+ 
+-	if (iface->main_dev.hotplug)
++	if (iface->main_dev.hotplug) {
+ 		interface_set_main_dev(iface, NULL);
++		mdev = iface->main_dev.dev;
++	}
+ 
+ 	if (mdev) {
+ 		if (mdev->hotplug_ops)

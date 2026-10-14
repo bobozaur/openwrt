@@ -1,0 +1,230 @@
+Subject: [PATCH] wave: serialize four-address policy with native peer retirement
+
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -19,6 +19,7 @@
+ #include "mtlkinc.h"
+ #include "core.h"
+ #include "core_config.h"
++#include "fw_recovery.h"
+ #include "fixed_data_power.h"
+ #include "mtlk_psdb.h"
+ #include "mtlk_df_nbuf.h"
+@@ -2298,11 +2299,50 @@
+   return mtlk_clpb_push_res(clpb, res);
+ }
+ 
++void
++core_cfg_apply_assoc_four_addr(mtlk_core_t *core,
++                               struct wave_peer_connect_request *request)
++{
++  /* The request carries peer declarations, not a policy decision made before
++   * entering the master serializer. STATIC/LIST/WDS-WPA are applied by the
++   * native station owner immediately after this association-time decision. */
++  if ((MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_4ADDR_MODE) == MTLK_CORE_4ADDR_DYNAMIC &&
++       request->four_addr) ||
++      (request->multi_ap_backhaul_sta &&
++       wave_df_multi_ap_backhaul(mtlk_df_get_user(mtlk_vap_get_df(core->vap_handle)))))
++    request->peer.WDS_client_type = FOUR_ADDRESSES_STATION;
++}
++
++/* The radio master serializes policy with STA_ADD, key operations and removal.
++ * STADB publication ends only after STOP_TRAFFIC, STA_REMOVE and native SID
++ * release have completed. An uncertain native lifetime quiesces the hardware;
++ * an empty host database alone must not authorize a new policy in that state.
++ */
++static int
++_core_cfg_four_addr_change_ready(mtlk_core_t *core, const IEEE_ADDR *addr)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  sta_entry *sta;
++
++  if (!wave_hw_mmb_ready(hw) || mtlk_core_rcvry_is_running(core) ||
++      wave_rcvry_mac_fatal_pending_get(hw) || core->slow_ctx->sta_connecting)
++    return MTLK_ERR_BUSY;
++  if (!addr)
++    return mtlk_stadb_get_sta_cnt(&core->slow_ctx->stadb) ?
++           MTLK_ERR_BUSY : MTLK_ERR_OK;
++
++  sta = mtlk_stadb_find_sta(&core->slow_ctx->stadb, addr->au8Addr);
++  if (!sta)
++    return MTLK_ERR_OK;
++  mtlk_sta_decref(sta);
++  return MTLK_ERR_BUSY;
++}
++
+ static int
+ _mtlk_core_store_four_addr_mode (mtlk_core_t *core, const uint32 four_addr_mode)
+ {
+     uint32 four_addr_mode_old;
+-    s32 flush;
++    int res;
+ 
+     MTLK_ASSERT(core != NULL);
+     if (four_addr_mode >= MTLK_CORE_4ADDR_LAST)
+@@ -2311,9 +2351,12 @@
+     four_addr_mode_old = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_4ADDR_MODE);
+ 
+     if (four_addr_mode != four_addr_mode_old) {
++      res = _core_cfg_four_addr_change_ready(core, NULL);
++      if (res != MTLK_ERR_OK)
++        return res;
++      /* Configure the next association, never an installed peer. The old
++       * vendor flush event has no acknowledged station/key retirement. */
+       MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_4ADDR_MODE, four_addr_mode);
+-      flush = mtlk_vap_get_id(core->vap_handle);
+-      wv_cfg80211_handle_flush_stations(core->vap_handle, &flush, sizeof(flush));
+     }
+     return MTLK_ERR_OK;
+ }
+@@ -2323,6 +2366,13 @@
+ {
+   ieee_addr_entry_t *ieee_addr_entry = NULL;
+   MTLK_HASH_ENTRY_T(ieee_addr) *h;
++  int res;
++
++  if (core_cfg_four_addr_entry_exists(nic, addr))
++    return MTLK_ERR_OK;
++  res = _core_cfg_four_addr_change_ready(nic, addr);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   ILOG2_DY("CID-%04x: four address list entry add %Y",
+     mtlk_vap_get_oid(nic->vap_handle), addr->au8Addr);
+@@ -2359,6 +2409,13 @@
+ mtlk_core_del_four_addr_entry (mtlk_core_t *nic, const IEEE_ADDR *addr)
+ {
+   MTLK_HASH_ENTRY_T(ieee_addr) *h;
++  int res;
++
++  if (!core_cfg_four_addr_entry_exists(nic, addr))
++    return MTLK_ERR_OK;
++  res = _core_cfg_four_addr_change_ready(nic, addr);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   ILOG2_DY("CID-%04x: four address list entry delete %Y",
+     mtlk_vap_get_oid(nic->vap_handle), addr->au8Addr);
+@@ -4435,11 +4492,25 @@
+ 
+ int mtlk_core_cfg_add_wds_wpa_entry (mtlk_core_t* nic, const IEEE_ADDR *addr)
+ {
++  int res;
++
++  if (mtlk_core_cfg_wds_wpa_entry_exists(nic, addr))
++    return MTLK_ERR_OK;
++  res = _core_cfg_four_addr_change_ready(nic, addr);
++  if (res != MTLK_ERR_OK)
++    return res;
+   return _mtlk_core_add_ieee_addr_entry(nic, addr, &nic->wds_wpa_sta_list, "WDS WPA");
+ }
+ 
+ int mtlk_core_cfg_del_wds_wpa_entry (mtlk_core_t* nic, const IEEE_ADDR *addr)
+ {
++  int res;
++
++  if (!mtlk_core_cfg_wds_wpa_entry_exists(nic, addr))
++    return MTLK_ERR_OK;
++  res = _core_cfg_four_addr_change_ready(nic, addr);
++  if (res != MTLK_ERR_OK)
++    return res;
+   return _mtlk_core_del_ieee_addr_entry(nic, addr, &nic->wds_wpa_sta_list, "WDS WPA",
+     TRUE);
+ }
+--- a/wireless/driver/linux/core_config.h
++++ b/wireless/driver/linux/core_config.h
+@@ -96,6 +96,10 @@
+ int core_cfg_wmm_param_init(mtlk_core_t *core);
+ /* Native AP/STA frontend; submits the target queue on the master serializer. */
+ int wave_core_set_txq_params(mtlk_df_t *df, const struct mtlk_txq_params *params);
++
++struct wave_peer_connect_request;
++void core_cfg_apply_assoc_four_addr(mtlk_core_t *core,
++                                    struct wave_peer_connect_request *request);
+ 
+ int __MTLK_IFUNC core_cfg_set_four_addr_cfg (mtlk_handle_t hcore, const void *data, uint32 data_size);
+ int __MTLK_IFUNC core_cfg_get_four_addr_cfg (mtlk_handle_t hcore, const void *data, uint32 data_size);
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -9929,9 +9929,9 @@
+     mtlk_osal_mem_free(reply);
+     return res;
+   }
+-
+   info = &request->peer;
+   if (mtlk_vap_is_ap(core->vap_handle)) {
++    core_cfg_apply_assoc_four_addr(core, request);
+     if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(core->vap_handle)))
+       res = MTLK_ERR_NOT_READY;
+   } else {
+@@ -12122,7 +12122,7 @@
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_STATION_MEASUREMENTS,  _mtlk_core_get_station_measurements);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_VAP_MEASUREMENTS,      _mtlk_core_get_vap_measurements);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_UNCONNECTED_STATION,   _mtlk_core_get_unconnected_station);
+-    _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_FOUR_ADDR_CFG,         core_cfg_set_four_addr_cfg);
++    _MTLK_CORE_HANDLE_REQ_MASTER(WAVE_CORE_REQ_SET_FOUR_ADDR_CFG,         core_cfg_set_four_addr_cfg);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_FOUR_ADDR_CFG,         core_cfg_get_four_addr_cfg);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_FOUR_ADDR_STA_LIST,    core_cfg_get_four_addr_sta_list);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_ATF_QUOTAS,            mtlk_core_cfg_set_atf_quotas);
+@@ -12130,7 +12130,7 @@
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_MCAST_RANGE_IPV4,      mtlk_core_cfg_get_mcast_range_list_ipv4);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_MCAST_RANGE_IPV6,      mtlk_core_cfg_get_mcast_range_list_ipv6);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_OPERATING_MODE,        mtlk_core_cfg_set_operating_mode);
+-    _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_WDS_WPA_LIST_ENTRY,    mtlk_core_cfg_set_wds_wpa_entry);
++    _MTLK_CORE_HANDLE_REQ_MASTER(WAVE_CORE_REQ_SET_WDS_WPA_LIST_ENTRY,    mtlk_core_cfg_set_wds_wpa_entry);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_WDS_WPA_LIST_ENTRIES,  mtlk_core_cfg_get_wds_wpa_entry);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_DGAF_DISABLED,         mtlk_core_cfg_set_dgaf_disabled);
+     _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_TX_POWER,             _mtlk_core_get_tx_power);
+--- a/wireless/driver/linux/mac80211.h
++++ b/wireless/driver/linux/mac80211.h
+@@ -20,6 +20,9 @@
+ struct wave_peer_connect_request {
+   sta_info peer;
+   struct wave_sta_bss_parameters bss; /* Used only by a station VAP. */
++  /* Validated AP association declarations; policy is applied on the master. */
++  bool four_addr;
++  bool multi_ap_backhaul_sta;
+ };
+ 
+ 
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2513,8 +2513,9 @@
+     struct net_device *ndev,
+     const uint8 *mac,
+     struct station_parameters *params,
+-    sta_info *info)
+-{
++    struct wave_peer_connect_request *request)
++{
++  sta_info *info = &request->peer;
+   struct wave_assoc_metadata metadata = {0};
+   uint32 flags_mask, flags_set;
+   mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
+@@ -2596,13 +2597,10 @@
+     return MTLK_ERR_NOT_READY;
+   info->bss_coex_20_40 = metadata.coexistence;
+   info->vendor = metadata.vendor;
+-  /* Multi-AP is a pair of roles, separate from legacy dynamic WDS policy.
+-   * Hostapd accepts this peer IE even on an ordinary AP, so it cannot by
+-   * itself authorize four-address firmware station creation. */
+-  if ((wave_pdb_get_int(param_db_core, PARAM_DB_CORE_4ADDR_MODE) == MTLK_CORE_4ADDR_DYNAMIC &&
+-       metadata.four_addr) ||
+-      (metadata.multi_ap_backhaul_sta && wave_df_multi_ap_backhaul(df_user)))
+-    info->WDS_client_type = FOUR_ADDRESSES_STATION;
++  /* Peer declarations do not authorize a mode by themselves. Evaluate
++   * the current local policy only when the master admits STA_ADD. */
++  request->four_addr = metadata.four_addr;
++  request->multi_ap_backhaul_sta = metadata.multi_ap_backhaul_sta;
+   if (params->link_sta_params.opmode_notif_used || metadata.opmode_valid) {
+     info->opmode_notif = params->link_sta_params.opmode_notif_used ?
+                          params->link_sta_params.opmode_notif : metadata.opmode;
+@@ -2741,7 +2739,7 @@
+     goto finish;
+   }
+ 
+-  res = _wave_radio_sta_param_process(ndev, mac, params, &request.peer);
++  res = _wave_radio_sta_param_process(ndev, mac, params, &request);
+   if (MTLK_ERR_OK != res) {
+     ELOG_SD("%s: Station parameters unavailable or invalid (%d)", ndev->name, res);
+     goto finish;

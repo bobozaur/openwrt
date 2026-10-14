@@ -1,0 +1,255 @@
+Subject: [PATCH] wave: carry native HE160 capabilities through AP and STA setup
+
+Advertise contiguous 160 MHz only where the existing hardware capability
+supports it. Preserve both RX/TX MCS pairs in peer and BSS requests, and
+accept the corresponding AP beacon layout even during an HE80 operation.
+The firmware already provides eight MCS bytes; 80+80 remains unsupported.
+
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -2137,7 +2137,9 @@
+       if (!wiphy->bands[band])
+         continue;
+       wave_he_cap_init(&cfg80211->he_iftype[band], band,
+-                       min_t(u32, num_sts, WAVE_HE_MAX_NSS), NL80211_IFTYPE_AP);
++                       min_t(u32, num_sts, WAVE_HE_MAX_NSS), NL80211_IFTYPE_AP,
++                       wiphy->bands[band]->vht_cap.cap &
++                         IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ);
+       _ieee80211_set_sband_iftype_data(wiphy->bands[band],
+                                       &cfg80211->he_iftype[band], 1);
+     }
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -1324,6 +1324,7 @@
+   sband = hw->wiphy->bands[vif->bss_conf.chanreq.oper.chan->band];
+   if (!sband)
+     return MTLK_ERR_PARAMS;
++  local_he = ieee80211_get_he_iftype_cap(sband, NL80211_IFTYPE_STATION);
+   memset(request.bss.vht_mcs, 0xff, sizeof(request.bss.vht_mcs));
+   memset(request.bss.he_mcs, 0xff, sizeof(request.bss.he_mcs));
+   if (sta->deflink.ht_cap.ht_supported) {
+@@ -1339,12 +1340,13 @@
+     memcpy(request.bss.vht_mcs, &sband->vht_cap.vht_mcs, sizeof(request.bss.vht_mcs));
+   }
+   if (sta->deflink.he_cap.has_he) {
+-    local_he = ieee80211_get_he_iftype_cap(sband, NL80211_IFTYPE_STATION);
+     if (!local_he || !local_he->has_he)
+       return MTLK_ERR_PARAMS;
+     request.bss.flags |= MTLK_BFIELD_VALUE(VAP_ADD_FLAGS_HE, 1, uint8);
+     memcpy(request.bss.he_mcs, &local_he->he_mcs_nss_supp.rx_mcs_80, 2);
+     memcpy(request.bss.he_mcs + 2, &local_he->he_mcs_nss_supp.tx_mcs_80, 2);
++    memcpy(request.bss.he_mcs + 4, &local_he->he_mcs_nss_supp.rx_mcs_160, 2);
++    memcpy(request.bss.he_mcs + 6, &local_he->he_mcs_nss_supp.tx_mcs_160, 2);
+   }
+ 
+   for (band = 0; band < NUM_SUPPORTED_BANDS; band++) {
+@@ -1421,8 +1423,7 @@
+     const struct ieee80211_sta_he_cap *he = &sta->deflink.he_cap;
+     wv_mac80211_t *mac80211 = __wv_ieee80211_hw_get_mac80211(hw);
+     struct wave_he_peer peer;
+-    u8 mcs[4];
+-    unsigned int width;
++    u8 mcs[8];
+ 
+     BUILD_BUG_ON(sizeof(he->he_cap_elem) != 17);
+     BUILD_BUG_ON(sizeof(peer.mac_phy) != sizeof(info->he_mac_phy_cap_info));
+@@ -1430,13 +1431,12 @@
+     BUILD_BUG_ON(sizeof(peer.ppe) != sizeof(info->he_ppe_th_info));
+     memcpy(mcs, &he->he_mcs_nss_supp.rx_mcs_80, 2);
+     memcpy(mcs + 2, &he->he_mcs_nss_supp.tx_mcs_80, 2);
+-    if (!vif->bss_conf.chanreq.oper.chan)
+-      return MTLK_ERR_NOT_READY;
+-    width = vif->bss_conf.chanreq.oper.chan->band == NL80211_BAND_2GHZ ?
+-              WAVE_HE_WIDTH_2G : WAVE_HE_WIDTH_5G;
++    memcpy(mcs + 4, &he->he_mcs_nss_supp.rx_mcs_160, 2);
++    memcpy(mcs + 6, &he->he_mcs_nss_supp.tx_mcs_160, 2);
+     if (wave_he_encode_peer(&peer, (const u8 *)&he->he_cap_elem, mcs,
+                             he->ppe_thres, sizeof(he->ppe_thres),
+-                            mac80211->he_nss, width)) {
++                            mac80211->he_nss,
++                            local_he->he_cap_elem.phy_cap_info[0])) {
+       ELOG_V("HE peer cannot be represented by retained firmware");
+       return MTLK_ERR_PARAMS;
+     }
+@@ -2494,7 +2494,8 @@
+       sband->ht_cap.mcs.tx_params |= IEEE80211_HT_MCS_TX_DEFINED;
+     if (sband) {
+       wave_he_cap_init(&mac80211->he_iftype[band], band,
+-                       mac80211->he_nss, NL80211_IFTYPE_STATION);
++                       mac80211->he_nss, NL80211_IFTYPE_STATION,
++                       sband->vht_cap.cap & IEEE80211_VHT_CAP_SUPP_CHAN_WIDTH_160MHZ);
+       _ieee80211_set_sband_iftype_data(sband, &mac80211->he_iftype[band], 1);
+     }
+   }
+--- a/wireless/driver/linux/wave_he_caps.h
++++ b/wireless/driver/linux/wave_he_caps.h
+@@ -7,7 +7,8 @@
+ 
+ static inline void
+ wave_he_cap_init(struct ieee80211_sband_iftype_data *data,
+-                       enum nl80211_band band, unsigned int nss, enum nl80211_iftype type)
++                 enum nl80211_band band, unsigned int nss,
++                 enum nl80211_iftype type, bool has_160)
+ {
+   struct ieee80211_sta_he_cap *he = &data->he_cap;
+   u16 mcs = 0xffff;
+@@ -27,6 +28,9 @@
+   he->he_cap_elem.mac_cap_info[3] = WAVE_HE_AMPDU_EXT_2;
+   he->he_cap_elem.phy_cap_info[0] = band == NL80211_BAND_2GHZ ?
+                                    WAVE_HE_WIDTH_2G : WAVE_HE_WIDTH_5G;
++  has_160 = has_160 && band == NL80211_BAND_5GHZ;
++  if (has_160)
++    he->he_cap_elem.phy_cap_info[0] |= WAVE_HE_WIDTH_160;
+   he->he_cap_elem.phy_cap_info[1] = WAVE_HE_LDPC;
+   he->he_cap_elem.phy_cap_info[7] = WAVE_HE_4XLTF_08GI;
+   /* Request conservative receive padding on air; the peer encoder separately
+@@ -40,8 +44,8 @@
+   }
+   he->he_mcs_nss_supp.rx_mcs_80 = cpu_to_le16(mcs);
+   he->he_mcs_nss_supp.tx_mcs_80 = cpu_to_le16(mcs);
+-  he->he_mcs_nss_supp.rx_mcs_160 = cpu_to_le16(0xffff);
+-  he->he_mcs_nss_supp.tx_mcs_160 = cpu_to_le16(0xffff);
++  he->he_mcs_nss_supp.rx_mcs_160 = cpu_to_le16(has_160 ? mcs : 0xffff);
++  he->he_mcs_nss_supp.tx_mcs_160 = cpu_to_le16(has_160 ? mcs : 0xffff);
+   he->he_mcs_nss_supp.rx_mcs_80p80 = cpu_to_le16(0xffff);
+   he->he_mcs_nss_supp.tx_mcs_80p80 = cpu_to_le16(0xffff);
+ }
+--- a/wireless/driver/linux/wave_he_compat.h
++++ b/wireless/driver/linux/wave_he_compat.h
+@@ -15,6 +15,8 @@
+ #define WAVE_HE_MAX_NSS 2
+ #define WAVE_HE_WIDTH_2G 0x02
+ #define WAVE_HE_WIDTH_5G 0x04
++#define WAVE_HE_WIDTH_160 0x08
++#define WAVE_HE_WIDTH_80P80 0x10
+ #define WAVE_HE_HTC 0x01
+ #define WAVE_HE_ACK_EN 0x80
+ #define WAVE_HE_AMPDU_EXT_MASK 0x18
+@@ -23,8 +25,9 @@
+ #define WAVE_HE_PPE_PRESENT 0x80
+ #define WAVE_HE_4XLTF_08GI 0x04
+ 
+-/* Inputs are the validated native 17-byte HE MAC/PHY element and the first
+- * four bytes of mac80211's already-intersected LE16 RX/TX MCS maps.
++/* Inputs are the validated native 17-byte HE MAC/PHY element and the LE16
++ * RX/TX MCS maps for <=80 and, when advertised, 160 MHz. The width mask is
++ * this radio's capability; the peer determines which maps are present.
+  * Return -1 for malformed/unrepresentable input; never downgrade a station
+  * that mac80211 has already negotiated as HE. Output is published on success.
+  * This profile deliberately omits TWT, DCM, STBC, beamforming, MU and ER.
+@@ -32,32 +35,40 @@
+ static inline int
+ wave_he_encode_peer(struct wave_he_peer *out,
+                     const unsigned char cap[17],
+-                    const unsigned char mcs[4],
++                    const unsigned char *mcs,
+                     const unsigned char *ppe, unsigned int ppe_len,
+                     unsigned int nss, unsigned int width)
+ {
+   struct wave_he_peer result = { 0 };
+-  unsigned int i, bit, mask, rx, tx, rx_nss, ppe_nss, ru_count, bits;
++  unsigned int i, bit, mask, rx, tx, rx_nss = 0, ppe_nss, ru_count, bits;
++  unsigned int maps, map_nss;
+   unsigned int extension, padding, ppet16, ppet8, value;
+ 
+   if (!nss || nss > WAVE_HE_MAX_NSS ||
+-      (width != WAVE_HE_WIDTH_2G && width != WAVE_HE_WIDTH_5G))
+-    return -1;
+-
++      (width != WAVE_HE_WIDTH_2G && width != WAVE_HE_WIDTH_5G &&
++       width != (WAVE_HE_WIDTH_5G | WAVE_HE_WIDTH_160)))
++    return -1;
++
++  width &= cap[6];
++  maps = (width & WAVE_HE_WIDTH_160) ? 2 : 1;
+   mask = (1U << (2 * nss)) - 1;
+-  rx = ((mcs[0] | (mcs[1] << 8)) & mask) | (0xffffU & ~mask);
+-  tx = ((mcs[2] | (mcs[3] << 8)) & mask) | (0xffffU & ~mask);
+-  if ((rx & 3) == 3 || (tx & 3) == 3)
+-    return -1;
+-  rx_nss = nss;
+-  while (((rx >> (2 * (rx_nss - 1))) & 3) == 3)
+-    rx_nss--;
+-  result.mcs[0] = rx;
+-  result.mcs[1] = rx >> 8;
+-  result.mcs[2] = tx;
+-  result.mcs[3] = tx >> 8;
+-  for (i = 4; i < sizeof(result.mcs); i++)
+-    result.mcs[i] = 0xff; /* No 160 MHz support. */
++  for (i = 0; i < sizeof(result.mcs); i++)
++    result.mcs[i] = 0xff;
++  for (i = 0; i < maps * 4; i += 4) {
++    rx = ((mcs[i] | (mcs[i + 1] << 8)) & mask) | (0xffffU & ~mask);
++    tx = ((mcs[i + 2] | (mcs[i + 3] << 8)) & mask) | (0xffffU & ~mask);
++    if ((rx & 3) == 3 || (tx & 3) == 3)
++      return -1;
++    map_nss = nss;
++    while (((rx >> (2 * (map_nss - 1))) & 3) == 3)
++      map_nss--;
++    if (map_nss > rx_nss)
++      rx_nss = map_nss;
++    result.mcs[i] = rx;
++    result.mcs[i + 1] = rx >> 8;
++    result.mcs[i + 2] = tx;
++    result.mcs[i + 3] = tx >> 8;
++  }
+ 
+   result.mac_phy[0] = 35; /* WLAN_EID_EXT_HE_CAPABILITY */
+   result.mac_phy[1] = cap[0] & WAVE_HE_HTC;
+@@ -66,7 +77,7 @@
+   extension = cap[3] & WAVE_HE_AMPDU_EXT_MASK;
+   result.mac_phy[4] = extension < WAVE_HE_AMPDU_EXT_2 ?
+                        extension : WAVE_HE_AMPDU_EXT_2;
+-  result.mac_phy[7] = cap[6] & width;
++  result.mac_phy[7] = width;
+   result.mac_phy[8] = cap[7] & WAVE_HE_LDPC;
+   result.mac_phy[14] = cap[13] & WAVE_HE_4XLTF_08GI;
+ 
+@@ -129,9 +140,9 @@
+ 
+   if (!cap || length < offset)
+     return -1;
+-  if (cap[6] & 0x08)
++  if (cap[6] & WAVE_HE_WIDTH_160)
+     offset += 4;
+-  if (cap[6] & 0x10)
++  if (cap[6] & WAVE_HE_WIDTH_80P80)
+     offset += 4;
+   if (length < offset)
+     return -1;
+@@ -184,17 +195,18 @@
+   if (cap || op) {
+     if (!cap || !op || cap_len < 21 || op_len < 6)
+       return -1;
+-    /* <=80MHz, no AP PPE/TWT/partial color/6GHz operation, PE16us. */
+-    if ((cap[6] & 0x18) || (cap[12] & WAVE_HE_PPE_PRESENT) ||
++    /* Contiguous widths, no AP PPE/TWT/partial color/6GHz operation, PE16us. */
++    if ((cap[6] & WAVE_HE_WIDTH_80P80) || (cap[12] & WAVE_HE_PPE_PRESENT) ||
+         (cap[0] & 0x06) || (op[0] & 0x0f) != 4 ||
+         (op[1] & 0x80) || (op[2] & 0x02) || (op[3] & 0x40) ||
+         (!(op[3] & 0x80) && !(op[3] & 0x3f)) ||
+         op[4] != 0xfc || op[5] != 0xff)
+       return -1;
+     needed = 6 + ((op[1] & 0x40) ? 3 : 0);
+-    if (op_len != needed || cap_len != 21)
+-      return -1;
+-    for (i = 0; i < 4; i++)
++    if (op_len != needed ||
++        cap_len != 21U + ((cap[6] & WAVE_HE_WIDTH_160) ? 4U : 0U))
++      return -1;
++    for (i = 0; i < cap_len - 17; i++)
+       result.mcs[i] = cap[17 + i];
+     result.enabled = 1;
+     result.color = (op[3] & 0x80) ? 0 : (op[3] & 0x3f);
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -2559,8 +2559,7 @@
+     while (nss < WAVE_HE_MAX_NSS && ((rx >> (2 * nss)) & 3) != 3)
+       nss++;
+     if (wave_he_encode_raw_peer(&peer, raw, len, nss,
+-                               band == NL80211_BAND_2GHZ ?
+-                                 WAVE_HE_WIDTH_2G : WAVE_HE_WIDTH_5G))
++                               local->he_cap_elem.phy_cap_info[0]))
+       return MTLK_ERR_PARAMS;
+     BUILD_BUG_ON(sizeof(peer.mac_phy) != sizeof(info->he_mac_phy_cap_info));
+     BUILD_BUG_ON(sizeof(peer.mcs) != sizeof(info->he_mcs_nss_info));

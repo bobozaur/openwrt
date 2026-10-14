@@ -1,0 +1,198 @@
+--- a/src/ap/wps_hostapd.c
++++ b/src/ap/wps_hostapd.c
+@@ -7,6 +7,8 @@
+  */
+ 
+ #include "utils/includes.h"
++#include <sys/file.h>
++#include <sys/stat.h>
+ 
+ #include "utils/common.h"
+ #include "utils/eloop.h"
+@@ -94,6 +96,111 @@
+ }
+ 
+ 
++static int hostapd_wps_psk_file_matches(const char *path, const struct stat *opened)
++{
++	struct stat named;
++
++	if (stat(path, &named) < 0)
++		return -1;
++	if (named.st_dev != opened->st_dev || named.st_ino != opened->st_ino) {
++		errno = ESTALE;
++		return -1;
++	}
++	return 0;
++}
++
++
++static int hostapd_wps_append_psk(const char *path, const u8 *mac_addr,
++				const u8 *psk, size_t psk_len)
++{
++	FILE *f;
++	struct stat st;
++	char hex[PMK_LEN * 2 + 1], record[PMK_LEN * 2 + 27];
++	const char *operation = "open";
++	int fd, last = '\n', len, saved_errno, ret = -1, restore = 0;
++
++	/* The configured owner must already exist: setup read this same file.
++	 * Do not create a new inode without its owner's permissions/durability.
++	 * One writer holds the lock through synchronization and rollback.
++	 * Providers must honor this lock for rotation and preserve committed rows,
++	 * or quiesce the BSS. Named-owner checks also detect a replaced inode.
++	 */
++	f = fopen(path, "r+");
++	if (!f) {
++		wpa_printf(MSG_WARNING, "WPS: Cannot open PSK file '%s': %s",
++			   path, strerror(errno));
++		return -1;
++	}
++	fd = fileno(f);
++	operation = "lock";
++	if (flock(fd, LOCK_EX | LOCK_NB) < 0)
++		goto out;
++	operation = "stat";
++	if (fstat(fd, &st) < 0)
++		goto out;
++	if (!S_ISREG(st.st_mode)) {
++		errno = EINVAL;
++		goto out;
++	}
++	operation = "owner check";
++	if (hostapd_wps_psk_file_matches(path, &st))
++		goto out;
++	/* No stdio output may remain queued after a failed append is truncated. */
++	operation = "buffer setup";
++	if (setvbuf(f, NULL, _IONBF, 0))
++		goto out;
++	operation = "seek";
++	if (st.st_size) {
++		if (fseeko(f, -1, SEEK_END) < 0 || (last = fgetc(f)) == EOF)
++			goto out;
++	}
++	if (fseeko(f, 0, SEEK_END) < 0)
++		goto out;
++	wpa_snprintf_hex(hex, sizeof(hex), psk, psk_len);
++	len = os_snprintf(record, sizeof(record), "%swps=1 " MACSTR " %s\n",
++			  last == '\n' ? "" : "\n", MAC2STR(mac_addr), hex);
++	if (os_snprintf_error(sizeof(record), len)) {
++		errno = EOVERFLOW;
++		goto out;
++	}
++	operation = "write";
++	restore = 1;
++	if (fwrite(record, 1, len, f) != (size_t) len)
++		goto out;
++	operation = "sync";
++	if (os_fdatasync(f))
++		goto out;
++	operation = "owner check";
++	if (hostapd_wps_psk_file_matches(path, &st))
++		goto out;
++	ret = 0;
++
++out:
++	if (ret) {
++		saved_errno = errno ? errno : EIO;
++		if (restore) {
++			clearerr(f);
++			if (ftruncate(fd, st.st_size) < 0 || os_fdatasync(f))
++				wpa_printf(MSG_ERROR,
++					   "WPS: Cannot restore PSK file '%s' after failed append: %s",
++					   path, strerror(errno));
++		}
++		wpa_printf(MSG_WARNING, "WPS: PSK file '%s' %s failed: %s",
++			   path, operation, strerror(saved_errno));
++	}
++	if (fclose(f)) {
++		/* A completed sync may already have committed a valid record.
++		 * Report the close error; never turn uncertain storage into RAM-only
++		 * successful enrollment or reopen a possibly replaced owner path.
++		 */
++		wpa_printf(MSG_WARNING, "WPS: PSK file '%s' close failed: %s",
++			   path, strerror(errno));
++		ret = -1;
++	}
++	return ret;
++}
++
++
+ static int hostapd_wps_new_psk_cb(void *ctx, const u8 *mac_addr,
+ 				  const u8 *p2p_dev_addr, const u8 *psk,
+ 				  size_t psk_len)
+@@ -120,7 +227,7 @@
+ 		return -1;
+ 	}
+ 
+-	/* Add the new PSK to runtime PSK list */
++	/* Prepare the runtime node, but publish only after its owner accepts it. */
+ 	p = os_zalloc(sizeof(*p));
+ 	if (p == NULL)
+ 		return -1;
+@@ -128,6 +235,11 @@
+ 	os_memcpy(p->p2p_dev_addr, p2p_dev_addr, ETH_ALEN);
+ 	os_memcpy(p->psk, psk, PMK_LEN);
+ 	p->wps = 1;
++	if (ssid->wpa_psk_file &&
++	    hostapd_wps_append_psk(ssid->wpa_psk_file, mac_addr, psk, psk_len)) {
++		bin_clear_free(p, sizeof(*p));
++		return -1;
++	}
+ 
+ 	if (hapd->new_psk_cb) {
+ 		hapd->new_psk_cb(hapd->new_psk_cb_ctx, mac_addr, p2p_dev_addr,
+@@ -136,23 +248,6 @@
+ 
+ 	p->next = ssid->wpa_psk;
+ 	ssid->wpa_psk = p;
+-
+-	if (ssid->wpa_psk_file) {
+-		FILE *f;
+-		char hex[PMK_LEN * 2 + 1];
+-
+-		/* Add the new PSK to PSK list file */
+-		f = fopen(ssid->wpa_psk_file, "a");
+-		if (!f) {
+-			wpa_printf(MSG_DEBUG, "Failed to add the PSK to '%s'",
+-				   ssid->wpa_psk_file);
+-			return -1;
+-		}
+-
+-		wpa_snprintf_hex(hex, sizeof(hex), psk, psk_len);
+-		fprintf(f, "wps=1 " MACSTR " %s\n", MAC2STR(mac_addr), hex);
+-		fclose(f);
+-	}
+ 
+ 	return 0;
+ }
+--- a/src/wps/wps_registrar.c
++++ b/src/wps/wps_registrar.c
+@@ -3329,7 +3329,6 @@
+ 		return WPS_FAILURE;
+ 	}
+ 
+-	wpa_printf(MSG_DEBUG, "WPS: Negotiation completed successfully");
+ 	wps_device_store(wps->wps->registrar, &wps->peer_dev,
+ 			 wps->uuid_e);
+ 
+@@ -3371,13 +3370,18 @@
+ 		if (wps_cb_new_psk(wps->wps->registrar, wps->mac_addr_e,
+ 				   wps->p2p_dev_addr, wps->new_psk,
+ 				   wps->new_psk_len)) {
+-			wpa_printf(MSG_DEBUG, "WPS: Failed to configure the "
++			wpa_printf(MSG_WARNING, "WPS: Failed to configure the "
+ 				   "new PSK");
++			bin_clear_free(wps->new_psk, wps->new_psk_len);
++			wps->new_psk = NULL;
++			wps->config_error = WPS_CFG_DEVICE_BUSY;
++			return WPS_FAILURE;
+ 		}
+ 		os_free(wps->new_psk);
+ 		wps->new_psk = NULL;
+ 	}
+ 
++	wpa_printf(MSG_DEBUG, "WPS: Negotiation completed successfully");
+ 	wps_cb_reg_success(wps->wps->registrar, wps->mac_addr_e, wps->uuid_e,
+ 			   wps->dev_password, wps->dev_password_len);
+ 

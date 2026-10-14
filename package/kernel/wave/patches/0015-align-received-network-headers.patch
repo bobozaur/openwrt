@@ -1,0 +1,120 @@
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -11142,7 +11142,26 @@
+ _mtlk_core_handle_rx_data (mtlk_vap_handle_t vap_handle, mtlk_core_handle_rx_data_t *data)
+ {
+   mtlk_nbuf_t *nbuf = data->nbuf;
+-  MTLK_ASSERT(nbuf != NULL);
++  unsigned int shift, len;
++  u8 *source;
++
++  /* The native handoff normally supplies aligned CPU storage. Keep this
++   * in-place fallback for allocation failure and other receive owners.
++   * DMA is unmapped and reassembly complete; no header offsets or clones
++   * exist yet. Firmware RX buffer/address requirements stay unchanged. */
++  if (unlikely(!nbuf || nbuf->len < ETH_HLEN || skb_is_nonlinear(nbuf) ||
++               skb_shared(nbuf) || skb_cloned(nbuf)))
++    return MTLK_ERR_NOT_IN_USE;
++  shift = ((unsigned long)nbuf->data + ETH_HLEN) & 3;
++  if (shift) {
++    if (unlikely(skb_headroom(nbuf) < shift))
++      return MTLK_ERR_NOT_IN_USE;
++    len = nbuf->len;
++    source = nbuf->data;
++    skb_push(nbuf, shift);
++    memmove(nbuf->data, source, len);
++    skb_trim(nbuf, len);
++  }
+   return _handle_rx_ind(mtlk_vap_get_core(vap_handle), nbuf, data);
+ }
+ 
+
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -1555,6 +1555,22 @@
+ #endif
+ #define _mtlk_mmb_nbuf_free(nbuf)   mtlk_df_nbuf_free(nbuf)
+ 
++/* CPU delivery/reassembly storage is never published as a firmware buffer.
++ * Keep the normal private-data/object-pool allocation owner, with Linux's
++ * Ethernet-to-IP alignment reserved before any bytes are copied. */
++static __INLINE mtlk_nbuf_t *
++_mtlk_mmb_nbuf_alloc_rx_cpu (uint32 size)
++{
++  mtlk_nbuf_t *nbuf;
++
++  if (unlikely(size > UINT_MAX - NET_IP_ALIGN))
++    return NULL;
++  nbuf = mtlk_df_nbuf_alloc(size + NET_IP_ALIGN);
++  if (nbuf)
++    mtlk_df_nbuf_reserve(nbuf, NET_IP_ALIGN);
++  return nbuf;
++}
++
+ /* Convert card index to wlan interface index of the master AP VAP
+  * for hw idx 0/1/2 interface names are wlan0/wlan2/wlan4 respectively
+  * AP interfaces use the even numbers while sta interfaces use the odd indexes */
+@@ -2089,6 +2105,7 @@
+   uint8                      radio_id;
+   uint8                      frame_type;
+   uint8                      frag_type;
++  BOOL                       reuse_rx_buffer = FALSE;
+ 
+   u32frameInfo3 = LE32_TO_CPU(pHD->u32frameInfo3);
+   if (__UNLIKELY(MTLK_OWNER_FW == MTLK_BFIELD_GET(u32frameInfo3, TX_DATA_INFO_OWN_BIT))) {
+@@ -2244,7 +2261,9 @@
+                            total_size += nbuf->len;
+                          }
+ 
+-                         comb_nbuf = _mtlk_mmb_nbuf_alloc(total_size);
++                         /* This buffer goes only to the CPU consumer. Align
++                          * it before assembly, avoiding a second frame copy. */
++                         comb_nbuf = _mtlk_mmb_nbuf_alloc_rx_cpu(total_size);
+                          if (__UNLIKELY(comb_nbuf == NULL)) {
+                            _mtlk_mmb_rx_free_all_fragments(hw);
+                            res = MTLK_ERR_OK;
+@@ -2289,6 +2308,28 @@
+                        }
+ 
+                        if (FRAME_TYPE_EAPOL != frame_type) {
++                         /* A native DMA skb has no consumer metadata yet. Use
++                          * its required replacement allocation for an aligned
++                          * CPU copy, then return this unchanged DMA allocation.
++                          * DP allocator ownership and unknown fragment types
++                          * retain their existing path. */
++                         if (!MTLK_USE_DIRECTCONNECT_DP_API &&
++                             frag_type == NO_FRAG &&
++                             data.nbuf->len >= ETH_HLEN &&
++                             !skb_is_nonlinear(data.nbuf) &&
++                             !skb_shared(data.nbuf) && !skb_cloned(data.nbuf) &&
++                             (((unsigned long)data.nbuf->data + ETH_HLEN) & 3)) {
++                           mtlk_nbuf_t *cpu_nbuf;
++
++                           cpu_nbuf = _mtlk_mmb_nbuf_alloc_rx_cpu(data_size);
++                           if (cpu_nbuf) {
++                             skb_put_data(cpu_nbuf, data.nbuf->data, data_size);
++                             data.nbuf = cpu_nbuf;
++                             reuse_rx_buffer = TRUE;
++                           }
++                           /* Failure preserves the in-place alignment and
++                            * ordinary post-delivery replacement path. */
++                         }
+                          res = mtlk_vap_get_core_vft(vap_handle)->handle_rx_data(vap_handle, &data);
+                          break;
+                        } else {
+@@ -2314,6 +2355,15 @@
+ 
+   if (res == MTLK_ERR_NOT_IN_USE) {
+     _mtlk_mmb_nbuf_free(data.nbuf);
++  }
++
++  if (reuse_rx_buffer) {
++    /* The callback consumed or rejected only the CPU copy. Restore the
++     * original allocation's DMA base/empty length before the same checked
++     * map, descriptor publication and failure-recovery owner below. */
++    mtlk_df_nbuf_push(data_ind->nbuf, offset);
++    mtlk_df_nbuf_trim(data_ind->nbuf, 0);
++    goto buf_return;
+   }
+ 
+ #if MTLK_USE_DIRECTCONNECT_DP_API

@@ -1,0 +1,51 @@
+Subject: [PATCH] wave: respect Linux bridge unicast hairpin ownership
+
+A returned bridge unicast may target another Ethernet host behind the same
+four-address station. Do not reject that selected destination merely because
+its station also supplied the ingress frame. Apply the same rule to bound
+software AP_VLAN ports while retaining their exact station ownership checks.
+
+Recognize only same-port unicast returns on an actual bridge port. Keep native
+internal forwarding, group-source exclusion, ARP fallback and station reference
+ownership unchanged; no firmware policy or descriptor contract changes.
+
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -1215,6 +1215,7 @@
+   mtlk_core_handle_tx_data_t tx_data = { .msg = msg };
+   struct net_device *vlan_ndev = NULL;
+   unsigned int vlan_bytes = nbuf->len;
++  BOOL bridge_unicast_return = FALSE;
+   int res = MTLK_ERR_PKT_DROPPED;
+ 
+   if (mtlk_vap_is_ap(vap_handle) &&
+@@ -1246,8 +1247,13 @@
+   bridge_mode = MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_BRIDGE_MODE);
+ 
+   if (mtlk_vap_is_ap(vap_handle)) {
++    /* Linux already selected this bridge port's unicast egress. A four-address
++     * peer can contain both Ethernet hosts; its SID is not a split horizon. */
++    bridge_unicast_return = nbuf->skb_iif == nbuf->dev->ifindex &&
++      netif_is_bridge_port(nbuf->dev) &&
++      !mtlk_osal_eth_is_multicast(ether_header->h_dest);
+     if (nbuf->dev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN) {
+-      if (nbuf->skb_iif == nbuf->dev->ifindex)
++      if (nbuf->skb_iif == nbuf->dev->ifindex && !bridge_unicast_return)
+         goto tx_error;
+       sta = wave_df_ap_vlan_tx_sta(nbuf->dev);
+       if (!sta)
+@@ -1312,10 +1318,10 @@
+     if (sta) {
+       if (rcu_access_pointer(sta->ap_vlan))
+         goto tx_error;
+-      /* Bridge multicast-to-unicast can target another host behind the same
+-       * peer. Apply the same split horizon as direct RX forwarding. */
+-      if (sta == src_sta) {
+-        ILOG3_V("Don't send bridge return back to its source peer");
++      /* Bridge unicast, including multicast-to-unicast copies, follows the
++       * selected Ethernet destination. Keep native split horizon otherwise. */
++      if (sta == src_sta && !bridge_unicast_return) {
++        ILOG3_V("Don't send local return back to its source peer");
+         goto tx_error;
+       }
+       nbuf_flags |= MTLK_NBUFF_UNICAST;

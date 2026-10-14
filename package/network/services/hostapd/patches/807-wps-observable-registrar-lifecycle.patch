@@ -1,0 +1,187 @@
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -315,6 +315,10 @@
+ 	unsigned int ap_pin_lockout_time;
+ 
+ 	struct wps_stat wps_stats;
++	/* Observable result lifetime; the registrar remains the session owner. */
++	const char *wps_status_event;
++	struct os_reltime wps_status_time;
++	bool wps_status_selected;
+ #endif /* CONFIG_WPS */
+ 
+ #ifdef CONFIG_MACSEC
+diff --git a/src/ap/wps_hostapd.c b/src/ap/wps_hostapd.c
+--- a/src/ap/wps_hostapd.c
++++ b/src/ap/wps_hostapd.c
+@@ -250,6 +250,29 @@
+ 	ssid->wpa_psk = p;
+ 
+ 	return 0;
++}
++
++
++static void hostapd_wps_status_reset(struct hostapd_data *hapd)
++{
++	hapd->wps_status_event = NULL;
++	hostapd_ucode_wps_state_changed();
++}
++
++
++static void hostapd_wps_set_sel_reg_cb(void *ctx, int sel_reg,
++				    u16 dev_passwd_id, u16 config_methods)
++{
++	struct hostapd_data *hapd = ctx;
++	bool selected = hapd->wps &&
++		wps_registrar_is_selected(hapd->wps->registrar);
++
++	/* The payload describes only the internal registrar. Observe the union
++	 * after every selection change, even if WPS IE construction failed. */
++	if (selected && !hapd->wps_status_selected)
++		hapd->wps_status_event = NULL;
++	hapd->wps_status_selected = selected;
++	hostapd_ucode_wps_state_changed();
+ }
+ 
+ 
+@@ -1042,6 +1065,36 @@
+ 		hostapd_wps_ap_pin_success(hapd);
+ 		break;
+ 	}
++	/* Record the native result once, so a reconnecting display does not
++	 * restart its lifetime. PBC/PIN/UPnP activation clears the old result. */
++	switch (event) {
++	case WPS_EV_SUCCESS:
++		hapd->wps_status_event = "success";
++		break;
++	case WPS_EV_FAIL:
++		hapd->wps_status_event =
++			data->fail.config_error == WPS_CFG_MULTIPLE_PBC_DETECTED ?
++			"overlap" : "failure";
++		break;
++	case WPS_EV_PWD_AUTH_FAIL:
++		hapd->wps_status_event = "failure";
++		break;
++	case WPS_EV_PBC_OVERLAP:
++		hapd->wps_status_event = "overlap";
++		break;
++	case WPS_EV_PBC_TIMEOUT:
++		hapd->wps_status_event = "timeout";
++		break;
++	case WPS_EV_PBC_ACTIVE:
++		hostapd_wps_status_reset(hapd);
++		/* fall through */
++	default:
++		goto notify;
++	}
++	if (os_get_reltime(&hapd->wps_status_time))
++		hapd->wps_status_event = NULL;
++notify:
++	hostapd_ucode_wps_state_changed();
+ 	if (hapd->wps_event_cb)
+ 		hapd->wps_event_cb(hapd->wps_event_cb_ctx, event, data);
+ }
+@@ -1406,6 +1459,7 @@
+ 	cfg.new_psk_cb = hostapd_wps_new_psk_cb;
+ 	cfg.new_psk_before_cred = conf->ssid.wpa_psk_file != NULL;
+ 	cfg.set_ie_cb = hostapd_wps_set_ie_cb;
++	cfg.set_sel_reg_cb = hostapd_wps_set_sel_reg_cb;
+ 	cfg.pin_needed_cb = hostapd_wps_pin_needed_cb;
+ 	cfg.reg_success_cb = hostapd_wps_reg_success_cb;
+ 	cfg.enrollee_seen_cb = hostapd_wps_enrollee_seen_cb;
+@@ -1542,6 +1596,8 @@
+ 
+ void hostapd_deinit_wps(struct hostapd_data *hapd)
+ {
++	hostapd_wps_status_reset(hapd);
++	hapd->wps_status_selected = false;
+ 	eloop_cancel_timeout(hostapd_wps_reenable_ap_pin, hapd, NULL);
+ 	eloop_cancel_timeout(hostapd_wps_ap_pin_timeout, hapd, NULL);
+ 	eloop_cancel_timeout(wps_reload_config, hapd->iface, NULL);
+@@ -1650,8 +1706,11 @@
+ 	ret = wps_registrar_add_pin(hapd->wps->registrar, data->addr,
+ 				    data->uuid, data->pin, data->pin_len,
+ 				    data->timeout);
+-	if (ret == 0)
++	if (ret == 0) {
+ 		data->added++;
++		/* A new PIN can replace one while the registrar is still selected. */
++		hostapd_wps_status_reset(hapd);
++	}
+ 	return ret;
+ }
+ 
+@@ -1728,6 +1787,9 @@
+ 		data->count++;
+ 		wps_registrar_wps_cancel(hapd->wps->registrar);
+ 		ap_for_each_sta(hapd, ap_sta_wps_cancel, NULL);
++		/* Native PBC cancellation also emits TIMEOUT; an explicit cancel
++		 * is not a failed enrollment and must not leave an error display. */
++		hostapd_wps_status_reset(hapd);
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, WPS_EVENT_CANCEL);
+ 	}
+ 
+diff --git a/src/wps/wps.h b/src/wps/wps.h
+--- a/src/wps/wps.h
++++ b/src/wps/wps.h
+@@ -335,11 +335,11 @@
+ 	 * @sel_reg_config_methods: Bit field of active config methods
+ 	 *
+ 	 * This callback is called whenever the Selected Registrar state
+-	 * changes (e.g., a new PIN becomes available or PBC is invoked). This
+-	 * callback is only used by External Registrar implementation;
+-	 * set_ie_cb() is used by AP implementation in similar caes, but it
+-	 * provides the full WPS IE data instead of just the minimal Registrar
+-	 * state information.
++	 * changes (e.g., a new PIN becomes available or PBC is invoked), even
++	 * if constructing the WPS IE fails. The payload describes the internal
++	 * registrar; an AP can query wps_registrar_is_selected() for the union
++	 * including external registrars. set_ie_cb() supplies full WPS IE data
++	 * only when that data was constructed successfully.
+ 	 */
+ 	void (*set_sel_reg_cb)(void *ctx, int sel_reg, u16 dev_passwd_id,
+ 			       u16 sel_reg_config_methods);
+@@ -889,6 +889,7 @@
+ 				const struct wpabuf *wps_data,
+ 				int p2p_wildcard);
+ int wps_registrar_update_ie(struct wps_registrar *reg);
++int wps_registrar_is_selected(struct wps_registrar *reg);
+ void wps_registrar_update_psk_policy(struct wps_registrar *reg,
+ 				     int new_psk_before_cred,
+ 				     int force_per_enrollee_psk);
+diff --git a/src/wps/wps_registrar.c b/src/wps/wps_registrar.c
+--- a/src/wps/wps_registrar.c
++++ b/src/wps/wps_registrar.c
+@@ -3547,6 +3547,13 @@
+ }
+ 
+ 
++/* Include externally selected registrars, as advertised in the WPS IE. */
++int wps_registrar_is_selected(struct wps_registrar *reg)
++{
++	return reg && reg->sel_reg_union;
++}
++
++
+ int wps_registrar_update_ie(struct wps_registrar *reg)
+ {
+ 	return wps_set_ie(reg);
+diff --git a/src/wps/wps_upnp_ap.c b/src/wps/wps_upnp_ap.c
+--- a/src/wps/wps_upnp_ap.c
++++ b/src/wps/wps_upnp_ap.c
+@@ -76,10 +76,11 @@
+ void upnp_er_remove_notification(struct wps_registrar *reg,
+ 				 struct subscription *s)
+ {
+-	bool was_sel_reg = s->selected_registrar;
+-
+ 	s->selected_registrar = 0;
+ 	eloop_cancel_timeout(upnp_er_set_selected_timeout, s, reg);
+-	if (reg && was_sel_reg)
++	/* A subscription is shared by all BSS interfaces. The first removal
++	 * notification already cleared its bit; each registrar still needs
++	 * its own selected union recomputed before its timer is discarded. */
++	if (reg)
+ 		wps_registrar_selected_registrar_changed(reg, 0);
+ }

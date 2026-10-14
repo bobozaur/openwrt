@@ -1,0 +1,14 @@
+Subject: [PATCH] preserve proc sequence position at EOF
+
+--- a/wireless/driver/linux/mtlk_df_proc_impl.c
++++ b/wireless/driver/linux/mtlk_df_proc_impl.c
+@@ -482,8 +482,7 @@
+   if ( *pos == 0 )
+     return &counter;
+   else {
+-    /* no => it's the end of the sequence, return NULL to stop reading */
+-    *pos = 0;
++    /* Preserve EOF across partial reads; seq_lseek handles rewinding. */
+     return NULL;
+   }
+ }

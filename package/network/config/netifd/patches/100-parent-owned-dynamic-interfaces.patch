@@ -1,0 +1,495 @@
+Subject: [PATCH] reconcile protocol-owned dynamic interfaces with parent updates
+
+DHCP transition options describe a desired set, not append-only interfaces.
+Let protocol notifications replace only their exact parent's children, fence
+old callbacks across setups, and retire children on parent loss or teardown.
+Keep legacy add_dynamic callers compatible and protect static/foreign names.
+
+--- a/interface.h
++++ b/interface.h
+@@ -127,6 +127,11 @@
+ 	bool renew;
+ 	bool remove_pending;
+ 
++	/* Dynamic interfaces published by this exact parent interface. */
++	struct interface *dynamic_parent;
++	struct list_head dynamic_list;
++	struct list_head dynamic_children;
++
+ 	unsigned int carrier_loss_delay;
+ 	struct uloop_timeout carrier_loss_timer;
+ 
+@@ -192,6 +197,7 @@
+ 
+ bool interface_add(struct interface *iface, struct blob_attr *config);
+ bool interface_add_alias(struct interface *iface, struct blob_attr *config);
++void interface_remove_dynamic_children(struct interface *parent);
+ 
+ void interface_set_proto_state(struct interface *iface, struct interface_proto_state *state);
+ 
+--- a/interface.c
++++ b/interface.c
+@@ -354,7 +354,8 @@
+ 	case IFS_SETUP:
+ 		uloop_timeout_cancel(&iface->carrier_loss_timer);
+ 		iface->state = IFS_TEARDOWN;
+-		if (iface->dynamic)
++		if (iface->dynamic && !iface->dynamic_parent &&
++		    iface->config_state == IFC_NORMAL)
+ 			__set_config_state(iface, IFC_REMOVE);
+ 
+ 		if (state == IFS_UP)
+@@ -402,7 +403,8 @@
+ 		if (!iface->enabled || !link_state) {
+ 			uloop_timeout_cancel(&iface->carrier_loss_timer);
+ 			iface->state = IFS_TEARDOWN;
+-			if (iface->dynamic)
++			if (iface->dynamic && !iface->dynamic_parent &&
++			    iface->config_state == IFC_NORMAL)
+ 				__set_config_state(iface, IFC_REMOVE);
+ 
+ 			interface_proto_event(iface->proto, PROTO_CMD_TEARDOWN, false);
+@@ -766,9 +768,39 @@
+ }
+ 
+ static void
++interface_set_dynamic_parent(struct interface *iface, struct interface *parent)
++{
++	list_del_init(&iface->dynamic_list);
++	iface->dynamic_parent = parent;
++	if (parent)
++		list_add_tail(&iface->dynamic_list, &parent->dynamic_children);
++}
++
++void
++interface_remove_dynamic_children(struct interface *parent)
++{
++	struct interface *child, *tmp;
++
++	list_for_each_entry_safe(child, tmp, &parent->dynamic_children, dynamic_list)
++		set_config_state(child, IFC_REMOVE);
++}
++
++static void
+ interface_cleanup(struct interface *iface)
+ {
+ 	struct interface_user *dep, *tmp;
++	struct interface *child, *child_tmp;
++	LIST_HEAD(children);
++
++	/* Detach all children before callbacks can observe a dying parent. */
++	list_splice_init(&iface->dynamic_children, &children);
++	list_for_each_entry(child, &children, dynamic_list)
++		child->dynamic_parent = NULL;
++	list_for_each_entry_safe(child, child_tmp, &children, dynamic_list) {
++		list_del_init(&child->dynamic_list);
++		set_config_state(child, IFC_REMOVE);
++	}
++	interface_set_dynamic_parent(iface, NULL);
+ 
+ 	uloop_timeout_cancel(&iface->remove_timer);
+ 	uloop_timeout_cancel(&iface->carrier_loss_timer);
+@@ -938,7 +970,11 @@
+ 	bool force_link = false;
+ 
+ 	iface = calloc_a(sizeof(*iface), &iface_name, strlen(name) + 1);
++	if (!iface)
++		return NULL;
+ 	iface->name = strcpy(iface_name, name);
++	INIT_LIST_HEAD(&iface->dynamic_list);
++	INIT_LIST_HEAD(&iface->dynamic_children);
+ 	INIT_LIST_HEAD(&iface->errors);
+ 	INIT_LIST_HEAD(&iface->users);
+ 	INIT_LIST_HEAD(&iface->hotplug_list);
+@@ -1077,7 +1113,6 @@
+ {
+ 	struct blob_attr *tb[IFACE_ATTR_MAX];
+ 	struct blob_attr *cur;
+-	char *name = NULL;
+ 
+ 	blobmsg_parse_attr(iface_attrs, IFACE_ATTR_MAX, tb, config);
+ 
+@@ -1095,25 +1130,9 @@
+ 			iface->device = blobmsg_data(cur);
+ 	}
+ 
+-	if (iface->dynamic) {
+-		name = strdup(iface->name);
+-
+-		if (!name)
+-			return false;
+-	}
+-
+ 	iface->config = config;
+ 	iface->tags = tb[IFACE_ATTR_TAGS];
+ 	vlist_add(&interfaces, &iface->node, iface->name);
+-
+-	if (name) {
+-		iface = vlist_find(&interfaces, name, iface, node);
+-		free(name);
+-
+-		/* Don't delete dynamic interface on reload */
+-		if (iface)
+-			iface->node.version = -1;
+-	}
+ 
+ 	return true;
+ }
+@@ -1531,7 +1550,8 @@
+ interface_change_config(struct interface *if_old, struct interface *if_new)
+ {
+ 	struct blob_attr *old_config = if_old->config;
+-	bool reload = false, reload_ip = false, update_prefix_delegation = false;
++	bool reload = if_old->config_state == IFC_REMOVE;
++	bool reload_ip = false, update_prefix_delegation = false;
+ 
+ 	/*
+ 	 * The interface is being redefined: cancel a pending deferred removal,
+@@ -1539,6 +1559,10 @@
+ 	 */
+ 	if (if_old->config_state == IFC_REMOVE)
+ 		__set_config_state(if_old, IFC_NORMAL);
++	uloop_timeout_cancel(&if_old->remove_timer);
++	if_old->remove_timer.cb = NULL;
++	if_old->remove_pending = false;
++	interface_set_dynamic_parent(if_old, if_new->dynamic_parent);
+ 
+ #define FIELD_CHANGED_STR(field)					\
+ 		((!!if_old->field != !!if_new->field) ||		\
+@@ -1672,12 +1696,19 @@
+ 
+ 	if (node_old && node_new) {
+ 		D(INTERFACE, "Update interface '%s'", if_new->name);
++		/* vlist_add has already copied the incoming node's version. */
++		if (if_new->dynamic)
++			if_old->node.version = -1;
+ 		interface_change_config(if_old, if_new);
+ 	} else if (node_old) {
+ 		D(INTERFACE, "Remove interface '%s'", if_old->name);
+ 		set_config_state(if_old, IFC_REMOVE);
+ 	} else if (node_new) {
+ 		D(INTERFACE, "Create interface '%s'", if_new->name);
++		/* Don't delete dynamic interfaces on a configuration reload. */
++		if (if_new->dynamic)
++			if_new->node.version = -1;
++		interface_set_dynamic_parent(if_new, if_new->dynamic_parent);
+ 		interface_event(if_new, IFEV_CREATE);
+ 		proto_init_interface(if_new, if_new->config);
+ 		interface_claim_device(if_new);
+--- a/proto-ext.h
++++ b/proto-ext.h
+@@ -44,6 +44,7 @@
+ 	bool restart_pending;
+ 
+ 	int last_error;
++	char token[80];
+ 
+ 	struct list_head deps;
+ };
+--- a/proto-ext.c
++++ b/proto-ext.c
+@@ -17,6 +17,7 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <signal.h>
++#include <time.h>
+ 
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
+@@ -24,6 +25,8 @@
+ #include "proto-ext.h"
+ #include "system.h"
+ #include "handler.h"
++
++#define PROTO_TOKEN_ENV "NETIFD_PROTO_TOKEN="
+ 
+ static void
+ proto_ext_check_dependencies(struct proto_ext_state *state)
+@@ -183,6 +186,7 @@
+ 		uloop_timeout_cancel(&state->teardown_timeout);
+ 		uloop_timeout_cancel(&state->checkup_timeout);
+ 		state->sm = S_IDLE;
++		state->token[0] = 0;
+ 		state->proto.proto_event(&state->proto, IFPEV_DOWN);
+ 		break;
+ 	}
+@@ -228,6 +232,7 @@
+ 	struct proto_ext_state *state;
+ 
+ 	state = container_of(proto, struct proto_ext_state, proto);
++	interface_remove_dynamic_children(proto->iface);
+ 	uloop_timeout_cancel(&state->teardown_timeout);
+ 	uloop_timeout_cancel(&state->checkup_timeout);
+ 	proto_ext_clear_host_dep(state);
+@@ -316,6 +321,8 @@
+ 	NOTIFY_DNS_SEARCH,
+ 	NOTIFY_NEIGHBORS,
+ 	NOTIFY_NEIGHBORS6,
++	NOTIFY_CHILDREN,
++	NOTIFY_TOKEN,
+ 	__NOTIFY_LAST
+ };
+ 
+@@ -339,7 +346,114 @@
+ 	[NOTIFY_DNS_SEARCH] = { .name = "dns_search", .type = BLOBMSG_TYPE_ARRAY },
+ 	[NOTIFY_NEIGHBORS]= {.name = "neighbor", .type = BLOBMSG_TYPE_ARRAY},
+ 	[NOTIFY_NEIGHBORS6]= {.name = "neighbor6", .type = BLOBMSG_TYPE_ARRAY},
++	[NOTIFY_CHILDREN] = { .name = "dynamic-children", .type = BLOBMSG_TYPE_UNSPEC },
++	[NOTIFY_TOKEN] = { .name = "proto-token", .type = BLOBMSG_TYPE_UNSPEC },
+ };
++
++static void
++proto_ext_free_children(struct interface **children, int n)
++{
++	int i;
++
++	for (i = 0; i < n; i++)
++		if (children[i])
++			interface_free(children[i]);
++	free(children);
++}
++
++/* Prepare the entire desired set before changing parent or child state. */
++static int
++proto_ext_prepare_children(struct proto_ext_state *state, struct blob_attr *attr,
++			   struct interface ***result, int *count)
++{
++	static const struct blobmsg_policy policy[] = {
++		{ .name = "name", .type = BLOBMSG_TYPE_STRING },
++		{ .name = "proto", .type = BLOBMSG_TYPE_STRING },
++	};
++	struct blob_attr *cur, *tb[ARRAY_SIZE(policy)], *config;
++	struct interface **children, *old, *child;
++	const char *name, *proto;
++	size_t rem;
++	int n, i = 0, j, ret = UBUS_STATUS_INVALID_ARGUMENT;
++
++	if (blobmsg_type(attr) != BLOBMSG_TYPE_ARRAY ||
++	    (n = blobmsg_check_array(attr, BLOBMSG_TYPE_TABLE)) < 0)
++		return ret;
++
++	children = calloc(n ? n : 1, sizeof(*children));
++	if (!children)
++		return UBUS_STATUS_UNKNOWN_ERROR;
++
++	blobmsg_for_each_attr(cur, attr, rem) {
++		blobmsg_parse_attr(policy, ARRAY_SIZE(policy), tb, cur);
++		if (!tb[0] || !tb[1])
++			goto error;
++		name = blobmsg_get_string(tb[0]);
++		proto = blobmsg_get_string(tb[1]);
++		if (!name[0] || !proto[0] ||
++		    strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != strlen(name) ||
++		    !strcmp(name, state->proto.iface->name))
++			goto error;
++		for (j = 0; j < i; j++)
++			if (!strcmp(name, children[j]->name))
++				goto error;
++
++		old = vlist_find(&interfaces, name, old, node);
++		if (old && old->dynamic_parent != state->proto.iface) {
++			ret = UBUS_STATUS_PERMISSION_DENIED;
++			goto error;
++		}
++
++		config = blob_memdup(cur);
++		if (!config) {
++			ret = UBUS_STATUS_UNKNOWN_ERROR;
++			goto error;
++		}
++		child = interface_alloc(name, config, true);
++		if (!child) {
++			free(config);
++			ret = UBUS_STATUS_UNKNOWN_ERROR;
++			goto error;
++		}
++		children[i++] = child;
++		child->config = config;
++		if (strcmp(child->proto_handler->name, proto))
++			goto error;
++		child->dynamic_parent = state->proto.iface;
++	}
++
++	*result = children;
++	*count = n;
++	return 0;
++
++error:
++	proto_ext_free_children(children, i);
++	return ret;
++}
++
++static int
++proto_ext_update_children(struct proto_ext_state *state,
++			  struct interface **children, int n)
++{
++	struct interface *old, *tmp, *child;
++	int i;
++
++	list_for_each_entry_safe(old, tmp, &state->proto.iface->dynamic_children, dynamic_list) {
++		for (i = 0; i < n; i++)
++			if (!strcmp(old->name, children[i]->name))
++				break;
++		if (i == n)
++			vlist_delete(&interfaces, &old->node);
++	}
++
++	for (i = 0; i < n; i++) {
++		child = children[i];
++		if (!interface_add(child, child->config))
++			return UBUS_STATUS_UNKNOWN_ERROR;
++		children[i] = NULL;
++	}
++	return 0;
++}
+ 
+ static int
+ proto_ext_update_link(struct proto_ext_state *state, struct blob_attr *data, struct blob_attr **tb)
+@@ -361,6 +475,7 @@
+ 
+ 	up = blobmsg_get_bool(tb[NOTIFY_LINK_UP]);
+ 	if (!up) {
++		interface_remove_dynamic_children(iface);
+ 		state->proto.proto_event(&state->proto, IFPEV_LINK_LOST);
+ 		return 0;
+ 	}
+@@ -464,7 +579,9 @@
+ proto_ext_run_command(struct proto_ext_state *state, struct blob_attr **tb)
+ {
+ 	static char *argv[64];
+-	static char *env[32];
++	static char *env[33];
++	char token_env[sizeof(PROTO_TOKEN_ENV) + sizeof(state->token)];
++	int i;
+ 
+ 	if (state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+@@ -475,8 +592,12 @@
+ 	if (!fill_string_list(tb[NOTIFY_COMMAND], argv, ARRAY_SIZE(argv)))
+ 		goto error;
+ 
+-	if (!fill_string_list(tb[NOTIFY_ENV], env, ARRAY_SIZE(env)))
++	if (!fill_string_list(tb[NOTIFY_ENV], env, ARRAY_SIZE(env) - 1))
+ 		goto error;
++	for (i = 0; env[i]; i++);
++	snprintf(token_env, sizeof(token_env), PROTO_TOKEN_ENV "%s", state->token);
++	env[i++] = token_env;
++	env[i] = NULL;
+ 
+ 	state->proto_task_killed = false;
+ 	netifd_start_process((const char **) argv, (char **) env, &state->proto_task);
+@@ -624,16 +745,35 @@
+ {
+ 	struct proto_ext_state *state;
+ 	struct blob_attr *tb[__NOTIFY_LAST];
++	struct interface **children = NULL;
++	int n = 0, ret, child_error = 0;
+ 
+ 	state = container_of(proto, struct proto_ext_state, proto);
+ 
+ 	blobmsg_parse_attr(notify_attr, __NOTIFY_LAST, tb, attr);
+ 	if (!tb[NOTIFY_ACTION])
+ 		return UBUS_STATUS_INVALID_ARGUMENT;
++	if (tb[NOTIFY_TOKEN] &&
++	    (blobmsg_type(tb[NOTIFY_TOKEN]) != BLOBMSG_TYPE_STRING ||
++	     !state->token[0] || strcmp(blobmsg_get_string(tb[NOTIFY_TOKEN]), state->token)))
++		return UBUS_STATUS_PERMISSION_DENIED;
++	if (tb[NOTIFY_CHILDREN]) {
++		if (!tb[NOTIFY_TOKEN] || state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
++			return UBUS_STATUS_PERMISSION_DENIED;
++		if (blobmsg_get_u32(tb[NOTIFY_ACTION]) != 0 || !tb[NOTIFY_LINK_UP] ||
++		    !blobmsg_get_bool(tb[NOTIFY_LINK_UP]))
++			return UBUS_STATUS_INVALID_ARGUMENT;
++		child_error = proto_ext_prepare_children(state, tb[NOTIFY_CHILDREN], &children, &n);
++	}
+ 
+ 	switch(blobmsg_get_u32(tb[NOTIFY_ACTION])) {
+ 	case 0:
+-		return proto_ext_update_link(state, attr, tb);
++		ret = proto_ext_update_link(state, attr, tb);
++		if (!ret && children && state->sm == S_IDLE)
++			ret = proto_ext_update_children(state, children, n);
++		proto_ext_free_children(children, n);
++		/* A rejected child set must not suppress a valid parent lease. */
++		return ret ? ret : child_error;
+ 	case 1:
+ 		return proto_ext_run_command(state, tb);
+ 	case 2:
+@@ -723,7 +863,10 @@
+ {
+ 	struct interface_proto_state *proto = &state->proto;
+ 	static char error_buf[32];
+-	char *envp[2];
++	static unsigned long long sequence;
++	char token_env[sizeof(PROTO_TOKEN_ENV) + sizeof(state->token)];
++	char *envp[3];
++	struct timespec now = {};
+ 	const char *action;
+ 	char *config;
+ 	int ret, j = 0;
+@@ -734,6 +877,10 @@
+ 			action = "setup";
+ 			state->last_error = -1;
+ 			proto_ext_clear_host_dep(state);
++			/* Fence callbacks from earlier setups and daemon instances. */
++			clock_gettime(CLOCK_MONOTONIC, &now);
++			snprintf(state->token, sizeof(state->token), "%ld:%lld:%ld:%llu",
++				 (long)getpid(), (long long)now.tv_sec, now.tv_nsec, ++sequence);
+ 			state->sm = S_SETUP;
+ 			break;
+ 
+@@ -776,6 +923,7 @@
+ 		state->restart_pending = false;
+ 		action = "restart";
+ 	} else {
++		interface_remove_dynamic_children(proto->iface);
+ 		switch (state->sm) {
+ 		case S_SETUP:
+ 			if (state->script_task.uloop.pending) {
+@@ -816,6 +964,8 @@
+ 		goto error;
+ 	}
+ 
++	snprintf(token_env, sizeof(token_env), PROTO_TOKEN_ENV "%s", state->token);
++	envp[j++] = token_env;
+ 	envp[j] = NULL;
+ 
+ 	ret = start_cb(state, action, config, envp);
+@@ -832,8 +982,10 @@
+ 	 * came up does not reach the proto handler, so a stuck S_SETUP would
+ 	 * block every future setup attempt
+ 	 */
+-	if (cmd == PROTO_CMD_SETUP)
++	if (cmd == PROTO_CMD_SETUP) {
+ 		state->sm = S_IDLE;
++		state->token[0] = 0;
++	}
+ 
+ 	return ret;
+ }
+--- a/scripts/netifd-proto.sh
++++ b/scripts/netifd-proto.sh
+@@ -112,6 +112,15 @@
+ 	proto_close_nested
+ }
+ 
++proto_add_dynamic_children() {
++	proto_close_nested
++	json_add_array "dynamic-children"
++}
++
++proto_close_dynamic_children() {
++	json_close_array
++}
++
+ proto_add_dns_server() {
+ 	local address="$1"
+ 
+@@ -327,6 +336,7 @@
+ 	local interface="$1"
+ 	local options="$2"
+ 	json_add_string "interface" "$interface"
++	[ -n "$NETIFD_PROTO_TOKEN" ] && json_add_string "proto-token" "$NETIFD_PROTO_TOKEN"
+ 	ubus $options call network.interface notify_proto "$(json_dump)"
+ }
+ 

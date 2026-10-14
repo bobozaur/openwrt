@@ -1,0 +1,78 @@
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -168,3 +168,5 @@
+ obj-y					+= xilinx/
+ obj-$(CONFIG_ARCH_ZYNQ)			+= zynq/
+ obj-$(CONFIG_COMMON_CLK_ZYNQMP)         += zynqmp/
++
++obj-$(CONFIG_CLK_GRX500) += clk-grx500.o
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -584,3 +584,8 @@
+ 	  Kunit test for the clk-fractional-divider type.
+ 
+ endif
++
++config CLK_GRX500
++	bool "Lantiq GRX500 clock controller"
++	depends on MACH_GRX500 && COMMON_CLK && OF
++	select MFD_SYSCON
+--- a/drivers/reset/Makefile
++++ b/drivers/reset/Makefile
+@@ -49,3 +49,5 @@
+ obj-$(CONFIG_RESET_UNIPHIER_GLUE) += reset-uniphier-glue.o
+ obj-$(CONFIG_RESET_ZYNQ) += reset-zynq.o
+ obj-$(CONFIG_RESET_ZYNQMP) += reset-zynqmp.o
++
++obj-$(CONFIG_RESET_GRX500) += reset-grx500.o
+--- a/drivers/reset/Kconfig
++++ b/drivers/reset/Kconfig
+@@ -399,3 +399,8 @@
+ source "drivers/reset/tegra/Kconfig"
+ 
+ endif
++
++config RESET_GRX500
++	bool "Lantiq GRX500 reset controller"
++	depends on MACH_GRX500 && RESET_CONTROLLER && OF
++	select MFD_SYSCON
+--- a/drivers/pci/controller/Makefile
++++ b/drivers/pci/controller/Makefile
+@@ -63,3 +63,5 @@
+ obj-$(CONFIG_ARM64) += pci-xgene.o
+ endif
+ endif
++
++obj-$(CONFIG_PCIE_GRX500) += pcie-grx500.o
+--- a/drivers/pci/controller/Kconfig
++++ b/drivers/pci/controller/Kconfig
+@@ -363,3 +363,9 @@
+ source "drivers/pci/controller/mobiveil/Kconfig"
+ source "drivers/pci/controller/plda/Kconfig"
+ endmenu
++
++config PCIE_GRX500
++	bool "Lantiq GRX500 paired PCIe controllers"
++	depends on MACH_GRX500 && PCI && OF && GPIOLIB
++	select MFD_SYSCON
++	depends on RESET_CONTROLLER
+--- a/drivers/usb/dwc3/Makefile
++++ b/drivers/usb/dwc3/Makefile
+@@ -58,3 +58,5 @@
+ obj-$(CONFIG_USB_DWC3_OCTEON)		+= dwc3-octeon.o
+ obj-$(CONFIG_USB_DWC3_RTK)		+= dwc3-rtk.o
+ obj-$(CONFIG_USB_DWC3_GENERIC_PLAT)	+= dwc3-generic-plat.o
++
++obj-$(CONFIG_USB_DWC3_GRX500) += dwc3-grx500.o
+--- a/drivers/usb/dwc3/Kconfig
++++ b/drivers/usb/dwc3/Kconfig
+@@ -201,3 +201,9 @@
+ 	  Say 'Y' or 'M' here if your platform integrates DWC3 in a similar way.
+ 
+ endif
++
++config USB_DWC3_GRX500
++	tristate "Lantiq GRX500 DWC3 glue"
++	depends on MACH_GRX500 && USB_DWC3 && OF && GPIOLIB
++	select MFD_SYSCON
++	depends on RESET_CONTROLLER

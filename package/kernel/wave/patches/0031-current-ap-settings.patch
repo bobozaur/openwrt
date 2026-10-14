@@ -1,0 +1,39 @@
+Subject: [PATCH] follow current AP settings and management callbacks
+
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -558,10 +558,10 @@
+ 
+   struct wave_he_ap_beacon he;
+ 
+-  if (info->eht_cap || info->eht_oper || info->twt_responder || info->he_obss_pd.enable)
++  if (info->eht_cap || info->beacon.eht_oper || info->twt_responder || info->he_obss_pd.enable)
+     return -EOPNOTSUPP;
+   if (wave_he_parse_ap_beacon(&he, info->beacon.tail, info->beacon.tail_len) ||
+-      (!!info->he_cap != !!he.enabled) || (info->he_required && !he.enabled) ||
++      (!!info->he_cap != !!he.enabled) ||
+       (info->beacon.he_bss_color_valid &&
+        (!info->beacon.he_bss_color.enabled || info->beacon.he_bss_color.partial ||
+         info->beacon.he_bss_color.color != 4)))
+@@ -1427,10 +1427,11 @@
+ 
+ static int API_WRAPPER(_wave_cfg80211_op_set_default_mgmt_key) (
+     struct wiphy *wiphy,
+-    struct net_device *ndev,
++    struct wireless_dev *wdev,
+     int link_id,
+     u8 key_index)
+ {
++  struct net_device *ndev = wdev->netdev;
+   int res;
+   int retry_times = 0;
+ 
+@@ -2155,7 +2156,7 @@
+ void __MTLK_IFUNC
+ wv_cfg80211_class3_error_notify (struct wireless_dev *wdev, const u8 *addr)
+ {
+-  cfg80211_rx_spurious_frame(wdev->netdev, addr, GFP_ATOMIC);
++  cfg80211_rx_spurious_frame(wdev->netdev, addr, -1, GFP_ATOMIC);
+ }
+ 
+ BOOL __MTLK_IFUNC

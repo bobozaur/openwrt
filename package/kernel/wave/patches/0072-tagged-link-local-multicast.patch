@@ -1,0 +1,80 @@
+Subject: [PATCH] wave: preserve link-local multicast forwarding through VLAN tags
+
+Inspect at most two VLAN tags without changing skb data or metadata. Use the
+existing IPv4 and IPv6 link-local broadcast-group exceptions while keeping all
+tagged groups out of the VLAN-unaware membership tables. Unknown, truncated and
+nonlocal tagged traffic retains the undefined-group verdict.
+
+--- a/wireless/driver/linux/mcast.c
++++ b/wireless/driver/linux/mcast.c
+@@ -21,6 +21,7 @@
+ #include "mtlkinc.h"
+ 
+ #include <linux/igmp.h>
++#include <linux/if_vlan.h>
+ #include <net/addrconf.h>        /* for ipv6_addr_is_multicast() */
+ 
+ #include "mcast.h"
+@@ -2029,6 +2030,48 @@
+   return;
+ }
+ 
++/* Membership tables have no VLAN identity. Preserve only the existing
++ * link-local broadcast-group exceptions for tagged traffic; never use an
++ * untagged membership for a tagged group. Inspect without changing the skb.
++ */
++static int
++_mtlk_mc_tagged_link_local_grid (struct sk_buff *skb, __be16 protocol)
++{
++  unsigned int offset = ETH_HLEN;
++  unsigned int depth = skb_vlan_tag_present(skb) ? 1 : 0;
++  struct vlan_hdr vlan_buf;
++  const struct vlan_hdr *vlan;
++
++  while (protocol == htons(ETH_P_8021Q) || protocol == htons(ETH_P_8021AD)) {
++    if (++depth > 2)
++      return MCAST_GROUP_UNDEF;
++    vlan = skb_header_pointer(skb, offset, sizeof(vlan_buf), &vlan_buf);
++    if (!vlan)
++      return MCAST_GROUP_UNDEF;
++    protocol = vlan->h_vlan_encapsulated_proto;
++    offset += VLAN_HLEN;
++  }
++
++  if (protocol == htons(ETH_P_IP)) {
++    struct iphdr ip_buf;
++    const struct iphdr *ip = skb_header_pointer(skb, offset, sizeof(ip_buf), &ip_buf);
++
++    if (ip && ip->version == 4 && ip->ihl >= 5 &&
++        skb->len - offset >= ip->ihl * 4 &&
++        (ntohl(ip->daddr) & 0xFFFFFF00) == 0xE0000000)
++      return MCAST_GROUP_BROADCAST;
++  } else if (protocol == htons(ETH_P_IPV6)) {
++    struct ipv6hdr ip6_buf;
++    const struct ipv6hdr *ip6 = skb_header_pointer(skb, offset, sizeof(ip6_buf), &ip6_buf);
++
++    if (ip6 && ip6->version == 6 && ip6->daddr.s6_addr[0] == 0xff &&
++        (ip6->daddr.s6_addr[1] & 0x0f) == 2)
++      return MCAST_GROUP_BROADCAST;
++  }
++
++  return MCAST_GROUP_UNDEF;
++}
++
+ int __MTLK_IFUNC
+ mtlk_mc_get_grid (mtlk_core_t *nic, mtlk_nbuf_t *nbuf)
+ {
+@@ -2036,6 +2079,13 @@
+   struct ethhdr *ether_header = (struct ethhdr *)nbuf->data;
+   mcast_group_info_t  *group;
+   mtlk_dlist_entry_t *entry, *head;
++
++  if (skb_headlen(nbuf) < sizeof(*ether_header))
++    return MCAST_GROUP_UNDEF;
++
++  if (skb_vlan_tag_present(nbuf) || ether_header->h_proto == htons(ETH_P_8021Q) ||
++      ether_header->h_proto == htons(ETH_P_8021AD))
++    return _mtlk_mc_tagged_link_local_grid(nbuf, ether_header->h_proto);
+ 
+   switch (ntohs(ether_header->h_proto)) {
+     case ETH_P_IP:

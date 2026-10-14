@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/dsa/lantiq,grx500-switch.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Lantiq GRX500 LAN switch
+
+maintainers:
+  - OpenWrt Development List <openwrt-devel@lists.openwrt.org>
+
+description: |
+  Child of the GRX500 Ethernet controller, sharing its LAN switch MMIO region.
+  Port 0 connects to the LAN DMA conduit; ports 2 through 5 connect to internal
+  GPHYs. Port 1 is unused. Each user port connects only to the CPU port; Linux
+  bridges perform forwarding, VLAN filtering and spanning tree.
+
+allOf:
+  - $ref: dsa.yaml#/$defs/ethernet-ports
+
+properties:
+  compatible:
+    const: lantiq,grx500-switch
+  ports:
+    type: object
+    patternProperties:
+      '^port@[0-9a-f]+$':
+        type: object
+        properties:
+          reg:
+            enum: [0, 2, 3, 4, 5]
+
+required:
+  - compatible
+  - ports
+
+unevaluatedProperties: false

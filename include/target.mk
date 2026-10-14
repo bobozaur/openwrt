@@ -234,6 +234,7 @@ ifeq ($(DUMP),1)
     CPU_CFLAGS_4kec = -mips32r2 -mtune=4kec
     CPU_CFLAGS_24kc = -mips32r2 -mtune=24kc
     CPU_CFLAGS_74kc = -mips32r2 -mtune=74kc
+    CPU_CFLAGS_interaptiv = -mips32r2 -mtune=interaptiv -mabi=32 -mno-mips16 -mno-micromips
     CPU_CFLAGS_octeonplus = -march=octeon+ -mabi=64
   endif
   ifeq ($(ARCH),i386)
@@ -341,7 +342,9 @@ ifeq ($(DUMP),1)
       FEATURES += virtio
     endif
     ifneq ($(CONFIG_CPU_MIPS32_R2),)
+      ifeq ($(filter interaptiv,$(CPU_TYPE)),)
       FEATURES += mips16
+      endif
     endif
 
     # remove duplicates

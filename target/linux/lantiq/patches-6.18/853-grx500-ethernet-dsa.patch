@@ -1,0 +1,79 @@
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -108,3 +108,6 @@
+ obj-$(CONFIG_NET_VENDOR_SYNOPSYS) += synopsys/
+ obj-$(CONFIG_NET_VENDOR_PENSANDO) += pensando/
+ obj-$(CONFIG_OA_TC6) += oa_tc6.o
++
++obj-$(CONFIG_NET_GRX500) += grx500_eth.o
++grx500_eth-objs := lantiq_grx500.o lantiq_grx500_flow.o
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -205,3 +205,11 @@
+ source "drivers/net/ethernet/xircom/Kconfig"
+ 
+ endif # ETHERNET
++
++config NET_GRX500
++	tristate "Lantiq GRX500 Ethernet DMA"
++	depends on MACH_GRX500 && NETDEVICES && ETHERNET && OF && NET_DSA && INET
++	select PHYLIB
++	select OF_MDIO
++	select FW_LOADER
++	depends on RESET_CONTROLLER
+--- a/drivers/net/dsa/Makefile
++++ b/drivers/net/dsa/Makefile
+@@ -24,3 +24,6 @@
+ obj-y				+= realtek/
+ obj-y				+= sja1105/
+ obj-y				+= xrs700x/
++
++obj-$(CONFIG_NET_DSA_GRX500) += grx500_switch.o
++grx500_switch-objs := lantiq_grx500.o
+--- a/drivers/net/dsa/Kconfig
++++ b/drivers/net/dsa/Kconfig
+@@ -155,3 +155,8 @@
+ 	  and VSC7398 SparX integrated ethernet switches, connected over
+ 	  a CPU-attached address bus and work in memory-mapped I/O mode.
+ endmenu
++
++config NET_DSA_GRX500
++	tristate "Lantiq GRX500 GSWIP3 LAN switch"
++	depends on NET_DSA && NET_GRX500
++	select NET_DSA_TAG_GRX500
+--- a/net/dsa/Makefile
++++ b/net/dsa/Makefile
+@@ -42,3 +42,5 @@
+ 
+ # for tracing framework to find trace.h
+ CFLAGS_trace.o := -I$(src)
++
++obj-$(CONFIG_NET_DSA_TAG_GRX500) += tag_grx500.o
+--- a/net/dsa/Kconfig
++++ b/net/dsa/Kconfig
+@@ -191,3 +191,7 @@
+ 	  Arrow SpeedChips XRS700x switches that use a single byte tag trailer.
+ 
+ endif
++
++config NET_DSA_TAG_GRX500
++	tristate "Lantiq GRX500 eight-byte PMAC tag"
++	depends on NET_DSA
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -25,6 +25,7 @@
+ struct dsa_8021q_context;
+ struct tc_action;
+ 
++#define DSA_TAG_PROTO_GRX500_VALUE		32
+ #define DSA_TAG_PROTO_NONE_VALUE		0
+ #define DSA_TAG_PROTO_BRCM_VALUE		1
+ #define DSA_TAG_PROTO_BRCM_PREPEND_VALUE	2
+@@ -58,6 +59,7 @@
+ 
+ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_NONE		= DSA_TAG_PROTO_NONE_VALUE,
++	DSA_TAG_PROTO_GRX500		= DSA_TAG_PROTO_GRX500_VALUE,
+ 	DSA_TAG_PROTO_BRCM		= DSA_TAG_PROTO_BRCM_VALUE,
+ 	DSA_TAG_PROTO_BRCM_LEGACY	= DSA_TAG_PROTO_BRCM_LEGACY_VALUE,
+ 	DSA_TAG_PROTO_BRCM_LEGACY_FCS	= DSA_TAG_PROTO_BRCM_LEGACY_FCS_VALUE,

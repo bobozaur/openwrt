@@ -1,0 +1,178 @@
+--- a/src/ap/wps_hostapd.c
++++ b/src/ap/wps_hostapd.c
+@@ -571,34 +571,9 @@
+ }
+ 
+ 
+-static int hapd_wps_cred_cb(struct hostapd_data *hapd, void *ctx)
+-{
+-	const struct wps_credential *cred = ctx;
+-	FILE *oconf, *nconf;
+-	size_t len, i;
+-	char *tmp_fname;
+-	char buf[1024];
+-	int multi_bss;
+-	int wpa;
+-	int pmf_changed = 0;
+-
+-	if (hapd->wps == NULL)
+-		return 0;
+-
+-	wpa_hexdump_key(MSG_DEBUG, "WPS: Received Credential attribute",
+-			cred->cred_attr, cred->cred_attr_len);
+-
+-	wpa_printf(MSG_DEBUG, "WPS: Received new AP Settings");
+-	wpa_hexdump_ascii(MSG_DEBUG, "WPS: SSID", cred->ssid, cred->ssid_len);
+-	wpa_printf(MSG_DEBUG, "WPS: Authentication Type 0x%x",
+-		   cred->auth_type);
+-	wpa_printf(MSG_DEBUG, "WPS: Encryption Type 0x%x", cred->encr_type);
+-	wpa_printf(MSG_DEBUG, "WPS: Network Key Index %d", cred->key_idx);
+-	wpa_hexdump_key(MSG_DEBUG, "WPS: Network Key",
+-			cred->key, cred->key_len);
+-	wpa_printf(MSG_DEBUG, "WPS: MAC Address " MACSTR,
+-		   MAC2STR(cred->mac_addr));
+-
++static void hapd_wps_notify_credential(struct hostapd_data *hapd,
++				       const struct wps_credential *cred)
++{
+ 	if ((hapd->conf->wps_cred_processing == 1 ||
+ 	     hapd->conf->wps_cred_processing == 2) && cred->cred_attr) {
+ 		hapd_new_ap_event(hapd, cred->cred_attr, cred->cred_attr_len);
+@@ -612,6 +587,39 @@
+ 		wpabuf_free(attr);
+ 	} else
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, WPS_EVENT_NEW_AP_SETTINGS);
++
++}
++
++
++static int hapd_wps_cred_cb(struct hostapd_data *hapd, void *ctx)
++{
++	const struct wps_credential *cred = ctx;
++	FILE *oconf, *nconf;
++	size_t len, i;
++	char *tmp_fname;
++	char buf[1024];
++	int multi_bss;
++	int wpa;
++	int pmf_changed = 0;
++
++	if (hapd->wps == NULL)
++		return 0;
++
++	wpa_hexdump_key(MSG_DEBUG, "WPS: Received Credential attribute",
++			cred->cred_attr, cred->cred_attr_len);
++
++	wpa_printf(MSG_DEBUG, "WPS: Received new AP Settings");
++	wpa_hexdump_ascii(MSG_DEBUG, "WPS: SSID", cred->ssid, cred->ssid_len);
++	wpa_printf(MSG_DEBUG, "WPS: Authentication Type 0x%x",
++		   cred->auth_type);
++	wpa_printf(MSG_DEBUG, "WPS: Encryption Type 0x%x", cred->encr_type);
++	wpa_printf(MSG_DEBUG, "WPS: Network Key Index %d", cred->key_idx);
++	wpa_hexdump_key(MSG_DEBUG, "WPS: Network Key",
++			cred->key, cred->key_len);
++	wpa_printf(MSG_DEBUG, "WPS: MAC Address " MACSTR,
++		   MAC2STR(cred->mac_addr));
++
++	hapd_wps_notify_credential(hapd, cred);
+ 
+ 	if (hapd->conf->wps_cred_processing == 1)
+ 		return 0;
+@@ -834,6 +842,23 @@
+ static int hostapd_wps_cred_cb(void *ctx, const struct wps_credential *cred)
+ {
+ 	struct hostapd_data *hapd = ctx;
++
++	/* Inline configurations belong to the native netifd/ucode BSS owner.
++	 * Publish only after that owner durably accepts the exact credential;
++	 * neither a pseudo filename nor a cross-BSS file rewrite owns it.
++	 * Explicit external processing retains its existing event-only path.
++	 */
++	if (hapd->iface->config_fname &&
++	    str_starts(hapd->iface->config_fname, "data:") &&
++	    hapd->conf->wps_cred_processing != 1) {
++		hapd_wps_notify_credential(hapd, cred);
++		if (hostapd_ucode_wps_credential(hapd, cred)) {
++			wpa_printf(MSG_WARNING,
++				   "WPS: Native BSS owner did not accept AP settings");
++			return -1;
++		}
++		return 0;
++	}
+ 	return hostapd_wps_for_each(hapd, hapd_wps_cred_cb, (void *) cred);
+ }
+ 
+--- a/src/ap/ucode.c
++++ b/src/ap/ucode.c
+@@ -1320,6 +1320,40 @@
+ }
+ #endif /* CONFIG_DPP */
+ 
++#ifdef CONFIG_WPS
++int hostapd_ucode_wps_credential(struct hostapd_data *hapd,
++				 const struct wps_credential *cred)
++{
++	uc_value_t *data, *ret;
++	int accepted;
++
++	if (!cred->ssid_len || cred->ssid_len > sizeof(cred->ssid) ||
++	    cred->key_len > sizeof(cred->key))
++		return -1;
++
++	if (wpa_ucode_call_prepare("wps_credential"))
++		return -1;
++
++	data = ucv_object_new(vm);
++	ucv_object_add(data, "ssid", ucv_string_new_length(
++		(const char *) cred->ssid, cred->ssid_len));
++	ucv_object_add(data, "key", ucv_string_new_length(
++		(const char *) cred->key, cred->key_len));
++	ucv_object_add(data, "auth_type", ucv_uint64_new(cred->auth_type));
++	ucv_object_add(data, "encr_type", ucv_uint64_new(cred->encr_type));
++	ucv_object_add(data, "ieee80211w", ucv_int64_new(hapd->conf->ieee80211w));
++	ucv_object_add(data, "add_sae", ucv_boolean_new(hapd->conf->wps_cred_add_sae));
++	uc_value_push(ucv_string_new(hapd->iface->phy));
++	uc_value_push(ucv_string_new(hapd->conf->iface));
++	uc_value_push(hostapd_ucode_bss_get_uval(hapd));
++	uc_value_push(data);
++	ret = wpa_ucode_call(4);
++	accepted = ucv_type(ret) == UC_BOOLEAN && ucv_is_truish(ret);
++	ucv_put(ret);
++	return accepted ? 0 : -1;
++}
++#endif /* CONFIG_WPS */
++
+ void hostapd_ucode_wps_m7_rx(struct hostapd_data *hapd, const u8 *addr,
+ 			      const u8 *data, size_t data_len,
+ 			      struct wpabuf **m8_encr_extra, int *skip_cred)
+--- a/src/ap/ucode.h
++++ b/src/ap/ucode.h
+@@ -5,6 +5,7 @@
+ 
+ struct hostapd_data;
+ struct hostapd_iface;
++struct wps_credential;
+ 
+ struct hostapd_ucode_bss {
+ #ifdef UCODE_SUPPORT
+@@ -28,6 +29,8 @@
+ void hostapd_ucode_iface_state_changed(struct hostapd_iface *iface);
+ void hostapd_ucode_iface_channel_changed(struct hostapd_iface *iface);
+ void hostapd_ucode_wps_state_changed(void);
++int hostapd_ucode_wps_credential(struct hostapd_data *hapd,
++				 const struct wps_credential *cred);
+ void hostapd_ucode_free_bss(struct hostapd_data *hapd);
+ void hostapd_ucode_bss_cb(struct hostapd_data *hapd, const char *type);
+ int hostapd_ucode_sta_auth(struct hostapd_data *hapd, struct sta_info *sta);
+@@ -70,6 +73,11 @@
+ }
+ static inline void hostapd_ucode_wps_state_changed(void)
+ {
++}
++static inline int hostapd_ucode_wps_credential(struct hostapd_data *hapd,
++					    const struct wps_credential *cred)
++{
++	return -1;
+ }
+ static inline void hostapd_ucode_bss_cb(struct hostapd_data *hapd, const char *type)
+ {

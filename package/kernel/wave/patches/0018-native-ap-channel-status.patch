@@ -1,0 +1,39 @@
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -1525,6 +1525,28 @@
+   return res;
+ }
+ 
++/* cfg80211 publishes this operating definition only after successful AP
++ * setup/width changes. Do not report the radio's temporary scan channel.
++ */
++static int wave_cfg80211_get_channel(struct wiphy *wiphy,
++                                    struct wireless_dev *wdev,
++                                    unsigned int link_id,
++                                    struct cfg80211_chan_def *chandef)
++{
++  wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
++
++  lockdep_assert_wiphy(wiphy);
++  if (link_id || wdev->iftype != NL80211_IFTYPE_AP)
++    return -EINVAL;
++  if (!wave_radio_control_ready_get(cfg80211->radio))
++    return -EBUSY;
++  if (!wdev->links[0].ap.beacon_interval ||
++      !cfg80211_chandef_valid(&wdev->links[0].ap.chandef))
++    return -ENODATA;
++  *chandef = wdev->links[0].ap.chandef;
++  return 0;
++}
++
+ static struct cfg80211_ops wv_cfg80211_ops = {
+   .add_virtual_intf = API_WRAPPER(_wave_cfg80211_op_add_virtual_iface),
+   .del_virtual_intf = API_WRAPPER(_wave_cfg80211_op_del_virtual_iface),
+@@ -1562,6 +1584,7 @@
+   .set_qos_map = API_WRAPPER(_wave_cfg80211_op_set_qos_map),
+   .set_antenna = API_WRAPPER(_wave_cfg80211_op_set_antenna),
+   .get_antenna = API_WRAPPER(_wave_cfg80211_op_get_antenna),
++  .get_channel = wave_cfg80211_get_channel,
+ };
+ 
+ /* Send flush stations request to Hostapd. */

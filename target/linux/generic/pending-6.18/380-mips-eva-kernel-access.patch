@@ -1,0 +1,62 @@
+--- a/arch/mips/kernel/branch.c
++++ b/arch/mips/kernel/branch.c
+@@ -20,6 +20,7 @@
+ #include <asm/ptrace.h>
+ #include <linux/uaccess.h>
+ 
++#include "access-helper.h"
+ #include "probes-common.h"
+ 
+ /*
+@@ -848,7 +849,6 @@
+ 
+ int __compute_return_epc(struct pt_regs *regs)
+ {
+-	unsigned int __user *addr;
+ 	long epc;
+ 	union mips_instruction insn;
+ 
+@@ -856,11 +856,8 @@
+ 	if (epc & 3)
+ 		goto unaligned;
+ 
+-	/*
+-	 * Read the instruction
+-	 */
+-	addr = (unsigned int __user *) epc;
+-	if (__get_user(insn.word, addr)) {
++	/* EVA kernel instructions require kernel access, not user loads. */
++	if (__get_inst32(&insn.word, (u32 *)epc, user_mode(regs))) {
+ 		force_sig(SIGSEGV);
+ 		return -EFAULT;
+ 	}
+--- a/arch/mips/include/asm/asm-eva.h
++++ b/arch/mips/include/asm/asm-eva.h
+@@ -33,10 +33,10 @@
+ #ifdef CONFIG_32BIT
+ /*
+  * No 'sd' or 'ld' instructions in 32-bit but the code will
+- * do the correct thing
++ * use pairs of word accesses in the kernel address space.
+  */
+-#define kernel_sd(reg, addr)		user_sw(reg, addr)
+-#define kernel_ld(reg, addr)		user_lw(reg, addr)
++#define kernel_sd(reg, addr)		kernel_sw(reg, addr)
++#define kernel_ld(reg, addr)		kernel_lw(reg, addr)
+ #else
+ #define kernel_sd(reg, addr)		"sd " reg", " addr "\n"
+ #define kernel_ld(reg, addr)		"ld " reg", " addr "\n"
+@@ -120,10 +120,10 @@
+ #ifdef CONFIG_32BIT
+ /*
+  * No 'sd' or 'ld' instructions in 32-bit but the code will
+- * do the correct thing
++ * use pairs of word accesses in the kernel address space.
+  */
+-#define kernel_sd(reg, addr)		user_sw(reg, addr)
+-#define kernel_ld(reg, addr)		user_lw(reg, addr)
++#define kernel_sd(reg, addr)		kernel_sw(reg, addr)
++#define kernel_ld(reg, addr)		kernel_lw(reg, addr)
+ #else
+ #define kernel_sd(reg, addr)		sd reg, addr
+ #define kernel_ld(reg, addr)		ld reg, addr
