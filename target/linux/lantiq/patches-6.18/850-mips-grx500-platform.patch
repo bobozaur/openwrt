@@ -1,3 +1,15 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] MIPS: add GRX500 EVA platform integration
+
+Register the GRX500 platform and its EVA address/uncached DMA aliases,
+firmware-owned secondary launch and serial support. The retained IBL
+protocol and watchdog requirement are specific to this platform; other
+MIPS platform address and startup paths remain unchanged.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 --- a/arch/mips/Kconfig
 +++ b/arch/mips/Kconfig
 @@ -452,6 +452,34 @@
@@ -56,18 +68,6 @@
  	select SERIAL_CORE
  	help
  	  Support for UART on Lantiq and Intel SoCs.
---- a/arch/mips/include/asm/mach-generic/spaces.h
-+++ b/arch/mips/include/asm/mach-generic/spaces.h
-@@ -30,7 +30,9 @@
- #endif /* __ASSEMBLER__ */
- 
- #ifdef CONFIG_32BIT
-+#ifndef CAC_BASE
- #define CAC_BASE		_AC(0x80000000, UL)
-+#endif
- #ifndef IO_BASE
- #define IO_BASE			_AC(0xa0000000, UL)
- #endif
 --- a/arch/mips/include/asm/addrspace.h
 +++ b/arch/mips/include/asm/addrspace.h
 @@ -146,4 +146,8 @@
@@ -100,7 +100,7 @@
  
  void *arch_dma_set_uncached(void *addr, size_t size)
  {
-+	#ifdef CONFIG_MACH_GRX500
++#ifdef CONFIG_MACH_GRX500
 +	/* GRX500 uncached DRAM starts at UNCAC_BASE, not at physical zero. */
 +	return (void *)((unsigned long)addr - PAGE_OFFSET + UNCAC_BASE);
 +#else

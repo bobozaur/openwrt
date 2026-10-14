@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] irqchip/mips-gic: Configure local interrupts on single-cluster systems
 
 Local interrupt mapping and mask updates are required for every cluster
@@ -9,6 +10,10 @@ Use the existing online-CPU iterator for single-cluster systems as well.
 It selects each VP under gic_lock and only releases a cluster lock when
 the multicluster path requires one. This also preserves the cached mask
 state used when another CPU comes online.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/drivers/irqchip/irq-mips-gic.c
 +++ b/drivers/irqchip/irq-mips-gic.c

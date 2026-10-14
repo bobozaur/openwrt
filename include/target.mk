@@ -343,7 +343,7 @@ ifeq ($(DUMP),1)
     endif
     ifneq ($(CONFIG_CPU_MIPS32_R2),)
       ifeq ($(filter interaptiv,$(CPU_TYPE)),)
-      FEATURES += mips16
+        FEATURES += mips16
       endif
     endif
 
