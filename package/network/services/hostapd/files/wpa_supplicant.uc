@@ -1217,8 +1217,14 @@ let main_obj = {
 			if (req.args.config)
 				set_config(phy, req.args.phy, req.args.radio, req.args.num_global_macaddr, req.args.macaddr_base, req.args.config, req.args.ap_phy);
 
-			if (!req.args.defer)
-				uloop.timer(100, () => start_pending(phy));
+			if (!req.args.defer) {
+				let owner = wpas.data.config[phy];
+				let generation = owner?.generation;
+				uloop.timer(100, () => {
+					if (wpas.data.config[phy] == owner && owner?.generation == generation)
+						start_pending(phy);
+				});
+			}
 
 			return {
 				pid: wpas.getpid()

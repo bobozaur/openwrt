@@ -1,5 +1,6 @@
 let libubus = require("ubus");
 import * as uloop from "uloop";
+import * as nl80211 from "nl80211";
 import { open, readfile, access } from "fs";
 import { wdev_remove, is_equal, vlist_new, phy_is_fullmac, phy_open, wdev_set_radio_mask, wdev_set_up, macaddr_keep, macaddr_sync, macaddr_sync_defer, macaddr_sync_entry, macaddr_release_defer, mld_prev_match } from "common";
 
@@ -65,6 +66,7 @@ hostapd.data.bss_info_fields = {
 
 hostapd.data.mld = {};
 hostapd.data.dpp_hooks = {};
+hostapd.data.station_macaddr = {};
 
 function iface_remove(cfg)
 {
@@ -425,6 +427,66 @@ function iface_macaddr_sync(phydev, config)
 			   iface_macaddr_options(config));
 }
 
+// A channel-following AP and its station may expose separate wiphys for one
+// physical radio. Reserve the AP's real BSS addresses in the station allocator
+// before pending channel setup can resume that station. This is a separate
+// hostapd group, so neither role's ordinary per-PHY prune discards the mirror.
+function iface_station_macaddr_sync(name, config)
+{
+	let group = name + "/station";
+	let list = {};
+	if (config?.station_phy && config.station_phy != config.phy && length(config.bss)) {
+		let addresses = {};
+		for (let bss in config.bss) {
+			if (!bss.bssid)
+				return false;
+			addresses[lc(bss.bssid)] = true;
+		}
+		let phydev = phy_open(config.phy, config.radio_idx);
+		if (!phydev)
+			return false;
+		nl80211.error();
+		let wdevs = phydev.wdev_list();
+		if (nl80211.error())
+			return false;
+		// These aliases intentionally share a MAC, as in native netifd.
+		let shared = [ nl80211.const.NL80211_IFTYPE_AP_VLAN,
+			nl80211.const.NL80211_IFTYPE_MONITOR, nl80211.const.NL80211_IFTYPE_P2P_DEVICE ];
+		for (let wdev in wdevs)
+			if (index(shared, wdev.iftype) < 0 && wdev.mac)
+				addresses[lc(wdev.mac)] = true;
+		for (let address in addresses)
+			list[group + "/" + address] =
+				macaddr_sync_entry(config.station_phy, -1, address, { static: true });
+	}
+	if (!length(list) && !hostapd.data.station_macaddr[name])
+		return true;
+
+	// A refused sync can have applied other entries. Retain ownership until
+	// an empty sync is acknowledged, including after transport failure.
+	hostapd.data.station_macaddr[name] = true;
+	let result = macaddr_sync(ubus, "hostapd", group, list);
+	let error = ubus.error();
+	if (error || type(result) != "object" ||
+	    type(result.refused) != "array" || length(result.refused)) {
+		hostapd.printf(`Station MAC reservation failed on phy ${name}`);
+		return false;
+	}
+	if (!length(list))
+		delete hostapd.data.station_macaddr[name];
+	return true;
+}
+
+function iface_station_macaddr_require(name, config)
+{
+	if (iface_station_macaddr_sync(name, config))
+		return;
+	// Keep AP addresses reserved until its pending work and live BSSes have
+	// actually been removed. The existing ubus guard returns a native error.
+	iface_config_remove(name, config);
+	die(`Could not reserve station MAC addresses on phy ${name}\n`);
+}
+
 function iface_supplicant_start(phydev)
 {
 	ubus.defer("wpa_supplicant", "phy_set_state", {
@@ -459,6 +521,8 @@ function __iface_pending_next(pending, state, ret, data)
 			});
 			if (err) {
 				hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
+				if (config.station_phy)
+					die(`Could not create AP interface ${bss.ifname} on phy ${phy}\n`);
 				iface_supplicant_start(phydev);
 				return null;
 			}
@@ -479,7 +543,8 @@ function __iface_pending_next(pending, state, ret, data)
 		}
 		if (config.station_phy) {
 			// Keep the AP disabled until the physical owner has stopped STA.
-			iface_add(phy, config, { state: 'INACTIVE' });
+			if (!iface_add(phy, config, { state: 'INACTIVE' }))
+				die(`Could not add channel-following AP on phy ${phy}\n`);
 			return 'done';
 		}
 		pending.call("wpa_supplicant", "phy_set_state", {
@@ -518,6 +583,15 @@ function iface_pending_next(ret, data)
 			}
 		} catch(e) {
 			hostapd.printf(`Exception: ${e}\n${e.stacktrace[0].context}`);
+			if (cfg.config.station_phy) {
+				cfg.error = `${e}`;
+				cfg.abort();
+				apsta_cancel(cfg.phy, true);
+				hostapd.remove_iface(cfg.phy);
+				iface_remove(cfg.config);
+				// The persistent radio master can remain after BSS removal.
+				// Keep its mirror until explicit reset or owner teardown.
+			}
 			return;
 		}
 		pending = !this.defer;
@@ -566,6 +640,8 @@ function iface_pending_init(phydev, config)
 
 	hostapd.data.pending_config[phy] = pending;
 	pending.next();
+	if (pending.error)
+		die(`Initial AP setup failed on phy ${phy}: ${pending.error}\n`);
 }
 
 function csa_timer_cancel(name)
@@ -596,6 +672,9 @@ function iface_restart(phydev, config, old_config)
 
 	iface_remove(old_config);
 	iface_remove(config);
+	if (hostapd.data.station_macaddr[phy] &&
+	    (hostapd.interfaces[phy] || !iface_station_macaddr_sync(phy, null)))
+		die(`Could not retire station MAC addresses on phy ${phy}\n`);
 
 	// an aborted setup can have stopped wpa_supplicant
 	if (!config.bss || !config.bss[0]) {
@@ -617,11 +696,14 @@ function iface_restart(phydev, config, old_config)
 		for (let cur in config.bss)
 			if (cur.default_macaddr)
 				delete cur.bssid;
+		if (config.station_phy)
+			die(`Could not allocate AP MAC addresses on phy ${phy}\n`);
 		if (pending)
 			iface_supplicant_start(phydev);
 		return;
 	}
 	iface_macaddr_sync(phydev, config);
+	iface_station_macaddr_require(phy, config);
 
 	iface_pending_init(phydev, config);
 }
@@ -1021,15 +1103,18 @@ function iface_macaddr_move(phydev, config, old_config, bss_list_cfg)
 function iface_reload_config(name, phydev, config, old_config)
 {
 	let phy = phydev.name;
+	let channel_change = false;
 
-	if (!old_config)
+	if (!old_config || old_config.station_phy != config.station_phy)
 		return false;
 
 	switch (radio_reload_class(old_config.radio, config.radio)) {
 	case "restart":
 		return false;
 	case "channel":
-		if (!iface_channel_switch(name, config))
+		if (config.station_phy)
+			channel_change = true;
+		else if (!iface_channel_switch(name, config))
 			return false;
 		break;
 	}
@@ -1041,6 +1126,9 @@ function iface_reload_config(name, phydev, config, old_config)
 	    (hostapd.interfaces[name] || hostapd.data.pending_config[name])) {
 		for (let i = 0; i < length(config.bss); i++)
 			config.bss[i].bssid = prev_macaddr_bss[i].bssid;
+		iface_station_macaddr_require(phy, config);
+		if (channel_change && !iface_channel_switch(name, config))
+			return false;
 		return true;
 	}
 
@@ -1233,6 +1321,9 @@ function iface_reload_config(name, phydev, config, old_config)
 		bsscfg.bssid = addr;
 	}
 
+	iface_station_macaddr_require(phy, config);
+	if (channel_change && !iface_channel_switch(name, config))
+		return false;
 	let config_inline = iface_gen_config(config);
 
 	// Step 7: fill in the gaps with new interfaces
@@ -1298,6 +1389,7 @@ function iface_reload_config(name, phydev, config, old_config)
 	}
 
 	iface_macaddr_sync(phydev, config);
+	iface_station_macaddr_require(phy, config);
 
 	return true;
 }
@@ -1383,7 +1475,10 @@ function iface_config_remove(name, old_config)
 	apsta_cancel(name, true);
 	delete hostapd.data.apsta_freq[name];
 	hostapd.remove_iface(name);
-	return iface_remove(old_config);
+	iface_remove(old_config);
+	if (hostapd.data.station_macaddr[name] &&
+	    (hostapd.interfaces[name] || !iface_station_macaddr_sync(name, null)))
+		die(`Could not retire station MAC addresses on phy ${name}\n`);
 }
 
 // No fallback to a PHY restart, which would take the other BSSes down.
@@ -1422,6 +1517,7 @@ function mld_link_bss_remove(phy, name)
 	splice(config.bss, idx, 1);
 	bss_remove(phy, bss, bss_config);
 	iface_macaddr_prune(phy, config);
+	iface_station_macaddr_require(phy, config);
 }
 
 function iface_set_config(name, config)
@@ -1440,6 +1536,8 @@ function iface_set_config(name, config)
 	let phydev = phy_open(phy, config.radio_idx);
 	if (!phydev && length(config.bss)) {
 		hostapd.printf(`Failed to open phy ${phy}`);
+		if (config.station_phy)
+			die(`Could not open channel-following AP phy ${phy}\n`);
 		return false;
 	}
 
