@@ -1,3 +1,15 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netfilter: flowtable: retain the route device for neighbour output
+
+A resolved lower output device is valid only when ingress and encapsulation
+resolution also succeeds. Replacing only the output device leaves neighbour
+resolution on a different device from the cached route. Keep the native
+route device unless the complete path can be installed.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 --- a/net/netfilter/nf_flow_table_path.c
 +++ b/net/netfilter/nf_flow_table_path.c
 @@ -203,14 +203,16 @@

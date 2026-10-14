@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] net: dsa: publish the requested ageing time before notification
 
 The switch-wide ageing calculation includes every port's cached value.
@@ -9,7 +10,10 @@ win the minimum. After STP changes a four-port bridge from 300 seconds to
 Publish the proposed value before the synchronous notifier and restore
 the old value on error. Keep the switch-wide minimum across ports intact.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 ---
+
 --- a/net/dsa/port.c
 +++ b/net/dsa/port.c
 @@ -877,15 +877,20 @@

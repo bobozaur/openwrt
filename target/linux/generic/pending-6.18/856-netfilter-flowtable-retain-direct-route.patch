@@ -1,4 +1,4 @@
-From: OpenWrt contributors
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] netfilter: flowtable: keep direct output tied to its route
 
 A direct flow keeps its L2 output and MTU after dropping the route reference.
@@ -10,6 +10,10 @@ teardown and slow path then select current routing policy before any rewrite.
 
 Keep the validated direct output in the existing per-hook context, under the
 same RCU lifetime, rather than looking it up again before transmission.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h

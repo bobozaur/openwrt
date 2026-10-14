@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] perf annotate: align non-Slang stubs with the current API
 
 The real annotation functions and their callers no longer take al_addr.
@@ -5,7 +6,10 @@ Their !HAVE_SLANG_SUPPORT stubs still declare that obsolete last argument,
 which prevents perf from building with NO_SLANG=1. Remove it from both
 stubs so the optional TUI configuration does not change the function API.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 ---
+
 --- a/tools/perf/util/hist.h
 +++ b/tools/perf/util/hist.h
 @@ -748,16 +748,14 @@

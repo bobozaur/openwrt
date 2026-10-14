@@ -1,4 +1,4 @@
-From: OpenWrt contributors
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] netfilter: flowtable: honor current bridge port state
 
 A direct flow transmits through its cached lower device, bypassing the bridge
@@ -11,6 +11,10 @@ Keep a cached bridge output tied to its current master. Invalid paths use the
 existing flow teardown and ordinary stack, retaining the route and MTU checks.
 Allow the existing state accessor under RCU as well as RTNL, matching the
 native bridge-port flag accessor's lifetime rules.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/include/linux/if_bridge.h
 +++ b/include/linux/if_bridge.h

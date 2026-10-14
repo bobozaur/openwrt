@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] bridge: retain host ownership for multicast source entries
 
 Include the reporting host in source-group identity on multicast-to-unicast
@@ -5,6 +6,10 @@ ports and filter before conversion. Keep user MDB entries port-wide, merge
 their forwarding with learned hosts, and discard dynamic ownership when
 the conversion mode changes. VLAN identity and protocol timers stay in
 the bridge.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/net/bridge/br_forward.c
 +++ b/net/bridge/br_forward.c

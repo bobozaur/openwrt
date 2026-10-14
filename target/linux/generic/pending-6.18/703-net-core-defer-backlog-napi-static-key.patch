@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] net: defer backlog NAPI static key activation until network init
 
 Some architectures, including MIPS, call parse_early_param() from
@@ -12,7 +13,10 @@ Enable the key in net_dev_init(), after jump-label initialization and before
 backlog-thread selection. PREEMPT_RT retains its unconditional threaded
 backlog path.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 ---
+
 --- a/net/core/dev.c
 +++ b/net/core/dev.c
 @@ -206,10 +206,11 @@

@@ -1,9 +1,14 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] serial: lantiq: retain console TX after tty shutdown
 
 The kernel console continues using polling output after the last tty closes.
 Keep its baud generator and TX FIFO running while retiring tty IRQ/RX ownership.
 Balance the tty CCF clock reference independently of the console setup reference,
 including startup failures. Legacy direct gates stay on for an active console.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/drivers/tty/serial/lantiq.c
 +++ b/drivers/tty/serial/lantiq.c
