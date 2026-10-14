@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wave600-firmware
 PKG_VERSION:=06.00.08.00.87
-PKG_RELEASE:=10
+PKG_RELEASE:=11
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar
 PKG_SOURCE_URL:=file://$(DL_DIR)
 PKG_SOURCE_PROTO:=wave-firmware-local

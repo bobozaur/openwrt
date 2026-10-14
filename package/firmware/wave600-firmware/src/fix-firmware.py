@@ -28,10 +28,11 @@ template owner and retain its native confirmation. The driver owns exclusive
 monitor admission and terminal stream retirement; this change does not add
 logger bookkeeping or a hot stream-removal contract. See add-stream.S/.ld.
 
-Only the exact original, PMF-only, BSS-color, stream, FIXED, TXOP or complete corrected
-result is accepted. Every affected span and the complete output hash are
-verified before writing. Repeated builds accept the exact final result without
-rewriting it. The original archive and device calibration are not modified.
+Only the exact original or complete corrected result is accepted. Historical
+intermediate development images are not package inputs. Every affected span
+and the complete output hash are verified before writing. Repeated builds
+accept the exact final result without rewriting it. The original archive and
+device calibration are not modified.
 
 FIXED DATA adds a paired eight-byte policy at0x047c, persistent native
 completion, calibrated final DATA writers and last-ACK replay. The host must
@@ -55,11 +56,6 @@ from pathlib import Path
 
 
 SOURCE_SHA256 = "1e4054dc053101048f85dc8d285f7bddb9ec4a847f6195ec319ed9521c215b7c"
-PMF_SHA256 = "951e97d5fad7e3011201b1fcb661ae5f532f127fcc42eb19d74ddf08a204ec81"
-COLOR_SHA256 = "fa78b85b1abede966e37f05e4316f27ba1caff86b03c064ea35d7eae1115f084"
-STREAM_SHA256 = "242c98ad9e230d48b4256ea5dcdb61bc4c1cf60cea65f71c4e3021702c3b4043"
-FIXED_SHA256 = "4d2bdefaf0ae1656d0f8d7638551c25e9bb6e0678ae955c7028eb746791bd41b"
-TXOP_SHA256 = "8484203266c86b4e681d9ca14f910128576704bb210b7ffa89ecb5a5a29ad092"
 RESULT_SHA256 = "b9f487cf7ccc989b1f08399500ab18ed2bd9cb93f334a549b5c4f4b97f57c699"
 PMF_OFFSET = 0x5DEB6
 PMF_ORIGINAL = bytes.fromhex("4223010a3079384a20e27e08effd2043")
@@ -512,55 +508,29 @@ def main():
     path = parser.parse_args().firmware
     data = path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
-    if digest not in (SOURCE_SHA256, PMF_SHA256, COLOR_SHA256, STREAM_SHA256, FIXED_SHA256, TXOP_SHA256, RESULT_SHA256):
+    if digest not in (SOURCE_SHA256, RESULT_SHA256):
         raise SystemExit("Unsupported WAVE600 firmware SHA256: " + digest)
 
-    end = PMF_OFFSET + len(PMF_ORIGINAL)
-    expected = PMF_ORIGINAL if digest == SOURCE_SHA256 else PMF_REPLACEMENT
-    if data[PMF_OFFSET:end] != expected or len(PMF_REPLACEMENT) != len(PMF_ORIGINAL):
-        raise SystemExit("WAVE600 protected RX instruction mismatch")
-    if digest == SOURCE_SHA256:
-        data = data[:PMF_OFFSET] + PMF_REPLACEMENT + data[end:]
-        if hashlib.sha256(data).hexdigest() != PMF_SHA256:
-            raise SystemExit("WAVE600 protected RX result SHA256 mismatch")
-
+    already_corrected = digest == RESULT_SHA256
+    patches = (
+        (PMF_OFFSET, PMF_ORIGINAL, PMF_REPLACEMENT),
+        *COLOR_PATCHES,
+        (STREAM_OFFSET, STREAM_ORIGINAL, STREAM_REPLACEMENT),
+        *FIXED_PATCHES,
+        *TXOP_READ_PATCHES,
+        *RTS_PATCHES,
+    )
     corrected = bytearray(data)
-    for offset, original, replacement in COLOR_PATCHES:
+    for offset, original, replacement in patches:
         end = offset + len(original)
-        expected = replacement if digest in (COLOR_SHA256, STREAM_SHA256, FIXED_SHA256, TXOP_SHA256, RESULT_SHA256) else original
+        expected = replacement if already_corrected else original
         if data[offset:end] != expected or len(replacement) != len(original):
-            raise SystemExit(f"WAVE600 BSS color instruction mismatch at {offset:#x}")
-        corrected[offset:end] = replacement
-
-    end = STREAM_OFFSET + len(STREAM_ORIGINAL)
-    expected = STREAM_REPLACEMENT if digest in (STREAM_SHA256, FIXED_SHA256, TXOP_SHA256, RESULT_SHA256) else STREAM_ORIGINAL
-    if data[STREAM_OFFSET:end] != expected or len(STREAM_REPLACEMENT) != len(STREAM_ORIGINAL):
-        raise SystemExit("WAVE600 stream-template instruction mismatch")
-    corrected[STREAM_OFFSET:end] = STREAM_REPLACEMENT
-    for offset, original, replacement in FIXED_PATCHES:
-        end = offset + len(original)
-        expected = replacement if digest in (FIXED_SHA256, TXOP_SHA256, RESULT_SHA256) else original
-        if data[offset:end] != expected or len(replacement) != len(original):
-            raise SystemExit(f"WAVE600 fixed DATA instruction mismatch at {offset:#x}")
-        corrected[offset:end] = replacement
-
-    for offset, original, replacement in TXOP_READ_PATCHES:
-        end = offset + len(original)
-        expected = replacement if digest in (TXOP_SHA256, RESULT_SHA256) else original
-        if data[offset:end] != expected or len(replacement) != len(original):
-            raise SystemExit(f"WAVE600 TXOP GET instruction mismatch at {offset:#x}")
-        corrected[offset:end] = replacement
-
-    for offset, original, replacement in RTS_PATCHES:
-        end = offset + len(original)
-        expected = replacement if digest == RESULT_SHA256 else original
-        if data[offset:end] != expected or len(replacement) != len(original):
-            raise SystemExit(f"WAVE600 RTS extension mismatch at {offset:#x}")
+            raise SystemExit(f"WAVE600 instruction mismatch at {offset:#x}")
         corrected[offset:end] = replacement
 
     if hashlib.sha256(corrected).hexdigest() != RESULT_SHA256:
         raise SystemExit("WAVE600 corrected firmware SHA256 mismatch")
-    if digest != RESULT_SHA256:
+    if not already_corrected:
         path.write_bytes(corrected)
 
 
