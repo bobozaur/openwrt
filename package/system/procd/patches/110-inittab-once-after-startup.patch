@@ -1,8 +1,12 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] support inittab once actions after successful startup
 
 Run non-respawning actions only after the entire sysinit queue completes. This
 provides a normal init boundary for board boot-success hooks without an extra
 daemon or assumptions about rc.d numbering.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- a/inittab.c
 +++ b/inittab.c
@@ -28,9 +32,7 @@ daemon or assumptions about rc.d numbering.
  	}, {
 --- a/state.c
 +++ b/state.c
-@@ -168,6 +168,7 @@
- 	case STATE_RUNNING:
- 		boot_timeout_complete();
+@@ -168,4 +168,5 @@
  		LOG("- init complete -\n");
 +		procd_inittab_run("once");
  		procd_inittab_run("respawnlate");

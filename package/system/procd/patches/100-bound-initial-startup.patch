@@ -1,9 +1,13 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] add an opt-in absolute boot deadline to PID 1
 
 boot_timeout=N bounds initd/preinit and procd startup independently of rcS and
 the event loop. Preserve the original CLOCK_BOOTTIME deadline across exec and
 cancel it only on entry to STATE_RUNNING. Normal watchdog feeding and upgraded
 are unchanged; devices without the parameter retain existing behavior.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- /dev/null
 +++ b/boot_timeout.h
