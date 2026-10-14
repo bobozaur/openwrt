@@ -1,4 +1,5 @@
-Subject: [PATCH] Freeze sessions from the event-loop reload boundary
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] main: freeze sessions after the event loop exits
 
 The raw HUP/USR1 signal handler serialized sessions using allocator-backed
 global RPC state. A reload could interrupt a request using that same session
@@ -7,6 +8,10 @@ tree or blob buffer, causing reentrancy, corruption or a stuck allocator.
 Use native uloop signal watchers to request loop exit, then freeze sessions
 after the active callback has completed. HUP still executes the same daemon
 and thaws its native sessions; USR1 retains its existing freeze-and-exit policy.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/main.c
 +++ b/main.c
