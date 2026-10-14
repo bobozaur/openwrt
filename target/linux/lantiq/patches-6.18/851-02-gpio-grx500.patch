@@ -1,24 +1,13 @@
---- a/drivers/mtd/nand/raw/Makefile
-+++ b/drivers/mtd/nand/raw/Makefile
-@@ -71,3 +71,5 @@
- nand-objs += nand_sandisk.o
- nand-objs += nand_samsung.o
- nand-objs += nand_toshiba.o
-+
-+obj-$(CONFIG_MTD_NAND_GRX500) += grx500-nand.o
---- a/drivers/mtd/nand/raw/Kconfig
-+++ b/drivers/mtd/nand/raw/Kconfig
-@@ -538,3 +538,10 @@
- 	  parameter "inftl_bbt_write=1".
- 
- endif # MTD_RAW_NAND
-+
-+config MTD_NAND_GRX500
-+	bool "Lantiq GRX500 EBU NAND controller"
-+	depends on MTD_RAW_NAND && MACH_GRX500 && OF
-+	select MTD_NAND_ECC_SW_BCH
-+	help
-+	  GRX500 EBU NAND with the factory BCH4/512 OOB layout.
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] gpio: add GRX500 controller build support
+
+Register the GRX500 GPIO controller, including its atomic data/direction
+operations and shared reset-controller pad routing.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 --- a/drivers/gpio/Makefile
 +++ b/drivers/gpio/Makefile
 @@ -217,3 +217,5 @@

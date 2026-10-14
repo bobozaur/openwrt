@@ -1,0 +1,30 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] net: dsa: add GRX500 switch build support
+
+Register the GSWIP3 DSA driver with its Ethernet parent dependency and
+PMAC tagger selection.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/drivers/net/dsa/Makefile
++++ b/drivers/net/dsa/Makefile
+@@ -24,3 +24,6 @@
+ obj-y				+= realtek/
+ obj-y				+= sja1105/
+ obj-y				+= xrs700x/
++
++obj-$(CONFIG_NET_DSA_GRX500) += grx500_switch.o
++grx500_switch-objs := lantiq_grx500.o
+--- a/drivers/net/dsa/Kconfig
++++ b/drivers/net/dsa/Kconfig
+@@ -155,3 +155,8 @@
+ 	  and VSC7398 SparX integrated ethernet switches, connected over
+ 	  a CPU-attached address bus and work in memory-mapped I/O mode.
+ endmenu
++
++config NET_DSA_GRX500
++	tristate "Lantiq GRX500 GSWIP3 LAN switch"
++	depends on NET_DSA && NET_GRX500
++	select NET_DSA_TAG_GRX500
