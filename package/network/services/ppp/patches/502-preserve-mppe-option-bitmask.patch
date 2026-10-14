@@ -1,20 +1,21 @@
-Subject: [PATCH] pppd: preserve the MPPE strength bitmask when requiring encryption
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] pppd: preserve MPPE strength masks in option parsing
 
-The require-mppe and +mppe options supply MPPE_OPT_40 | MPPE_OPT_128 through
-o_bool. Since bool is now the C Boolean type, process_option() normalizes
-that value from 3 to 1, enabling only 40-bit MPPE. A subsequent nomppe-40
-then clears the wanted mask entirely while its scratch allow mask remains
-40-bit, resulting in an empty local CCP request and rejection of a peer's
-128-bit offer.
+The require-mppe and +mppe options pass both strength bits through o_bool.
+That parser now writes the C Boolean type and reduces the mask from 3 to 1,
+leaving only 40-bit MPPE. Clearing 40-bit support then removes the wanted
+mask instead of retaining 128-bit encryption.
 
-Set the unsigned-char mask through a no-argument option callback instead.
-Keep the Boolean option machinery unchanged: other options use its true
-Boolean semantics. The existing strength-specific OR/clear operations
-already access their secondary masks as unsigned char.
+Use a no-argument callback to set the unsigned-char strength mask directly.
+Retain option priority/alias handling, strength-specific mask operations and
+the Boolean parser used by other options.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- a/pppd/ccp.c
 +++ b/pppd/ccp.c
-@@ -64,6 +64,9 @@ static int setbsdcomp (char **);
+@@ -62,6 +62,9 @@ static int setbsdcomp (char **);
  static int setdeflate (char **);
  static char bsd_value[8];
  static char deflate_value[8];
@@ -24,7 +25,7 @@ already access their secondary masks as unsigned char.
  
  /*
   * Option variables.
-@@ -111,12 +114,12 @@ static struct option ccp_option_list[] = {
+@@ -111,12 +114,12 @@ static struct option ccp_option_list[] =
  
  #ifdef PPP_WITH_MPPE
      /* MPPE options are symmetrical ... we only set wantoptions here */
@@ -41,7 +42,7 @@ already access their secondary masks as unsigned char.
      { "nomppe", o_bool, &ccp_wantoptions[0].mppe,
        "don't allow MPPE encryption", OPT_PRIO },
      { "-mppe", o_bool, &ccp_wantoptions[0].mppe,
-@@ -258,6 +261,15 @@ static int all_rejected[NUM_PPP];
+@@ -258,6 +261,15 @@ static int all_rejected[NUM_PPP];	/* we
  /*
   * Option parsing.
   */
