@@ -1,4 +1,0 @@
-# Companion feed revisions for the AX50 port. Copy to feeds.conf before setup.
-src-git packages https://github.com/bobozaur/packages.git^328a189cc1b68e9796bd253957b6670f70057abf
-src-git luci https://github.com/bobozaur/luci.git^6386542d015439952619b41e4b6743dddde154b9
-src-git routing https://git.openwrt.org/feed/routing.git^4b9891b9136259f93294a424507ed24c5e8c1cbd
