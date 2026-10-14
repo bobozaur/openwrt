@@ -1,50 +1,20 @@
-Subject: [PATCH] interface: withdraw policy rules using their installed identity
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: withdraw policy rules using their installed identity
 
-Device settings and interface route-table selections can change before the
-old IP state is disabled. The current IPv6 setting, ifindex, device name
-or lookup table then no longer describes the rule to delete. Retain that
-identity in the existing interface policy owner and use it for withdrawal,
-including when the L3 device has already disappeared. Keep per-interface
-references and config/protocol coalescing; do not flush other owners' rules.
+Device settings and interface route tables can change before old IP state
+is disabled. The current IPv6 setting, ifindex, device name or lookup table
+then no longer identifies the rule to delete.
 
---- a/interface.h
-+++ b/interface.h
-@@ -98,6 +98,16 @@
- 	char name[];
- };
- 
-+/* Rule withdrawal must use the identity installed before device/config changes. */
-+struct interface_ip_policy {
-+	bool enabled;
-+	bool ipv6;
-+	unsigned int ifindex;
-+	unsigned int ip4table;
-+	unsigned int ip6table;
-+	char ifname[IFNAMSIZ];
-+};
-+
- /*
-  * interface configuration
-  */
-@@ -122,7 +132,6 @@
- 	bool link_state;
- 	bool force_link;
- 	bool dynamic;
--	bool policy_rules_set;
- 	bool link_up_event;
- 	bool renew;
- 	bool remove_pending;
-@@ -169,6 +178,7 @@
- 	int dns_metric;
- 	unsigned int ip4table;
- 	unsigned int ip6table;
-+	struct interface_ip_policy policy_rules;
- 
- 	/* IPv6 assignment parameters */
- 	enum interface_id_selection_type assignment_iface_id_selection;
+Retain the installed identity in the interface policy owner, including for
+withdrawal after the L3 device disappears. Preserve per-interface ownership
+and config/protocol coalescing instead of flushing other owners' rules.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
 --- a/interface-ip.c
 +++ b/interface-ip.c
-@@ -186,12 +186,12 @@
+@@ -186,12 +186,12 @@ static int set_ip_source_policy(bool add
  	return (add) ? system_add_iprule(&rule) : system_del_iprule(&rule);
  }
  
@@ -60,12 +30,10 @@ references and config/protocol coalescing; do not flush other owners' rules.
  		.in_dev = "lo"
  	};
  
-@@ -201,6 +201,41 @@
- 	rule.flags |= (v6) ? IPRULE_INET6 : IPRULE_INET4;
- 
+@@ -203,6 +203,41 @@ static int set_ip_lo_policy(bool add, bo
  	return (add) ? system_add_iprule(&rule) : system_del_iprule(&rule);
-+}
-+
+ }
+ 
 +static void interface_ip_set_policy_rules(struct interface *iface, bool enabled)
 +{
 +	struct interface_ip_policy *policy = &iface->policy_rules;
@@ -99,10 +67,12 @@ references and config/protocol coalescing; do not flush other owners' rules.
 +	}
 +	set_ip_lo_policy(enabled, false, policy);
 +	policy->enabled = enabled;
- }
- 
++}
++
  static bool
-@@ -1814,8 +1849,11 @@
+ __find_ip_addr_target(struct interface_ip_settings *ip, union if_addr *a, bool v6)
+ {
+@@ -1814,8 +1849,11 @@ void interface_ip_set_enabled(struct int
  	ip->enabled = enabled;
  	iface = ip->iface;
  	dev = iface->l3_dev.dev;
@@ -115,7 +85,7 @@ references and config/protocol coalescing; do not flush other owners' rules.
  
  	vlist_for_each_element(&ip->addr, addr, node) {
  		bool v6 = ((addr->flags & DEVADDR_FAMILY) == DEVADDR_INET6) ? true : false;
-@@ -1904,17 +1942,7 @@
+@@ -1904,17 +1942,7 @@ void interface_ip_set_enabled(struct int
  			if (!strcmp(a->name, ip->iface->name))
  				interface_set_prefix_address(a, c, ip->iface, enabled);
  
@@ -134,3 +104,38 @@ references and config/protocol coalescing; do not flush other owners' rules.
  }
  
  void
+--- a/interface.h
++++ b/interface.h
+@@ -98,6 +98,16 @@ struct interface_assignment_class {
+ 	char name[];
+ };
+ 
++/* Rule withdrawal must use the identity installed before device/config changes. */
++struct interface_ip_policy {
++	bool enabled;
++	bool ipv6;
++	unsigned int ifindex;
++	unsigned int ip4table;
++	unsigned int ip6table;
++	char ifname[IFNAMSIZ];
++};
++
+ /*
+  * interface configuration
+  */
+@@ -122,7 +132,6 @@ struct interface {
+ 	bool link_state;
+ 	bool force_link;
+ 	bool dynamic;
+-	bool policy_rules_set;
+ 	bool link_up_event;
+ 	bool renew;
+ 	bool remove_pending;
+@@ -169,6 +178,7 @@ struct interface {
+ 	int dns_metric;
+ 	unsigned int ip4table;
+ 	unsigned int ip6table;
++	struct interface_ip_policy policy_rules;
+ 
+ 	/* IPv6 assignment parameters */
+ 	enum interface_id_selection_type assignment_iface_id_selection;

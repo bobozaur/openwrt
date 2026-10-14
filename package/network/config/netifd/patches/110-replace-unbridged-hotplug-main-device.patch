@@ -1,15 +1,21 @@
-Subject: [PATCH] Replace an unbridged hotplug main device before attaching its successor
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: refresh the main device during hotplug replacement
 
-A wireless interface can move between radios before the previous device is
-removed. Clearing its hotplug main device invalidates the cached master.
-Refresh that pointer before testing for bridge operations, otherwise the old
-non-bridge device rejects the replacement and leaves the interface unavailable.
-Configured masters and removal of a different device retain their existing
-ownership checks.
+A wireless interface can move between radios before its previous device
+is removed. Releasing the hotplug main device invalidates the cached master
+pointer. Refresh it before testing bridge operations so the retired
+non-bridge device cannot reject its successor.
+
+Preserve configured masters and checks against removing a different device.
+This device-owner correction does not depend on wireless bridge-forwarding
+policy.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- a/interface.c
 +++ b/interface.c
-@@ -1285,8 +1285,10 @@
+@@ -1285,8 +1285,10 @@ interface_add_link(struct interface *ifa
  		return 0;
  	}
  

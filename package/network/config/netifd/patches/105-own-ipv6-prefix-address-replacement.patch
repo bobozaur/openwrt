@@ -1,101 +1,26 @@
-Subject: [PATCH] netifd: reconcile implicit VLAN and IPv6 prefix address ownership
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: retain ownership when replacing IPv6 prefix addresses
 
-Reclaim removed explicit VLAN settings before interface configuration claims the
-implicit device. Respect canonical intermediate VLAN owners and leave custom
-names outside this handover.
+Linux address replacement does not change an existing IPv6 prefix length.
+Query the exact assigned address, replace a differing mask and retain its
+previous attributes and remaining lifetimes for rollback on failure.
+Leave other enabled owners and unrelated deprecated addresses untouched.
 
-IPv6 address replacement preserves the old kernel prefix length. Query the exact
-assigned address, replace a differing mask and retain previous kernel attributes
-for failure recovery. Other enabled address owners block this mutation; unrelated
-deprecated addresses retain their normal lifetime.
+Ownership checks walk published prefix assignments during address updates.
+Move renewal assignments with list_splice_init() and publish the new prefix
+before callbacks run, so the old head cannot retain a link into the new
+list and both renewal and expiry traversal remain finite.
 
---- a/config.c
-+++ b/config.c
-@@ -835,6 +835,7 @@
- 	config_init_vlans();
- 	config_init_devices(false);
- 	netifd_ucode_config_load(false);
-+	device_reset_old_vlans();
- 	config_init_interfaces();
- 	config_free_vlans();
- 	config_init_ip();
---- a/device.c
-+++ b/device.c
-@@ -1436,6 +1436,61 @@
- 
- 	avl_for_each_element(&devices, dev, avl)
- 		dev->current_config = false;
-+}
-+
-+void
-+device_reset_old_vlans(void)
-+{
-+	struct device *dev, *tmp, *ndev;
-+	const char *suffix;
-+	struct blob_buf empty = {};
-+
-+	blob_buf_init(&empty, 0);
-+	if (!empty.head)
-+		return;
-+
-+	/* Reclaim removed explicit VLAN settings before interfaces claim their
-+	 * devices, so legacy interface attributes apply to the implicit owner.
-+	 * Other virtual types may still be declared by legacy interface sections.
-+	 */
-+	avl_for_each_element_safe(&devices, dev, avl, tmp) {
-+		if (dev->current_config || dev->default_config || dev->external)
-+			continue;
-+
-+		if (!strcmp(dev->type->name, "VLAN")) {
-+			/* An implicit VLAN configured by a device section without a
-+			 * type already has the correct parent and VLAN identity.
-+			 */
-+			if (device_apply_config(dev, dev->type, empty.head) == DEV_CONFIG_RECREATE)
-+				continue;
-+			dev->iface_config = false;
-+			dev->config_iface = NULL;
-+			dev->default_config = true;
-+			continue;
-+		}
-+
-+		if (strcmp(dev->type->name, "8021q"))
-+			continue;
-+		suffix = strrchr(dev->ifname, '.');
-+		if (!suffix || !suffix[1] || strspn(suffix + 1, "0123456789") != strlen(suffix + 1))
-+			continue;
-+
-+		device_delete(dev);
-+		ndev = get_vlan_device_chain(dev->ifname, 1);
-+		if (ndev && ndev != dev && ndev->default_config &&
-+		    !strcmp(ndev->type->name, "VLAN") &&
-+		    !strcmp(ndev->ifname, dev->ifname)) {
-+			device_replace(ndev, dev);
-+			continue;
-+		}
-+
-+		/* An alias may resolve to an existing, differently named owner.
-+		 * Never replace or free it on failure to create this exact device.
-+		 */
-+		dev->avl.key = dev->ifname;
-+		avl_insert(&devices, &dev->avl);
-+	}
-+	blob_buf_free(&empty);
- }
- 
- void
---- a/device.h
-+++ b/device.h
-@@ -420,6 +420,7 @@
- 		    struct blob_attr *config);
- 
- void device_reset_config(void);
-+void device_reset_old_vlans(void);
- void device_reset_old(void);
- 
- int device_init_virtual(struct device *dev, struct device_type *type, const char *name);
+Keep the ownership check and assignment-list publication in one change;
+introducing the check without that list lifetime would expose an invalid
+intermediate state.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
 --- a/interface-ip.c
 +++ b/interface-ip.c
-@@ -1038,6 +1038,41 @@
+@@ -1038,6 +1038,41 @@ generate_ifaceid(struct interface *iface
  	return ret;
  }
  
@@ -137,7 +62,7 @@ deprecated addresses retain their normal lifetime.
  static void
  interface_set_prefix_address(struct device_prefix_assignment *assignment,
  		const struct device_prefix *prefix, struct interface *iface, bool add)
-@@ -1094,10 +1129,12 @@
+@@ -1094,10 +1129,12 @@ interface_set_prefix_address(struct devi
  		interface_set_route_info(iface, &route);
  
  		system_del_route(l3_downlink, &route);
@@ -154,7 +79,7 @@ deprecated addresses retain their normal lifetime.
  
  		assignment->addr = in6addr_any;
  		assignment->enabled = false;
-@@ -1112,8 +1149,11 @@
+@@ -1112,8 +1149,11 @@ interface_set_prefix_address(struct devi
  			route.addr = addr.addr;
  		}
  
@@ -167,9 +92,40 @@ deprecated addresses retain their normal lifetime.
  			return;
  
  		if (!assignment->enabled) {
+@@ -1408,10 +1448,18 @@ interface_update_prefix(struct vlist_tre
+ 	struct interface *iface;
+ 	bool new_valid = node_new && !(prefix_new->valid_until && prefix_new->valid_until - 1 <= system_get_rtime());
+ 
++	if (node_old && node_new)
++		list_splice_init(&prefix_old->assignments, &prefix_new->assignments);
++
++	/* Ownership checks walk the published prefixes during address updates.
++	 * Publish the new list before callbacks, and leave the old list empty:
++	 * plain list_splice() leaves its head pointing into the new head's ring.
++	 */
++	if (node_new && (!prefix_new->iface || !prefix_new->iface->proto_ip.no_delegation))
++		list_add(&prefix_new->head, &prefixes);
++
+ 	if (node_old && node_new) {
+ 		/* Move assignments and refresh addresses to update valid times */
+-		list_splice(&prefix_old->assignments, &prefix_new->assignments);
+-
+ 		list_for_each_entry(c, &prefix_new->assignments, head)
+ 			if ((iface = vlist_find(&interfaces, c->name, iface, node)))
+ 				interface_set_prefix_address(c, prefix_new, iface, new_valid);
+@@ -1437,9 +1485,6 @@ interface_update_prefix(struct vlist_tre
+ 		free(prefix_old);
+ 	}
+ 
+-	if (node_new && (!prefix_new->iface || !prefix_new->iface->proto_ip.no_delegation))
+-		list_add(&prefix_new->head, &prefixes);
+-
+ }
+ 
+ struct device_prefix*
 --- a/system-dummy.c
 +++ b/system-dummy.c
-@@ -412,3 +412,8 @@
+@@ -412,3 +412,8 @@ void system_tcp_l3mdev(bool enable)
  void system_udp_l3mdev(bool enable)
  {
  }
@@ -180,7 +136,7 @@ deprecated addresses retain their normal lifetime.
 +}
 --- a/system-linux.c
 +++ b/system-linux.c
-@@ -3813,6 +3813,159 @@
+@@ -3816,6 +3816,159 @@ int system_del_address(struct device *de
  	return system_addr(dev, addr, RTM_DELADDR);
  }
  
@@ -342,7 +298,7 @@ deprecated addresses retain their normal lifetime.
  	int alen = ((neighbor->flags & DEVADDR_FAMILY) == DEVADDR_INET4) ? 4 : 16;
 --- a/system.h
 +++ b/system.h
-@@ -291,6 +291,7 @@
+@@ -291,6 +291,7 @@ void system_if_apply_settings_after_up(s
  
  int system_add_address(struct device *dev, struct device_addr *addr);
  int system_del_address(struct device *dev, struct device_addr *addr);
@@ -350,38 +306,3 @@ deprecated addresses retain their normal lifetime.
  
  int system_add_route(struct device *dev, struct device_route *route);
  int system_del_route(struct device *dev, struct device_route *route);
---- a/vlan.c
-+++ b/vlan.c
-@@ -205,6 +205,7 @@
- 	};
- 	struct vlan_device *vldev;
- 	struct device_user *dep;
-+	struct device *existing;
- 	char name[IFNAMSIZ];
- 	char *err = NULL;
- 	int id, *alias_id;
-@@ -218,6 +219,14 @@
- 		id = *alias_id;
- 	}
- 
-+	if (snprintf(name, sizeof(name), "%s.%d", dev->ifname, id) >= (int)sizeof(name))
-+		return NULL;
-+
-+	/* Explicitly configured intermediate VLANs own their canonical name. */
-+	existing = device_find(name);
-+	if (existing)
-+		return existing;
-+
- 	/* look for an existing interface before creating a new one */
- 	list_for_each_entry(dep, &dev->users.list, list.list) {
- 		if (dep->cb != vlan_dev_cb)
-@@ -231,9 +240,6 @@
- 	}
- 
- 	if (!create)
--		return NULL;
--
--	if (snprintf(name, sizeof(name), "%s.%d", dev->ifname, id) >= (int)sizeof(name))
- 		return NULL;
- 
- 	D(DEVICE, "Create vlan device '%s'", name);
