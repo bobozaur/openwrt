@@ -141,9 +141,9 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +}
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -22,7 +22,7 @@
- 	system.c sysupgrade.c service/service.c service/instance.c
- 	service/validate.c service/trigger.c service/watch.c utils/utils.c)
+@@ -23,7 +23,7 @@
+ 	service/validate.c service/trigger.c service/watch.c service/vrf.c
+ 	utils/utils.c)
  IF(NOT DISABLE_INIT)
 -  SET(SOURCES ${SOURCES} watchdog.c plug/coldplug.c plug/hotplug.c)
 +  SET(SOURCES ${SOURCES} boot_timeout.c watchdog.c plug/coldplug.c plug/hotplug.c)
