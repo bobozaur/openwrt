@@ -10,7 +10,6 @@ SECTIONS
   *(.extension_boot)
   *(.extension.text .extension.text.*)
   *(.rts.text .rts.text.*)
-  *(.twt.text .twt.text.*)
   *(.extension.rodata .extension.rodata.*)
   . = ALIGN(4);
   __extension_code_end = .;
@@ -19,7 +18,6 @@ SECTIONS
   __extension_state_start = .;
   *(.extension.state .extension.state.*)
   *(.rts.state .rts.state.*)
-  *(.twt.state .twt.state.*)
   . = ALIGN(4);
   __extension_state_end = .;
  }
