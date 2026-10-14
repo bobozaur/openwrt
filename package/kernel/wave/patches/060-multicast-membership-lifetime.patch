@@ -1,137 +1,25 @@
-Subject: wave: own standalone VLAN/source policy and association-time backhaul admission
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wave: own multicast policy and membership lifetimes
 
-Use the Linux bridge as the sole bridged forwarding/querier owner. Standalone
-APs retain exact station/reporting-host VLAN and IGMPv3/MLDv2 source state in a
-bounded host engine, with query and expiry work on the existing radio master.
-Admit filtered ordinary data through exclusive, immutable firmware recipient
-classes only after acknowledged membership; preserve shared command, membership,
-quarantine and DAT_CFM pins. Pool or partial-admission failure remains closed.
-Observe bridge upper changes without blocking the master on RTNL, and restart
-standalone discovery after detach. Preserve explicit aggregate-air mode.
+Parse bounded reports and serialize VLAN/source-filter membership generations.
+Keep host state, pending messages, applied firmware groups and descriptor pins
+alive until their actual owners retire; quarantine uncertain transport.
 
-Consume the configured Association Response Multi-AP role through the existing
-nl80211 IE_ASSOC_RESP handoff before STA_ADD, separately from bounded peer
-metadata. The companion hostapd AP-template producer supplies that role; peer
-IEs alone cannot authorize four-address mode. No firmware command or child GTK
-context is invented.
+This is the final native integration against the pinned vendor source.
+Firmware-dependent policy remains downstream with exact image admission.
 
---- a/wireless/driver/Makefile.am
-+++ b/wireless/driver/Makefile.am
-@@ -54,6 +54,8 @@
-               linux/l2nat.c linux/l2nat.h \
-               linux/log_osdep.c linux/log_osdep.h \
-               linux/mcast.c linux/mcast.h \
-+              linux/wave_mc_policy.c linux/wave_mc_policy.h \
-+              linux/wave_mc_native.c linux/wave_mc_native.h \
-               linux/eth_parser.c linux/eth_parser.h \
-               linux/memdefs.h \
-               linux/mib_osdep.c linux/mib_osdep.h \
---- a/wireless/driver/linux/Kbuild
-+++ b/wireless/driver/linux/Kbuild
-@@ -29,7 +29,7 @@
- obj-m := mtlk.o
- 
- mtlk-objs := wave_pmf.o core.o core_ab.o wave_radio_ab.o core_pdb.o\
--   eth_parser.o mcast.o utils.o osal_defs.o l2nat.o \
-+   eth_parser.o mcast.o wave_mc_native.o wave_mc_policy.o utils.o osal_defs.o l2nat.o \
-    mtlk_serializer_osdep.o mtlk_fast_mem.o \
-    mib_osdep.o \
-    progmodel.o log_osdep.o mtlk_df_linux.o mtlk_dfg_linux.o \
---- a/wireless/driver/linux/core.c
-+++ b/wireless/driver/linux/core.c
-@@ -1876,10 +1876,12 @@
- 
-     /* Four-address copies select a peer SID (MCF=0), so firmware multicast
-      * membership is irrelevant even for non-link-local IPv4/IPv6 payloads. */
--    if (!wds && (nbuf_flags & MTLK_NBUFF_MULTICAST) &&
-+    if (!wds && ((nbuf_flags & MTLK_NBUFF_MULTICAST) ||
-+                 (nic->mcast.native && (nbuf_flags & MTLK_NBUFF_BROADCAST))) &&
-         ((nbuf_flags & MTLK_NBUFF_FORWARD) ||
-          !wave_df_bridge_mcast_owned(mtlk_df_get_user(mtlk_vap_get_df(nic->vap_handle))))) {
--      mc_index = mtlk_mc_get_grid(nic, data->nbuf, TRUE);
-+      mc_index = data->native_control ? MCAST_GROUP_BROADCAST :
-+        mtlk_mc_get_grid_peer(nic, data->nbuf, TRUE, data->src_sta);
-       if (MCAST_GROUP_UNDEF == mc_index) {
-         ILOG2_V("Drop due to undefined MC index.");
-         nic->pstats.txerr_undef_mc_index++;
-@@ -3465,15 +3467,10 @@
- static int
- _mtlk_core_cfg_init_mcast (mtlk_core_t *core)
- {
--  int res;
-   uint8 mcast_flag;
- 
--  res = mtlk_core_receive_reliable_multicast(core, &mcast_flag);
--
--  if (MTLK_ERR_OK == res)
--    MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_RELIABLE_MCAST, mcast_flag);
--
--  return res;
-+  mtlk_mc_publish_reliable_mode(core, -1);
-+  return mtlk_core_receive_reliable_multicast(core, &mcast_flag);
- }
- 
- int mtlk_core_init_defaults (mtlk_core_t *core)
---- a/wireless/driver/linux/core_config.c
-+++ b/wireless/driver/linux/core_config.c
-@@ -5144,7 +5144,8 @@
- 
-   MTLK_ASSERT(vap_handle != 0);
- 
--  MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_RELIABLE_MCAST, flag);
-+  if (flag != ENABLE_RELIABLE_MULTICAST && flag != DISABLE_RELIABLE_MULTICAST)
-+    return MTLK_ERR_PARAMS;
- 
-   man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
-   if (NULL == man_entry) {
-@@ -5157,16 +5158,22 @@
-   man_entry->payload_size = sizeof(UMI_MULTICAST_MODE);
- 
-   pMcastMode = (UMI_MULTICAST_MODE *)(man_entry->payload);
-+  memset(pMcastMode, 0, sizeof(*pMcastMode));
-+  pMcastMode->getSetOperation = API_SET_OPERATION;
-   pMcastMode->u8Action = flag;
-   pMcastMode->u8VapID = mtlk_vap_get_id(vap_handle);
- 
-   ILOG2_DSD("CID-%04x: Multicast FW request: Set %s mode for VAP %d", mtlk_vap_get_oid(vap_handle), flag ? "Reliable Multicast" : "Regular Multicast", pMcastMode->u8VapID);
- 
-+  /* A submitted but unacknowledged mode is not an aggregate-air fallback. */
-+  mtlk_mc_publish_reliable_mode(core, -1);
-   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
-   if (MTLK_ERR_OK != res) {
-     ELOG_DD("CID-%04x: Set Reliable Multicast failure (%i)", mtlk_vap_get_oid(vap_handle), res);
-     goto FINISH;
-   }
-+
-+  mtlk_mc_publish_reliable_mode(core, flag);
- 
- FINISH:
-   if (man_entry) {
-@@ -5195,12 +5202,20 @@
-   man_entry->payload_size = sizeof(UMI_MULTICAST_MODE);
- 
-   pMcastMode = (UMI_MULTICAST_MODE *)(man_entry->payload);
-+  memset(pMcastMode, 0, sizeof(*pMcastMode));
-   pMcastMode->getSetOperation = API_GET_OPERATION;
-   pMcastMode->u8VapID = mtlk_vap_get_id(vap_handle);
- 
-   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
-   if (MTLK_ERR_OK == res) {
--    *flag = pMcastMode->u8Action;
-+    if (pMcastMode->u8Action != ENABLE_RELIABLE_MULTICAST &&
-+        pMcastMode->u8Action != DISABLE_RELIABLE_MULTICAST) {
-+      res = MTLK_ERR_MAC;
-+      mtlk_mc_publish_reliable_mode(core, -1);
-+    } else {
-+      *flag = pMcastMode->u8Action;
-+      mtlk_mc_publish_reliable_mode(core, *flag);
-+    }
-   }
-   else {
-     ELOG_D("CID-%04x: Receive UM_MAN_SET_MULTICAST_MODE_REQ failed", mtlk_vap_get_oid(vap_handle));
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+---
 --- a/wireless/driver/linux/mcast.c
 +++ b/wireless/driver/linux/mcast.c
-@@ -26,6 +26,7 @@
+@@ -21,9 +21,12 @@
+ #include "mtlkinc.h"
+ 
+ #include <linux/igmp.h>
++#include <linux/if_vlan.h>
++#include <net/ip.h>
  #include <net/addrconf.h>        /* for ipv6_addr_is_multicast() */
  
  #include "mcast.h"
@@ -139,7 +27,16 @@ context is invented.
  #include "mtlk_df_nbuf.h"
  
  #if (defined MTLK_DEBUG_IPERF_PAYLOAD_RX) || (defined MTLK_DEBUG_IPERF_PAYLOAD_TX)
-@@ -143,6 +144,7 @@
+@@ -50,7 +53,7 @@
+ /*****************************************************************************/
+ 
+ /* IPv4*/
+-static int                  parse_igmp  (mtlk_core_t *nic, struct igmphdr *igmp_header, sta_entry *sta)    __MTLK_INT_HANDLER_SECTION;
++static int                  parse_igmp  (mtlk_core_t *nic, struct igmphdr *igmp_header, uint32 length, sta_entry *sta)    __MTLK_INT_HANDLER_SECTION;
+ static void                 _mtlk_mc_change_to_exclude_ip4  (mtlk_core_t *nic, sta_entry *sta, const struct in_addr *grp_addr);
+ static void                 _mtlk_mc_change_to_include_ip4  (mtlk_core_t *nic, sta_entry *sta, const struct in_addr *grp_addr, int src_num);
+ static void                 _mtlk_mc_block_old_sources_ip4  (mtlk_core_t *nic, sta_entry *sta, const struct in_addr *grp_addr, int src_num);
+@@ -141,12 +144,15 @@
    MTLK_INIT_STEPS_LIST_ENTRY(mcast, MCAST_IP4_RANGES_LIST)
    MTLK_INIT_STEPS_LIST_ENTRY(mcast, MCAST_IP6_RANGES_LIST)
    MTLK_INIT_STEPS_LIST_ENTRY(mcast, MCAST_RANGES_INIT)
@@ -147,34 +44,262 @@ context is invented.
  MTLK_INIT_INNER_STEPS_BEGIN(mcast)
  MTLK_INIT_STEPS_LIST_END(mcast);
  
-@@ -174,6 +176,8 @@
+ /*****************************************************************************/
+ /***                        API Implementation                             ***/
+ /*****************************************************************************/
++
++static void _wave_mc_flush_hosts(mtlk_core_t *nic);
+ 
+ static const struct in_addr  all_IPv4 = {0};
+ static const struct in6_addr all_IPv6 = {{{0}}};
+@@ -170,6 +176,12 @@
                          mtlk_dlist_init, (&mcast->ip6_ranges_list));
      MTLK_INIT_STEP(mcast, MCAST_RANGES_INIT, MTLK_OBJ_PTR(mcast),
                          _mtlk_mc_ranges_init_all, (nic));
 +    MTLK_INIT_STEP(mcast, MCAST_NATIVE, MTLK_OBJ_PTR(mcast),
 +                    wave_mc_native_init, (nic));
-     INIT_LIST_HEAD(&mcast->pending);
-     INIT_LIST_HEAD(&mcast->memberships);
-     mcast->initialized = true;
-@@ -193,6 +197,8 @@
-     _wave_mc_flush_hosts(nic);
-   mcast->initialized = false;
++    INIT_LIST_HEAD(&mcast->pending);
++    INIT_LIST_HEAD(&mcast->memberships);
++    mcast->initialized = true;
++    mcast->accepting = true;
+   MTLK_INIT_FINALLY(mcast, MTLK_OBJ_PTR(mcast));
+   MTLK_INIT_RETURN(mcast, MTLK_OBJ_PTR(mcast), mtlk_mc_uninit, (nic));
+ }
+@@ -180,7 +192,13 @@
+   mcast_ctx_t *mcast;
+   MTLK_ASSERT(nic);
+   mcast = &nic->mcast;
++  mtlk_mc_close_owned(nic);
++  if (mcast->initialized)
++    _wave_mc_flush_hosts(nic);
++  mcast->initialized = false;
    MTLK_CLEANUP_BEGIN(mcast, MTLK_OBJ_PTR(mcast))
 +    MTLK_CLEANUP_STEP(mcast, MCAST_NATIVE, MTLK_OBJ_PTR(mcast),
 +                      wave_mc_native_destroy, (nic));
      MTLK_CLEANUP_STEP(mcast, MCAST_RANGES_INIT, MTLK_OBJ_PTR(mcast),
                        _mtlk_mc_ranges_cleanup_all, (nic));
      MTLK_CLEANUP_STEP(mcast, MCAST_IP6_RANGES_LIST, MTLK_OBJ_PTR(mcast),
-@@ -411,6 +417,8 @@
-    */
+@@ -266,10 +284,8 @@
+ static BOOL
+ _mtlk_mc_add_new_mcsta(mcast_sta_t **root, sta_entry *sta)
+ {
+-  if (!__mtlk_mc_find_mcsta(*root, sta)) {
+-    __mtlk_mc_add_mcsta(root, sta);
+-    return TRUE;
+-  }
++  if (!__mtlk_mc_find_mcsta(*root, sta))
++    return __mtlk_mc_add_mcsta(root, sta) != NULL;
+   return FALSE;
+ }
+ 
+@@ -279,6 +295,36 @@
+   /* structure MUST be cleared before usage */
+   memset(grp_mc_addr, 0, sizeof(*grp_mc_addr));
+   grp_mc_addr->type = type;
++}
++
++static int _wave_mc_queue_locked(mtlk_core_t *nic, mc_action_t action, int group,
++                                  sta_entry *sta, const mtlk_mc_addr_t *addr);
++
++/* Host membership is published only after hardware admission. Retry an
++ * undefined ID instead of treating a previous allocation failure as success.
++ * Existing members need JOINs if a previously undefined group is recovered. */
++static BOOL
++_mtlk_mc_admit_group (mtlk_core_t *nic, mtlk_mc_addr_t *addr,
++                     mcast_group_info_t *info, int requested)
++{
++  mcast_sta_t *mcsta;
++
++  if (info->grp_id != MCAST_GROUP_UNDEF)
++    return requested == MCAST_GROUP_UNDEF || requested == info->grp_id;
++  info->grp_id = mtlk_core_mcast_handle_grid(nic, addr, MTLK_GRID_ADD, requested);
++  if (info->grp_id == MCAST_GROUP_UNDEF)
++    return FALSE;
++  for (mcsta = info->mcsta; mcsta; mcsta = mcsta->next) {
++    if (_wave_mc_queue_locked(nic, MTLK_MC_STA_JOIN_GROUP, info->grp_id,
++                               mcsta->sta, addr) != MTLK_ERR_OK) {
++      /* The lock prevents earlier queued JOINs from validating this rolled
++       * back admission. Their pins keep the old ID retired until they finish. */
++      mtlk_core_mcast_handle_grid(nic, addr, MTLK_GRID_DEL, info->grp_id);
++      info->grp_id = MCAST_GROUP_UNDEF;
++      return FALSE;
++    }
++  }
++  return TRUE;
+ }
+ 
+ static void
+@@ -362,76 +408,116 @@
+ int __MTLK_IFUNC
+ mtlk_mc_parse (mtlk_core_t* nic, struct sk_buff *skb, sta_entry *sta)
+ {
+-  int res = -1;
+   struct ethhdr *ether_header;
+-
+-  /* If multicast module is available, IGMP parsing is not required */
++  unsigned length, header_length;
++
++  /* The helper owns membership when present. Otherwise validate the entire
++   * advertised IP payload before handing a linear report to the snooper.
++   * Ethernet padding must not complete a truncated IGMP or MLD record.
++   */
    if (mtlk_core_mcast_module_is_available(nic))
-     return -1;
+-    return res;
+-
+-  /* Check IP content in MAC header (Ethernet II assumed) */
++    return -1;
 +  if (nic->mcast.native)
 +    return wave_mc_native_observe(nic, skb, sta);
-   if (!pskb_may_pull(skb, ETH_HLEN))
-     return MTLK_ERR_NOT_IN_USE;
++  if (!pskb_may_pull(skb, ETH_HLEN))
++    return MTLK_ERR_NOT_IN_USE;
    ether_header = (struct ethhdr *)skb->data;
-@@ -588,6 +596,11 @@
+-  switch (ntohs(ether_header->h_proto))
+-  {
++
++  switch (ntohs(ether_header->h_proto)) {
+   case ETH_P_IP:
+     {
+-      /* Check IGMP content in IP header */
+-      struct iphdr *ip_header = (struct iphdr *)
+-            ((mtlk_handle_t)ether_header + sizeof(struct ethhdr));
+-      struct igmphdr *igmp_header;
+-      if (mtlk_df_nbuf_get_data_length(skb) < sizeof(*ether_header) + sizeof(*ip_header)) {
+-        ILOG1_D("CID-%04x: Frame length is wrong", mtlk_vap_get_oid(nic->vap_handle));
++      struct iphdr *ip_header;
++
++      if (!pskb_may_pull(skb, ETH_HLEN + sizeof(*ip_header)))
+         return MTLK_ERR_NOT_IN_USE;
+-      }
+-      igmp_header = (struct igmphdr *)((mtlk_handle_t)ip_header + ip_header->ihl * 4);
+-      if (mtlk_df_nbuf_get_data_length(skb) < sizeof(*ether_header) + ip_header->ihl * 4 +
+-        sizeof(*igmp_header)) {
+-        ILOG1_D("CID-%04x: Frame length is wrong", mtlk_vap_get_oid(nic->vap_handle));
++      ip_header = (struct iphdr *)(skb->data + ETH_HLEN);
++      if (ip_header->version != 4 || ip_header->protocol != IPPROTO_IGMP ||
++          (ntohs(ip_header->frag_off) & (IP_MF | IP_OFFSET)))
+         return MTLK_ERR_NOT_IN_USE;
+-      }
+-      if (ip_header->protocol == IPPROTO_IGMP) {
+-        res = parse_igmp(nic, igmp_header, sta);
+-      }
+-      break;
++      header_length = ip_header->ihl * 4;
++      length = ntohs(ip_header->tot_len);
++      if (header_length < sizeof(*ip_header) ||
++          length < header_length + sizeof(struct igmphdr) ||
++          !pskb_may_pull(skb, ETH_HLEN + length))
++        return MTLK_ERR_NOT_IN_USE;
++      return parse_igmp(nic, (struct igmphdr *)(skb->data + ETH_HLEN + header_length),
++                        length - header_length, sta);
+     }
+   case ETH_P_IPV6:
+     {
+-      /* Check MLD content in IPv6 header */
+-      struct ipv6hdr *ipv6_header = (struct ipv6hdr *)
+-            ((mtlk_handle_t)ether_header + sizeof(struct ethhdr));
+-      struct ipv6_hopopt_hdr *hopopt_header = (struct ipv6_hopopt_hdr *)
+-            ((mtlk_handle_t)ipv6_header + sizeof(struct ipv6hdr));
+-      uint16 *hopopt_data = (uint16 *)
+-            ((mtlk_handle_t)hopopt_header + 2);
+-      uint16 *rtalert_data = (uint16 *)
+-            ((mtlk_handle_t)hopopt_data + 2);
+-      struct icmp6hdr *icmp6_header;
+-      if (mtlk_df_nbuf_get_data_length(skb) < sizeof(*ether_header) + sizeof(*ipv6_header) +
+-        sizeof(*hopopt_header)) {
+-        ILOG1_D("CID-%04x: Frame length is wrong", mtlk_vap_get_oid(nic->vap_handle));
++      struct ipv6hdr *ip_header;
++      struct ipv6_opt_hdr *hop_header;
++      const uint8 *options;
++      unsigned offset, option_length;
++      BOOL router_alert = FALSE;
++
++      if (!pskb_may_pull(skb, ETH_HLEN + sizeof(*ip_header)))
+         return MTLK_ERR_NOT_IN_USE;
+-      }
+-      icmp6_header = (struct icmp6hdr *)
+-        ((mtlk_handle_t)hopopt_header + 8 * (hopopt_header->hdrlen + 1));
+-      if (mtlk_df_nbuf_get_data_length(skb) < sizeof(*ether_header) + sizeof(*ipv6_header) +
+-        sizeof(*hopopt_header) + 8 * (hopopt_header->hdrlen + 1) + sizeof(*icmp6_header)) {
+-        ILOG1_D("CID-%04x: Frame length is wrong", mtlk_vap_get_oid(nic->vap_handle));
++      ip_header = (struct ipv6hdr *)(skb->data + ETH_HLEN);
++      if (ip_header->version != 6 || ip_header->nexthdr != IPPROTO_HOPOPTS)
+         return MTLK_ERR_NOT_IN_USE;
+-      }
+-      if (
+-          (ipv6_header->nexthdr == IPPROTO_HOPOPTS) &&  // hop-by-hop option in IPv6 packet header
+-          (htons(*hopopt_data) == 0x0502) &&            // Router Alert option in hop-by-hop option header
+-          (*rtalert_data == 0) &&                       // MLD presence in Router Alert option header
+-          (hopopt_header->nexthdr == IPPROTO_ICMPV6)    // ICMPv6 next option in hop-by-hop option header
+-         )
+-        res = parse_icmp6(nic, icmp6_header,
+-          mtlk_df_nbuf_get_data_length(skb) - ((wave_addr)icmp6_header - (wave_addr)skb->data),
+-          sta);
++      length = ntohs(ip_header->payload_len);
++      if (length < 8 + sizeof(struct icmp6hdr) ||
++          !pskb_may_pull(skb, ETH_HLEN + sizeof(*ip_header) + length))
++        return MTLK_ERR_NOT_IN_USE;
++      hop_header = (struct ipv6_opt_hdr *)(skb->data + ETH_HLEN + sizeof(*ip_header));
++      header_length = 8 * (hop_header->hdrlen + 1);
++      if (hop_header->nexthdr != IPPROTO_ICMPV6 ||
++          header_length > length - sizeof(struct icmp6hdr))
++        return MTLK_ERR_NOT_IN_USE;
++      options = (const uint8 *)hop_header;
++      for (offset = sizeof(*hop_header); offset < header_length; offset += option_length) {
++        if (options[offset] == 0) { /* Pad1 */
++          option_length = 1;
++          continue;
++        }
++        if (header_length - offset < 2)
++          return MTLK_ERR_NOT_IN_USE;
++        option_length = options[offset + 1] + 2;
++        if (option_length > header_length - offset)
++          return MTLK_ERR_NOT_IN_USE;
++        if (options[offset] == 5 && option_length == 4 &&
++            options[offset + 2] == 0 && options[offset + 3] == 0)
++          router_alert = TRUE;
++      }
++      if (router_alert)
++        return parse_icmp6(nic, (struct icmp6hdr *)((uint8 *)hop_header + header_length),
++                           length - header_length, sta);
+       break;
+     }
+   default:
+     break;
+   }
++  return -1;
++}
++
++typedef struct _whole_dhcp_packet_t
++{
++  struct ethhdr  eth_hdr;
++  struct iphdr   ip_hdr;
++  struct udphdr  udp_hdr;
++  struct dhcphdr dhcp_hdr;
++} __attribute__((aligned(1), packed)) whole_dhcp_packet_t;
++
++#define UDP_PORT_DHCP_SERVER (67)
++#define UDP_PORT_DHCP_CLIENT (68)
++
++BOOL
++mtlk_mc_convert_dhcp_bcast_to_ucast(mtlk_nbuf_t *nbuf)
++{
++  BOOL res = FALSE;
++  whole_dhcp_packet_t *wdp = (whole_dhcp_packet_t*) nbuf->data;
++
++  if (nbuf->len >= sizeof(*wdp) &&
++      wdp->eth_hdr.h_proto == __constant_htons(ETH_P_IP) &&
++      wdp->ip_hdr.protocol == IPPROTO_UDP &&
++      (wdp->udp_hdr.source == __constant_htons(UDP_PORT_DHCP_SERVER) || wdp->udp_hdr.source == __constant_htons(UDP_PORT_DHCP_CLIENT)) &&
++      (wdp->udp_hdr.dest == __constant_htons(UDP_PORT_DHCP_SERVER) || wdp->udp_hdr.dest == __constant_htons(UDP_PORT_DHCP_CLIENT)))
++  {
++    mtlk_osal_copy_eth_addresses(wdp->eth_hdr.h_dest, wdp->dhcp_hdr.chaddr);
++    res = TRUE;
++  }
++
+   return res;
+ }
+ 
+@@ -510,63 +596,79 @@
    debug_ooo_analyze_packet(FALSE, tx_data->nbuf, 0);
  #endif
  
@@ -186,50 +311,118 @@ context is invented.
    /* analyze and adjust packet's priority */
    qos_adjust_priority(nic->vap_handle, nic->dscp_table, tx_data->nbuf);
  
-@@ -604,6 +617,8 @@
+-  /* for WDS bridge on AP, clone broadcast packets to all peer APs */
+-  if ((BR_MODE_WDS == bridge_mode) && (nbuf_flags & (MTLK_NBUFF_BROADCAST | MTLK_NBUFF_MULTICAST)))
++  /* Four-address peers cannot consume the BSS's three-address group frames.
++   * Replicate according to peer state, independently of legacy bridge mode. */
++  if (mtlk_vap_is_ap(nic->vap_handle) &&
++      (nbuf_flags & (MTLK_NBUFF_BROADCAST | MTLK_NBUFF_MULTICAST)) &&
++      (BR_MODE_WDS == bridge_mode ||
++       mtlk_stadb_get_four_addr_sta_cnt(&nic->slow_ctx->stadb)))
+   {
+-    int wds_sta_num;
+-    mtlk_core_handle_tx_data_t clone_data;
++    bool send_group = true;
++    mtlk_core_handle_tx_data_t clone_data = {0};
+ 
      /* copy rx_if's into cloned buffer tx_data */
      clone_data.rx_if = tx_data->rx_if;
      clone_data.rx_subif = tx_data->rx_subif;
+-
+-    wds_sta_num = 0;
+-
+-    /*
+-     * When repeater bridge sends b-cast/m-cast frames to AP via VSTA AP will
+-     * distribute frames as 3addr mode. VSTA will get the frame again after header conversion
+-     * in 802.3 with source addr of its bridge or a PC behind the bridge. Therefore driver
+-     * does not know it needs to drop the packet.
+-     *
+-     * Therefore, FW drops 3addr b-cast and multicast frames for 4addr VSTA interfaces.
+-     *
+-     * Clone broadcast packets to all 4addr stations (does not include WDS peer APs) aside from the
+-     * station, which sent the frame so 4addr VSTA does not lose b-cat/m-cast frames it needs to get.
+-     */
 +    clone_data.native_control = tx_data->native_control;
 +    clone_data.src_sta = src_sta;
- 
-     /* Each copy targets the peer SID. Preserve an ordinary BSS group copy only
-      * for ordinary receivers, and never send a peer copy back to its source. */
-@@ -619,6 +634,11 @@
-           send_group = true;
-           continue;
++
++    /* Each copy targets the peer SID. Preserve an ordinary BSS group copy only
++     * for ordinary receivers, and never send a peer copy back to its source. */
+     sta = mtlk_stadb_iterate_first(&nic->slow_ctx->stadb, &iter);
+     if (sta) {
+-      do {
+-        /* ignore sending to itself or to non-4addr clients */
+-        if ((sta->peer_ap || mtlk_sta_is_4addr(sta)) && (sta != src_sta)){
+-          clone_data.dst_sta = (sta_entry *)sta;
+-          wds_sta_num++;
+-
+-          /* STA is other than source STA*/
+-          clone_data.nbuf = mtlk_df_nbuf_clone_no_priv(tx_data->nbuf);
+-
+-          if (!clone_data.nbuf) {
+-            mtlk_sta_on_packet_dropped(clone_data.dst_sta, MTLK_TX_DISCARDED_DRV_NO_RESOURCES);
+-            res = MTLK_ERR_NO_MEM;
+-            break;
+-          }
+-          /* Adjust cloned packet's priority */
+-          mtlk_df_nbuf_set_priority(clone_data.nbuf, mtlk_df_nbuf_get_priority(tx_data->nbuf));
+-
+-          mtlk_sta_incref(clone_data.dst_sta);
+-
+-          ILOG3_Y("Broadcast packet sending to 4addr sta %Y", mtlk_sta_get_addr(clone_data.dst_sta));
+-          res = _mtlk_do_send_data_to_sta(nic, &clone_data, nbuf_flags);
++      /* If the referenced snapshot could not be allocated, leave the ordinary
++       * group path available. Only a complete snapshot can rule out receivers. */
++      send_group = false;
++      for (; sta; sta = mtlk_stadb_iterate_next(&iter)) {
++        if (sta == src_sta || rcu_access_pointer(sta->ap_vlan))
++          continue;
++        if (!sta->peer_ap && !mtlk_sta_is_4addr(sta)) {
++          send_group = true;
++          continue;
          }
+-        sta = mtlk_stadb_iterate_next(&iter);
+-      } while (sta);
 +        if (nic->mcast.native && !tx_data->native_control &&
 +            ((nbuf_flags & MTLK_NBUFF_FORWARD) ||
 +             !wave_df_bridge_mcast_owned(mtlk_df_get_user(mtlk_vap_get_df(nic->vap_handle)))) &&
 +            !wave_mc_native_receiver(nic, tx_data->nbuf, sta))
 +          continue;
-         clone_data.dst_sta = (sta_entry *)sta;
- 
-         clone_data.nbuf = mtlk_df_nbuf_clone_no_priv(tx_data->nbuf);
-@@ -628,6 +648,10 @@
-           /* One failed recipient must not hide later ordinary/group peers. */
-           continue;
-         }
++        clone_data.dst_sta = (sta_entry *)sta;
++
++        clone_data.nbuf = mtlk_df_nbuf_clone_no_priv(tx_data->nbuf);
++
++        if (!clone_data.nbuf) {
++          mtlk_sta_on_packet_dropped(clone_data.dst_sta, MTLK_TX_DISCARDED_DRV_NO_RESOURCES);
++          /* One failed recipient must not hide later ordinary/group peers. */
++          continue;
++        }
 +        if (tx_data->native_control && tx_data->msg) {
 +          clone_data.msg = tx_data->msg;
 +          tx_data->msg = NULL;
 +        }
-         /* Adjust cloned packet's priority */
-         mtlk_df_nbuf_set_priority(clone_data.nbuf, mtlk_df_nbuf_get_priority(tx_data->nbuf));
- 
-@@ -635,6 +659,10 @@
- 
-         ILOG3_Y("Broadcast packet sending to 4addr sta %Y", mtlk_sta_get_addr(clone_data.dst_sta));
-         res = _mtlk_do_send_data_to_sta(nic, &clone_data, nbuf_flags);
++        /* Adjust cloned packet's priority */
++        mtlk_df_nbuf_set_priority(clone_data.nbuf, mtlk_df_nbuf_get_priority(tx_data->nbuf));
++
++        mtlk_sta_incref(clone_data.dst_sta);
++
++        ILOG3_Y("Broadcast packet sending to 4addr sta %Y", mtlk_sta_get_addr(clone_data.dst_sta));
++        res = _mtlk_do_send_data_to_sta(nic, &clone_data, nbuf_flags);
 +        if (clone_data.msg) {
 +          mtlk_hw_release_msg_to_send(mtlk_vap_get_hwapi(nic->vap_handle), clone_data.msg);
 +          clone_data.msg = NULL;
 +        }
-       }
++      }
        mtlk_stadb_iterate_done(&iter);
      } /* End of "for each 4addr client" */
-@@ -657,8 +685,9 @@
+ 
+-    /* Check is any non-wds stations to send broadcast */
+-    if (0 == (mtlk_stadb_get_sta_cnt(&nic->slow_ctx->stadb) - wds_sta_num)){
++    /* Count receivers, not clones: the source is not a group destination. */
++    if (!send_group) {
+       /* drop original buffer*/
+       mtlk_df_nbuf_free(tx_data->nbuf);
+       return MTLK_ERR_OK;
+@@ -583,8 +685,9 @@
  {
    struct in6_addr ip_addr;
  
@@ -241,74 +434,526 @@ context is invented.
      return;
  
    /* Add the station to the special all-node multicast group
-@@ -1897,6 +1926,7 @@
-   mtlk_core_t *nic;
-   sta_entry *sta;
-   mtlk_mc_addr_t addr;
+@@ -605,7 +708,7 @@
+   BOOL no_mcast_module = !mtlk_core_mcast_module_is_available(nic);
+ 
+   /* RM option disabled or not AP */
+-  if (!mtlk_vap_is_ap(nic->vap_handle))
++  if (!mtlk_vap_is_ap(nic->vap_handle) || !nic->mcast.initialized)
+     return;
+ 
+   mtlk_osal_lock_acquire(&nic->mcast.lock);
+@@ -953,6 +1056,9 @@
+   mtlk_mc_addr_t grp_mc_addr;
+   mcast_ctx_t *mcast = &nic->mcast;
+ 
++  if (!mcast->accepting || sta->info.mc_retiring)
++    return NULL;
++
+   __mtlk_mc_set_mc_addr_type(&grp_mc_addr, MTLK_IPv4);
+   grp_mc_addr.grp_ip.ip4_addr = *grp_addr;
+   grp_mc_addr.src_ip.ip4_addr = all_IPv4;
+@@ -968,14 +1074,28 @@
+     if (!grp) goto end;
+     /* Update mode */
+     grp->info.mode = mode;
+-    /* Request a new group index from HW table. */
+-    grp->info.grp_id = mtlk_core_mcast_handle_grid(nic, &grp_mc_addr, MTLK_GRID_ADD, MCAST_GROUP_UNDEF);
++  }
++
++  if (!_mtlk_mc_admit_group(nic, &grp_mc_addr, &grp->info, MCAST_GROUP_UNDEF)) {
++    if (!grp->info.mcsta && !grp->ip4_src_list)
++      _mtlk_mc_del_ip4_grp(mcast, grp);
++    return NULL;
+   }
+ 
+   /* STEP 2a: add STA to a common list */
+   if (_mtlk_mc_add_new_mcsta(&grp->info.mcsta, sta)) {
+     /* STEP 2b: add STA to group in FW */
+-    mtlk_core_mcast_group_id_action_serialized(nic, MTLK_MC_STA_JOIN_GROUP, grp->info.grp_id, (uint8 *) &sta->info.addr, &grp_mc_addr);
++    if (_wave_mc_queue_locked(nic, MTLK_MC_STA_JOIN_GROUP, grp->info.grp_id,
++                                sta, &grp_mc_addr) != MTLK_ERR_OK) {
++      __mtlk_mc_del_mcsta(&grp->info.mcsta, sta);
++      mtlk_sta_decref(sta);
++    }
++  }
++  /* A failed station allocation must not retain an empty hardware owner. */
++  if (!grp->info.mcsta && !grp->ip4_src_list) {
++    mtlk_core_mcast_handle_grid(nic, &grp_mc_addr, MTLK_GRID_DEL, grp->info.grp_id);
++    _mtlk_mc_del_ip4_grp(mcast, grp);
++    grp = NULL;
+   }
+   _mtlk_mc_print_ip4_group(grp);
+ 
+@@ -989,6 +1109,9 @@
+   mcast_ip4_grp_t *grp;
+   mtlk_mc_addr_t grp_mc_addr;
+   mcast_ctx_t *mcast = &nic->mcast;
++
++  if (!mcast->accepting || sta->info.mc_retiring)
++    return NULL;
+ 
+   /* STEP 1: find group */
+   grp = _mtlk_mc_find_ip4_grp(mcast, grp_addr);
+@@ -997,15 +1120,19 @@
+ 
+   ILOG1_D("Deleting STA from ip4 mcast group %B", htonl(grp->ip4_grp_addr.s_addr));
+ 
+-  /* STEP 1: remove sta from list */
+-  if (!__mtlk_mc_del_mcsta(&grp->info.mcsta, sta))
++  /* Keep the host membership if withdrawal cannot acquire its queue owner. */
++  if (!__mtlk_mc_find_mcsta(grp->info.mcsta, sta))
+     goto end;
+ 
+   /* STEP 2: remove STA from group in FW here, if mcast helper is inactive */
+   __mtlk_mc_set_mc_addr_type(&grp_mc_addr, MTLK_IPv4);
+   grp_mc_addr.grp_ip.ip4_addr = grp->ip4_grp_addr;
+   grp_mc_addr.src_ip.ip4_addr = all_IPv4;
+-  mtlk_core_mcast_group_id_action_serialized(nic, MTLK_MC_STA_LEAVE_GROUP, grp->info.grp_id, (uint8 *) &sta->info.addr, &grp_mc_addr);
++  if (grp->info.grp_id != MCAST_GROUP_UNDEF &&
++      _wave_mc_queue_locked(nic, MTLK_MC_STA_LEAVE_GROUP, grp->info.grp_id,
++                             sta, &grp_mc_addr) != MTLK_ERR_OK)
++    goto end;
++  __mtlk_mc_del_mcsta(&grp->info.mcsta, sta);
+   mtlk_sta_decref(sta);
+ 
+   /* STEP 3: delete group if no more sta's */
+@@ -1209,13 +1336,36 @@
+ 
+ 
+ static int
+-parse_igmp (mtlk_core_t *nic, struct igmphdr *igmp_header, sta_entry *sta)
++parse_igmp (mtlk_core_t *nic, struct igmphdr *igmp_header, uint32 length, sta_entry *sta)
+ {
+   unsigned grp_num, src_num;
+   unsigned i;
+   struct igmpv3_report *report;
+   struct igmpv3_grec *record;
+   struct in_addr grp_addr;
++
++  /* Validate all variable records first: a later truncation must not leave
++   * membership changes from the valid prefix of an incomplete report.
++   */
++  if (igmp_header->type == IGMPV3_HOST_MEMBERSHIP_REPORT) {
++    const uint8 *cursor = (const uint8 *)igmp_header + sizeof(*report);
++    unsigned remaining = length - sizeof(*report);
++
++    report = (struct igmpv3_report *)igmp_header;
++    for (i = 0; i < ntohs(report->ngrec); i++) {
++      unsigned record_length;
++
++      if (remaining < sizeof(*record))
++        return -1;
++      record = (struct igmpv3_grec *)cursor;
++      record_length = sizeof(*record) + ntohs(record->grec_nsrcs) * sizeof(struct in_addr) +
++                      record->grec_auxwords * sizeof(u32);
++      if (record_length > remaining)
++        return -1;
++      cursor += record_length;
++      remaining -= record_length;
++    }
++  }
+ 
+   grp_addr.s_addr = ntohl(igmp_header->group);
+ 
+@@ -1341,6 +1491,9 @@
+   mtlk_mc_addr_t grp_mc_addr;
+   mcast_ctx_t *mcast = &nic->mcast;
+ 
++  if (!mcast->accepting || sta->info.mc_retiring)
++    return NULL;
++
+   __mtlk_mc_set_mc_addr_type(&grp_mc_addr, MTLK_IPv6);
+   grp_mc_addr.grp_ip.ip6_addr = *grp_addr;
+   grp_mc_addr.src_ip.ip6_addr = all_IPv6;
+@@ -1356,14 +1509,28 @@
+     if (!grp) goto end;
+     /* Update mode */
+     grp->info.mode = mode;
+-    /* Request a new group index from HW table. */
+-    grp->info.grp_id = mtlk_core_mcast_handle_grid(nic, &grp_mc_addr, MTLK_GRID_ADD, MCAST_GROUP_UNDEF);
++  }
++
++  if (!_mtlk_mc_admit_group(nic, &grp_mc_addr, &grp->info, MCAST_GROUP_UNDEF)) {
++    if (!grp->info.mcsta && !grp->ip6_src_list)
++      _mtlk_mc_del_ip6_grp(mcast, grp);
++    return NULL;
+   }
+ 
+   /* STEP 2a: add STA to a common list */
+   if (_mtlk_mc_add_new_mcsta(&grp->info.mcsta, sta)) {
+     /* STEP 2b: add STA to group in FW */
+-    mtlk_core_mcast_group_id_action_serialized(nic, MTLK_MC_STA_JOIN_GROUP, grp->info.grp_id, (uint8 *) &sta->info.addr, &grp_mc_addr);
++    if (_wave_mc_queue_locked(nic, MTLK_MC_STA_JOIN_GROUP, grp->info.grp_id,
++                                sta, &grp_mc_addr) != MTLK_ERR_OK) {
++      __mtlk_mc_del_mcsta(&grp->info.mcsta, sta);
++      mtlk_sta_decref(sta);
++    }
++  }
++  /* A failed station allocation must not retain an empty hardware owner. */
++  if (!grp->info.mcsta && !grp->ip6_src_list) {
++    mtlk_core_mcast_handle_grid(nic, &grp_mc_addr, MTLK_GRID_DEL, grp->info.grp_id);
++    _mtlk_mc_del_ip6_grp(mcast, grp);
++    grp = NULL;
+   }
+   _mtlk_mc_print_ip6_group(grp);
+ 
+@@ -1377,6 +1544,9 @@
+   mcast_ip6_grp_t *grp;
+   mtlk_mc_addr_t grp_mc_addr;
+   mcast_ctx_t *mcast = &nic->mcast;
++
++  if (!mcast->accepting || sta->info.mc_retiring)
++    return NULL;
+ 
+   /* STEP 1: find group */
+   grp = _mtlk_mc_find_ip6_grp(mcast, grp_addr);
+@@ -1385,15 +1555,19 @@
+ 
+   ILOG1_K("Deleting STA from ip6 mcast group %K", grp->ip6_grp_addr.s6_addr);
+ 
+-  /* STEP 1: remove sta from list */
+-  if (!__mtlk_mc_del_mcsta(&grp->info.mcsta, sta))
++  /* Keep the host membership if withdrawal cannot acquire its queue owner. */
++  if (!__mtlk_mc_find_mcsta(grp->info.mcsta, sta))
+     goto end;
+ 
+   /* STEP 2: remove STA from group in FW here, if mcast helper is inactive */
+   __mtlk_mc_set_mc_addr_type(&grp_mc_addr, MTLK_IPv6);
+   grp_mc_addr.grp_ip.ip6_addr = grp->ip6_grp_addr;
+   grp_mc_addr.src_ip.ip6_addr = all_IPv6;
+-  mtlk_core_mcast_group_id_action_serialized(nic, MTLK_MC_STA_LEAVE_GROUP, grp->info.grp_id, (uint8 *) &sta->info.addr, &grp_mc_addr);
++  if (grp->info.grp_id != MCAST_GROUP_UNDEF &&
++      _wave_mc_queue_locked(nic, MTLK_MC_STA_LEAVE_GROUP, grp->info.grp_id,
++                             sta, &grp_mc_addr) != MTLK_ERR_OK)
++    goto end;
++  __mtlk_mc_del_mcsta(&grp->info.mcsta, sta);
+   mtlk_sta_decref(sta);
+ 
+   /* STEP 3: delete group if no more sta's */
+@@ -1604,18 +1778,34 @@
+   struct mldv2_report *report;
+   struct mldv2_grec *record;
+   struct in6_addr grp_addr, *addr;
+-  wave_addr end = (wave_addr)icmp6_header + length;
+- 
+-  addr = (struct in6_addr *)
+-    ((mtlk_handle_t)icmp6_header + sizeof(struct icmp6hdr));
+-  if ((wave_addr)addr + sizeof(*addr) > end) {
+-    ILOG1_D("CID-%04x: Frame length is wrong", mtlk_vap_get_oid(nic->vap_handle));
+-    return -1;
+-  }
+-  grp_addr.in6_u.u6_addr32[0] = ntohl(addr->in6_u.u6_addr32[0]);
+-  grp_addr.in6_u.u6_addr32[1] = ntohl(addr->in6_u.u6_addr32[1]);
+-  grp_addr.in6_u.u6_addr32[2] = ntohl(addr->in6_u.u6_addr32[2]);
+-  grp_addr.in6_u.u6_addr32[3] = ntohl(addr->in6_u.u6_addr32[3]);
++  if (icmp6_header->icmp6_type == ICMPV6_MLD2_REPORT) {
++    const uint8 *cursor = (const uint8 *)icmp6_header + sizeof(*report);
++    unsigned remaining = length - sizeof(*report);
++
++    report = (struct mldv2_report *)icmp6_header;
++    for (i = 0; i < ntohs(report->ngrec); i++) {
++      unsigned record_length;
++
++      if (remaining < sizeof(*record))
++        return -1;
++      record = (struct mldv2_grec *)cursor;
++      record_length = sizeof(*record) + ntohs(record->grec_nsrcs) * sizeof(struct in6_addr) +
++                      record->grec_auxwords * sizeof(u32);
++      if (record_length > remaining)
++        return -1;
++      cursor += record_length;
++      remaining -= record_length;
++    }
++  } else if (icmp6_header->icmp6_type == ICMPV6_MGM_REPORT ||
++             icmp6_header->icmp6_type == ICMPV6_MGM_REDUCTION) {
++    if (length < sizeof(*icmp6_header) + sizeof(*addr))
++      return -1;
++    addr = (struct in6_addr *)((uint8 *)icmp6_header + sizeof(*icmp6_header));
++    grp_addr.in6_u.u6_addr32[0] = ntohl(addr->in6_u.u6_addr32[0]);
++    grp_addr.in6_u.u6_addr32[1] = ntohl(addr->in6_u.u6_addr32[1]);
++    grp_addr.in6_u.u6_addr32[2] = ntohl(addr->in6_u.u6_addr32[2]);
++    grp_addr.in6_u.u6_addr32[3] = ntohl(addr->in6_u.u6_addr32[3]);
++  }
+ 
+   switch (icmp6_header->icmp6_type) {
+   case ICMPV6_MGM_QUERY:
+@@ -1634,13 +1824,7 @@
+     ILOG1_DY("MLDv2 report: %d record(s), sta %Y", grp_num, mtlk_sta_get_addr(sta)->au8Addr);
+     record = report->grec;
+     for (i = 0; i < grp_num; i++) {
+-      if ((wave_addr)record + sizeof(*record) > end) {
+-        ILOG1_D("CID-%04x: Frame length is wrong", mtlk_vap_get_oid(nic->vap_handle));
+-        return -1;
+-      }
+       src_num = ntohs(record->grec_nsrcs);
+-      addr = (struct in6_addr *)
+-        ((mtlk_handle_t)icmp6_header + sizeof(struct icmp6hdr));
+       grp_addr.in6_u.u6_addr32[0] = ntohl(record->grec_mca.in6_u.u6_addr32[0]);
+       grp_addr.in6_u.u6_addr32[1] = ntohl(record->grec_mca.in6_u.u6_addr32[1]);
+       grp_addr.in6_u.u6_addr32[2] = ntohl(record->grec_mca.in6_u.u6_addr32[2]);
+@@ -1688,91 +1872,359 @@
+   return 0;
+ }
+ 
+-void __MTLK_IFUNC
+-mtlk_mc_update_group_id_sta (mtlk_core_t *nic, uint32 grp_id, mc_action_t action, mtlk_mc_addr_t *mc_addr, sta_entry *sta)
+-{
+-  /* Update GRP_ID in FW for defined Station.
+-   *
+-   * action == MTLK_STA_JOIN:
+-   *    1) get GRP_ID, which corresponds to multicast address mc_addr, from internal database
+-   *    2) send ADD_MULTICAST_GROUP request with this GRP_ID to FW
+-   *
+-   * action == MTLK_STA_LEAVE:
+-   *    1) send REMOVE_MULTICAST_GROUP request with "grp_id" to FW
++struct wave_mc_barrier_context {
++  mtlk_core_t *core;
++  BOOL all;
++};
++
++static void wave_mc_barrier_command(mtlk_handle_t handle)
++{
++  struct wave_mc_barrier_context *ctx = HANDLE_T_PTR(struct wave_mc_barrier_context, handle);
++  mtlk_vap_manager_t *manager;
++  mtlk_vap_handle_t vap;
++  int i;
++
++  if (!ctx->all) {
++    mtlk_mc_close_owned(ctx->core);
++    return;
++  }
++  manager = mtlk_vap_get_manager(ctx->core->vap_handle);
++  for (i = 0; i < mtlk_vap_manager_get_max_vaps_count(manager); i++)
++    if (mtlk_vap_manager_get_vap_handle(manager, i, &vap) == MTLK_ERR_OK)
++      mtlk_mc_close_owned(mtlk_vap_get_core(vap));
++}
++
++/* External teardown only. Normal master operations and recovery after its
++ * all-serializer barrier use mtlk_mc_close_owned() directly. */
++void mtlk_mc_close_external(mtlk_core_t *core, BOOL all)
++{
++  struct wave_mc_barrier_context ctx = { .core = core, .all = all };
++  mtlk_core_t *master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(core->vap_handle));
++  mtlk_command_t command;
++  int res;
++
++  if (!master || (!all && (!mtlk_vap_is_ap(core->vap_handle) || !core->mcast.initialized)))
++    return;
++  res = mtlk_command_init(&command, wave_mc_barrier_command, HANDLE_T(&ctx), MTLK_SLID);
++  if (res == MTLK_ERR_OK) {
++    res = mtlk_core_execute_hw_command(master, &command, 2000);
++    mtlk_command_cleanup(&command);
++  }
++  if (res != MTLK_ERR_OK) {
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++    mtlk_serializer_stop(&master->slow_ctx->serializer);
++    wave_mc_barrier_command(HANDLE_T(&ctx));
++  }
++}
++
++/* The radio master owns firmware membership and station/SID retirement.
++ * RX producers hold mcast.lock while queueing; that lock also fences admission.
++ * Pending commands and applied memberships hold independent station/ID owners. */
++struct wave_mc_command {
++  struct list_head pending;
++  mtlk_command_t command;
++  mtlk_core_t *nic;
++  sta_entry *sta;
++  mtlk_mc_addr_t addr;
 +  struct wave_mc_native_class *native;
-   uint32 sid_order;
-   uint16 sid;
-   uint8 group;
-@@ -1942,7 +1972,9 @@
-   valid = !work->command.is_cancelled && nic->mcast.accepting &&
-           !sta->info.mc_retiring && sta->info.sid == work->sid &&
-           sta->info.sid_order == work->sid_order;
--  if (valid) {
++  uint32 sid_order;
++  uint16 sid;
++  uint8 group;
++  mc_action_t action;
++  BOOL pinned;
++  BOOL retry;
++};
++
++static void
++_wave_mc_membership_unlink(sta_entry *sta, uint8 group)
++{
++  sta->info.mc_memberships &= ~BIT(group);
++  if (!sta->info.mc_memberships) {
++    list_del_init(&sta->mc_membership_node);
++    mtlk_sta_decref(sta);
++  }
++}
++
++static void
++_wave_mc_membership_put(mtlk_core_t *nic, sta_entry *sta, uint8 group)
++{
++  wave_hw_mc_put(mtlk_vap_get_hw(nic->vap_handle), group);
++  _wave_mc_membership_unlink(sta, group);
++}
++
++static void
++_wave_mc_command_run(mtlk_handle_t handle)
++{
++  struct wave_mc_command *work = HANDLE_T_PTR(struct wave_mc_command, handle);
++  mtlk_core_t *nic = work->nic;
++  sta_entry *sta = work->sta;
++  mcast_group_info_t *group;
++  BOOL valid, attempted;
++  int res;
++
++  /* Pool pressure is retryable without spinning or changing owner identity.
++   * Only subsequent attempts wait; higher-priority teardown can cancel the
++   * command between attempts, and each active attempt delays it by at most 20ms. */
++  if (work->retry)
++    mtlk_osal_msleep(20);
++  work->retry = FALSE;
++  mtlk_osal_lock_acquire(&nic->mcast.lock);
++  valid = !work->command.is_cancelled && nic->mcast.accepting &&
++          !sta->info.mc_retiring && sta->info.sid == work->sid &&
++          sta->info.sid_order == work->sid_order;
 +  if (valid && work->native) {
 +    valid = wave_mc_native_command_valid(work->native, sta, work->action);
 +  } else if (valid) {
-     if (work->addr.type == MTLK_IPv4)
-       group = _mtlk_mc_find_ip4_group(nic, &work->addr.grp_ip.ip4_addr,
-                                       &work->addr.src_ip.ip4_addr);
-@@ -2020,6 +2052,8 @@
-     }
-   }
-   list_del(&work->pending);
++    if (work->addr.type == MTLK_IPv4)
++      group = _mtlk_mc_find_ip4_group(nic, &work->addr.grp_ip.ip4_addr,
++                                      &work->addr.src_ip.ip4_addr);
++    else
++      group = _mtlk_mc_find_ip6_group(nic, &work->addr.grp_ip.ip6_addr,
++                                      &work->addr.src_ip.ip6_addr);
++    valid = group && group->grp_id == work->group &&
++            __mtlk_mc_find_mcsta(group->mcsta, sta);
++    if (work->action == MTLK_MC_STA_JOIN_GROUP)
++      valid = valid && wave_hw_mc_get(mtlk_vap_get_hw(nic->vap_handle), work->group, FALSE);
++    else
++      /* A retry may follow a later JOIN. Withdraw only if this exact station
++       * is still absent from the host's desired membership. */
++      valid = !valid;
++  }
++  mtlk_osal_lock_release(&nic->mcast.lock);
++  if (!valid)
++    return;
++
++  if (work->action == MTLK_MC_STA_JOIN_GROUP) {
++    if (sta->info.mc_memberships & BIT(work->group))
++      return;
++    /* Retain even an uncertain JOIN until terminal reset or confirmed REMOVE. */
++    if (!sta->info.mc_memberships) {
++      mtlk_sta_incref(sta);
++      list_add_tail(&sta->mc_membership_node, &nic->mcast.memberships);
++    }
++    sta->info.mc_memberships |= BIT(work->group);
++    work->pinned = FALSE; /* Command pin becomes the applied-membership pin. */
++  } else if (!(sta->info.mc_memberships & BIT(work->group))) {
++    return;
++  }
++
++  res = mtlk_core_mcast_notify_fw(nic->vap_handle, work->action,
++                                  work->sid, work->group, &attempted);
++  if (res != MTLK_ERR_OK && !attempted) {
++    if (work->action == MTLK_MC_STA_JOIN_GROUP) {
++      /* The message was never allocated: transfer the pin back to its exact
++       * pending command, without claiming a firmware membership. */
++      work->pinned = TRUE;
++      _wave_mc_membership_unlink(sta, work->group);
++    }
++    work->retry = TRUE;
++  } else if (res != MTLK_ERR_OK) {
++    wave_hw_mc_quarantine(mtlk_vap_get_hw(nic->vap_handle), work->group);
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(nic->vap_handle));
++  } else if (work->action == MTLK_MC_STA_LEAVE_GROUP) {
++    _wave_mc_membership_put(nic, sta, work->group);
++  }
++}
++
++static void
++_wave_mc_command_done(serializer_result_t result, mtlk_command_t *command,
++                      mtlk_handle_t handle)
++{
++  struct wave_mc_command *work = HANDLE_T_PTR(struct wave_mc_command, handle);
++
++  mtlk_core_t *master;
++  int err;
++
++  /* EXECUTED also covers recovery-marked cancellation; only run() knows
++   * whether a firmware operation succeeded or transferred its group owner. */
++  mtlk_osal_lock_acquire(&work->nic->mcast.lock);
++  if (result == MTLK_CMD_EXECUTED && work->retry && !command->is_cancelled &&
++      work->nic->mcast.accepting && !work->sta->info.mc_retiring &&
++      wave_hw_mmb_ready(mtlk_vap_get_hw(work->nic->vap_handle))) {
++    master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(work->nic->vap_handle));
++    /* Requeue only from done: keep the same pending link, pin and STA ref.
++     * The master cannot execute the next attempt until this done returns. */
++    err = mtlk_core_schedule_hw_command(master, command,
++                                        _wave_mc_command_done, HANDLE_T(work));
++    if (err == MTLK_ERR_OK) {
++      mtlk_osal_lock_release(&work->nic->mcast.lock);
++      return;
++    }
++  }
++  list_del(&work->pending);
 +  if (work->native)
 +    wave_mc_native_command_done(work->native, work->sta, work->action);
-   mtlk_osal_lock_release(&work->nic->mcast.lock);
-   if (work->pinned)
-     wave_hw_mc_put(mtlk_vap_get_hw(work->nic->vap_handle), work->group);
-@@ -2031,8 +2065,9 @@
- /* Caller holds the host membership lock, including across enqueue. This makes
-  * publication of the pending owner atomic with station/VAP admission fencing. */
- static int
--_wave_mc_queue_locked(mtlk_core_t *nic, mc_action_t action, int group,
--                       sta_entry *sta, const mtlk_mc_addr_t *addr)
++  mtlk_osal_lock_release(&work->nic->mcast.lock);
++  if (work->pinned)
++    wave_hw_mc_put(mtlk_vap_get_hw(work->nic->vap_handle), work->group);
++  mtlk_sta_decref(work->sta);
++  mtlk_command_cleanup(command);
++  mtlk_osal_mem_free(work);
++}
++
++/* Caller holds the host membership lock, including across enqueue. This makes
++ * publication of the pending owner atomic with station/VAP admission fencing. */
++static int
 +_wave_mc_queue_locked_ex(mtlk_core_t *nic, mc_action_t action, int group,
 +                          sta_entry *sta, const mtlk_mc_addr_t *addr,
 +                          struct wave_mc_native_class *native)
- {
-   mtlk_core_t *master;
-   struct wave_mc_command *work;
-@@ -2047,7 +2082,9 @@
-   memset(work, 0, sizeof(*work));
-   work->nic = nic;
-   work->sta = sta;
--  work->addr = *addr;
++{
++  mtlk_core_t *master;
++  struct wave_mc_command *work;
++  int res;
++
++  if (!nic->mcast.accepting || sta->info.mc_retiring ||
++      group < MC_MIN_GROUP || group >= MC_GROUPS)
++    return MTLK_ERR_NOT_READY;
++  work = mtlk_osal_mem_alloc(sizeof(*work), MTLK_MEM_TAG_MCAST);
++  if (!work)
++    return MTLK_ERR_NO_MEM;
++  memset(work, 0, sizeof(*work));
++  work->nic = nic;
++  work->sta = sta;
 +  if (addr)
 +    work->addr = *addr;
 +  work->native = native;
-   work->sid = sta->info.sid;
-   work->sid_order = sta->info.sid_order;
-   work->group = group;
-@@ -2066,8 +2103,11 @@
-   master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(nic->vap_handle));
-   res = mtlk_core_schedule_hw_command(master, &work->command,
-                                       _wave_mc_command_done, HANDLE_T(work));
--  if (res == MTLK_ERR_OK)
++  work->sid = sta->info.sid;
++  work->sid_order = sta->info.sid_order;
++  work->group = group;
++  work->action = action;
++  res = mtlk_command_init(&work->command, _wave_mc_command_run,
++                          HANDLE_T(work), MTLK_SLID);
++  if (res != MTLK_ERR_OK)
++    goto free_work;
++  if (!wave_hw_mc_get(mtlk_vap_get_hw(nic->vap_handle), group, TRUE)) {
++    res = MTLK_ERR_NOT_READY;
++    goto free_command;
++  }
++  work->pinned = TRUE;
++  mtlk_sta_incref(sta);
++  list_add_tail(&work->pending, &nic->mcast.pending);
++  master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(nic->vap_handle));
++  res = mtlk_core_schedule_hw_command(master, &work->command,
++                                      _wave_mc_command_done, HANDLE_T(work));
 +  if (res == MTLK_ERR_OK) {
 +    if (native)
 +      wave_mc_native_command_queued(native, sta, action);
-     return res;
++    return res;
 +  }
-   /* Enqueue failure has no completion callback. */
-   list_del(&work->pending);
-   mtlk_sta_decref(sta);
-@@ -2079,6 +2119,19 @@
-   return res;
- }
- 
++  /* Enqueue failure has no completion callback. */
++  list_del(&work->pending);
++  mtlk_sta_decref(sta);
++  wave_hw_mc_put(mtlk_vap_get_hw(nic->vap_handle), group);
++free_command:
++  mtlk_command_cleanup(&work->command);
++free_work:
++  mtlk_osal_mem_free(work);
++  return res;
++}
++
 +static int
 +_wave_mc_queue_locked(mtlk_core_t *nic, mc_action_t action, int group,
 +                       sta_entry *sta, const mtlk_mc_addr_t *addr)
@@ -322,49 +967,507 @@ context is invented.
 +  return _wave_mc_queue_locked_ex(nic, action, group, sta, NULL, owner);
 +}
 +
- /* Radio-master ownership (or joined/blocked serializers during terminal
-  * teardown) is required. Never call from a serializer-enumeration callback. */
- static void
-@@ -2113,6 +2166,15 @@
- 
-   if (!mtlk_vap_is_ap(nic->vap_handle) || !nic->mcast.initialized)
-     return MTLK_ERR_OK;
++/* Radio-master ownership (or joined/blocked serializers during terminal
++ * teardown) is required. Never call from a serializer-enumeration callback. */
++static void
++_wave_mc_cancel_owned(mtlk_core_t *nic, sta_info *info)
++{
++  mtlk_core_t *master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(nic->vap_handle));
++  struct wave_mc_command *work, *found;
++  BOOL canceled;
++
++  for (;;) {
++    found = NULL;
++    mtlk_osal_lock_acquire(&nic->mcast.lock);
++    list_for_each_entry(work, &nic->mcast.pending, pending) {
++      if (!info || &work->sta->info == info) {
++        found = work;
++        break;
++      }
++    }
++    mtlk_osal_lock_release(&nic->mcast.lock);
++    if (!found)
++      return;
++    /* The owning master cannot concurrently execute another command. */
++    canceled = mtlk_serializer_cancel(&master->slow_ctx->serializer, &found->command);
++    MTLK_ASSERT(canceled);
++  }
++}
++
++int mtlk_mc_retire_sta_owned(mtlk_core_t *nic, sta_info *info)
++{
++  sta_entry *sta;
++  int group, res, first_error = MTLK_ERR_OK;
++
++  if (!mtlk_vap_is_ap(nic->vap_handle) || !nic->mcast.initialized)
++    return MTLK_ERR_OK;
 +  /* Setup copies also pass here on failed STA_ADD. Only a matching live
 +   * station incarnation can own native reports or immutable recipient sets.
-+   */
+    */
+-  mcast_group_info_t *group;
+-  mcast_sta_t *mcsta;
+-
+-  switch (action) {
+-  case MTLK_MC_STA_JOIN_GROUP:
+-    mtlk_osal_lock_acquire(&nic->mcast.lock);
+-
+-    if (mc_addr->type == MTLK_IPv4) {
+-      group = _mtlk_mc_find_ip4_group(nic, &mc_addr->grp_ip.ip4_addr, &mc_addr->src_ip.ip4_addr);
+-      if (!group) {
+-        goto finish;
+-      }
+-
+-      mcsta = __mtlk_mc_find_mcsta(group->mcsta, sta);
+-      if (!mcsta) {
+-        ILOG1_D("CID-%04x: station is not found", mtlk_vap_get_oid(nic->vap_handle));
+-        goto finish;  /* Station is not found */
+-      }
+-
+-      if (group->grp_id == MCAST_GROUP_UNDEF) {
+-        ILOG1_DDD("CID-%04x: GRID is not yet set for IPv4:%B --> %B", mtlk_vap_get_oid(nic->vap_handle),
+-            htonl(mc_addr->src_ip.ip4_addr.s_addr), htonl(mc_addr->grp_ip.ip4_addr.s_addr));
+-        goto finish;
+-      }
+-
+-      grp_id = group->grp_id;
+-    } else {
+-      group = _mtlk_mc_find_ip6_group(nic, &mc_addr->grp_ip.ip6_addr, &mc_addr->src_ip.ip6_addr);
+-      if (!group) {
+-        goto finish;
+-      }
+-
+-      mcsta = __mtlk_mc_find_mcsta(group->mcsta, sta);
+-      if (!mcsta) {
+-        goto finish;  /* Station is not found */
+-      }
+-
+-      if (group->grp_id == MCAST_GROUP_UNDEF) {
+-        ILOG1_DKK("CID-%04x: GRID is not yet set for IPv6:%K --> %K", mtlk_vap_get_oid(nic->vap_handle),
+-            mc_addr->src_ip.ip6_addr.s6_addr, mc_addr->grp_ip.ip6_addr.s6_addr);
+-        goto finish;
+-      }
+-
+-      grp_id = group->grp_id;
+-    }
+-
+-    mtlk_osal_lock_release(&nic->mcast.lock);
+-    break;
+-
+-  case MTLK_MC_STA_LEAVE_GROUP:
+-    if (grp_id == MCAST_GROUP_UNDEF) {
+-      ILOG1_D("CID-%04x: can't remove group - group is not set", mtlk_vap_get_oid(nic->vap_handle));
+-      return;
+-    }
+-    break;
+-
+-  default:
+-    ELOG_V("Invalid action");
 +  sta = mtlk_stadb_find_sid(&nic->slow_ctx->stadb, info->sid);
 +  if (sta) {
 +    if (&sta->info == info)
 +      wave_mc_native_drop_sta(nic, sta);
 +    mtlk_sta_decref(sta);
 +  }
-   mtlk_osal_lock_acquire(&nic->mcast.lock);
-   info->mc_retiring = true;
++  mtlk_osal_lock_acquire(&nic->mcast.lock);
++  info->mc_retiring = true;
++  mtlk_osal_lock_release(&nic->mcast.lock);
++  _wave_mc_cancel_owned(nic, info);
++  if (!info->mc_memberships)
++    return MTLK_ERR_OK;
++
++  /* Only a live STA owner can acquire membership bits, never a setup copy. */
++  sta = container_of(info, sta_entry, info);
++  mtlk_sta_incref(sta); /* Preserve this walk across the final membership put. */
++  for (group = MC_MIN_GROUP; group < MC_GROUPS; group++) {
++    if (!(info->mc_memberships & BIT(group)))
++      continue;
++    res = mtlk_core_mcast_notify_fw(nic->vap_handle, MTLK_MC_STA_LEAVE_GROUP,
++                                    info->sid, group, NULL);
++    if (res != MTLK_ERR_OK) {
++      wave_hw_mc_quarantine(mtlk_vap_get_hw(nic->vap_handle), group);
++      /* No uncertain station membership may outlive reuse of its SID. */
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(nic->vap_handle));
++      if (first_error == MTLK_ERR_OK)
++        first_error = res;
++    }
++    _wave_mc_membership_put(nic, sta, group);
++  }
++  mtlk_sta_decref(sta);
++  return first_error;
++}
++
++void mtlk_mc_close_owned(mtlk_core_t *nic)
++{
++  sta_entry *sta;
++
++  if (!mtlk_vap_is_ap(nic->vap_handle) || !nic->mcast.initialized)
+     return;
+-  }
+-
+-  /* update fw sta group */
+-  mtlk_core_mcast_notify_fw(nic->vap_handle, action, mtlk_sta_get_sid(sta), grp_id);
+-  return;
+-
+-finish:
++  mtlk_osal_lock_acquire(&nic->mcast.lock);
++  nic->mcast.accepting = false;
    mtlk_osal_lock_release(&nic->mcast.lock);
-@@ -2150,11 +2212,13 @@
-   mtlk_osal_lock_acquire(&nic->mcast.lock);
-   nic->mcast.accepting = false;
-   mtlk_osal_lock_release(&nic->mcast.lock);
+-  return;
+-}
+-
+-static void
 +  wave_mc_native_stop_owned(nic);
-   _wave_mc_cancel_owned(nic, NULL);
-   while (!list_empty(&nic->mcast.memberships)) {
-     sta = list_first_entry(&nic->mcast.memberships, sta_entry, mc_membership_node);
-     mtlk_mc_retire_sta_owned(nic, &sta->info);
-   }
++  _wave_mc_cancel_owned(nic, NULL);
++  while (!list_empty(&nic->mcast.memberships)) {
++    sta = list_first_entry(&nic->mcast.memberships, sta_entry, mc_membership_node);
++    mtlk_mc_retire_sta_owned(nic, &sta->info);
++  }
 +  wave_mc_native_clear_owned(nic);
++}
++
++static int
+ _mtlk_mc_update_sta_status (mtlk_core_t *nic, mtlk_core_ui_mc_update_sta_db_t *req, mcast_group_info_t *group_info)
+ {
++  int result = MTLK_ERR_OK, res;
+   /* Depending from "action: STA DB will be updated according the following rules
+    * UPDATE:
+    *  1) mark all STA in group as candidates for "remove from group" (set status to MCAST_STA_STATUS_DELETE);
+@@ -1796,7 +2248,7 @@
+    *  4) walk through all STA in group and mark them as MCAST_STA_STATUS_NONE;
+    */
+ 
+-  mcast_sta_t *mcsta, *prev_mcsta, *del_mcsta, *mcsta_root;
++  mcast_sta_t *mcsta, *prev_mcsta, *del_mcsta;
+   IEEE_ADDR  *mac_list = req->macs_list;
+   unsigned i;
+ 
+@@ -1810,7 +2262,6 @@
+   }
+ 
+   /* Store original root of stations list */
+-  mcsta_root = group_info->mcsta;
+ 
+   /* STEP 2: go trough MAC's list and update status of STA's, associated with source:group */
+   for (i = 0; i < req->macs_num; i++, mac_list++) {
+@@ -1825,20 +2276,22 @@
+       }
+     }
+ 
+-    /* Find STA in source's entry starting from the original root (w/o new stations) */
+-    mcsta = __mtlk_mc_find_mcsta(mcsta_root, sta);
++    /* A request may name one STA through several host MACs. */
++    mcsta = __mtlk_mc_find_mcsta(group_info->mcsta, sta);
+     if (MTLK_MC_STADB_DEL == req->action) {
+       if (mcsta)
+          mcsta->status = MCAST_STA_STATUS_DELETE;
+     } else {
+-      if (mcsta)
+-        mcsta->status = MCAST_STA_STATUS_NONE;
+-      else {
++      if (mcsta) {
++        if (mcsta->status != MCAST_STA_STATUS_JOIN)
++          mcsta->status = MCAST_STA_STATUS_NONE;
++      } else {
+         /* Otherwise create a new STA entry at the top of list. */
+         mcsta = __mtlk_mc_add_mcsta(&group_info->mcsta, sta);
+         if (mcsta)
+           mcsta->status = MCAST_STA_STATUS_JOIN;
+         else {
++          result = MTLK_ERR_NO_MEM;
+           ELOG_DYD("CID-%04x: can't add sta:%Y to group %u: no memory", mtlk_vap_get_oid(nic->vap_handle), mac_list->au8Addr, req->grp_id);
+         }
+       }
+@@ -1857,7 +2310,12 @@
+     switch (status) {
+       case MCAST_STA_STATUS_JOIN:
+         /* Join to new group in FW */
+-        mtlk_core_mcast_group_id_action_serialized(nic, MTLK_MC_STA_JOIN_GROUP, req->grp_id, (uint8 *) mtlk_sta_get_addr(mcsta->sta)->au8Addr, &req->mc_addr);
++        res = _wave_mc_queue_locked(nic, MTLK_MC_STA_JOIN_GROUP, group_info->grp_id,
++                                     mcsta->sta, &req->mc_addr);
++        if (res != MTLK_ERR_OK) {
++          result = res;
++          goto remove_entry;
++        }
+         /* Move to the next entry */
+         prev_mcsta = mcsta;
+         mcsta = mcsta->next;
+@@ -1865,8 +2323,16 @@
+ 
+       case MCAST_STA_STATUS_DELETE:
+         /* Leave group in FW */
+-        mtlk_core_mcast_group_id_action_serialized(nic, MTLK_MC_STA_LEAVE_GROUP, group_info->grp_id, (uint8 *) mtlk_sta_get_addr(mcsta->sta)->au8Addr, &req->mc_addr);
+-
++        res = group_info->grp_id == MCAST_GROUP_UNDEF ? MTLK_ERR_OK :
++              _wave_mc_queue_locked(nic, MTLK_MC_STA_LEAVE_GROUP, group_info->grp_id,
++                                     mcsta->sta, &req->mc_addr);
++        if (res != MTLK_ERR_OK) {
++          result = res;
++          prev_mcsta = mcsta;
++          mcsta = mcsta->next;
++          break;
++        }
++remove_entry:
+         /* Remove entry from the list */
+         del_mcsta = mcsta;
+         mcsta = mcsta->next;
+@@ -1888,22 +2354,26 @@
+     }
+   }
+ 
+-  /* STEP 4: Update group ID */
+-  group_info->grp_id = req->grp_id;
+-}
+-
+-void __MTLK_IFUNC
++  return result;
++}
++
++int __MTLK_IFUNC
+ mtlk_mc_update_stadb (mtlk_core_t *nic, mtlk_core_ui_mc_update_sta_db_t *req)
+ {
++  int result = MTLK_ERR_OK;
+   MTLK_ASSERT(nic);
+   MTLK_ASSERT(req);
+ 
+   /* Do not update STA db, if multucast helper is not available.
+    * In this case the group id was already assigned by wlan driver when parsing the IGMP packet */
+   if (!mtlk_core_mcast_module_is_available(nic))
+-    return;
++    return MTLK_ERR_NOT_SUPPORTED;
+ 
+   mtlk_osal_lock_acquire(&nic->mcast.lock);
++  if (!nic->mcast.accepting) {
++    result = MTLK_ERR_NOT_READY;
++    goto end;
++  }
+ 
+   switch (req->mc_addr.type) {
+     case MTLK_IPv4: {
+@@ -1918,6 +2388,7 @@
+         if ((MTLK_MC_STADB_DEL == req->action) || (0 == req->macs_num)) goto end;
+         grp = _mtlk_mc_create_ip4_grp(&nic->mcast, &req->mc_addr.grp_ip.ip4_addr);
+         if (!grp) {
++          result = MTLK_ERR_NO_MEM;
+           ILOG1_D("Cannot create group IPv4:%B", htonl(req->mc_addr.grp_ip.ip4_addr.s_addr));
+           goto end;
+         }
+@@ -1932,18 +2403,29 @@
+       if (!src) {
+         if ((MTLK_MC_STADB_DEL == req->action) || (0 == req->macs_num)) goto end;
+         src = _mtlk_mc_create_ip4_src(grp, &req->mc_addr.src_ip.ip4_addr);
+-        if (!src) goto end;
++        if (!src) { result = MTLK_ERR_NO_MEM; goto empty_ip4_group; }
+         ILOG1_D("Created source IPv4:%B", htonl(src->ip4_src_addr.s_addr));
+ 
+-        /* Update group index in HW table. */
+-        src->info.grp_id = mtlk_core_mcast_handle_grid(nic, &req->mc_addr, MTLK_GRID_ADD, req->grp_id);
+-        if (MCAST_GROUP_UNDEF == src->info.grp_id) goto end;
+       } else {
+         ILOG1_D("Found source IPv4:%B",   htonl(src->ip4_src_addr.s_addr));
+       }
+ 
++      /* Never retarget an already admitted source to a different helper ID. */
++      if (src->info.grp_id != MCAST_GROUP_UNDEF && src->info.grp_id != req->grp_id) {
++        result = MTLK_ERR_VALUE;
++        goto end;
++      }
++      if (req->action != MTLK_MC_STADB_DEL && req->macs_num &&
++          !_mtlk_mc_admit_group(nic, &req->mc_addr, &src->info, req->grp_id)) {
++        result = MTLK_ERR_NO_RESOURCES;
++        if (src->info.mcsta)
++          goto end;
++        _mtlk_mc_del_ip4_src(src);
++        goto empty_ip4_group;
++      }
++
+       /* STEP 3: Update status of stations */
+-      _mtlk_mc_update_sta_status(nic, req, &src->info);
++      result = _mtlk_mc_update_sta_status(nic, req, &src->info);
+ 
+       /* STEP 4: if last STA was removed, release group index and remove source from group */
+       if (!src->info.mcsta) {
+@@ -1954,6 +2436,7 @@
+         }
+       }
+ 
++empty_ip4_group:
+       /* STEP 5: delete group, if last source was removed from group */
+       if ((!grp->info.mcsta) && (!grp->ip4_src_list)) {
+         if (_mtlk_mc_del_ip4_grp(&nic->mcast, grp)) {
+@@ -1977,6 +2460,7 @@
+         if ((MTLK_MC_STADB_DEL == req->action) || (0 == req->macs_num)) goto end;
+         grp = _mtlk_mc_create_ip6_grp(&nic->mcast, &req->mc_addr.grp_ip.ip6_addr);
+         if (!grp) {
++          result = MTLK_ERR_NO_MEM;
+           ILOG1_K("Cannot create group IPv6:%K", req->mc_addr.grp_ip.ip6_addr.s6_addr);
+           goto end;
+         }
+@@ -1991,18 +2475,29 @@
+       if (!src) {
+         if ((MTLK_MC_STADB_DEL == req->action) || (0 == req->macs_num)) goto end;
+         src = _mtlk_mc_create_ip6_src(grp, &req->mc_addr.src_ip.ip6_addr);
+-        if (!src) goto end;
++        if (!src) { result = MTLK_ERR_NO_MEM; goto empty_ip6_group; }
+         ILOG1_K("Created source IPv6:%K", src->ip6_src_addr.s6_addr);
+ 
+-        /* Update group index in HW table. */
+-        src->info.grp_id = mtlk_core_mcast_handle_grid(nic, &req->mc_addr, MTLK_GRID_ADD, req->grp_id);
+-        if (MCAST_GROUP_UNDEF == src->info.grp_id) goto end;
+       } else {
+         ILOG1_K("Found source IPv6:%K",   src->ip6_src_addr.s6_addr);
+       }
+ 
++      /* Never retarget an already admitted source to a different helper ID. */
++      if (src->info.grp_id != MCAST_GROUP_UNDEF && src->info.grp_id != req->grp_id) {
++        result = MTLK_ERR_VALUE;
++        goto end;
++      }
++      if (req->action != MTLK_MC_STADB_DEL && req->macs_num &&
++          !_mtlk_mc_admit_group(nic, &req->mc_addr, &src->info, req->grp_id)) {
++        result = MTLK_ERR_NO_RESOURCES;
++        if (src->info.mcsta)
++          goto end;
++        _mtlk_mc_del_ip6_src(src);
++        goto empty_ip6_group;
++      }
++
+       /* STEP 3: Update status of stations */
+-      _mtlk_mc_update_sta_status(nic, req, &src->info);
++      result = _mtlk_mc_update_sta_status(nic, req, &src->info);
+ 
+       /* STEP 4: if last STA was removed, release group index and remove source from group */
+       if (!src->info.mcsta) {
+@@ -2013,6 +2508,7 @@
+         }
+       }
+ 
++empty_ip6_group:
+       /* STEP 5: delete group, if last source was removed from group */
+       if ((!grp->info.mcsta) && (!grp->ip6_src_list)) {
+         if (_mtlk_mc_del_ip6_grp(&nic->mcast, grp)) {
+@@ -2030,16 +2526,67 @@
+ 
+ end:
+   mtlk_osal_lock_release(&nic->mcast.lock);
+-  return;
++  return result;
++}
++
++/* Membership tables have no VLAN identity. Preserve only the existing
++ * link-local broadcast-group exceptions for tagged traffic; never use an
++ * untagged membership for a tagged group. Inspect without changing the skb.
++ */
++static int
++_mtlk_mc_tagged_link_local_grid (struct sk_buff *skb, __be16 protocol)
++{
++  unsigned int offset = ETH_HLEN;
++  unsigned int depth = skb_vlan_tag_present(skb) ? 1 : 0;
++  struct vlan_hdr vlan_buf;
++  const struct vlan_hdr *vlan;
++
++  while (protocol == htons(ETH_P_8021Q) || protocol == htons(ETH_P_8021AD)) {
++    if (++depth > 2)
++      return MCAST_GROUP_UNDEF;
++    vlan = skb_header_pointer(skb, offset, sizeof(vlan_buf), &vlan_buf);
++    if (!vlan)
++      return MCAST_GROUP_UNDEF;
++    protocol = vlan->h_vlan_encapsulated_proto;
++    offset += VLAN_HLEN;
++  }
++
++  if (protocol == htons(ETH_P_IP)) {
++    struct iphdr ip_buf;
++    const struct iphdr *ip = skb_header_pointer(skb, offset, sizeof(ip_buf), &ip_buf);
++
++    if (ip && ip->version == 4 && ip->ihl >= 5 &&
++        skb->len - offset >= ip->ihl * 4 &&
++        (ntohl(ip->daddr) & 0xFFFFFF00) == 0xE0000000)
++      return MCAST_GROUP_BROADCAST;
++  } else if (protocol == htons(ETH_P_IPV6)) {
++    struct ipv6hdr ip6_buf;
++    const struct ipv6hdr *ip6 = skb_header_pointer(skb, offset, sizeof(ip6_buf), &ip6_buf);
++
++    if (ip6 && ip6->version == 6 && ip6->daddr.s6_addr[0] == 0xff &&
++        (ip6->daddr.s6_addr[1] & 0x0f) == 2)
++      return MCAST_GROUP_BROADCAST;
++  }
++
++  return MCAST_GROUP_UNDEF;
  }
  
- static int
-@@ -2515,6 +2579,8 @@
+ int __MTLK_IFUNC
+-mtlk_mc_get_grid (mtlk_core_t *nic, mtlk_nbuf_t *nbuf)
++mtlk_mc_get_grid (mtlk_core_t *nic, mtlk_nbuf_t *nbuf, BOOL pin)
+ {
+   int group_id = MCAST_GROUP_UNDEF;
+   struct ethhdr *ether_header = (struct ethhdr *)nbuf->data;
    mcast_group_info_t  *group;
    mtlk_dlist_entry_t *entry, *head;
- 
++
 +  if (nic->mcast.native && !mtlk_core_mcast_module_is_available(nic))
 +    return wave_mc_native_grid(nic, nbuf, pin, NULL);
-   if (skb_headlen(nbuf) < sizeof(*ether_header))
-     return MCAST_GROUP_UNDEF;
++  if (skb_headlen(nbuf) < sizeof(*ether_header))
++    return MCAST_GROUP_UNDEF;
++
++  if (skb_vlan_tag_present(nbuf) || ether_header->h_proto == htons(ETH_P_8021Q) ||
++      ether_header->h_proto == htons(ETH_P_8021AD))
++    return _mtlk_mc_tagged_link_local_grid(nbuf, ether_header->h_proto);
  
-@@ -2661,6 +2727,14 @@
+   switch (ntohs(ether_header->h_proto)) {
+     case ETH_P_IP:
+@@ -2048,7 +2595,7 @@
+       struct iphdr *ip_header = (struct iphdr *)
+           ((mtlk_handle_t)ether_header + sizeof(struct ethhdr));
+ 
+-      if (mtlk_df_nbuf_get_data_length(nbuf) < sizeof(*ether_header) + sizeof(*ip_header)) {
++      if (skb_headlen(nbuf) < sizeof(*ether_header) + sizeof(*ip_header)) {
+         ILOG1_D("CID-%04x: Frame length is wrong", mtlk_vap_get_oid(nic->vap_handle));
+         return MCAST_GROUP_UNDEF;
+       }
+@@ -2062,10 +2609,19 @@
+         break;
+       }
+ 
++      if (!mtlk_vap_is_ap(nic->vap_handle) || !READ_ONCE(nic->mcast.initialized))
++        return MCAST_GROUP_UNDEF;
+       mtlk_osal_lock_acquire(&nic->mcast.lock);
++      if (!nic->mcast.accepting) {
++        mtlk_osal_lock_release(&nic->mcast.lock);
++        return MCAST_GROUP_UNDEF;
++      }
+       if ((group = _mtlk_mc_find_ip4_group(nic, &grp_addr, &src_addr)) != NULL) {
+-        /* Group was found */
+         group_id = group->grp_id;
++        if (!wave_hw_mc_get(mtlk_vap_get_hw(nic->vap_handle), group_id, pin)) {
++          mtlk_osal_lock_release(&nic->mcast.lock);
++          return MCAST_GROUP_UNDEF;
++        }
+       }
+       mtlk_osal_lock_release(&nic->mcast.lock);
+ 
+@@ -2119,10 +2675,19 @@
+         break;
+       }
+ 
++      if (!mtlk_vap_is_ap(nic->vap_handle) || !READ_ONCE(nic->mcast.initialized))
++        return MCAST_GROUP_UNDEF;
+       mtlk_osal_lock_acquire(&nic->mcast.lock);
+-      if ((group = _mtlk_mc_find_ip6_group(nic, &src_addr, &grp_addr)) != NULL) {
+-        /* Group was found */
++      if (!nic->mcast.accepting) {
++        mtlk_osal_lock_release(&nic->mcast.lock);
++        return MCAST_GROUP_UNDEF;
++      }
++      if ((group = _mtlk_mc_find_ip6_group(nic, &grp_addr, &src_addr)) != NULL) {
+         group_id = group->grp_id;
++        if (!wave_hw_mc_get(mtlk_vap_get_hw(nic->vap_handle), group_id, pin)) {
++          mtlk_osal_lock_release(&nic->mcast.lock);
++          return MCAST_GROUP_UNDEF;
++        }
+       }
+       mtlk_osal_lock_release(&nic->mcast.lock);
+ 
+@@ -2162,6 +2727,14 @@
    }
  
    return group_id;
@@ -379,11 +1482,84 @@ context is invented.
  }
  
  /***********************************************************
-@@ -3039,4 +3113,19 @@
-   MTLK_ASSERT(list_empty(&nic->mcast.memberships));
-   nic->mcast.accepting = true;
-   mtlk_osal_lock_release(&nic->mcast.lock);
--}
+@@ -2466,3 +3039,93 @@
+   mcast_range_vect_cfg->range_vect = clpb_range_vect;
+   return res;
+ }
++
++/* Caller has withdrawn the VAP/data producer and synchronized receive work. */
++static void
++_wave_mc_free_host_info(mtlk_core_t *nic, mcast_group_info_t *info,
++                         mtlk_mc_addr_t *addr)
++{
++  mcast_sta_t *member;
++
++  mtlk_core_mcast_handle_grid(nic, addr, MTLK_GRID_DEL, info->grp_id);
++  while ((member = info->mcsta) != NULL) {
++    info->mcsta = member->next;
++    mtlk_sta_decref(member->sta);
++    mtlk_osal_mem_free(member);
++  }
++}
++
++static void
++_wave_mc_flush_hosts(mtlk_core_t *nic)
++{
++  mcast_ip4_grp_t *v4[MCAST_HASH_SIZE], *g4, *next4;
++  mcast_ip6_grp_t *v6[MCAST_HASH_SIZE], *g6, *next6;
++  mcast_ip4_src_t *s4, *sn4;
++  mcast_ip6_src_t *s6, *sn6;
++  mtlk_mc_addr_t addr;
++  int i;
++
++  mtlk_osal_lock_acquire(&nic->mcast.lock);
++  memcpy(v4, nic->mcast.mcast_ip4_hash, sizeof(v4));
++  memcpy(v6, nic->mcast.mcast_ip6_hash, sizeof(v6));
++  memset(nic->mcast.mcast_ip4_hash, 0, sizeof(v4));
++  memset(nic->mcast.mcast_ip6_hash, 0, sizeof(v6));
++  mtlk_osal_lock_release(&nic->mcast.lock);
++
++  for (i = 0; i < MCAST_HASH_SIZE; i++) {
++    for (g4 = v4[i]; g4; g4 = next4) {
++      next4 = g4->next;
++      __mtlk_mc_set_mc_addr_type(&addr, MTLK_IPv4);
++      addr.grp_ip.ip4_addr = g4->ip4_grp_addr;
++      for (s4 = g4->ip4_src_list; s4; s4 = sn4) {
++        sn4 = s4->next;
++        addr.src_ip.ip4_addr = s4->ip4_src_addr;
++        _wave_mc_free_host_info(nic, &s4->info, &addr);
++        mtlk_osal_mem_free(s4);
++      }
++      addr.src_ip.ip4_addr = all_IPv4;
++      _wave_mc_free_host_info(nic, &g4->info, &addr);
++      mtlk_osal_mem_free(g4);
++    }
++    for (g6 = v6[i]; g6; g6 = next6) {
++      next6 = g6->next;
++      __mtlk_mc_set_mc_addr_type(&addr, MTLK_IPv6);
++      addr.grp_ip.ip6_addr = g6->ip6_grp_addr;
++      for (s6 = g6->ip6_src_list; s6; s6 = sn6) {
++        sn6 = s6->next;
++        addr.src_ip.ip6_addr = s6->ip6_src_addr;
++        _wave_mc_free_host_info(nic, &s6->info, &addr);
++        mtlk_osal_mem_free(s6);
++      }
++      addr.src_ip.ip6_addr = all_IPv6;
++      _wave_mc_free_host_info(nic, &g6->info, &addr);
++      mtlk_osal_mem_free(g6);
++    }
++  }
++}
++
++void mtlk_mc_open_owned(mtlk_core_t *nic)
++{
++  if (!mtlk_vap_is_ap(nic->vap_handle) || !nic->mcast.initialized)
++    return;
++  mtlk_osal_lock_acquire(&nic->mcast.lock);
++  MTLK_ASSERT(list_empty(&nic->mcast.pending));
++  MTLK_ASSERT(list_empty(&nic->mcast.memberships));
++  nic->mcast.accepting = true;
++  mtlk_osal_lock_release(&nic->mcast.lock);
 +  wave_mc_native_open_owned(nic);
 +}
 +
@@ -402,197 +1578,48 @@ context is invented.
 +}
 --- a/wireless/driver/linux/mcast.h
 +++ b/wireless/driver/linux/mcast.h
-@@ -104,6 +104,7 @@
+@@ -102,6 +102,11 @@
+   mtlk_dlist_t  ip6_ranges_list;
+   mtlk_osal_spinlock_t lock;
    mtlk_osal_spinlock_t lock_ranges;
-   struct list_head pending;
-   struct list_head memberships;
++  struct list_head pending;
++  struct list_head memberships;
 +  struct wave_mc_native *native;
-   bool initialized;
-   bool accepting;
++  bool initialized;
++  bool accepting;
    MTLK_DECLARE_INIT_STATUS;
-@@ -164,8 +165,10 @@
- /* Process context outside the radio master/recovery serializers. */
- void mtlk_mc_close_external(mtlk_core_t *nic, BOOL all);
- void mtlk_mc_open_owned(mtlk_core_t *nic);
-+void mtlk_mc_publish_reliable_mode(mtlk_core_t *nic, int mode);
- int mtlk_mc_update_stadb (mtlk_core_t *nic, mtlk_core_ui_mc_update_sta_db_t *req);
+ } mcast_ctx_t;
  
+@@ -143,6 +148,7 @@
+ #define LOG_LOCAL_GID   GID_MCAST
+ #define LOG_LOCAL_FID   0
+ 
++BOOL mtlk_mc_convert_dhcp_bcast_to_ucast(mtlk_nbuf_t *nbuf);
+ int  mtlk_mc_parse (mtlk_core_t* nic, struct sk_buff *skb, sta_entry *sta)
+   __MTLK_INT_HANDLER_SECTION;
+ int  mtlk_mc_transmit (mtlk_core_t* nic, mtlk_core_handle_tx_data_t *tx_data, uint32 nbuf_flags, int bridge_mode, sta_entry *src_sta)
+@@ -153,10 +159,17 @@
+ void mtlk_mc_restore_mac (struct sk_buff *skb);
+ int  mtlk_mc_init (mtlk_core_t *nic);
+ void mtlk_mc_uninit (mtlk_core_t *nic);
+-void mtlk_mc_update_group_id_sta (mtlk_core_t *nic, uint32 grid, mc_action_t action, mtlk_mc_addr_t *mc_addr, sta_entry *sta);
+-void mtlk_mc_update_stadb (mtlk_core_t *nic, mtlk_core_ui_mc_update_sta_db_t *req);
++/* Owning master, or exclusive joined/blocked serializers at teardown. */
++int mtlk_mc_retire_sta_owned(mtlk_core_t *nic, sta_info *info);
++void mtlk_mc_close_owned(mtlk_core_t *nic);
++/* Process context outside the radio master/recovery serializers. */
++void mtlk_mc_close_external(mtlk_core_t *nic, BOOL all);
++void mtlk_mc_open_owned(mtlk_core_t *nic);
++void mtlk_mc_publish_reliable_mode(mtlk_core_t *nic, int mode);
++int mtlk_mc_update_stadb (mtlk_core_t *nic, mtlk_core_ui_mc_update_sta_db_t *req);
+ 
+-int mtlk_mc_get_grid(mtlk_core_t *nic, mtlk_nbuf_t *nbuf)
 +int mtlk_mc_get_grid_peer(mtlk_core_t *nic, mtlk_nbuf_t *nbuf, BOOL pin, sta_entry *source);
- int mtlk_mc_get_grid(mtlk_core_t *nic, mtlk_nbuf_t *nbuf, BOOL pin)
++int mtlk_mc_get_grid(mtlk_core_t *nic, mtlk_nbuf_t *nbuf, BOOL pin)
      __MTLK_INT_HANDLER_SECTION;
  
---- a/wireless/driver/linux/mtlk_df_user.c
-+++ b/wireless/driver/linux/mtlk_df_user.c
-@@ -258,6 +258,7 @@
- 
-   spinlock_t assoc_lock;
-   struct wave_assoc_metadata assoc_metadata[16];
-+  bool multi_ap_backhaul_bss; /* protected by assoc_lock */
- 
-   int corrupted_packets_counter;
- 
-@@ -792,25 +793,23 @@
-   dev_put(vlan->parent_ndev);
- }
- 
--/* Preserve the existing administrator hairpin decision. Without hairpin,
-- * driver intra-BSS forwarding still serves a non-isolated AP with m2u off.
-+/* netifd enables bridge hairpin for non-isolated WAVE APs. Every bridged
-+ * frame is handed to that owner; an explicit hairpin-off choice is never
-+ * bypassed by driver-local forwarding, VLAN learning or a second querier.
-  */
- bool wave_df_intra_bss_forwarding(mtlk_df_user_t *df_user)
- {
--  bool forwarding = true;
--
- #if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
--  rcu_read_lock();
--  forwarding = !br_port_flag_is_set(df_user->ndev, BR_HAIRPIN_MODE);
--  rcu_read_unlock();
-+  return !netif_is_bridge_port(df_user->ndev);
-+#else
-+  return true;
- #endif
--  return forwarding;
- }
- 
- /* A bridged parent has already passed VLAN and source policy. Remaining
-  * group frames use BSS flooding rather than the native VLAN-blind cache.
-- * Native RX shortcuts still use their own membership owner; their FORWARD
-- * flag is checked by the caller before selecting this OS/bridge policy.
-+ * Standalone RX shortcuts use their native membership owner. Bridged
-+ * forwarding remains entirely subject to Linux VLAN/source/port policy.
-  */
- bool wave_df_bridge_mcast_owned(mtlk_df_user_t *df_user)
- {
-@@ -942,17 +941,17 @@
-   mtlk_core_t *core = mtlk_vap_get_core(sta->vap_handle);
-   struct net_device *old_ndev;
-   bool old_ref = false, reopen = false;
--  sta_entry *current;
-+  sta_entry *sid_sta;
-   int res;
- 
--  current = mtlk_stadb_find_sid(&core->slow_ctx->stadb, binding->sid);
--  if (current != sta || sta->info.sid_order != binding->sid_order) {
--    if (current)
--      mtlk_sta_decref(current);
-+  sid_sta = mtlk_stadb_find_sid(&core->slow_ctx->stadb, binding->sid);
-+  if (sid_sta != sta || sta->info.sid_order != binding->sid_order) {
-+    if (sid_sta)
-+      mtlk_sta_decref(sid_sta);
-     binding->result = -ENOENT;
-     return;
-   }
--  mtlk_sta_decref(current);
-+  mtlk_sta_decref(sid_sta);
-   spin_lock_bh(&parent->ap_vlan_lock);
-   if (sta->ap_vlan_retiring || (vlan && vlan->sta && vlan->sta != sta)) {
-     binding->result = sta->ap_vlan_retiring ? -ENOENT : -EBUSY;
-@@ -2243,6 +2242,8 @@
-       wave_hw_mmb_quiesce(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df_user->df)));
-     }
-   }
-+  wave_df_multi_ap_backhaul_set(df_user, false);
-+  wave_df_assoc_clear(df_user);
- 
-   if (df_user->hs20_enabled)
-   {
-@@ -9955,6 +9956,26 @@
-   spin_unlock_irqrestore(&df_user->assoc_lock, flags);
- }
- 
-+void wave_df_multi_ap_backhaul_set(mtlk_df_user_t *df_user, bool backhaul)
-+{
-+  unsigned long flags;
-+
-+  spin_lock_irqsave(&df_user->assoc_lock, flags);
-+  df_user->multi_ap_backhaul_bss = backhaul;
-+  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
-+}
-+
-+bool wave_df_multi_ap_backhaul(mtlk_df_user_t *df_user)
-+{
-+  unsigned long flags;
-+  bool backhaul;
-+
-+  spin_lock_irqsave(&df_user->assoc_lock, flags);
-+  backhaul = df_user->multi_ap_backhaul_bss;
-+  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
-+  return backhaul;
-+}
-+
- static void wave_df_channel_notify_work(struct wiphy *wiphy,
-                                        struct wiphy_work *work)
- {
-@@ -10027,6 +10048,8 @@
- {
-   lockdep_assert_wiphy(df_user->ndev->ieee80211_ptr->wiphy);
-   df_user->ap_stop_pending = false;
-+  wave_df_multi_ap_backhaul_set(df_user, false);
-+  wave_df_assoc_clear(df_user);
- }
- 
- void wave_df_notifications_start_locked(mtlk_df_user_t *df_user)
---- a/wireless/driver/linux/mtlk_df_user_priv.h
-+++ b/wireless/driver/linux/mtlk_df_user_priv.h
-@@ -708,6 +708,7 @@
-   u8 opmode;
-   bool opmode_valid;
-   bool four_addr;
-+  bool multi_ap_backhaul_sta;
-   bool pbac;
-   unsigned long expires;
- };
-@@ -719,6 +720,10 @@
- bool wave_df_assoc_take(mtlk_df_user_t *df_user, const u8 *mac,
-                        struct wave_assoc_metadata *metadata);
- void wave_df_assoc_clear(mtlk_df_user_t *df_user);
-+/* Accepted AP setup Association Response IEs own the local BSS role. A peer
-+ * declaration cannot enable it; flushing stations does not replace it. */
-+void wave_df_multi_ap_backhaul_set(mtlk_df_user_t *df_user, bool backhaul);
-+bool wave_df_multi_ap_backhaul(mtlk_df_user_t *df_user);
- 
- struct _sta_entry;
- struct wireless_dev *wave_df_ap_vlan_add(struct wiphy *wiphy, const char *name,
---- a/wireless/driver/linux/mtlk_mmb_drv.c
-+++ b/wireless/driver/linux/mtlk_mmb_drv.c
-@@ -21,6 +21,7 @@
- #include "mtlk_df.h"
- #include "fw_recovery.h"
- #include "wave_fapi_if.h"
-+#include "wave_mc_native.h"
- 
- #include <linux/module.h>
- #include <linux/init.h>
-@@ -1778,6 +1779,7 @@
- 
- MTLK_INIT_STEPS_LIST_BEGIN(bus_drv_mod)
-   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_DFG_INIT)
-+  MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_MC_NOTIFY)
-   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_RCVRY_INIT)
- #ifdef MTCFG_PMCU_SUPPORT
-   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_PMCU_INIT)
-@@ -1802,6 +1804,8 @@
- #endif /* MTCFG_PMCU_SUPPORT */
-     MTLK_CLEANUP_STEP(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
-                       wave_rcvry_cleanup, ());
-+    MTLK_CLEANUP_STEP(bus_drv_mod, DRV_MC_NOTIFY, MTLK_OBJ_PTR(&drv_state),
-+                      wave_mc_native_module_exit, ());
-     MTLK_CLEANUP_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
-                       mtlk_dfg_cleanup, ());
-   MTLK_CLEANUP_END(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
-@@ -1821,6 +1825,9 @@
-   MTLK_INIT_TRY(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
-     MTLK_INIT_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
-                    mtlk_dfg_init, ());
-+    MTLK_INIT_STEP_EX(bus_drv_mod, DRV_MC_NOTIFY, MTLK_OBJ_PTR(&drv_state),
-+                      wave_mc_native_module_init, (),
-+                      drv_state.os_res, 0 == drv_state.os_res, MTLK_ERR_NO_RESOURCES);
-     MTLK_INIT_STEP_VOID(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
-                         wave_rcvry_init, ());
- #ifdef MTCFG_PMCU_SUPPORT
---- /dev/null
+ int  __MTLK_IFUNC mtlk_mc_ranges_add (mtlk_core_t *nic, mtlk_ip_netmask_t *netmask);
+--- a/wireless/driver/linux/wave_mc_native.c
 +++ b/wireless/driver/linux/wave_mc_native.c
 @@ -0,0 +1,1449 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
@@ -2044,7 +3071,7 @@ context is invented.
 +  mtlk_osal_lock_release(&core->mcast.lock);
 +  kfree(native);
 +}
---- /dev/null
+--- a/wireless/driver/linux/wave_mc_native.h
 +++ b/wireless/driver/linux/wave_mc_native.h
 @@ -0,0 +1,35 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
@@ -2082,7 +3109,7 @@ context is invented.
 +                                struct _sta_entry *sta,
 +                                struct wave_mc_native_class *owner);
 +#endif
---- /dev/null
+--- a/wireless/driver/linux/wave_mc_policy.c
 +++ b/wireless/driver/linux/wave_mc_policy.c
 @@ -0,0 +1,1017 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
@@ -3102,7 +4129,7 @@ context is invented.
 +            mc_drain_general(p, now, budget - used, emit, ctx);
 +  return used;
 +}
---- /dev/null
+--- a/wireless/driver/linux/wave_mc_policy.h
 +++ b/wireless/driver/linux/wave_mc_policy.h
 @@ -0,0 +1,123 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
@@ -3228,287 +4255,3 @@ context is invented.
 +                                         wave_mc_query_fn emit, void *ctx);
 +
 +#endif
---- a/wireless/driver/linux/wave_radio.c
-+++ b/wireless/driver/linux/wave_radio.c
-@@ -2048,6 +2048,54 @@
-   return _wave_radio_tx_power(radio, WAVE_TX_POWER_MAC, limit, NULL);
- }
- 
-+#define WAVE_MULTI_AP_EXTENSION    6
-+#define WAVE_MULTI_AP_BACKHAUL_BSS BIT(6)
-+#define WAVE_MULTI_AP_BACKHAUL_STA BIT(7)
-+
-+/* Select the Multi-AP IE itself: a later WFA IE may have a different type.
-+ * Only one complete extension declaration can authorize a local/peer role. */
-+static bool wave_multi_ap_role(const u8 *ies, size_t len, u8 role)
-+{
-+  bool found = false, extension = false, backhaul = false;
-+
-+  if (!ies)
-+    return false;
-+  while (len) {
-+    const u8 *attr;
-+    size_t size, left;
-+
-+    if (len < 2 || ies[1] > len - 2)
-+      return false;
-+    size = ies[1] + 2;
-+    if (ies[0] == WLAN_EID_VENDOR_SPECIFIC && ies[1] >= 4 &&
-+        ies[2] == ((WLAN_OUI_WFA >> 16) & 0xff) &&
-+        ies[3] == ((WLAN_OUI_WFA >> 8) & 0xff) &&
-+        ies[4] == (WLAN_OUI_WFA & 0xff) &&
-+        ies[5] == WLAN_OUI_TYPE_WFA_MULTI_AP) {
-+      if (found)
-+        return false;
-+      found = true;
-+      attr = ies + 6;
-+      left = ies[1] - 4;
-+      while (left) {
-+        if (left < 2 || attr[1] > left - 2)
-+          return false;
-+        if (attr[0] == WAVE_MULTI_AP_EXTENSION) {
-+          if (extension || attr[1] != 1)
-+            return false;
-+          extension = true;
-+          backhaul = !!(attr[2] & role);
-+        }
-+        left -= attr[1] + 2;
-+        attr += attr[1] + 2;
-+      }
-+    }
-+    ies += size;
-+    len -= size;
-+  }
-+  return found && extension && backhaul;
-+}
-+
- int wave_radio_beacon_change(
-   wave_radio_t *radio,
-   struct net_device *ndev,
-@@ -2055,6 +2103,7 @@
- {
-   int res = MTLK_ERR_OK;
-   mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
-+  mtlk_df_t *master_df;
-   mtlk_vap_handle_t vap_handle;
-   uint8 vap_idx;
-   mtlk_beacon_data_t beacon_data;
-@@ -2069,7 +2118,7 @@
-   vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
-   vap_idx = mtlk_vap_get_id(vap_handle);
- 
--  df_user = mtlk_df_get_user(mtlk_vap_manager_get_master_df(radio->vap_manager));
-+  master_df = mtlk_vap_manager_get_master_df(radio->vap_manager);
- 
-   if (beacon->head_len < 0 || beacon->tail_len < 0 || beacon->probe_resp_len < 0 ||
-       beacon->head_len > 65535 || beacon->tail_len > 65535 || beacon->probe_resp_len > 65535)
-@@ -2078,8 +2127,16 @@
-   beacon_data.vap_idx = vap_idx;
-   beacon_data.bmgr_priv = &radio->bmgr_priv;
- 
--  res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user), WAVE_CORE_REQ_SET_BEACON, &clpb, &beacon_data, sizeof(beacon_data));
-+  res = _mtlk_df_user_invoke_core(master_df, WAVE_CORE_REQ_SET_BEACON, &clpb, &beacon_data, sizeof(beacon_data));
-   res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_SET_BEACON, TRUE);
-+  /* Userspace MLME supplies its local Association Response IEs during AP
-+   * setup, before ADD_STA. Omission preserves the accepted template's role;
-+   * a successful explicit replacement, including an empty one, replaces it.
-+   * Beacon contents and received peer declarations do not own this policy. */
-+  if (res == MTLK_ERR_OK && beacon->assocresp_ies)
-+    wave_df_multi_ap_backhaul_set(df_user,
-+      wave_multi_ap_role(beacon->assocresp_ies, beacon->assocresp_ies_len,
-+                         WAVE_MULTI_AP_BACKHAUL_BSS));
-   return _mtlk_df_mtlk_to_linux_error_code(res);
- }
- 
-@@ -2167,6 +2224,8 @@
-   ILOG1_SSD("%s: Invoked from %s (%i)", ndev->name, current->comm, current->pid);
-   MTLK_CHECK_DF_USER(df_user);
- 
-+  /* A new BSS cannot inherit the previous response template's local role. */
-+  wave_df_multi_ap_backhaul_set(df_user, false);
-   res = _wave_radio_abort_and_prevent_scan(radio);
-   if (res != MTLK_ERR_OK)
-     goto finish;
-@@ -2267,6 +2326,8 @@
-   if (beacon_accepted && (linux_error || res != MTLK_ERR_OK)) {
-     int stop_res;
- 
-+    wave_df_multi_ap_backhaul_set(df_user, false);
-+    wave_df_assoc_clear(df_user);
-     clpb = NULL;
-     stop_res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user),
-                                         WAVE_CORE_REQ_DEACTIVATE, &clpb, NULL, 0);
-@@ -2318,8 +2379,10 @@
-       break;
-     mtlk_osal_msleep(100);
-   }
--  if (res == MTLK_ERR_OK)
-+  if (res == MTLK_ERR_OK) {
-     wave_df_assoc_clear(df_user);
-+    wave_df_multi_ap_backhaul_set(df_user, false);
-+  }
- 
- finish:
-   if (scan_paused == 1 && _wave_radio_allow_or_resume_scan(radio) != MTLK_ERR_OK)
-@@ -2362,31 +2425,6 @@
- {
-   return !(MTLK_VHT_MCS_MAP_INVALID == vht_mcs_info->rx_mcs_map ||
-            MTLK_VHT_MCS_MAP_INVALID == vht_mcs_info->tx_mcs_map);
--}
--
--/* Multi-AP's extension attribute explicitly identifies a backhaul station.
-- * Merely finding the WFA OUI/type also matches fronthaul-only associations.
-- */
--static bool wave_multi_ap_backhaul_sta(const u8 *ie)
--{
--  const u8 *pos, *end;
--  bool backhaul = false;
--
--  if (!ie || ie[-1] < 4 || ie[3] != WLAN_OUI_TYPE_WFA_MULTI_AP)
--    return false;
--  pos = ie + 4;
--  end = ie + ie[-1];
--  while (end - pos >= 2) {
--    u8 id = pos[0], len = pos[1];
--
--    pos += 2;
--    if (len > end - pos)
--      return false;
--    if (id == 6 && len == 1)
--      backhaul |= !!(pos[0] & BIT(7));
--    pos += len;
--  }
--  return pos == end && backhaul;
- }
- 
- void wave_radio_assoc_req_capture(struct net_device *ndev,
-@@ -2431,8 +2469,8 @@
-       elems.vendor_brcm[3] == WLAN_EID_BRCM_VENDOR_VERSION_2 &&
-       (elems.vendor_brcm[6] & WLAN_EID_BRCM_VENDOR_DWDS_CAPABLE))
-     metadata.four_addr = true;
--  if (wave_multi_ap_backhaul_sta(elems.vendor_wfa))
--    metadata.four_addr = true;
-+  metadata.multi_ap_backhaul_sta =
-+    wave_multi_ap_role(buf + offset, len - offset, WAVE_MULTI_AP_BACKHAUL_STA);
-   if (elems.opmode_notif) {
-     metadata.opmode = *elems.opmode_notif;
-     metadata.opmode_valid = true;
-@@ -2525,8 +2563,12 @@
-     return MTLK_ERR_NOT_READY;
-   info->bss_coex_20_40 = metadata.coexistence;
-   info->vendor = metadata.vendor;
--  if (wave_pdb_get_int(param_db_core, PARAM_DB_CORE_4ADDR_MODE) == MTLK_CORE_4ADDR_DYNAMIC &&
--      metadata.four_addr)
-+  /* Multi-AP is a pair of roles, separate from legacy dynamic WDS policy.
-+   * Hostapd accepts this peer IE even on an ordinary AP, so it cannot by
-+   * itself authorize four-address firmware station creation. */
-+  if ((wave_pdb_get_int(param_db_core, PARAM_DB_CORE_4ADDR_MODE) == MTLK_CORE_4ADDR_DYNAMIC &&
-+       metadata.four_addr) ||
-+      (metadata.multi_ap_backhaul_sta && wave_df_multi_ap_backhaul(df_user)))
-     info->WDS_client_type = FOUR_ADDRESSES_STATION;
-   if (params->link_sta_params.opmode_notif_used || metadata.opmode_valid) {
-     info->opmode_notif = params->link_sta_params.opmode_notif_used ?
---- a/wireless/driver/shared/hw_mmb.c
-+++ b/wireless/driver/shared/hw_mmb.c
-@@ -726,6 +726,7 @@
-   uint32         ref_cnt;
-   uint32         pins;
-   bool           quarantined;
-+  bool           native; /* Exclusive immutable native recipient-set owner. */
- } mtlk_hw_mc_t;
- 
- 
-@@ -2439,7 +2440,7 @@
-       mtlk_handle_eapol(vap_handle, skb->data, skb->len);
-       mtlk_df_nbuf_free(skb);
-     } else {
--      mtlk_core_handle_tx_data_t tx_data;
-+      mtlk_core_handle_tx_data_t tx_data = {0};
-       tx_data.nbuf = skb;
-       tx_data.msg = NULL;
-       tx_data.dst_sta = NULL;
-@@ -8811,6 +8812,49 @@
-   mtlk_osal_lock_release(&hw->mc_group_lock);
- }
- 
-+/* Native source policy owns immutable recipient sets. These IDs share the
-+ * same pin/quarantine pool, but never alias an address-keyed helper group or
-+ * another VAP's recipient set. A host owner is released only after its command
-+ * and applied-membership owners have withdrawn; DAT_CFM may retain TX pins.
-+ */
-+int wave_hw_mc_alloc_native(mtlk_hw_t *hw)
-+{
-+  int id, result = MCAST_GROUP_UNDEF;
-+
-+  mtlk_osal_lock_acquire(&hw->mc_group_lock);
-+  if (!READ_ONCE(hw->quiescing)) {
-+    for (id = MC_MIN_GROUP; id < MC_GROUPS; id++) {
-+      mtlk_hw_mc_t *group = &hw->mc_groups[id];
-+
-+      if (group->ref_cnt || group->pins || group->quarantined)
-+        continue;
-+      memset(group, 0, sizeof(*group));
-+      group->native = true;
-+      group->ref_cnt = 1;
-+      result = id;
-+      break;
-+    }
-+  }
-+  mtlk_osal_lock_release(&hw->mc_group_lock);
-+  return result;
-+}
-+
-+void wave_hw_mc_release_native(mtlk_hw_t *hw, uint8 id)
-+{
-+  mtlk_hw_mc_t *group;
-+
-+  MTLK_ASSERT(id >= MC_MIN_GROUP && id < MC_GROUPS);
-+  mtlk_osal_lock_acquire(&hw->mc_group_lock);
-+  group = &hw->mc_groups[id];
-+  MTLK_ASSERT(group->native && group->ref_cnt == 1);
-+  if (group->native && group->ref_cnt == 1) {
-+    group->ref_cnt = 0;
-+    if (!group->pins && !group->quarantined)
-+      memset(group, 0, sizeof(*group));
-+  }
-+  mtlk_osal_lock_release(&hw->mc_group_lock);
-+}
-+
- /* Group IDs are shared by all VAPs of this hardware. Match semantic keys,
-  * and admit the requested ID under the same lock as reference changes. A
-  * failed request must leave every existing owner and reference unchanged. */
-@@ -8848,7 +8892,8 @@
-   mtlk_osal_lock_acquire(&hw->mc_group_lock);
-   for (i = MC_MIN_GROUP; i < MC_GROUPS; i++) {
-     if (hw->mc_groups[i].ref_cnt || hw->mc_groups[i].pins || hw->mc_groups[i].quarantined) {
--      if (_mtlk_hw_mc_addr_equal(&hw->mc_groups[i].mc_addr, &req->mc_addr))
-+      if (!hw->mc_groups[i].native &&
-+          _mtlk_hw_mc_addr_equal(&hw->mc_groups[i].mc_addr, &req->mc_addr))
-         found = i;
-     } else if (!first_free) {
-       first_free = i;
---- a/wireless/driver/shared/hw_mmb.h
-+++ b/wireless/driver/shared/hw_mmb.h
-@@ -263,6 +263,8 @@
- };
- void wave_hw_tx_queue_start(mtlk_hw_t *hw, struct wave_tx_queue *queue);
- void wave_hw_tx_queue_stop(mtlk_hw_t *hw, struct wave_tx_queue *queue);
-+int wave_hw_mc_alloc_native(mtlk_hw_t *hw);
-+void wave_hw_mc_release_native(mtlk_hw_t *hw, uint8 id);
- struct wave_pmf;
- void wave_hw_mmb_detach_pmf(mtlk_hw_t *hw, struct wave_pmf *pmf);
- void wave_hw_mmb_flush_sta_tx(mtlk_hw_t *hw, unsigned int radio_id);
---- a/wireless/driver/shared/mtlkhal.h
-+++ b/wireless/driver/shared/mtlkhal.h
-@@ -102,8 +102,10 @@
- typedef struct _mtlk_core_handle_tx_data_t
- {
-   mtlk_nbuf_t               *nbuf;     /* Network buffer         */
--  mtlk_hw_msg_t             *msg;      /* Optional native TX reservation; not copied to clones */
-+  mtlk_hw_msg_t             *msg;      /* Optional TX reservation; query may transfer it to one clone */
-   sta_entry                 *dst_sta;  /* Dest. station Entry    */
-+  sta_entry                 *src_sta;  /* Borrowed for this synchronous forwarding call. */
-+  bool                       native_control; /* Owned query; bypass policy reentry. */
-   mtlk_ndev_t               *rx_if;    /* RX interface           */
-   void                      *rx_subif; /* pointer to DC DP subinterface data: struct dp_subif */
- } __MTLK_IDATA mtlk_core_handle_tx_data_t;

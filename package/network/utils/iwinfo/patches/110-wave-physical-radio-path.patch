@@ -1,4 +1,12 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] nl80211: resolve paired WAVE wiphys by physical radio ID
+
+Use the persistent native radio ID and AP role rather than current wiphy
+registration order. Station interfaces continue to resolve through ifindex.
+The suffix matches the native wave-scripts physical topology contract.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- a/iwinfo_nl80211.c
 +++ b/iwinfo_nl80211.c

@@ -1,0 +1,815 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wave: adapt kernel build and support APIs
+
+Use the staged backports headers and symbols, current timer/netlink interfaces
+and bounded wire layouts. Keep support-module and driver builds coherent.
+
+This is the final native integration against the pinned vendor source.
+Firmware-dependent policy remains downstream with exact image admission.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+---
+--- a/Makefile.am.module_build
++++ b/Makefile.am.module_build
+@@ -6,8 +6,8 @@
+       ln -s $(abs_srcdir)/$($(module_canonical_name)_src_dir)/Kbuild $(abs_builddir)/$($(module_canonical_name)_src_dir)/Kbuild) && \
+      cd $($(module_canonical_name)_src_dir) && \
+      echo -n > .mtlk_kernel_target && \
+-     { test x"$(mtlk_build_kernel_library)" = x"y" || echo modules > .mtlk_kernel_target; } && \
+-         $(MAKE) $(KERNEL_MAKE_EXT_PARAMS) -C @kernel_dir@ SUBDIRS=$(CURDIR)/$($(module_canonical_name)_src_dir) `cat .mtlk_kernel_target` \
++     { if test x"$(mtlk_build_kernel_library)" = x"y"; then echo lib.a; else echo modules; fi; } > .mtlk_kernel_target && \
++         $(MAKE) $(KERNEL_MAKE_EXT_PARAMS) -C @kernel_dir@ M=$(CURDIR)/$($(module_canonical_name)_src_dir) `cat .mtlk_kernel_target` \
+                                   abs_srcdir=$(abs_srcdir)/$($(module_canonical_name)_src_dir)/ \
+                                   top_srcdir=../$(top_srcdir)/ \
+                                   abs_top_builddir=$(abs_top_builddir)/ \
+@@ -22,7 +22,10 @@
+                                   CUSTOM_DRV_ENV_INFO=@CUSTOM_DRV_ENV_INFO@ \
+                                   LD_LIBRARY_PATH=@env_lib_path@ \
+                                   mtlk_build_kernel_library=$(mtlk_build_kernel_library) && \
+-     { { test x"$(mtlk_build_kernel_library)" != x"y"; } || echo lib.a > .built_binary_name; } && \
++     { if test x"$(mtlk_build_kernel_library)" = x"y"; then \
++         rm -f lib-export.a && \
++         printf 'create lib-export.a\naddlib lib.a\nsave\nend\n' | @kernel_cross_compile@ar -M && \
++         echo lib-export.a > .built_binary_name; fi; } && \
+      { { test x"$(mtlk_build_kernel_library)" = x"y"; } || echo $($(module_canonical_name)_binary_name) > .built_binary_name; } && \
+      ( @kernel_cross_compile@strip -dx `cat .built_binary_name` ) && \
+      ( $(rebase_copy_cmd) drv_toolchain_info $(abs_builddir)) && \
+--- a/Makefile.am.module_helper
++++ b/Makefile.am.module_helper
+@@ -1,11 +1,5 @@
+ # $Id$
+ 
+-.PRECIOUS: $(abs_builddir)%.c
+-
+-# Rule for repository sources
+-$(abs_builddir)%.c:: $(abs_top_srcdir)%.c
+-	@mkdir -p `dirname $@`
+-	@ln -s $< $@
+ 
+ ifeq ($(mtlk_build_kernel_library),y)
+  binary_name := driver_lib
+@@ -24,11 +18,23 @@
+ rebased_list := $(abspath $(addprefix $(abs_srcdir)/, $(orig_list)))
+ rebased_list := $(subst $(abspath $(abs_top_srcdir))/,, $(rebased_list) )
+ 
++# Kbuild 6.18 names external-module objects relative to the module directory.
++# Use static source prerequisites: a generic %.c pattern would strip the
++# target directory before substituting the absolute source path.
++source_links := $(filter-out %drv_info.c,$(rebased_list:.o=.c))
++$(source_links): %.c: $(abs_top_srcdir)%.c
++	@mkdir -p $(dir $@)
++	@ln -sf $< $@
++.PRECIOUS: $(source_links)
++
+ $(orig_list_var) := $(rebased_list) $($(binary_name)-libs)
+ 
+ 
+-$(abs_builddir)$(filter %logmacro_database.o, $($(orig_list_var))): \
+-    $(addprefix $(abs_builddir), $(filter-out %logmacro_database.o, $(filter-out /%, $($(orig_list_var))))) \
++$(filter %logmacro_database.o, $($(orig_list_var))): \
++    $(filter-out %logmacro_database.o, $(filter-out /%, $($(orig_list_var)))) \
+     $(filter-out %logmacro_database.o, $(filter /%, $($(orig_list_var))))
+ 
+ EXTRA_CFLAGS := -I$(abs_builddir) -I$(abs_srcdir) $(EXTRA_CFLAGS) $(MTLK_KERNEL_CFLAGS)
++
++# EXTRA_CFLAGS is no longer consumed by current Kbuild.
++ccflags-y += $(EXTRA_CFLAGS)
+--- a/support/mtlkfront.sh
++++ b/support/mtlkfront.sh
+@@ -158,8 +158,8 @@
+   # Build dependencies list
+   MKDEP_CMD=`echo $* |                                                                           \
+              sed -e's|-M[TF][[:space:]][[:space:]]*[^[:space:]][^[:space:]]*||g'                 \
+-                 -e's|\(-Wp,\)*-M[DP][[:space:]][[:space:]]*||g'                                 \
+-                 -e's|\(-Wp,\)*-M[DP]\,[^[:space:]]*||g'                                         \
++                 -e's|\(-Wp,\)*-M\{1,2\}[DP][[:space:]][[:space:]]*||g'                                 \
++                 -e's|\(-Wp,\)*-M\{1,2\}[DP]\,[^[:space:]]*||g'                                         \
+                  -e"s|-o[[:space:]][[:space:]]*[^[:space:]][^[:space:]]*| -D__MTLK_DEPENDENCY_GENERATION_PATH -MM -MT $FILE_NAME|g"`
+ 
+   # Create logmacros.[ch] and loggroups.h because source code depends on them
+@@ -167,7 +167,7 @@
+     test -e $file || touch $file
+   done
+ 
+-  TOP_SRCDIR=`readlink -f $abs_top_srcdir/../`
++  TOP_SRCDIR=`readlink -f $abs_top_srcdir`
+   RAW_DEPS="`run_stderr_filtered $MKDEP_CMD`" || exit 10
+   DEPS=`echo $RAW_DEPS                               | \
+         awk '{ for (i = 1; i <= NF; i++) print $i }' | \
+@@ -176,7 +176,7 @@
+         sed 's/\\\\//'                               | \
+         grep -v 'logmacros\\.[hc]'                   | \
+         xargs -n 1 -r readlink -f                    | \
+-        grep $TOP_SRCDIR`
++        grep -F "$TOP_SRCDIR/"`
+ 
+   # DEPS already contains name of file being compiled, so we just need 
+   # to run logprep for each file in list
+--- a/tools/mtlkroot/linux/logdrv_osdep.c
++++ b/tools/mtlkroot/linux/logdrv_osdep.c
+@@ -168,7 +168,7 @@
+ struct file_operations mtlk_log_fops =
+ {
+   .owner =     THIS_MODULE,
+-  .llseek =    no_llseek,
++  .llseek =    NULL, /* VFS rejects seeking without a seek operation. */
+   .open =      cdev_log_open,
+   .release =   cdev_log_release,
+   .read =      cdev_log_read,
+@@ -266,21 +266,19 @@
+   MTLK_CLEANUP_END(logdrv_osdep, MTLK_OBJ_PTR(&log_data_osdep));
+ }
+ 
+-static const struct file_operations logger_debug_fops = {
+-  .owner      = THIS_MODULE,
+-  .open       = logger_debug_open,
+-  .read       = seq_read,
+-  .llseek     = seq_lseek,
+-  .release    = single_release,
+-  .write      = logger_debug_write
++static const struct proc_ops logger_debug_fops = {
++  .proc_open       = logger_debug_open,
++  .proc_read       = seq_read,
++  .proc_lseek     = seq_lseek,
++  .proc_release    = single_release,
++  .proc_write      = logger_debug_write
+ };
+ 
+-static struct file_operations logger_stat_fops = {
+-  .owner      = THIS_MODULE,
+-  .open       = logger_stat_open,
+-  .read       = seq_read,
+-  .llseek     = seq_lseek,
+-  .release    = single_release,
++static const struct proc_ops logger_stat_fops = {
++  .proc_open       = logger_stat_open,
++  .proc_read       = seq_read,
++  .proc_lseek     = seq_lseek,
++  .proc_release    = single_release,
+ };
+ 
+ /* --- HW RT-Logger --------------------------------------------- */
+@@ -323,13 +321,12 @@
+   return result;
+ }
+ 
+-static const struct file_operations logger_rtlog_fops = {
+-  .owner      = THIS_MODULE,
+-  .open       = logger_rtlog_open,
+-  .read       = seq_read,
+-  .llseek     = seq_lseek,
+-  .release    = single_release,
+-  .write      = logger_rtlog_write
++static const struct proc_ops logger_rtlog_fops = {
++  .proc_open       = logger_rtlog_open,
++  .proc_read       = seq_read,
++  .proc_lseek     = seq_lseek,
++  .proc_release    = single_release,
++  .proc_write      = logger_rtlog_write
+ };
+ 
+ static int
+--- a/tools/mtlkroot/linux/mtlkcdev.c
++++ b/tools/mtlkroot/linux/mtlkcdev.c
+@@ -292,7 +292,7 @@
+ static struct file_operations _mtlk_cdev_fops =
+ {
+   .owner          = THIS_MODULE,
+-  .llseek         = no_llseek,
++  .llseek         = NULL,
+   .open           = _mtlk_cdev_open,
+   .release        = _mtlk_cdev_release,
+ 
+--- a/tools/mtlkroot/linux/nlmsgs.c
++++ b/tools/mtlkroot/linux/nlmsgs.c
+@@ -29,25 +29,13 @@
+ #endif
+ 
+ #include "nlmsgs.h"
+-
+-#include "bt_acs.h"
++#include "mtlk_rtlog_app_comm.h"
+ 
+ #define LOG_LOCAL_GID   GID_NLMSGS
+ #define LOG_LOCAL_FID   1
+ 
+ /* Configuration structure */
+ static wave_nl_socket_t wave_nl_socket;
+-
+-struct sock *bt_acs_nl_sock = NULL;
+-DEFINE_MUTEX(bt_acs_nl_mutex);
+-static void bt_acs_nl_input (struct sk_buff *inskb) {}
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3,19,0)
+-static int bt_acs_nl_bind (struct net *net, int group) { return 0; }
+-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3,16,0)
+-static int bt_acs_nl_bind (int group) { return 0; }
+-#else
+-static void bt_acs_nl_bind (int group) {}
+-#endif
+ 
+ #ifdef MTCFG_USE_GENL
+ 
+@@ -67,7 +55,7 @@
+ 
+ /* family structure */
+ static struct genl_family mtlk_genl_family = {
+-        .id = GENL_ID_GENERATE,
++        .module = THIS_MODULE,
+         .name = MTLK_GENL_FAMILY_NAME,
+         .version = MTLK_GENL_FAMILY_VERSION,
+         .maxattr = MTLK_GENL_ATTR_MAX,
+@@ -80,7 +68,7 @@
+ /* attribute policy structure */
+ static struct nla_policy wave_genl_policy[MTLK_GENL_ATTR_MAX + 1] =
+ {
+-  [MTLK_GENL_ATTR_EVENT] = { .type = NLA_UNSPEC  },
++  [MTLK_GENL_ATTR_EVENT] = NLA_POLICY_MIN_LEN(sizeof(struct mtlk_nl_msghdr)),
+ };
+ 
+ #else /* MTCFG_USE_GENL */
+@@ -98,64 +86,6 @@
+ #endif
+ 
+ #endif /* MTCFG_USE_GENL */
+-
+-int mtlk_nl_bt_acs_send_brd_msg(void *data, int length)
+-{
+-  struct sk_buff *skb = NULL;
+-  struct nlmsghdr *nlh;
+-
+-  /* no socket - no messages */
+-  if (!bt_acs_nl_sock)
+-    return MTLK_ERR_UNKNOWN;
+-
+-  skb = alloc_skb(NLMSG_SPACE(length), GFP_ATOMIC);
+-  if (skb == NULL)
+-    return MTLK_ERR_NO_MEM;
+-
+-  nlh = (struct nlmsghdr*) skb->data;
+-  nlh->nlmsg_len = NLMSG_SPACE(length);
+-  nlh->nlmsg_pid = 0;
+-  nlh->nlmsg_flags = 0;
+-
+-  /* fill the message header */
+-  skb_put(skb, NLMSG_SPACE(length));
+-
+-  memcpy(NLMSG_DATA(nlh), data, length);
+-  NETLINK_CB(skb).portid = 0;  /* from kernel */
+-  
+-  if (netlink_broadcast(bt_acs_nl_sock, skb, 0, NETLINK_BT_ACS_GROUP, GFP_ATOMIC))
+-    return MTLK_ERR_UNKNOWN;
+-  
+-  return MTLK_ERR_OK;
+-}
+-
+-int mtlk_nl_bt_acs_init(void)
+-{
+-  struct netlink_kernel_cfg bt_acs_nl_cfg;
+-
+-  memset(&bt_acs_nl_cfg, 0, sizeof(bt_acs_nl_cfg));
+-  bt_acs_nl_cfg.groups = NETLINK_BT_ACS_GROUP_LAST;
+-  bt_acs_nl_cfg.flags = 0;
+-  bt_acs_nl_cfg.input = &bt_acs_nl_input;
+-  bt_acs_nl_cfg.cb_mutex = &bt_acs_nl_mutex;
+-  bt_acs_nl_cfg.bind = &bt_acs_nl_bind;
+-
+-  bt_acs_nl_sock = netlink_kernel_create(&init_net, NETLINK_BT_ACS, &bt_acs_nl_cfg);
+-  if (!bt_acs_nl_sock) {
+-    return MTLK_ERR_UNKNOWN;
+-  }
+-  return MTLK_ERR_OK;
+-
+-}
+-
+-void mtlk_nl_bt_acs_cleanup(void)
+-{
+-
+-  if(bt_acs_nl_sock){
+-    sock_release(bt_acs_nl_sock->sk_socket);
+-  }
+-
+-}
+ 
+ BOOL wave_nl_is_active (void)
+ {
+@@ -247,10 +177,6 @@
+     return MTLK_ERR_UNKNOWN;
+   }
+ 
+-  if (mtlk_nl_bt_acs_init() != MTLK_ERR_OK){
+-    return MTLK_ERR_UNKNOWN;
+-  }
+-
+   nl_socket->is_active = TRUE;
+ 
+   return MTLK_ERR_OK;
+@@ -263,7 +189,6 @@
+ 
+   memset(&wave_nl_socket, 0, sizeof(wave_nl_socket));
+ 
+-  mtlk_nl_bt_acs_cleanup();
+ }
+ 
+ 
+@@ -382,29 +307,55 @@
+   }
+ }
+ 
++/* Validate the complete original userspace wire contract before callbacks
++ * that consume typed payloads without receiving their length. */
++static int wave_nl_validate_payload(const struct mtlk_nl_msghdr *hdr)
++{
++  const rtlog_app_drv_msg_t *msg = (const void *)(hdr + 1);
++  size_t len = hdr->data_len;
++
++  switch (hdr->cmd_id) {
++  case NL_DRV_CMD_FAPI_NOTIFY:
++    /* wave_fapi_msghdr_t: subcommand and card index, one byte each. */
++    return len == 2 ? 0 : -EINVAL;
++  case NL_DRV_CMD_RTLOG_NOTIFY:
++    if (len < sizeof(*msg) || msg->hdr.length < sizeof(msg->data) ||
++        sizeof(msg->hdr) + msg->hdr.length != len ||
++        !memchr(msg->data.name, '\0', sizeof(msg->data.name)))
++      return -EINVAL;
++    switch (msg->hdr.cmd_id) {
++    case RTLOG_APP_DRV_CMDID_STARTUP:
++    case RTLOG_APP_DRV_CMDID_CLEANUP:
++      return len == sizeof(*msg) ? 0 : -EINVAL;
++    case RTLOG_APP_DRV_CMDID_LOG:
++      return len - sizeof(*msg) <= 2047 ? 0 : -EMSGSIZE;
++    default:
++      return -EOPNOTSUPP;
++    }
++  default:
++    return -EOPNOTSUPP;
++  }
++}
++
+ static int _wave_nl_parse_brd_msg_cb (struct sk_buff *skb2, struct genl_info *info)
+ {
+-  struct nlattr *attr;
+-  void *data;
+-
+-  if (info == NULL)
+-    return 0;
+-
+-  attr = info->attrs[MTLK_GENL_ATTR_EVENT];
+-  if (attr) {
+-    data = nla_data(attr);
+-    if (NULL == data) {
+-      ELOG_V("Fail to receive Notification message from application: payload is absent.");
+-    }
+-    else {
+-      _wave_nl_parse_msg((struct mtlk_nl_msghdr *)data);
+-    }
+-  }
+-  else {
+-    ELOG_D("Fail to receive Notification message from application: "
+-           "no genl_info.attrs[%d].", MTLK_GENL_CMD_EVENT);
+-  }
+-
++  const struct nlattr *attr = info->attrs[MTLK_GENL_ATTR_EVENT];
++  struct mtlk_nl_msghdr *hdr;
++  int ret;
++
++  if (!attr || nla_len(attr) < sizeof(*hdr))
++    return -EINVAL;
++
++  hdr = nla_data(attr);
++  /* This is the original native-endian userspace protocol. The attribute
++   * length excludes netlink padding, so the declared payload must match. */
++  if (hdr->data_len != nla_len(attr) - sizeof(*hdr))
++    return -EINVAL;
++
++  ret = wave_nl_validate_payload(hdr);
++  if (ret)
++    return ret;
++  _wave_nl_parse_msg(hdr);
+   return 0;
+ }
+ 
+@@ -412,7 +363,7 @@
+ static struct genl_ops wave_genl_ops[] = {
+   {
+     .cmd = MTLK_GENL_CMD_EVENT,
+-    .flags = 0,
++    .flags = GENL_ADMIN_PERM,
+     .policy = wave_genl_policy,
+     .doit = _wave_nl_parse_brd_msg_cb,
+     .dumpit = NULL,
+@@ -428,12 +379,15 @@
+   nl_socket->receive_callback[cmd] = rx_clb_fn;
+   nl_socket->receive_callback_ctx[cmd] = rx_clb_fn_params;
+ 
+-  if(mtlk_genl_family_id) {
+-    mtlk_genl_family.id = mtlk_genl_family_id;
+-  }
++  /* Linux owns dynamic family IDs; retain the module parameter as the
++   * readback used by the existing control applications. */
++  if (mtlk_genl_family_id)
++    return MTLK_ERR_PARAMS;
++  mtlk_genl_family.ops = wave_genl_ops;
++  mtlk_genl_family.n_ops = ARRAY_SIZE(wave_genl_ops);
+ 
+ #if defined(MTCFG_LINUX_BACKPORT) || LINUX_VERSION_CODE >= KERNEL_VERSION(3,13,0)
+-  result = genl_register_family_with_ops_groups(&mtlk_genl_family, wave_genl_ops, mtlk_mcgrps);
++  result = genl_register_family(&mtlk_genl_family);
+   if (result) {
+     mtlk_osal_emergency_print("Failed to register Netlink family with ops: res=%d", result);
+     return MTLK_ERR_UNKNOWN;
+@@ -455,22 +409,15 @@
+    * to be readable via sysfs and iwpriv */
+   mtlk_genl_family_id = mtlk_genl_family.id;
+ 
+-  if (mtlk_nl_bt_acs_init() != MTLK_ERR_OK) {
+-    mtlk_osal_emergency_print("Failed to create Netlink socket for ACS-algo");
+-    goto unreg_ops;
+-  }
+-
+   nl_socket->is_active = TRUE;
+   return MTLK_ERR_OK;
+ 
+-unreg_ops:
+ #if !defined(MTCFG_LINUX_BACKPORT) && LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
+-  genl_unregister_ops(&mtlk_genl_family, wave_genl_ops);
+ unreg_family:
+-#endif
+   genl_unregister_family(&mtlk_genl_family);
+   memset(nl_socket, 0, sizeof(*nl_socket));
+   return MTLK_ERR_UNKNOWN;
++#endif
+ }
+ 
+ void mtlk_nl_cleanup (void)
+@@ -481,7 +428,6 @@
+   genl_unregister_family(&mtlk_genl_family);
+   memset(&wave_nl_socket, 0, sizeof(wave_nl_socket));
+ 
+-  mtlk_nl_bt_acs_cleanup();
+   ILOG1_V("Netlink module cleanup done");
+ }
+ 
+@@ -490,4 +436,3 @@
+ EXPORT_SYMBOL(wave_nl_is_active);
+ EXPORT_SYMBOL(wave_nl_update_receive_callback);
+ EXPORT_SYMBOL(mtlk_nl_send_brd_msg);
+-EXPORT_SYMBOL(mtlk_nl_bt_acs_send_brd_msg);
+--- a/tools/mtlkroot/linux/nlmsgs.h
++++ b/tools/mtlkroot/linux/nlmsgs.h
+@@ -49,11 +49,6 @@
+ int wave_nl_update_receive_callback(wave_nl_callback_t rx_clb_fn, void *rx_clb_fn_params, u8 cmd);
+ BOOL wave_nl_is_active(void);
+ 
+-int mtlk_nl_bt_acs_init(void);
+-void mtlk_nl_bt_acs_cleanup(void);
+-int mtlk_nl_bt_acs_send_brd_msg(void *data, int length);
+-
+-
+ #undef LOG_LOCAL_GID
+ #undef LOG_LOCAL_FID
+ 
+--- a/tools/mtlkroot/log_drv.c
++++ b/tools/mtlkroot/log_drv.c
+@@ -20,6 +20,7 @@
+ #define RTLOG_FLAGS (RTLF_CONSOLE_ENABLED)
+ 
+ #include "mtlkinc.h"
++#include <linux/timekeeping.h>
+ 
+ #include "log_drv.h"
+ #include "mtlk_rtlog.h"
+@@ -1394,10 +1395,10 @@
+ 
+ uint32 mtlk_log_get_timestamp(void)
+ {
+-    struct timespec ts;
++    struct timespec64 ts;
+     uint32 t_usec;
+ 
+-    getnstimeofday(&ts);
++    ktime_get_real_ts64(&ts);
+     t_usec  = __TIMESPEC_TO_US(&ts);
+ 
+     return t_usec;
+--- a/wireless/driver/Makefile.am
++++ b/wireless/driver/Makefile.am
+@@ -41,7 +41,7 @@
+ 
+ EXTRA_DIST =  linux/Kbuild \
+               linux/compat.h \
+-              linux/core.c \
++              linux/core.c linux/wave_pmf.c linux/wave_pmf.h \
+               shared/core_dut.c shared/core_common.c \
+               linux/core.h shared/core_common.h \
+               linux/core_ab.c \
+@@ -54,6 +54,8 @@
+               linux/l2nat.c linux/l2nat.h \
+               linux/log_osdep.c linux/log_osdep.h \
+               linux/mcast.c linux/mcast.h \
++              linux/wave_mc_policy.c linux/wave_mc_policy.h \
++              linux/wave_mc_native.c linux/wave_mc_native.h \
+               linux/eth_parser.c linux/eth_parser.h \
+               linux/memdefs.h \
+               linux/mib_osdep.c linux/mib_osdep.h \
+--- a/wireless/driver/linux/Kbuild
++++ b/wireless/driver/linux/Kbuild
+@@ -20,12 +20,16 @@
+ 
+ EXTRA_CFLAGS+=-DMTLK_FW_MBSS_API_VERSION=$(_FW_MBSS_API_VERSION) -g
+ 
++override KBUILD_EXTRA_SYMBOLS += $(abs_top_builddir)/tools/mtlkroot/linux/Module.symvers
++
++ifeq ($(CONFIG_DC_DP_LIB_SUPPORT), y)
+ KBUILD_EXTRA_SYMBOLS += $(modvers_path)/directconnect-dp.symvers
++endif
+ 
+ obj-m := mtlk.o
+ 
+-mtlk-objs := core.o core_ab.o wave_radio_ab.o core_pdb.o\
+-   eth_parser.o mcast.o utils.o osal_defs.o l2nat.o \
++mtlk-objs := wave_pmf.o core.o core_ab.o wave_radio_ab.o core_pdb.o\
++   eth_parser.o mcast.o wave_mc_native.o wave_mc_policy.o utils.o osal_defs.o l2nat.o \
+    mtlk_serializer_osdep.o mtlk_fast_mem.o \
+    mib_osdep.o \
+    progmodel.o log_osdep.o mtlk_df_linux.o mtlk_dfg_linux.o \
+--- a/wireless/driver/linux/compat.h
++++ b/wireless/driver/linux/compat.h
+@@ -26,6 +26,10 @@
+ 
+ #include <linux/etherdevice.h>
+ #include <linux/wireless.h>
++/* Original WAVE private ioctl cipher IDs. Linux has no WEXT GCMP IDs;
++ * retain these values for the existing source-built control applications. */
++#define IW_ENCODE_ALG_GCMP 6
++#define IW_ENCODE_ALG_GCMP_256 7
+ #include <linux/icmpv6.h>
+ 
+ #define LOG_LOCAL_GID   GID_COMPAT
+--- a/wireless/driver/linux/l2nat.c
++++ b/wireless/driver/linux/l2nat.c
+@@ -19,7 +19,21 @@
+ 
+ #include <linux/if_arp.h>
+ #include <linux/udp.h>
+-#include <net/ipx.h>
++/* IPX is not a Linux protocol module anymore; retain only its wire layout
++ * for the existing L2 address translator.  These are bytes, never host ABI.
++ */
++struct wave_ipx_addr {
++  __be32 net;
++  u8 node[ETH_ALEN];
++  __be16 sock;
++} __packed;
++
++struct wave_ipxhdr {
++  __be16 checksum, packet_size;
++  u8 transport_control, packet_type;
++  struct wave_ipx_addr ipx_dest, ipx_source;
++} __packed;
++static_assert(sizeof(struct wave_ipxhdr) == 30);
+ #include <asm/checksum.h>
+ 
+ #include "mtlk_df.h"
+@@ -199,7 +213,7 @@
+   dent = &l2nat->l2nat_hash_entries[del_ind];
+ 
+   dent->flags |= L2NAT_ENTRY_STOP_AGING_TIMER;
+-  del_timer(&dent->timer);
++  timer_delete(&dent->timer);
+ 
+   if (!(dent->flags & L2NAT_ENTRY_ACTIVE))
+     return;
+@@ -374,9 +388,9 @@
+ }
+ 
+ 
+-static void entry_aging_timer_function(unsigned long data)
+-{
+-  struct l2nat_hash_entry *ent = (struct l2nat_hash_entry *)data;
++static void entry_aging_timer_function(struct timer_list *timer)
++{
++  struct l2nat_hash_entry *ent = timer_container_of(ent, timer, timer);
+   unsigned long delta, next_time_offset, send_arp_timeout, get_info_timeout;
+   struct nic *nic = ent->nic;
+   mtlk_l2nat_t *l2nat = &nic->l2nat;
+@@ -478,7 +492,7 @@
+ 
+     for (i = 0; MTLK_CLEANUP_ITERATONS_LEFT(MTLK_OBJ_PTR(mtlk_l2nat), TIMER_INIT) > 0; i++) {
+       MTLK_CLEANUP_STEP_LOOP(l2nat, TIMER_INIT, MTLK_OBJ_PTR(mtlk_l2nat),
+-                             del_timer, (&mtlk_l2nat->l2nat_hash_entries[i].timer));
++                             timer_shutdown_sync, (&mtlk_l2nat->l2nat_hash_entries[i].timer));
+     }
+ 
+     MTLK_CLEANUP_STEP(l2nat, ALLOC_IPMAC_INIT, MTLK_OBJ_PTR(mtlk_l2nat),
+@@ -553,9 +567,7 @@
+       list_add_tail(&ent->list, &mtlk_l2nat->l2nat_free_entries);
+       ent->nic = nic;
+       MTLK_INIT_STEP_VOID_LOOP(l2nat, TIMER_INIT, MTLK_OBJ_PTR(mtlk_l2nat),
+-                               init_timer, (&ent->timer));
+-      ent->timer.function = entry_aging_timer_function;
+-      ent->timer.data = (unsigned long)ent;
++                               timer_setup, (&ent->timer, entry_aging_timer_function, 0));
+     }
+ 
+     MTLK_INIT_STEP_IF(!mtlk_vap_is_ap(nic->vap_handle), l2nat, REG_ABILITIES, MTLK_OBJ_PTR(mtlk_l2nat),
+@@ -808,7 +820,7 @@
+ {
+   struct ethhdr *ether_header;
+   struct vlanhdr *vlan_header;
+-  struct ipxhdr *ipx_header;
++  struct wave_ipxhdr *ipx_header;
+   struct arphdr *arp_header;
+   struct iphdr *ip_header;
+   uint16 proto_ne;
+@@ -889,7 +901,7 @@
+       if (likely(nskb != NULL))
+         skb = nskb;
+ 
+-      ipx_header = (struct ipxhdr *)(skb->data + offset);
++      ipx_header = (struct wave_ipxhdr *)(skb->data + offset);
+ 
+       /* set source node to wilreless MAC address */
+       MTLK_CORE_HOT_PATH_PDB_GET_MAC(nic, CORE_DB_CORE_MAC_ADDR, ipx_header->ipx_source.node);
+@@ -931,7 +943,7 @@
+   struct vlanhdr *vlan_header;
+   struct arphdr *arp_header;
+   struct iphdr  *ip_header;
+-  struct ipxhdr *ipx_header;
++  struct wave_ipxhdr *ipx_header;
+   u32 ip = 0;
+   uint16 proto_ne;
+   u8 *p;
+@@ -1020,9 +1032,9 @@
+ 
+   case __constant_htons(ETH_P_IPX):
+     if (likely(pmac != NULL)) {
+-      ipx_header = (struct ipxhdr *)(skb->data + offset);
++      ipx_header = (struct wave_ipxhdr *)(skb->data + offset);
+       /* set dest node node to default GW MAC address (pmac is already set to it) */
+-      wave_memcpy(ipx_header->ipx_dest.node, sizeof(ipx_header->ipx_dest.node), pmac, IPX_NODE_LEN);
++      wave_memcpy(ipx_header->ipx_dest.node, sizeof(ipx_header->ipx_dest.node), pmac, ETH_ALEN);
+     }
+     break;
+ 
+--- a/wireless/driver/linux/mtlkinc.h
++++ b/wireless/driver/linux/mtlkinc.h
+@@ -11,6 +11,7 @@
+ #define _MTLKINC_H_
+ 
+ #include <linux/types.h>
++#include <linux/minmax.h>
+ 
+ /* TODO: WAVE300_SW-100: remove this after FW fix */
+ #define MBSS_FORCE_VAP_ACTIVATION_SUCCEEDED
+@@ -50,8 +51,7 @@
+ #define SIZEOF(a) ((size_t)sizeof(a)/sizeof((a)[0]))
+ #define INC_WRAP_IDX(i,s) do { (i)++; if ((i) == (s)) (i) = 0; } while (0)
+ 
+-#define MIN(x,y) ((x) < (y) ? (x) : (y))
+-#define MAX(x,y) ((x) > (y) ? (x) : (y))
++/* MIN/MAX are provided by the current kernel. */
+ 
+ typedef unsigned char BOOL;
+ #define FALSE (0)
+--- a/wireless/driver/linux/osal_defs.c
++++ b/wireless/driver/linux/osal_defs.c
+@@ -14,9 +14,9 @@
+ #define LOG_LOCAL_FID   3
+ 
+ static void
+-__mtlk_osal_timer_clb (unsigned long data)
+-{
+-  mtlk_osal_timer_t *timer = (mtlk_osal_timer_t *)data;
++__mtlk_osal_timer_clb (struct timer_list *os_timer)
++{
++  mtlk_osal_timer_t *timer = timer_container_of(timer, os_timer, os_timer);
+   uint32             msec  = 0;
+ 
+   if (__LIKELY(!timer->stop)) {
+@@ -60,12 +60,10 @@
+   ASSERT(clb != NULL);
+ 
+   memset(timer, 0, sizeof(*timer));
+-  init_timer(&timer->os_timer);
++  timer_setup(&timer->os_timer, __mtlk_osal_timer_clb, 0);
+   mtlk_rmlock_init(&timer->rmlock);
+   mtlk_rmlock_acquire(&timer->rmlock); /* Acquire RM Lock initially */
+ 
+-  timer->os_timer.data     = (unsigned long)timer;
+-  timer->os_timer.function = __mtlk_osal_timer_clb;
+   timer->clb               = clb;
+   timer->clb_usr_data      = clb_usr_data;
+   timer->stop              = TRUE;
+@@ -95,10 +93,10 @@
+ {
+   timer->stop = TRUE; /* Mark timer stopped */
+   timer->cancelled = TRUE;
+-  if (del_timer(&timer->os_timer)) {
++  if (timer_delete(&timer->os_timer)) {
+     /* del_timer_sync (and del_timer) returns whether it has 
+-     * deactivated a pending timer or not. (ie. del_timer() 
+-     * of an inactive timer returns 0, del_timer() of an
++     * deactivated a pending timer or not. (ie. timer_delete() 
++     * of an inactive timer returns 0, timer_delete() of an
+      * active timer returns 1.)
+      * So, we're releasing RMLock for active (set) timers only.
+      */
+@@ -112,10 +110,10 @@
+ {
+   timer->stop = TRUE; /* Mark timer stopped */
+   timer->cancelled = TRUE;
+-  if (del_timer_sync(&timer->os_timer)) {
++  if (timer_delete_sync(&timer->os_timer)) {
+     /* del_timer_sync (and del_timer) returns whether it has 
+-     * deactivated a pending timer or not. (ie. del_timer() 
+-     * of an inactive timer returns 0, del_timer() of an
++     * deactivated a pending timer or not. (ie. timer_delete() 
++     * of an inactive timer returns 0, timer_delete() of an
+      * active timer returns 1.)
+      * So, we're releasing RMLock for active (set) timers only.
+      */
+--- a/wireless/driver/linux/osal_osdep_defs.h
++++ b/wireless/driver/linux/osal_osdep_defs.h
+@@ -58,7 +58,9 @@
+ #define DIV_ROUND_UP(n, d)                  (((n) + (d) - 1) / (d))
+ #endif /* DIV_ROUND_UP */
+ 
++#ifndef BITS_TO_BYTES
+ #define BITS_TO_BYTES(n)                    DIV_ROUND_UP(n, BITS_PER_BYTE)
++#endif
+ 
+ 
+ #define mtlk_osal_emergency_print(fmt, ...) printk("[MTLKD] " fmt "\n", ##__VA_ARGS__)
+@@ -67,12 +69,10 @@
+ 
+ #define MTLK_STATIC_ASSERT(x) BUILD_BUG_ON(!(x))
+ 
+-typedef enum
+-{
+-  MTLK_DATA_BIDIRECTIONAL = PCI_DMA_BIDIRECTIONAL,
+-  MTLK_DATA_FROM_DEVICE = PCI_DMA_FROMDEVICE,
+-  MTLK_DATA_TO_DEVICE = PCI_DMA_TODEVICE
+-} mtlk_data_direction_e;
++typedef enum dma_data_direction mtlk_data_direction_e;
++#define MTLK_DATA_BIDIRECTIONAL DMA_BIDIRECTIONAL
++#define MTLK_DATA_FROM_DEVICE DMA_FROM_DEVICE
++#define MTLK_DATA_TO_DEVICE DMA_TO_DEVICE
+ 
+ 
+ #ifdef MTCFG_ENABLE_OBJPOOL
+--- a/wireless/shared/mem_leak.c
++++ b/wireless/shared/mem_leak.c
+@@ -40,7 +40,7 @@
+ {
+   mtlk_objpool_context_t objpool_ctx;
+   uint32 size;
+-  uint8  front_guard[1]; /* The actual length is FRONT_GUARD_LEN, to have the total struct size MTLK_MEM_ALLOC_ALIGN */
++  uint8  front_guard[]; /* The actual length is FRONT_GUARD_LEN, to have the total struct size MTLK_MEM_ALLOC_ALIGN */
+ };
+ 
+ #define MIN_BACK_GUARD_SIZE (4)          /* The minimum number of back guard characters */
+--- a/wireless/shared/mtlk_algorithms.h
++++ b/wireless/shared/mtlk_algorithms.h
+@@ -71,7 +71,7 @@
+ \retval 0        - source string was truncated.
+ */
+ 
+-int static __INLINE
++static __INLINE int
+ wave_strncopy (char *dest, const char *src, size_t size, ssize_t count)
+ {
+     if (count < 0) return 0;
+--- a/wireless/shared/mtlk_slid.h
++++ b/wireless/shared/mtlk_slid.h
+@@ -31,25 +31,25 @@
+                      MTLK_BFIELD_VALUE(MTLK_SLID_FID, LOG_LOCAL_FID, mtlk_slid_t) | \
+                      MTLK_BFIELD_VALUE(MTLK_SLID_LID, __LINE__, mtlk_slid_t))
+ 
+-static uint32 __INLINE
++static __INLINE uint32
+ mtlk_slid_get_oid (mtlk_slid_t slid)
+ {
+   return (uint32)MTLK_BFIELD_GET(slid, MTLK_SLID_OID);
+ }
+ 
+-static uint32 __INLINE
++static __INLINE uint32
+ mtlk_slid_get_gid (mtlk_slid_t slid)
+ {
+   return (uint32)MTLK_BFIELD_GET(slid, MTLK_SLID_GID);
+ }
+ 
+-static uint32 __INLINE
++static __INLINE uint32
+ mtlk_slid_get_fid (mtlk_slid_t slid)
+ {
+   return (uint32)MTLK_BFIELD_GET(slid, MTLK_SLID_FID);
+ }
+ 
+-static uint32 __INLINE
++static __INLINE uint32
+ mtlk_slid_get_lid (mtlk_slid_t slid)
+ {
+   return (uint32)MTLK_BFIELD_GET(slid, MTLK_SLID_LID);
