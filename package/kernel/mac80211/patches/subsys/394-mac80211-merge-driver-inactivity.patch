@@ -1,5 +1,15 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] mac80211: combine driver and software inactivity observations
 
+Firmware data offload can observe payload activity while mac80211 sees only
+management traffic. Preserve a filled driver inactivity value and combine it
+with the software observation by taking the shorter interval, for both link
+and station reporting. Connection lifetime remains owned by mac80211.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -4354,7 +4354,9 @@

@@ -1,5 +1,16 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] cfg80211: retain and serialize radar propagation
 
+The single saved radar chandef can be overwritten before its work runs.
+Retain affected radar subchannels as atomic pending bits until the existing
+worker consumes them. Work keeps RTNL lifetime protection and takes one peer
+wiphy lock at a time for DFS state and CAC cancellation, matching completion
+serialization without nesting the source wiphy mutex.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/include/net/cfg80211.h
 +++ b/include/net/cfg80211.h
 @@ -188,6 +188,7 @@
@@ -42,24 +53,6 @@ Subject: [PATCH] cfg80211: retain and serialize radar propagation
  void cfg80211_set_dfs_state(struct wiphy *wiphy,
  			    const struct cfg80211_chan_def *chandef,
  			    enum nl80211_dfs_state dfs_state)
-@@ -966,8 +981,6 @@
- 	struct wireless_dev *wdev;
- 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
- 
--	lockdep_assert_held(&rdev->wiphy.mtx);
--
- 	if (!wiphy_ext_feature_isset(&rdev->wiphy,
- 				     NL80211_EXT_FEATURE_DFS_CONCURRENT) ||
- 	    !(chan->flags & IEEE80211_CHAN_DFS_CONCURRENT))
-@@ -976,6 +989,8 @@
- 	/* only valid for P2P GO */
- 	if (iftype != NL80211_IFTYPE_P2P_GO)
- 		return false;
-+
-+	lockdep_assert_held(&rdev->wiphy.mtx);
- 
- 	/*
- 	 * Allow only if there's a concurrent BSS
 --- a/net/wireless/core.c
 +++ b/net/wireless/core.c
 @@ -499,16 +499,30 @@

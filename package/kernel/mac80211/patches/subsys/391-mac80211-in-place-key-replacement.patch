@@ -1,5 +1,15 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] mac80211: support opt-in hardware key replacement
 
+Some firmware key tables replace an occupied slot atomically and cannot
+install a second key before retiring the first. Let those drivers opt in to
+SET-before-DISABLE replacement while preserving the existing fallback and
+tailroom accounting. This flag does not establish RX key-generation identity.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -3074,6 +3074,13 @@

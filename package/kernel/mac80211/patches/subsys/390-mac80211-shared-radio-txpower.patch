@@ -1,5 +1,15 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] mac80211: allow a shared radio to own userspace power control
 
+Some shared radios expose more than one cfg80211 control interface for the
+same physical power limit. Let a driver explicitly own the synchronous radio
+setting while preserving regulatory and peer ceilings from mac80211. Drivers
+without the callback retain their per-interface power-control behavior.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -4608,6 +4608,15 @@

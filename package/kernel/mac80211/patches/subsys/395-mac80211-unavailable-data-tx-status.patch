@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] mac80211: distinguish unavailable data TX status from management ACKs
 
 Some drivers provide real management and NULL-frame TX status while a
@@ -10,6 +11,10 @@ failure defaults. Driver-supplied station/link/TID statistics remain valid;
 other drivers retain their existing defaults. Do not carry management-only
 removed-link retry/failure counters into an aggregate data total.
 
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/include/net/mac80211.h
 +++ b/include/net/mac80211.h
 @@ -2888,6 +2888,13 @@

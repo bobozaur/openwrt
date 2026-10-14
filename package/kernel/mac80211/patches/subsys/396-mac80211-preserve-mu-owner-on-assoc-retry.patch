@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] wifi: mac80211: keep MU-MIMO ownership on association retries
 
 The requesting interface already owns the MU-MIMO capability after its
@@ -5,8 +6,11 @@ first association request. Exclude it when checking whether another
 interface owns the capability, so retries keep the same advertisement.
 Other interfaces continue to prevent conflicting ownership.
 
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 ---
-diff --git a/net/mac80211/mlme.c b/net/mac80211/mlme.c
 --- a/net/mac80211/mlme.c
 +++ b/net/mac80211/mlme.c
 @@ -1938,7 +1938,7 @@

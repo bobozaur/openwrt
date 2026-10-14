@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] wifi: mac80211: determine AP mode before direct association
 
 FT over DS reaches association without a preceding authentication request.
@@ -12,6 +13,10 @@ local request restrictions, AP membership and channel checks, and leave the
 actual channel/station acquisition and its cleanup in prep_connection().
 Matching authentication and MLO paths are unchanged.
 
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/net/mac80211/mlme.c
 +++ b/net/mac80211/mlme.c
 @@ -10480,6 +10480,20 @@

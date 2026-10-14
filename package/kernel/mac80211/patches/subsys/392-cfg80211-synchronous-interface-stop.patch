@@ -1,5 +1,16 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] cfg80211: allow interface leave under the wiphy lock
 
+The queued stop notification cannot order a synchronous shared-radio owner
+transition against cfg80211 leave callbacks. Export the existing locked leave
+path for callers already holding the wiphy mutex. Whole-wiphy shutdown would
+also stop unrelated interfaces. Preserve callback errors and asynchronous
+completion semantics; a return is not proof of completed hardware teardown.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/include/net/cfg80211.h
 +++ b/include/net/cfg80211.h
 @@ -10357,6 +10357,18 @@
