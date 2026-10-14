@@ -1,6 +1,27 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] odhcpd: retain ownership of NDP routes and proxy entries
+
+Track relay runtimes, address/neighbour demand and successful allocations
+separately. Configuration may clear mode before setup; retire the previous
+ifindex owner before touching its procfs state, and reconcile withdrawn
+allocations before creating replacements. Retain failed withdrawals for
+bounded retry and preserve independent local-address and neighbour reasons.
+
+Use exclusive route creation and exact withdrawal keys. Preserve existing
+proxy entries; proxy-neighbour creation cannot arbitrate a concurrent writer
+of the same key because Linux does not implement exclusive creation there.
+Kernel proxy flags or route metrics alone are not ownership receipts.
+
+Keep shutdown while the native netlink socket is live, release temporary
+probe routes through the same owner, and initialize successful empty proxy
+queries to zero before waiting for the acknowledgement.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
 --- a/src/ndp.c
 +++ b/src/ndp.c
-@@ -28,18 +28,315 @@
+@@ -28,19 +28,316 @@
  
  #include <linux/filter.h>
  #include <linux/neighbour.h>
@@ -18,7 +39,7 @@
  		struct interface *iface, void *dest);
  
  static struct netevent_handler ndp_netevent_handler = { .cb = ndp_netevent_cb, };
-+
+ 
 +/* Runtime ownership survives configuration reloads, which clear iface->ndp
 + * before setup is called. Never infer ownership from a kernel proxy flag or
 + * route metric: either may also belong to an administrator. */
@@ -315,20 +336,21 @@
 +	}
 +	ndp_reconcile();
 +}
- 
++
  /* Initialize NDP-proxy */
  int ndp_init(void)
-@@ -50,6 +347,9 @@
- 		error("Failed to add ndp netevent handler");
+ {
+@@ -51,6 +348,9 @@ int ndp_init(void)
  		ret = -1;
  	}
-+
+ 
 +	if (!ret)
 +		atexit(ndp_shutdown);
- 
++
  	return ret;
  }
-@@ -80,11 +380,20 @@
+ 
+@@ -80,12 +380,21 @@ int ndp_setup_interface(struct interface
  		.filter = (struct sock_filter *)bpf,
  	};
  
@@ -338,7 +360,7 @@
  	char procbuf[64];
  
  	enable = enable && (iface->ndp == MODE_RELAY);
-+
+ 
 +	/* This must precede opening procfs: the old netdev may already be gone. */
 +	runtime = ndp_runtime_find(iface);
 +	if (runtime && (!enable || runtime->ifindex != iface->ifindex)) {
@@ -346,10 +368,11 @@
 +		runtime = NULL;
 +	}
 +	dump_neigh = !runtime;
- 
++
  	snprintf(procbuf, sizeof(procbuf), "/proc/sys/net/ipv6/conf/%s/proxy_ndp", iface->ifname);
  	procfd = open(procbuf, O_WRONLY);
-@@ -107,7 +416,6 @@
+ 
+@@ -107,7 +416,6 @@ int ndp_setup_interface(struct interface
  		if (!enable)
  			if (write(procfd, "0\n", 2) < 0) {}
  
@@ -357,7 +380,7 @@
  	}
  
  	if (enable) {
-@@ -235,19 +543,22 @@
+@@ -235,19 +543,22 @@ int ndp_setup_interface(struct interface
  		iface->ndp_event.handle_dgram = handle_solicit;
  		odhcpd_register(&iface->ndp_event);
  
@@ -371,12 +394,11 @@
  			netlink_dump_neigh_table(false);
 -		else
 -			dump_neigh = false;
--	}
--
+ 	}
+ 
 -	if (dump_neigh)
 -		netlink_dump_neigh_table(true);
-+	}
- 
+-
   out:
  	if (ret < 0) {
 +		runtime = ndp_runtime_find(iface);
@@ -388,7 +410,7 @@
  			close(iface->ndp_event.uloop.fd);
  			iface->ndp_event.uloop.fd = -1;
  		}
-@@ -267,46 +578,52 @@
+@@ -267,46 +578,52 @@ int ndp_setup_interface(struct interface
  static void ndp_netevent_cb(unsigned long event, struct netevent_handler_info *info)
  {
  	struct interface *iface = info->iface;
@@ -454,9 +476,8 @@
  		break;
  	default:
 -		break;
--	}
 +		return;
-+	}
+ 	}
 +
 +	if (ndp_observe(runtime, addr, reason, add) && !ndp_update.pending)
 +		uloop_timeout_set(&ndp_update, 0);
@@ -465,7 +486,7 @@
  }
  
  /* Send an ICMP-ECHO. This is less for actually pinging but for the
-@@ -317,17 +634,33 @@
+@@ -317,17 +634,33 @@ static void ping6(struct in6_addr *addr,
  	struct sockaddr_in6 dest = { .sin6_family = AF_INET6, .sin6_addr = *addr , };
  	struct icmp6_hdr echo = { .icmp6_type = ICMP6_ECHO_REQUEST };
  	struct iovec iov = { .iov_base = &echo, .iov_len = sizeof(echo) };
@@ -477,8 +498,6 @@
  	debug("Pinging for %s on %s", ipbuf, iface->name);
  
 -	netlink_setup_route(addr, 128, iface->ifindex, NULL, 128, true);
--
--	/* Use link-local address as source for RFC 4861 compliance and macOS compatibility */
 +	allocation = calloc(1, sizeof(*allocation));
 +	if (!allocation)
 +		return;
@@ -493,7 +512,8 @@
 +		allocation->metric = 128;
 +		list_add_tail(&allocation->head, &ndp_allocations);
 +	}
-+
+ 
+-	/* Use link-local address as source for RFC 4861 compliance and macOS compatibility */
 +	/* Use link-local address as source for RFC 4861 compliance and macOS compatibility. */
  	odhcpd_try_send_with_src(iface->ndp_ping_fd, &dest, &iov, 1, iface);
  
@@ -503,7 +523,7 @@
  }
  
  /* Send a Neighbor Advertisement. */
-@@ -422,38 +755,3 @@
+@@ -422,38 +755,3 @@ static void handle_solicit(void *addr, v
  	}
  }
  
@@ -544,7 +564,7 @@
 -}
 --- a/src/netlink.c
 +++ b/src/netlink.c
-@@ -1010,6 +1010,7 @@
+@@ -1010,6 +1010,7 @@ int netlink_get_interface_proxy_neigh(in
  	if (ctxt.ret < 0)
  		goto free;
  
@@ -552,7 +572,7 @@
  	while (ctxt.pending)
  		nl_recvmsgs(rtnl_socket, cb);
  
-@@ -1022,9 +1023,9 @@
+@@ -1022,9 +1023,9 @@ out:
  }
  
  
@@ -564,7 +584,7 @@
  {
  	struct nl_msg *msg;
  	struct rtmsg rtm = {
-@@ -1032,14 +1033,14 @@
+@@ -1032,14 +1033,14 @@ int netlink_setup_route(const struct in6
  		.rtm_dst_len = prefixlen,
  		.rtm_src_len = 0,
  		.rtm_table = RT_TABLE_MAIN,
@@ -581,13 +601,10 @@
  	if (!msg)
  		return -1;
  
-@@ -1059,6 +1060,23 @@
- 		return ret;
+@@ -1062,6 +1063,23 @@ int netlink_setup_route(const struct in6
+ }
  
- 	return nl_wait_for_ack(rtnl_socket);
-+}
-+
-+
+ 
 +
 +int netlink_setup_route(const struct in6_addr *addr, const int prefixlen,
 +		const int ifindex, const struct in6_addr *gw,
@@ -602,12 +619,15 @@
 +		const uint32_t metric, const bool add)
 +{
 +	return setup_route(addr, prefixlen, ifindex, gw, metric, add, true);
- }
- 
- 
++}
++
++
+ int netlink_setup_proxy_neigh(const struct in6_addr *addr,
+ 		const int ifindex, const bool add)
+ {
 --- a/src/odhcpd.h
 +++ b/src/odhcpd.h
-@@ -637,6 +637,9 @@
+@@ -637,6 +637,9 @@ int netlink_get_interface_proxy_neigh(in
  int netlink_setup_route(const struct in6_addr *addr, const int prefixlen,
  			const int ifindex, const struct in6_addr *gw,
  			const uint32_t metric, const bool add);
