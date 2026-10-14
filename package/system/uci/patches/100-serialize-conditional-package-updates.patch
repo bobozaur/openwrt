@@ -1,3 +1,20 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] uci: serialize conditional package updates and preserve publication state
+
+A conditional configuration owner must load, check and publish against the
+same inode lifetime as ordinary save, commit and revert users. Retain package
+locks across atomic replacement, provide nonblocking acquisition before load,
+and preserve saved edits until configuration publication succeeds.
+
+Check output, synchronization and rename failures without consuming unpublished
+changes. Report already-published state distinctly so a caller does not blindly
+replay non-idempotent deltas. The public context and error interface require
+a matching libuci consumer ABI; session and wireless policy remain outside UCI.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
 --- a/uci.h
 +++ b/uci.h
 @@ -52,6 +52,9 @@
@@ -10,15 +27,27 @@
  	UCI_ERR_LAST
  };
  
-@@ -239,8 +242,33 @@
+@@ -228,6 +231,10 @@
+  * uci_save: save change delta for a package
+  * @ctx: uci context
+  * @p: uci_package struct
++ *
++ * UCI_ERR_PUBLISHED means the delta file was published but its directory
++ * synchronization failed. The in-memory delta was consumed at publication;
++ * inspect the saved state before retrying non-idempotent changes.
+  */
+ extern int uci_save(struct uci_context *ctx, struct uci_package *p);
+ 
+@@ -239,8 +246,34 @@
   *
   * committing may reload the whole uci_package data,
   * the supplied pointer is updated accordingly
 + *
 + * Saved edits are consumed only after durable configuration publication.
-+ * UCI_ERR_PUBLISHED means publication happened but synchronization or saved
-+ * delta cleanup failed. Inspect committed and pending state before retrying;
-+ * replaying non-idempotent deltas after that error can repeat their effects.
++ * UCI_ERR_PUBLISHED may report the prerequisite uci_save publication, or a
++ * configuration publication followed by synchronization/delta cleanup failure.
++ * Inspect both committed and pending state before retrying; replaying
++ * non-idempotent deltas after that error can repeat their effects.
   */
  extern int uci_commit(struct uci_context *ctx, struct uci_package **p, bool overwrite);
 +
@@ -44,7 +73,7 @@
  
  /**
   * uci_list_configs: List available uci config files
-@@ -431,6 +459,9 @@
+@@ -431,6 +464,9 @@
  	bool internal, nested;
  	char *buf;
  	int bufsz;
