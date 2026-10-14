@@ -1,0 +1,324 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] tests: exercise invoke errors and descriptor retirement
+
+Send native local socket frames through public libubus connection/channel APIs.
+Check early error peer/sequence/object matching, no-reply suppression and incoming
+FD retirement through exact per-message pipe EOF on missing objects/attributes
+and notify/unsubscribe errors. Retain
+one claimed descriptor across deferred completion, and require an actual public
+synchronous caller to complete with NOT_FOUND rather than timeout.
+
+Keep this in the existing native CTest suite; no hidden API or implementation
+source is exposed to tests and no router or external ubus daemon is required.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -29,3 +29,9 @@ ADD_TEST(NAME cplusplus COMMAND test-cpl
+ IF(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+   ADD_SUBDIRECTORY(fuzz)
+ ENDIF()
++
++ADD_EXECUTABLE(invoke-errors invoke-errors.c)
++TARGET_LINK_LIBRARIES(invoke-errors ubus ${ubox_library})
++TARGET_INCLUDE_DIRECTORIES(invoke-errors PRIVATE ${PROJECT_SOURCE_DIR})
++ADD_TEST(NAME invoke-errors COMMAND invoke-errors)
++SET_TESTS_PROPERTIES(invoke-errors PROPERTIES TIMEOUT 10)
+--- /dev/null
++++ b/tests/invoke-errors.c
+@@ -0,0 +1,292 @@
++/* Exercise native libubus dispatch through local socket frames and public APIs. */
++#include <arpa/inet.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++#include "libubus.h"
++
++#define CHECK(expr) do { \
++	if (!(expr)) { \
++		fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #expr); \
++		exit(1); \
++	} \
++} while (0)
++
++#define OBJECT_ID 0x10203040
++#define PEER_ID 0x50607080
++#define SEQUENCE 0x1234
++
++static int claimed_fd = -1;
++static struct ubus_request_data deferred;
++
++static void send_frame(int socket, uint8_t type, struct blob_attr *data, int fd)
++{
++	struct ubus_msghdr hdr = {
++		.type = type, .seq = htons(SEQUENCE), .peer = htonl(PEER_ID)
++	};
++	struct iovec iov[] = {
++		{ .iov_base = &hdr, .iov_len = sizeof(hdr) },
++		{ .iov_base = data, .iov_len = blob_raw_len(data) }
++	};
++	union {
++		struct cmsghdr alignment;
++		char bytes[CMSG_SPACE(sizeof(int))];
++	} control = { 0 };
++	struct msghdr msg = { .msg_iov = iov, .msg_iovlen = ARRAY_SIZE(iov) };
++
++	if (fd >= 0) {
++		struct cmsghdr *cmsg;
++		msg.msg_control = control.bytes;
++		msg.msg_controllen = sizeof(control.bytes);
++		cmsg = CMSG_FIRSTHDR(&msg);
++		cmsg->cmsg_level = SOL_SOCKET;
++		cmsg->cmsg_type = SCM_RIGHTS;
++		cmsg->cmsg_len = CMSG_LEN(sizeof(int));
++		memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
++	}
++	CHECK(sendmsg(socket, &msg, 0) == (ssize_t)(sizeof(hdr) + blob_raw_len(data)));
++}
++
++/* The peer receives its own pipe writer. EOF proves that exact descriptor
++ * retired, without inferring ownership from a process-wide FD count. */
++static int send_pipe_frame(int socket, uint8_t type, struct blob_attr *data)
++{
++	int ends[2];
++	CHECK(!pipe(ends));
++	CHECK(fcntl(ends[0], F_SETFL, O_NONBLOCK) >= 0);
++	send_frame(socket, type, data, ends[1]);
++	close(ends[1]);
++	return ends[0];
++}
++
++static void expect_pipe(int read_end, bool retired)
++{
++	char byte;
++	ssize_t result = read(read_end, &byte, 1);
++	if (retired)
++		CHECK(result == 0);
++	else
++		CHECK(result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
++}
++
++static void expect_reply(int socket, int status)
++{
++	struct {
++		struct ubus_msghdr hdr;
++		struct blob_attr data;
++	} prefix;
++	uint32_t storage[256];
++	struct blob_attr *data = (struct blob_attr *)storage;
++	struct blob_attr *tb[UBUS_ATTR_MAX];
++	static const struct blob_attr_info policy[UBUS_ATTR_MAX] = {
++		[UBUS_ATTR_STATUS] = { .type = BLOB_ATTR_INT32 },
++		[UBUS_ATTR_OBJID] = { .type = BLOB_ATTR_INT32 }
++	};
++	size_t len;
++
++	CHECK(recv(socket, &prefix, sizeof(prefix), MSG_WAITALL) == (ssize_t)sizeof(prefix));
++	CHECK(prefix.hdr.type == UBUS_MSG_STATUS);
++	CHECK(ntohs(prefix.hdr.seq) == SEQUENCE);
++	CHECK(ntohl(prefix.hdr.peer) == PEER_ID);
++	len = blob_raw_len(&prefix.data);
++	CHECK(len >= sizeof(prefix.data) && len <= sizeof(storage));
++	memcpy(data, &prefix.data, sizeof(prefix.data));
++	CHECK(recv(socket, blob_data(data), len - sizeof(prefix.data), MSG_WAITALL) ==
++	      (ssize_t)(len - sizeof(prefix.data)));
++	blob_parse(data, tb, policy, UBUS_ATTR_MAX);
++	CHECK(tb[UBUS_ATTR_STATUS] && blob_get_u32(tb[UBUS_ATTR_STATUS]) == (uint32_t)status);
++	CHECK(tb[UBUS_ATTR_OBJID] && blob_get_u32(tb[UBUS_ATTR_OBJID]) == OBJECT_ID);
++}
++
++static void expect_silence(int socket)
++{
++	char byte;
++	CHECK(recv(socket, &byte, 1, MSG_DONTWAIT) < 0 &&
++	      (errno == EAGAIN || errno == EWOULDBLOCK));
++}
++
++/* The peer supplies a native HELLO, then hands the accepted socket back. This
++ * enters normal object dispatch without changing internal context identities. */
++static int connect_peer(struct ubus_context *ctx)
++{
++	char directory[] = "/tmp/ubus-invoke-errors.XXXXXX";
++	struct sockaddr_un address = { .sun_family = AF_UNIX };
++	int listener, transfer[2], peer, status;
++	pid_t child;
++
++	CHECK(mkdtemp(directory));
++	CHECK(snprintf(address.sun_path, sizeof(address.sun_path), "%s/socket", directory) <
++	      (int)sizeof(address.sun_path));
++	listener = socket(AF_UNIX, SOCK_STREAM, 0);
++	CHECK(listener >= 0);
++	CHECK(!bind(listener, (struct sockaddr *)&address, sizeof(address)));
++	CHECK(!listen(listener, 1));
++	CHECK(!socketpair(AF_UNIX, SOCK_DGRAM, 0, transfer));
++	child = fork();
++	CHECK(child >= 0);
++	if (!child) {
++		struct blob_buf hello = { 0 };
++		struct pollfd ready = { .fd = listener, .events = POLLIN };
++		CHECK(poll(&ready, 1, 2000) == 1);
++		peer = accept(listener, NULL, NULL);
++		CHECK(peer >= 0);
++		blob_buf_init(&hello, 0);
++		/* A normal ubusd connection has a client ID greater than CHANNEL. */
++		send_frame(peer, UBUS_MSG_HELLO, hello.head, -1);
++		send_frame(transfer[1], UBUS_MSG_HELLO, hello.head, peer);
++		blob_buf_free(&hello);
++		close(peer);
++		_exit(0);
++	}
++	CHECK(!ubus_connect_ctx(ctx, address.sun_path));
++	{
++		char bytes[64];
++		union {
++			struct cmsghdr alignment;
++			char bytes[CMSG_SPACE(sizeof(int))];
++		} control = { 0 };
++		struct iovec iov = { .iov_base = bytes, .iov_len = sizeof(bytes) };
++		struct msghdr msg = {
++			.msg_iov = &iov, .msg_iovlen = 1,
++			.msg_control = control.bytes, .msg_controllen = sizeof(control.bytes)
++		};
++		struct cmsghdr *cmsg;
++		CHECK(recvmsg(transfer[0], &msg, 0) > 0);
++		cmsg = CMSG_FIRSTHDR(&msg);
++		CHECK(cmsg && cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
++		      cmsg->cmsg_len == CMSG_LEN(sizeof(peer)));
++		memcpy(&peer, CMSG_DATA(cmsg), sizeof(peer));
++	}
++	CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
++	close(listener);
++	close(transfer[0]);
++	close(transfer[1]);
++	CHECK(!unlink(address.sun_path));
++	CHECK(!rmdir(directory));
++	return peer;
++}
++
++static int claim_deferred(struct ubus_context *ctx, struct ubus_object *obj,
++			  struct ubus_request_data *req, const char *method,
++			  struct blob_attr *data)
++{
++	claimed_fd = ubus_request_get_caller_fd(req);
++	ubus_defer_request(ctx, req, &deferred);
++	return 0;
++}
++
++static void check_frames(void)
++{
++	struct ubus_context ctx;
++	struct blob_buf data = { 0 };
++	int peer = connect_peer(&ctx), read_end;
++	/* Repeat the failing descriptor paths enough to expose a per-message leak. */
++	for (int i = 0; i < 20; i++) {
++		blob_buf_init(&data, 0);
++		blob_put_int32(&data, UBUS_ATTR_OBJID, OBJECT_ID);
++		blob_put_string(&data, UBUS_ATTR_METHOD, "missing");
++		blob_put(&data, UBUS_ATTR_DATA, NULL, 0);
++		read_end = send_pipe_frame(peer, UBUS_MSG_INVOKE, data.head);
++		ubus_handle_event(&ctx);
++		expect_reply(peer, UBUS_STATUS_NOT_FOUND);
++		expect_pipe(read_end, true);
++		close(read_end);
++		blob_put_int8(&data, UBUS_ATTR_NO_REPLY, 1);
++		read_end = send_pipe_frame(peer, UBUS_MSG_INVOKE, data.head);
++		ubus_handle_event(&ctx);
++		expect_silence(peer);
++		expect_pipe(read_end, true);
++		close(read_end);
++		for (uint8_t type = UBUS_MSG_UNSUBSCRIBE; type <= UBUS_MSG_NOTIFY; type++) {
++			read_end = send_pipe_frame(peer, type, data.head);
++			ubus_handle_event(&ctx);
++			expect_silence(peer);
++			expect_pipe(read_end, true);
++			close(read_end);
++		}
++		blob_buf_init(&data, 0);
++		read_end = send_pipe_frame(peer, UBUS_MSG_INVOKE, data.head); /* Missing OBJID. */
++		ubus_handle_event(&ctx);
++		expect_silence(peer);
++		expect_pipe(read_end, true);
++		close(read_end);
++	}
++	blob_buf_free(&data);
++	close(peer);
++	ubus_shutdown(&ctx);
++
++	/* Public channels reach invalid-method/data early exits and a handler that
++	 * claims a descriptor and defers completion; neither may lose ownership. */
++	CHECK(!ubus_channel_create(&ctx, &peer, claim_deferred));
++	blob_buf_init(&data, 0);
++	blob_put_int32(&data, UBUS_ATTR_OBJID, OBJECT_ID);
++	send_frame(peer, UBUS_MSG_INVOKE, data.head, -1);
++	ubus_handle_event(&ctx);
++	expect_reply(peer, UBUS_STATUS_INVALID_ARGUMENT);
++	blob_put_string(&data, UBUS_ATTR_METHOD, "claim");
++	send_frame(peer, UBUS_MSG_INVOKE, data.head, -1);
++	ubus_handle_event(&ctx);
++	expect_reply(peer, UBUS_STATUS_INVALID_ARGUMENT);
++	blob_put(&data, UBUS_ATTR_DATA, NULL, 0);
++	read_end = send_pipe_frame(peer, UBUS_MSG_INVOKE, data.head);
++	ubus_handle_event(&ctx);
++	expect_pipe(read_end, false);
++	CHECK(claimed_fd >= 0 && fcntl(claimed_fd, F_GETFD) >= 0);
++	expect_silence(peer);
++	ubus_complete_deferred_request(&ctx, &deferred, UBUS_STATUS_OK);
++	expect_reply(peer, UBUS_STATUS_OK);
++	CHECK(fcntl(claimed_fd, F_GETFD) >= 0);
++	expect_pipe(read_end, false);
++	close(claimed_fd);
++	expect_pipe(read_end, true);
++	close(read_end);
++	blob_buf_free(&data);
++	close(peer);
++	ubus_shutdown(&ctx);
++}
++
++static void check_sync_call(void)
++{
++	struct ubus_context server, caller;
++	int peer, status, fd;
++	pid_t child;
++
++	CHECK(!ubus_channel_create(&server, &peer, NULL));
++	child = fork();
++	CHECK(child >= 0);
++	if (!child) {
++		struct pollfd ready = { .fd = server.sock.fd, .events = POLLIN };
++		close(peer);
++		CHECK(poll(&ready, 1, 2000) == 1);
++		ubus_handle_event(&server);
++		ubus_shutdown(&server);
++		_exit(0);
++	}
++	ubus_shutdown(&server);
++	CHECK(!ubus_channel_connect(&caller, peer, NULL));
++	fd = open("/dev/null", O_RDONLY);
++	CHECK(fd >= 0);
++	/* A matching early error must complete the waiting public caller instead
++	 * of being discarded as an unrelated envelope and timing out. */
++	CHECK(ubus_invoke_fd(&caller, OBJECT_ID, "missing", NULL, NULL, NULL, 1000, fd) ==
++	      UBUS_STATUS_NOT_FOUND);
++	close(fd);
++	CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
++	ubus_shutdown(&caller);
++}
++
++int main(void)
++{
++	check_frames();
++	check_sync_call();
++	uloop_done();
++	return 0;
++}

@@ -1,16 +1,23 @@
-Subject: [PATCH] libubus: retain the request envelope on early invoke errors
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] libubus: preserve request envelope on early invoke errors
 
 An object can disappear while its invocation is queued during a nested
 synchronous call. Initialize the caller, sequence and requested object before
 validating the local object so NOT_FOUND reaches the waiting caller. Missing
 method errors need the same envelope.
 
-Read no_reply before validation and close unclaimed incoming descriptors on
-the common exit. Deferred handlers retain the existing completion ownership.
+Read no_reply before validation so a fire-and-forget early error does not
+emit a reply. Descriptor retirement is supplied separately by upstream
+commit 618f3cf75ae3920c1a3164215ef084cbd50eaf92. Deferred handlers retain
+the existing completion ownership.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/libubus-obj.c
 +++ b/libubus-obj.c
-@@ -54,13 +54,17 @@
+@@ -54,13 +54,17 @@ ubus_process_invoke(struct ubus_context
  		    struct ubus_object *obj, struct blob_attr **attrbuf, int fd)
  {
  	struct ubus_request_data req = {
@@ -29,7 +36,7 @@ the common exit. Deferred handlers retain the existing completion ownership.
  
  	if ((!obj && !ubus_context_is_channel(ctx)) ||
  	    (!ctx->request_handler && ubus_context_is_channel(ctx))) {
-@@ -73,18 +77,11 @@
+@@ -73,18 +77,11 @@ ubus_process_invoke(struct ubus_context
  		goto send;
  	}
  
@@ -48,17 +55,21 @@ the common exit. Deferred handlers retain the existing completion ownership.
  	if (attrbuf[UBUS_ATTR_USER] && attrbuf[UBUS_ATTR_GROUP]) {
  		req.acl.user = blobmsg_get_string(attrbuf[UBUS_ATTR_USER]);
  		req.acl.group = blobmsg_get_string(attrbuf[UBUS_ATTR_GROUP]);
-@@ -110,12 +107,12 @@
+@@ -110,15 +107,11 @@ found:
  
  	ret = handler(ctx, obj, &req, blob_data(attrbuf[UBUS_ATTR_METHOD]),
  		      attrbuf[UBUS_ATTR_DATA]);
-+send:
+-	if (req.deferred || no_reply) {
+-		if (req.req_fd >= 0)
+-			close(req.req_fd);
+-		return;
+-	}
+-
+ send:
  	if (req.req_fd >= 0)
  		close(req.req_fd);
- 	if (req.deferred || no_reply)
- 		return;
- 
--send:
++	if (req.deferred || no_reply)
++		return;
  	ubus_complete_deferred_request(ctx, &req, ret);
  }
  
