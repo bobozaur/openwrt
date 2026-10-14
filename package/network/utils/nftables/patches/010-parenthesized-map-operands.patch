@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] evaluate scalar map lookups as left binary operands
 
 Allow a parenthesized map on the left of a binary expression and explicitly
@@ -8,6 +9,9 @@ Normalize scalar map result metadata at the binary-operand boundary, keeping
 legacy map statement validation unchanged. Restore scalar metadata when reading
 lookup registers, and give JSON child operands their own grammar contexts.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/src/evaluate.c
 +++ b/src/evaluate.c
 @@ -1515,6 +1515,49 @@
