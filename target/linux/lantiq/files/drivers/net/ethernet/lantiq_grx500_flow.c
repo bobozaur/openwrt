@@ -124,22 +124,6 @@ struct grx500_flow_mac {
 	u16 users;
 };
 
-/* Stable diagnostic stages; no stage changes the native admission result. */
-enum grx500_flow_add_stage {
-	GF_ADD_STATE = 1,
-	GF_ADD_COOKIE,
-	GF_ADD_ALLOC,
-	GF_ADD_MATCH,
-	GF_ADD_ACTION,
-	GF_ADD_PATH,
-	GF_ADD_EPOCH,
-	GF_ADD_DOMAIN,
-	GF_ADD_RESOURCE,
-	GF_ADD_MTU,
-	GF_ADD_SUBTABLE,
-	GF_ADD_PUBLICATION,
-};
-
 enum grx500_flow_rx_reject {
 	GF_RX_DESCRIPTOR,
 	GF_RX_IP_HEADER,
@@ -149,53 +133,6 @@ enum grx500_flow_rx_reject {
 	GF_RX_MTU,
 	GF_RX_ALLOC,
 	GF_RX_REJECT_COUNT,
-};
-
-enum grx500_flow_rx_field {
-	GF_RX_LAST_STAGE,
-	GF_RX_LAST_DW0,
-	GF_RX_LAST_DW1,
-	GF_RX_LAST_FRAME_LEN,
-	GF_RX_LAST_IP_LEN,
-	GF_RX_LAST_HAS_ENTRY,
-	GF_RX_LAST_EXPECTED_L3,
-	GF_RX_LAST_ACTUAL_L3,
-	GF_RX_LAST_EXPECTED_PROTO,
-	GF_RX_LAST_ACTUAL_PROTO,
-	GF_RX_LAST_EXPECTED_PORTS,
-	GF_RX_LAST_ACTUAL_PORTS,
-	GF_RX_LAST_EXPECTED_SADDR_HI,
-	GF_RX_LAST_EXPECTED_SADDR_LO,
-	GF_RX_LAST_EXPECTED_DADDR_HI,
-	GF_RX_LAST_EXPECTED_DADDR_LO,
-	GF_RX_LAST_ACTUAL_SADDR_HI,
-	GF_RX_LAST_ACTUAL_SADDR_LO,
-	GF_RX_LAST_ACTUAL_DADDR_HI,
-	GF_RX_LAST_ACTUAL_DADDR_LO,
-	GF_RX_LAST_EXPECTED_SMAC,
-	GF_RX_LAST_EXPECTED_DMAC,
-	GF_RX_LAST_ACTUAL_SMAC,
-	GF_RX_LAST_ACTUAL_DMAC,
-	GF_RX_LAST_MTU_CACHED,
-	GF_RX_LAST_MTU_CURRENT,
-	GF_RX_LAST_RESOURCE,
-	GF_RX_LAST_IP_HEAD,
-	GF_RX_LAST_IP_CSUM,
-	GF_RX_LAST_L4_INFO,
-	GF_RX_LAST_SMAC_INDEX,
-	GF_RX_LAST_DMAC_INDEX,
-	GF_RX_LAST_COUNT,
-};
-
-struct grx500_flow_rx_info {
-	struct grx500_flow_tuple tuple;
-	struct ethhdr eth;
-	u32 dw0, dw1, frame_len, ip_len, ip_head, ip_csum, l4_info;
-	u8 l3, protocol;
-};
-
-struct grx500_flow_admission {
-	u32 stage, iif, oif;
 };
 
 struct grx500_flow {
@@ -224,11 +161,7 @@ struct grx500_flow {
 	atomic64_t rx_validated, tx_rejected;
 	spinlock_t rx_reject_lock;
 	u64 rx_rejects[GF_RX_REJECT_COUNT];
-	u64 last_rx_reject[GF_RX_LAST_COUNT];
 	u64 add_requests, add_accepted, add_rejected;
-	u64 hw_read_errors;
-	u32 last_add_errno;
-	struct grx500_flow_admission last_add_rejection;
 	unsigned int active;
 	bool stopping, faulted, software_ingress;
 };
@@ -240,17 +173,17 @@ static const struct rhashtable_params grx500_flow_hash_params = {
 	.automatic_shrinking = true,
 };
 
+/* Cumulative counters live until parent teardown. Active sessions and MAC
+ * capacities/leases are gauges; accepted return bytes count the IP extent,
+ * after Linux egress accepted the frame, without claiming wire delivery.
+ */
 const char grx500_flow_stats_names[GRX500_FLOW_STATS_COUNT][ETH_GSTRING_LEN] = {
 	"pae_active_sessions", "pae_return_packets", "pae_return_l3_bytes",
 	"pae_stale_returns", "pae_invalid_returns", "pae_table_failures",
 	"pae_capacity_fallbacks",
 	"pae_add_requests", "pae_add_accepted", "pae_add_rejected",
-	"pae_last_add_errno", "pae_last_add_stage",
-	"pae_last_add_iif", "pae_last_add_oif",
 	"pae_rx_examined", "pae_rx_candidates", "pae_rx_unmarked_nat",
 	"pae_rx_validated", "pae_tx_rejected",
-	"pae_hw_read_ok", "pae_hw_identity_ok", "pae_hw_matched_sessions",
-	"pae_hw_hit_sessions", "pae_hw_counter_raw", "pae_hw_read_errors",
 	"pae_rx_reject_descriptor",
 	"pae_rx_reject_ip_header",
 	"pae_rx_reject_transport",
@@ -258,38 +191,6 @@ const char grx500_flow_stats_names[GRX500_FLOW_STATS_COUNT][ETH_GSTRING_LEN] = {
 	"pae_rx_reject_mac",
 	"pae_rx_reject_mtu",
 	"pae_rx_reject_alloc",
-	"pae_last_rx_stage",
-	"pae_last_rx_dw0",
-	"pae_last_rx_dw1",
-	"pae_last_rx_frame_len",
-	"pae_last_rx_ip_len",
-	"pae_last_rx_has_entry",
-	"pae_last_rx_expected_l3",
-	"pae_last_rx_actual_l3",
-	"pae_last_rx_expected_proto",
-	"pae_last_rx_actual_proto",
-	"pae_last_rx_expected_ports",
-	"pae_last_rx_actual_ports",
-	"pae_last_rx_expected_saddr_hi",
-	"pae_last_rx_expected_saddr_lo",
-	"pae_last_rx_expected_daddr_hi",
-	"pae_last_rx_expected_daddr_lo",
-	"pae_last_rx_actual_saddr_hi",
-	"pae_last_rx_actual_saddr_lo",
-	"pae_last_rx_actual_daddr_hi",
-	"pae_last_rx_actual_daddr_lo",
-	"pae_last_rx_expected_smac",
-	"pae_last_rx_expected_dmac",
-	"pae_last_rx_actual_smac",
-	"pae_last_rx_actual_dmac",
-	"pae_last_rx_mtu_cached",
-	"pae_last_rx_mtu_current",
-	"pae_last_rx_resource",
-	"pae_last_rx_ip_head",
-	"pae_last_rx_ip_csum",
-	"pae_last_rx_l4_info",
-	"pae_last_rx_smac_index",
-	"pae_last_rx_dmac_index",
 	"pae_mac_cap14",
 	"pae_mac_smac_capacity",
 	"pae_mac_dmac_capacity",
@@ -299,12 +200,13 @@ const char grx500_flow_stats_names[GRX500_FLOW_STATS_COUNT][ETH_GSTRING_LEN] = {
 	"pae_mac_references",
 };
 
-static void gf_observe_sessions(struct grx500_flow *f, u64 *data);
-
+/* Statistics observe software ownership only; reading ethtool must not issue
+ * hardware table transactions or retain packet-specific metadata.
+ */
 void grx500_flow_get_stats(struct grx500_flow *f, u64 *data)
 {
 	unsigned long flags;
-	unsigned int i, index = 25 + GF_RX_REJECT_COUNT + GF_RX_LAST_COUNT;
+	unsigned int i, index = 15 + GF_RX_REJECT_COUNT;
 	u64 macs = 0, references = 0;
 
 	memset(data, 0, sizeof(*data) * GRX500_FLOW_STATS_COUNT);
@@ -321,20 +223,13 @@ void grx500_flow_get_stats(struct grx500_flow *f, u64 *data)
 	data[7] = f->add_requests;
 	data[8] = f->add_accepted;
 	data[9] = f->add_rejected;
-	data[10] = f->last_add_errno;
-	data[11] = f->last_add_rejection.stage;
-	data[12] = f->last_add_rejection.iif;
-	data[13] = f->last_add_rejection.oif;
-	data[14] = atomic64_read(&f->rx_examined);
-	data[15] = atomic64_read(&f->rx_candidates);
-	data[16] = atomic64_read(&f->rx_unmarked_nat);
-	data[17] = atomic64_read(&f->rx_validated);
-	data[18] = atomic64_read(&f->tx_rejected);
-	gf_observe_sessions(f, data);
+	data[10] = atomic64_read(&f->rx_examined);
+	data[11] = atomic64_read(&f->rx_candidates);
+	data[12] = atomic64_read(&f->rx_unmarked_nat);
+	data[13] = atomic64_read(&f->rx_validated);
+	data[14] = atomic64_read(&f->tx_rejected);
 	spin_lock_irqsave(&f->rx_reject_lock, flags);
-	memcpy(data + 25, f->rx_rejects, sizeof(f->rx_rejects));
-	memcpy(data + 25 + GF_RX_REJECT_COUNT, f->last_rx_reject,
-	       sizeof(f->last_rx_reject));
+	memcpy(data + 15, f->rx_rejects, sizeof(f->rx_rejects));
 	spin_unlock_irqrestore(&f->rx_reject_lock, flags);
 	for (i = 1; i < GF_MAC_ENTRIES; i++) {
 		macs += !!f->macs[i].users;
@@ -703,62 +598,6 @@ static int gf_session(struct grx500_flow *f, struct grx500_flow_entry *entry,
 	return ret;
 }
 
-static void gf_observe_sessions(struct grx500_flow *f, u64 *data)
-{
-	struct grx500_flow_entry *entry;
-	struct grx500_flow_words words;
-	unsigned int examined = 0, matched = 0, hits = 0;
-	u64 raw = 0;
-	bool read_ok = !READ_ONCE(f->stopping);
-	int ret;
-
-	lockdep_assert_held(&f->lock);
-	if (!read_ok)
-		goto out;
-	list_for_each_entry(entry, &f->entries, list) {
-		if (!entry->hardware_valid)
-			continue;
-		if (examined == GF_RESOURCES) {
-			read_ok = false;
-			break;
-		}
-		examined++;
-		memset(&words, 0, sizeof(words));
-		/* Native GSW_ROUTE_HIT_N_CNTR_READ: an address read only.
-		 * Never use the hit-status/counter-clear write operations.
-		 */
-		ret = gf_table(f, true, 0, entry->slot, false, false, false, &words);
-		if (ret) {
-			f->hw_read_errors++;
-			read_ok = false;
-			break;
-		}
-		if (words.key[0] != entry->resource * 12 + 4 ||
-		    words.key[1] != entry->resource * 12 ||
-		    words.key[2] != be16_to_cpu(entry->before.dport) ||
-		    words.key[3] != be16_to_cpu(entry->before.sport) ||
-		    words.key[4] != (entry->domain | BIT(15)) ||
-		    words.key[5] != entry->slot ||
-		    words.val[4] != (entry->mtu_index | (entry->source_mac_index << 8)) ||
-		    words.val[5] != entry->dest_mac_index ||
-		    words.val[1] != ((entry->generation & GENMASK(12, 0)) << 3) ||
-		    words.val[8] != ((entry->generation >> 13) << 8))
-			continue;
-		matched++;
-		if (words.val[12] & BIT(15))
-			hits++;
-		raw += (u32)words.val[10] | ((u32)words.val[11] << 16);
-	}
-out:
-	read_ok = read_ok && !READ_ONCE(f->stopping);
-	data[19] = read_ok;
-	data[20] = read_ok && examined == f->active && matched == f->active;
-	data[21] = matched;
-	data[22] = hits;
-	data[23] = raw;
-	data[24] = f->hw_read_errors;
-}
-
 static void gf_path_free(struct rcu_head *rcu)
 {
 	struct grx500_flow_path *path = container_of(rcu, struct grx500_flow_path, rcu);
@@ -928,8 +767,7 @@ static int gf_domain_get(struct grx500_flow *f, struct net_device *dev, u16 port
 }
 
 static int gf_parse(struct grx500_flow *f, struct flow_cls_offload *cls,
-		    struct grx500_flow_entry *entry,
-		    struct grx500_flow_admission *admission)
+		    struct grx500_flow_entry *entry)
 {
 	u64 keys = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
 		BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
@@ -951,11 +789,9 @@ static int gf_parse(struct grx500_flow *f, struct flow_cls_offload *cls,
 	bool snat, dnat;
 	int i, ret = -EOPNOTSUPP;
 
-	admission->stage = GF_ADD_MATCH;
 	if ((rule->match.dissector->used_keys & keys) != keys)
 		return -EOPNOTSUPP;
 	flow_rule_match_meta(rule, &meta);
-	admission->iif = meta.key->ingress_ifindex;
 	flow_rule_match_control(rule, &control);
 	flow_rule_match_basic(rule, &basic);
 	flow_rule_match_ports(rule, &ports);
@@ -997,7 +833,7 @@ static int gf_parse(struct grx500_flow *f, struct flow_cls_offload *cls,
 	entry->before.sport = ports.key->src;
 	entry->before.dport = ports.key->dst;
 	entry->after = entry->before;
-	admission->stage = GF_ADD_ACTION;
+
 	flow_action_for_each(i, action, &rule->action) {
 		u32 value = action->mangle.val;
 		u16 half;
@@ -1007,7 +843,6 @@ static int gf_parse(struct grx500_flow *f, struct flow_cls_offload *cls,
 			if (output)
 				return -EOPNOTSUPP;
 			output = action->dev;
-			admission->oif = output ? output->ifindex : 0;
 			break;
 		case FLOW_ACTION_CSUM:
 			if (action->csum_flags & ~(TCA_CSUM_UPDATE_FLAG_IPV4HDR |
@@ -1101,7 +936,7 @@ static int gf_parse(struct grx500_flow *f, struct flow_cls_offload *cls,
 	entry->source_nat = snat;
 	entry->nat = snat || dnat;
 	entry->port_nat = entry->before.sport != entry->after.sport || entry->before.dport != entry->after.dport;
-	admission->stage = GF_ADD_PATH;
+
 	path = kzalloc(sizeof(*path), GFP_KERNEL);
 	if (!path)
 		return -ENOMEM;
@@ -1350,45 +1185,43 @@ static int gf_netdev_event(struct notifier_block *nb, unsigned long event, void 
 }
 
 static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding,
-		      struct flow_cls_offload *cls,
-		      struct grx500_flow_admission *admission)
+		      struct flow_cls_offload *cls)
 {
 	struct grx500_flow_entry *entry;
 	struct grx500_flow_path *path;
 	unsigned int resource, slot;
 	int ret, domain, mtu;
 
-	admission->stage = GF_ADD_STATE;
 	if (f->stopping || f->faulted || binding->detached ||
 	    !netif_running(f->lan) || !netif_running(f->wan))
 		return -EOPNOTSUPP;
-	admission->stage = GF_ADD_COOKIE;
+
 	if (rhashtable_lookup_fast(&f->cookies, &cls->cookie, grx500_flow_hash_params))
 		return -EEXIST;
-	admission->stage = GF_ADD_ALLOC;
+
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
 		return -ENOMEM;
 	entry->cookie = cls->cookie;
 	entry->binding = binding;
 	spin_lock_init(&entry->stats_lock);
-	ret = gf_parse(f, cls, entry, admission);
+	ret = gf_parse(f, cls, entry);
 	if (ret)
 		goto free;
 	path = rcu_dereference_protected(entry->path, lockdep_is_held(&f->lock));
-	admission->stage = GF_ADD_EPOCH;
+
 	if (path->epoch != atomic_read(&f->epoch)) {
 		ret = -EAGAIN;
 		goto free_path;
 	}
-	admission->stage = GF_ADD_DOMAIN;
+
 	domain = gf_domain_get(f, path->ingress, path->source_ports, path->ingress_mac);
 	if (domain < 0) {
 		ret = domain;
 		goto free_path;
 	}
 	domain += (entry->ipv6 ? 2 : 0) | (entry->protocol == IPPROTO_TCP ? 1 : 0);
-	admission->stage = GF_ADD_RESOURCE;
+
 	slot = gf_hash(entry, domain);
 	resource = find_first_zero_bit(f->resources, GF_RESOURCES);
 	if (rcu_access_pointer(f->slots[slot]) || resource == GF_RESOURCES ||
@@ -1400,7 +1233,7 @@ static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding
 	entry->resource = resource;
 	entry->domain = domain;
 	entry->generation = ++f->generations[slot];
-	admission->stage = GF_ADD_MTU;
+
 	mtu = gf_mtu_get(f, path->mtu);
 	if (mtu < 0) {
 		ret = mtu;
@@ -1408,7 +1241,7 @@ static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding
 	}
 	entry->mtu_index = mtu;
 	set_bit(resource, f->resources);
-	admission->stage = GF_ADD_SUBTABLE;
+
 	if (entry->ipv6) {
 		ret = gf_ip6_write(f, resource * 12, &entry->before.src6);
 		if (!ret)
@@ -1440,7 +1273,7 @@ static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding
 			gf_fault(f, ret);
 		goto free_resource;
 	}
-	admission->stage = GF_ADD_RESOURCE;
+
 	ret = rhashtable_insert_fast(&f->cookies, &entry->node, grx500_flow_hash_params);
 	if (ret)
 		goto free_resource;
@@ -1453,14 +1286,13 @@ static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding
 	rcu_assign_pointer(f->slots[slot], entry);
 	entry->hardware_valid = true;
 	f->active++;
-	admission->stage = GF_ADD_PUBLICATION;
+
 	ret = gf_session(f, entry, true);
 	if (!ret && path->epoch == atomic_read(&f->epoch))
 		return 0;
-	if (!ret) {
-		admission->stage = GF_ADD_EPOCH;
+	if (!ret)
 		ret = -EAGAIN;
-	} else
+	else
 		gf_fault(f, ret);
 	/* A failed publication is never reported as hardware support. Keep
 	 * resources pinned if the checked invalidation also fails.
@@ -1544,7 +1376,6 @@ static int gf_block_cb(enum tc_setup_type type, void *type_data, void *cb_priv)
 	struct grx500_flow_binding *binding = cb_priv;
 	struct grx500_flow *f = binding->flow;
 	struct flow_cls_offload *cls = type_data;
-	struct grx500_flow_admission admission = {};
 	int ret;
 
 	if (type != TC_SETUP_CLSFLOWER)
@@ -1553,14 +1384,11 @@ static int gf_block_cb(enum tc_setup_type type, void *type_data, void *cb_priv)
 	switch (cls->command) {
 	case FLOW_CLS_REPLACE:
 		f->add_requests++;
-		ret = gf_replace(f, binding, cls, &admission);
-		if (!ret) {
+		ret = gf_replace(f, binding, cls);
+		if (!ret)
 			f->add_accepted++;
-		} else {
+		else
 			f->add_rejected++;
-			f->last_add_errno = -ret;
-			f->last_add_rejection = admission;
-		}
 		break;
 	case FLOW_CLS_DESTROY:
 		ret = gf_destroy_entry(f, binding, cls);
@@ -1664,76 +1492,13 @@ int grx500_flow_setup_tc(struct grx500_flow *f, enum tc_setup_type type,
 	return ret;
 }
 
-static u64 gf_rx_mac(const u8 *mac)
-{
-	return ((u64)get_unaligned_be16(mac) << 32) |
-		get_unaligned_be32(mac + 2);
-}
-
-static void gf_rx_addresses(u64 *values, const struct grx500_flow_tuple *tuple,
-			    bool ipv6)
-{
-	if (ipv6) {
-		values[0] = get_unaligned_be64(&tuple->src6.s6_addr[0]);
-		values[1] = get_unaligned_be64(&tuple->src6.s6_addr[8]);
-		values[2] = get_unaligned_be64(&tuple->dst6.s6_addr[0]);
-		values[3] = get_unaligned_be64(&tuple->dst6.s6_addr[8]);
-	} else {
-		values[1] = be32_to_cpu(tuple->src);
-		values[3] = be32_to_cpu(tuple->dst);
-	}
-}
-
 static void gf_rx_reject(struct grx500_flow *f,
-			enum grx500_flow_rx_reject stage,
-			const struct grx500_flow_rx_info *info,
-			const struct grx500_flow_entry *entry,
-			const struct grx500_flow_path *path)
+			enum grx500_flow_rx_reject stage)
 {
-	u64 values[GF_RX_LAST_COUNT] = {};
 	unsigned long flags;
 
-	values[GF_RX_LAST_STAGE] = stage + 1;
-	values[GF_RX_LAST_DW0] = info->dw0;
-	values[GF_RX_LAST_DW1] = info->dw1;
-	values[GF_RX_LAST_FRAME_LEN] = info->frame_len;
-	values[GF_RX_LAST_IP_LEN] = info->ip_len;
-	values[GF_RX_LAST_ACTUAL_L3] = info->l3;
-	values[GF_RX_LAST_ACTUAL_PROTO] = info->protocol;
-	values[GF_RX_LAST_ACTUAL_PORTS] =
-		((u32)be16_to_cpu(info->tuple.sport) << 16) |
-		be16_to_cpu(info->tuple.dport);
-	if (info->l3)
-		gf_rx_addresses(values + GF_RX_LAST_ACTUAL_SADDR_HI,
-				&info->tuple, info->l3 == 6);
-	values[GF_RX_LAST_ACTUAL_SMAC] = gf_rx_mac(info->eth.h_source);
-	values[GF_RX_LAST_ACTUAL_DMAC] = gf_rx_mac(info->eth.h_dest);
-	values[GF_RX_LAST_IP_HEAD] = info->ip_head;
-	values[GF_RX_LAST_IP_CSUM] = info->ip_csum;
-	values[GF_RX_LAST_L4_INFO] = info->l4_info;
-	/* Expected metadata is copied while the caller still holds the path's
-	 * RCU read-side lifetime. No packet payload or pointer is retained.
-	 */
-	if (entry) {
-		values[GF_RX_LAST_HAS_ENTRY] = 1;
-		values[GF_RX_LAST_EXPECTED_L3] = entry->ipv6 ? 6 : 4;
-		values[GF_RX_LAST_EXPECTED_PROTO] = entry->protocol;
-		values[GF_RX_LAST_EXPECTED_PORTS] =
-			((u32)be16_to_cpu(entry->after.sport) << 16) |
-			be16_to_cpu(entry->after.dport);
-		gf_rx_addresses(values + GF_RX_LAST_EXPECTED_SADDR_HI,
-				&entry->after, entry->ipv6);
-		values[GF_RX_LAST_EXPECTED_SMAC] = gf_rx_mac(entry->source_mac);
-		values[GF_RX_LAST_EXPECTED_DMAC] = gf_rx_mac(entry->dest_mac);
-		values[GF_RX_LAST_RESOURCE] = entry->resource;
-		values[GF_RX_LAST_SMAC_INDEX] = entry->source_mac_index;
-		values[GF_RX_LAST_DMAC_INDEX] = entry->dest_mac_index;
-		values[GF_RX_LAST_MTU_CACHED] = path->mtu;
-		values[GF_RX_LAST_MTU_CURRENT] = READ_ONCE(path->egress->mtu);
-	}
 	spin_lock_irqsave(&f->rx_reject_lock, flags);
 	f->rx_rejects[stage]++;
-	memcpy(f->last_rx_reject, values, sizeof(values));
 	spin_unlock_irqrestore(&f->rx_reject_lock, flags);
 	atomic64_inc(&f->invalid_returns);
 }
@@ -1743,7 +1508,8 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 {
 	struct grx500_flow_entry *entry;
 	struct grx500_flow_path *path;
-	struct grx500_flow_rx_info info;
+	struct grx500_flow_tuple tuple;
+	struct ethhdr eth;
 	enum grx500_flow_rx_reject rejection = GF_RX_DESCRIPTOR;
 	union {
 		struct iphdr v4;
@@ -1778,11 +1544,6 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	if (!f)
 		return true;
 	atomic64_inc(&f->rx_candidates);
-	/* Ordinary CPU misses never publish a return-rejection snapshot. */
-	memset(&info, 0, sizeof(info));
-	info.dw0 = dw0;
-	info.dw1 = dw1;
-	info.frame_len = len;
 	if (((dw1 >> 8) & 15) != GF_RETURN_EP || ((dw1 >> 4) & 15) != GF_RETURN_MARK ||
 	    (dw1 & BIT(19)) || len < GF_PMAC_LEN + ETH_HLEN)
 		goto invalid;
@@ -1790,49 +1551,36 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	/* Descriptor offsets do not guarantee CPU alignment. Copy each fixed
 	 * header before inspecting fields, including the IPv4 checksum words.
 	 */
-	memcpy(&info.eth, frame + GF_PMAC_LEN, sizeof(info.eth));
+	memcpy(&eth, frame + GF_PMAC_LEN, sizeof(eth));
 	rejection = GF_RX_IP_HEADER;
 	packet = frame + GF_PMAC_LEN + ETH_HLEN;
 	available = len - GF_PMAC_LEN - ETH_HLEN;
-	if (info.eth.h_proto == htons(ETH_P_IP)) {
+	if (eth.h_proto == htons(ETH_P_IP)) {
 		iphlen = sizeof(ip.v4);
 		if (available < iphlen)
 			goto invalid;
 		memcpy(&ip.v4, packet, iphlen);
-		info.l3 = 4;
-		info.protocol = ip.v4.protocol;
-		info.ip_len = ntohs(ip.v4.tot_len);
-		info.ip_head = get_unaligned_be32(&ip.v4);
-		info.ip_csum = (__force u16)ip_fast_csum(&ip.v4, 5);
-		info.tuple.src = ip.v4.saddr;
-		info.tuple.dst = ip.v4.daddr;
 		if (ip.v4.version != 4 || ip.v4.ihl != 5 ||
 		    ip_is_fragment(&ip.v4) || !ip.v4.ttl ||
-		    info.ip_csum)
+		    ip_fast_csum(&ip.v4, 5))
 			goto invalid;
 		ipv6 = false;
 		protocol = ip.v4.protocol;
 		iplen = ntohs(ip.v4.tot_len);
-		info.tuple.src = ip.v4.saddr;
-		info.tuple.dst = ip.v4.daddr;
-	} else if (info.eth.h_proto == htons(ETH_P_IPV6)) {
+		tuple.src = ip.v4.saddr;
+		tuple.dst = ip.v4.daddr;
+	} else if (eth.h_proto == htons(ETH_P_IPV6)) {
 		iphlen = sizeof(ip.v6);
 		if (available < iphlen)
 			goto invalid;
 		memcpy(&ip.v6, packet, iphlen);
-		info.l3 = 6;
-		info.protocol = ip.v6.nexthdr;
-		info.ip_len = iphlen + ntohs(ip.v6.payload_len);
-		info.ip_head = get_unaligned_be32(&ip.v6);
-		info.tuple.src6 = ip.v6.saddr;
-		info.tuple.dst6 = ip.v6.daddr;
 		if (ip.v6.version != 6 || !ip.v6.hop_limit)
 			goto invalid;
 		ipv6 = true;
 		protocol = ip.v6.nexthdr;
 		iplen = iphlen + ntohs(ip.v6.payload_len);
-		info.tuple.src6 = ip.v6.saddr;
-		info.tuple.dst6 = ip.v6.daddr;
+		tuple.src6 = ip.v6.saddr;
+		tuple.dst6 = ip.v6.daddr;
 	} else {
 		goto invalid;
 	}
@@ -1844,22 +1592,15 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 		if (l4len < sizeof(transport.udp))
 			goto invalid;
 		memcpy(&transport.udp, packet + iphlen, sizeof(transport.udp));
-		info.tuple.sport = transport.udp.source;
-		info.tuple.dport = transport.udp.dest;
-		info.l4_info = ((u32)ntohs(transport.udp.len) << 16) |
-			ntohs(transport.udp.check);
 		if (ntohs(transport.udp.len) != l4len ||
 		    (ipv6 && !transport.udp.check))
 			goto invalid;
-		info.tuple.sport = transport.udp.source;
-		info.tuple.dport = transport.udp.dest;
+		tuple.sport = transport.udp.source;
+		tuple.dport = transport.udp.dest;
 	} else if (protocol == IPPROTO_TCP) {
 		if (l4len < sizeof(transport.tcp))
 			goto invalid;
 		memcpy(&transport.tcp, packet + iphlen, sizeof(transport.tcp));
-		info.tuple.sport = transport.tcp.source;
-		info.tuple.dport = transport.tcp.dest;
-		info.l4_info = get_unaligned_be16((const u8 *)&transport.tcp + 12);
 		/* FIN/RST must miss the hardware route classifier. A marked
 		 * exception cannot safely re-enter receive after NAT/TTL rewrite.
 		 */
@@ -1867,8 +1608,8 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 		    transport.tcp.doff * 4 > l4len ||
 		    transport.tcp.fin || transport.tcp.rst)
 			goto invalid;
-		info.tuple.sport = transport.tcp.source;
-		info.tuple.dport = transport.tcp.dest;
+		tuple.sport = transport.tcp.source;
+		tuple.dport = transport.tcp.dest;
 	} else {
 		/* No IPv6 extension/fragment headers or other L4 protocol. */
 		goto invalid;
@@ -1886,18 +1627,18 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 		goto stale;
 	rejection = GF_RX_TUPLE;
 	if (entry->ipv6 != ipv6 || entry->protocol != protocol ||
-	    entry->after.sport != info.tuple.sport || entry->after.dport != info.tuple.dport)
+	    entry->after.sport != tuple.sport || entry->after.dport != tuple.dport)
 		goto invalid_locked;
 	if (ipv6) {
-		if (memcmp(&entry->after.src6, &info.tuple.src6, sizeof(info.tuple.src6)) ||
-		    memcmp(&entry->after.dst6, &info.tuple.dst6, sizeof(info.tuple.dst6)))
+		if (memcmp(&entry->after.src6, &tuple.src6, sizeof(tuple.src6)) ||
+		    memcmp(&entry->after.dst6, &tuple.dst6, sizeof(tuple.dst6)))
 			goto invalid_locked;
-	} else if (entry->after.src != info.tuple.src || entry->after.dst != info.tuple.dst) {
+	} else if (entry->after.src != tuple.src || entry->after.dst != tuple.dst) {
 		goto invalid_locked;
 	}
 	rejection = GF_RX_MAC;
-	if (!ether_addr_equal(entry->source_mac, info.eth.h_source) ||
-	    !ether_addr_equal(entry->dest_mac, info.eth.h_dest))
+	if (!ether_addr_equal(entry->source_mac, eth.h_source) ||
+	    !ether_addr_equal(entry->dest_mac, eth.h_dest))
 		goto invalid_locked;
 	rejection = GF_RX_MTU;
 	if (iplen > min_t(unsigned int, path->mtu, READ_ONCE(path->egress->mtu)))
@@ -1913,7 +1654,7 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	skb_set_network_header(skb, ETH_HLEN);
 	skb_set_transport_header(skb, ETH_HLEN + iphlen);
 	skb->dev = path->egress;
-	skb->protocol = info.eth.h_proto;
+	skb->protocol = eth.h_proto;
 	skb->ip_summed = CHECKSUM_NONE;
 	ret = dev_queue_xmit(skb);
 	if (!net_xmit_eval(ret)) {
@@ -1933,11 +1674,11 @@ stale:
 	rcu_read_unlock();
 	return true;
 invalid_locked:
-	gf_rx_reject(f, rejection, &info, entry, path);
+	gf_rx_reject(f, rejection);
 	rcu_read_unlock();
 	return true;
 invalid:
-	gf_rx_reject(f, rejection, &info, NULL, NULL);
+	gf_rx_reject(f, rejection);
 	return true;
 }
 

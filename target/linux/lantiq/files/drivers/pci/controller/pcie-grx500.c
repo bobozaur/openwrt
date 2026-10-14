@@ -194,7 +194,7 @@ static int grx500_root_setup(struct grx500_pcie *pcie, struct grx500_pcie_port *
 {
 	u32 id = __raw_readl(port->csr + PCI_VENDOR_ID);
 
-	dev_info(pcie->device, "RC%u DBI ID=%08x\n", port->index, id);
+	dev_dbg(pcie->device, "RC%u DBI ID=%08x\n", port->index, id);
 	if (id != ROOT_ID)
 		return -ENODEV;
 	grx500_write(port->app, APP_IRQ_ENABLE, 0);
@@ -286,7 +286,7 @@ static int grx500_prepare_links(struct grx500_pcie *pcie)
 		if (!ret)
 			ret = read_poll_timeout(__raw_readl, value, value & BIT(0),
 						10, 10000, false, port->app + APP_DLL);
-		dev_info(pcie->device, "RC%u link=%08x DLL=%08x LCTLSTS=%08x\n", i,
+		dev_dbg(pcie->device, "RC%u link=%08x DLL=%08x LCTLSTS=%08x\n", i,
 			 __raw_readl(port->app + APP_LINK), __raw_readl(port->app + APP_DLL),
 			 __raw_readl(port->csr + 0x80));
 		if (ret || !(__raw_readl(port->csr + 0x80) & BIT(29)))
@@ -298,7 +298,7 @@ static int grx500_prepare_links(struct grx500_pcie *pcie)
 		struct grx500_pcie_port *port = &pcie->ports[i];
 		u32 id = __raw_readl(port->config + (1 << 20));
 
-		dev_info(pcie->device, "RC%u endpoint ID=%08x\n", i, id);
+		dev_dbg(pcie->device, "RC%u endpoint ID=%08x\n", i, id);
 		if (id != WAVE_ID)
 			return -ENODEV;
 		grx500_write(port->config + (1 << 20), PCI_COMMAND, PCI_COMMAND_INTX_DISABLE);

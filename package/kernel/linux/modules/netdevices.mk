@@ -723,7 +723,6 @@ $(eval $(call KernelPackage,dsa))
 define KernelPackage/grx500-eth
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=Lantiq GRX500 Ethernet and GSWIP3 switch
-  VERSION:=$(subst -rc,_rc,$(LINUX_VERSION))-r12
   DEPENDS:=@TARGET_lantiq_grx500 +kmod-dsa +kmod-nf-flow
   KCONFIG:=CONFIG_NET_GRX500 \
 	CONFIG_NET_DSA_GRX500 \

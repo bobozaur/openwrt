@@ -12,8 +12,10 @@ maintainers:
 description: |
   Child of the GRX500 Ethernet controller, sharing its LAN switch MMIO region.
   Port 0 connects to the LAN DMA conduit; ports 2 through 5 connect to internal
-  GPHYs. Port 1 is unused. Each user port connects only to the CPU port; Linux
-  bridges perform forwarding, VLAN filtering and spanning tree.
+  GPHYs. Port 1 is unused. VLAN-unaware bridges can forward learned unicast
+  between user ports in hardware. Unknown, group and local traffic is sent to
+  the CPU port. Linux owns VLAN filtering and bridge modes that require CPU
+  forwarding; spanning-tree state controls the hardware forwarding domain.
 
 allOf:
   - $ref: dsa.yaml#/$defs/ethernet-ports
