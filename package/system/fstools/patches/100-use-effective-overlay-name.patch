@@ -1,8 +1,18 @@
-Subject: [PATCH] use the selected overlay throughout its lifecycle
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] libfstools: use the selected overlay throughout its lifecycle
 
-mount_root start already honors fstools_overlay_name. Share that choice with
-mount completion, reset, snapshots and extroot discovery so these operations
-do not act on another bank. The default remains rootfs_data.
+mount_root start already honors fstools_overlay_name, but completion, reset,
+snapshots and block's extroot discovery still look up rootfs_data. Operations
+on a selected writable overlay can therefore miss it or act on another volume.
+
+Keep the choice in one libfstools accessor and use it throughout those paths.
+Leave rootfs_data as the default when no nonempty selector is supplied. Link
+block with the owning library in both extroot build variants; no board-specific
+mount or reset path is needed.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/libfstools/libfstools.h
 +++ b/libfstools/libfstools.h
@@ -169,7 +179,8 @@ do not act on another bank. The default remains rootfs_data.
 @@ -529,7 +530,7 @@
  	buf[strlen(buf) - 1] = '\0'; /* strip final char (newline) */
  
- 	/* only return true if name differs from 'rootfs' and 'rootfs_data' */
+-	/* only return true if name differs from 'rootfs' and 'rootfs_data' */
++	/* Only return true if name differs from rootfs and the selected overlay. */
 -	if (strcmp(buf, "rootfs") && strcmp(buf, "rootfs_data"))
 +	if (strcmp(buf, "rootfs") && strcmp(buf, overlay_name()))
  		return true;

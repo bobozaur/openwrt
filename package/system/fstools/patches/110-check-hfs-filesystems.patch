@@ -1,9 +1,16 @@
-Subject: [PATCH] block: check HFS volumes before mounting
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] block: dispatch HFS filesystem checks to hfsprogs
 
-Dispatch HFS and HFS+ volumes to the installed hfsprogs checker when
-filesystem checking is enabled. Its noninteractive preen option matches
-the existing -p invocation and repairs the clean-unmount state after a
-successful check. Keep checker absence and failure handling unchanged.
+HFS and HFS+ volumes have no checker dispatch even when filesystem checking
+is enabled and hfsprogs is installed. Select its fsck.hfsplus binary for both
+probe types and use the existing noninteractive -p invocation.
+
+Keep checker absence and failure handling unchanged. This dispatch neither
+enables filesystem checking nor installs the optional checker.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 
 --- a/block.c
 +++ b/block.c
