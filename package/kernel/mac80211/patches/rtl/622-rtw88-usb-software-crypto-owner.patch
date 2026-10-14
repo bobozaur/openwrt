@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] wifi: rtw88: add a cold USB software-crypto policy
 
 Keep USB keys in mac80211 when selected at module load. Hardware-decrypted
@@ -9,8 +10,10 @@ crypto. Fail closed if RX nevertheless reports hardware-decrypted data.
 Do not advertise firmware WoWLAN while keys remain software-owned. Other
 transports and the hardware-key policy remain unchanged.
 
----
+Not submitted upstream.
 
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/drivers/net/wireless/realtek/rtw88/main.c
 +++ b/drivers/net/wireless/realtek/rtw88/main.c
 @@ -23,8 +23,9 @@

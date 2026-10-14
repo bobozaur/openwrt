@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] wifi: rtw88: drain USB transfers before changing CAM keys
 
 USB queues hold frames with software-assigned packet numbers. Drain those
@@ -11,8 +12,10 @@ never report failed URBs as acknowledged frames.
 This fixes the USB TX boundary. RX key-generation synchronization remains
 outside this change.
 
----
+Not submitted upstream.
 
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/drivers/net/wireless/realtek/rtw88/hci.h
 +++ b/drivers/net/wireless/realtek/rtw88/hci.h
 @@ -12,6 +12,11 @@

@@ -1,5 +1,14 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] wifi: rtw88: avoid aligned loads from packed USB efuse MAC
 
+The USB MAC address resides in a packed efuse structure. ether_addr_copy()
+requires alignment that this field does not guarantee; copy its six bytes
+without architecture-dependent aligned loads.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/drivers/net/wireless/realtek/rtw88/rtw8822b.c
 +++ b/drivers/net/wireless/realtek/rtw88/rtw8822b.c
 @@ -29,7 +29,8 @@

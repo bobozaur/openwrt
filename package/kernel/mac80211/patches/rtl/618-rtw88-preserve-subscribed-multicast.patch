@@ -1,4 +1,4 @@
-From: OpenWrt Developers <openwrt-devel@lists.openwrt.org>
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] wifi: rtw88: retain subscribed multicast reception
 
 An ALLMULTI on-to-off transition currently disables every multicast frame,
@@ -6,6 +6,10 @@ even when interfaces still subscribe to IPv6 all-nodes and solicited-node
 addresses. Report the combined subscription count to configure_filter and
 recompute multicast acceptance when either subscriptions or flags change.
 
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/drivers/net/wireless/realtek/rtw88/mac80211.c
 +++ b/drivers/net/wireless/realtek/rtw88/mac80211.c
 @@ -273,6 +273,12 @@

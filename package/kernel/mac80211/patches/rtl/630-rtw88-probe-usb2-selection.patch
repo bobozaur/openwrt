@@ -1,9 +1,17 @@
-Subject: [STAGED] rtw88: add checked RTL8822B probe-time USB2 selection
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] rtw88: add checked RTL8822B probe-time USB2 selection
 
-Default policy and ordinary register access are unchanged. Selection is only
-executed by a fresh native probe, before mac80211 registration. The source
-owner must separately admit the new physical speed and own the return path.
+Offer an explicit probe-time USB2 policy for RTL8822B devices whose efuse
+allows USB mode switching. Check every control transfer, including the
+native always-on synchronization write, before continuing the transition.
+The old probe retires before mac80211 registration and RX submission; only
+successful re-enumeration establishes the new speed. The default is false,
+and an active interface is never switched as automatic stall recovery.
 
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/drivers/net/wireless/realtek/rtw88/usb.c
 +++ b/drivers/net/wireless/realtek/rtw88/usb.c
 @@ -22,6 +22,12 @@

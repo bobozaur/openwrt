@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] rtw88: preserve DIG gain when the RSSI sample is unavailable
 
 Station iteration can return no RSSI sample while the driver still counts a
@@ -10,6 +11,10 @@ Calculate the RSSI upper bound without narrowing the addition to u8. Otherwise
 the native DIG minimum. Valid samples and the unlinked coverage policy keep
 their existing behavior.
 
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/drivers/net/wireless/realtek/rtw88/phy.c
 +++ b/drivers/net/wireless/realtek/rtw88/phy.c
 @@ -473,7 +473,7 @@

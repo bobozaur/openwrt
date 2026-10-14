@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] wifi: rtw88: preserve FIFO dump bytes and access state
 
 FIFO dumps are byte streams consumed by firmware crash-header decoding and
@@ -8,8 +9,10 @@ Serialize reserved-page debugfs access with firmware recovery and other
 register users,
 and reject invalid page ranges before allocation.
 
----
+Not submitted upstream.
 
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
 --- a/drivers/net/wireless/realtek/rtw88/fw.c
 +++ b/drivers/net/wireless/realtek/rtw88/fw.c
 @@ -3,6 +3,7 @@
