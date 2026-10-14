@@ -128,7 +128,10 @@ ax50_select_bank() {
 	[ "$(fw_printenv -n update_chk)" = "$value" ] &&
 		[ "$(fw_printenv -n loadaddr)" = 0x82000000 ] && return 0
 	script=$(mktemp /tmp/ax50-env.XXXXXX) || return 1
-	printf 'update_chk %s\nloadaddr 0x82000000\n' "$value" > "$script"
+	printf 'update_chk %s\nloadaddr 0x82000000\n' "$value" > "$script" || {
+		rm -f "$script"
+		return 1
+	}
 	fw_setenv -s "$script"
 	result=$?
 	rm -f "$script"
