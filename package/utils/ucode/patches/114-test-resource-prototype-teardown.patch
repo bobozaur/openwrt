@@ -1,3 +1,4 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] tests: cover resource prototype graphs at VM teardown
 
 Exercise the production uc_vm_free path through the existing CTest suite.
@@ -5,6 +6,8 @@ Cover prototype-held objects and arrays, cycles, a stack reference, ordinary
 GC rooting, and exactly one native destructor while its type remains alive.
 Use an instrumented host build to detect stale reads and leaked allocations.
 
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 ---
 
 --- a/tests/CMakeLists.txt
