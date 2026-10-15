@@ -23,6 +23,10 @@ PKG_SOURCE:=backports-$(PKG_SOURCE_VERSION).tar.zst
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(if $(BUILD_VARIANT),$(PKG_NAME)-$(BUILD_VARIANT)/)backports-$(PKG_SOURCE_VERSION)
 PKG_BUILD_PARALLEL:=1
 
+# Backports resolves Kbuild's per-symbol dependencies in its own tree.
+# Reprepare on kernel configuration changes so no objects retain old layouts.
+PKG_FILE_DEPENDS:=$(LINUX_DIR)/include/generated/autoconf.h
+
 PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 
 PKG_DRIVERS = \
@@ -39,6 +43,7 @@ PKG_CONFIG_DEPENDS:= \
 	CONFIG_PACKAGE_MAC80211_TRACING \
 	CONFIG_PACKAGE_IWLWIFI_DEBUG \
 	CONFIG_PACKAGE_IWLWIFI_DEBUGFS \
+	CONFIG_PACKAGE_RTW88_DEBUGFS \
 	CONFIG_PACKAGE_RTLWIFI_DEBUG \
 
 SCAN_DEPS = *.mk
