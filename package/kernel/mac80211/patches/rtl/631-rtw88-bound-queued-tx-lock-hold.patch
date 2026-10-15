@@ -11,6 +11,10 @@ rotate nonempty queues for fairness. Select each queue under the lock again
 instead of carrying a TXQ or station pointer across unlock. Empty or failed
 dequeues remove their node, retaining the existing wake/retry behavior.
 
+Yield between attempts in the process-context worker so large snapshots
+also allow other tasks to run on non-preemptible kernels. Reschedule only
+after frame handling has dropped txq_lock and its RCU read lock.
+
 Serialize wake admission, worker continuation and the RUNNING transition
 with txq_lock. Cancel queued TX work after releasing the device mutex and
 before powering off. The synchronous VO path checks RUNNING under the same
@@ -69,7 +73,16 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	cancel_delayed_work_sync(&rtwdev->watch_dog_work);
 --- a/drivers/net/wireless/realtek/rtw88/tx.c
 +++ b/drivers/net/wireless/realtek/rtw88/tx.c
-@@ -625,9 +625,9 @@
+@@ -1,6 +1,8 @@
+ // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+ /* Copyright(c) 2018-2019  Realtek Corporation
+  */
++
++#include <linux/sched.h>
+ 
+ #include "main.h"
+ #include "tx.h"
+@@ -625,9 +627,9 @@
  	return 0;
  }
  
@@ -82,7 +95,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
  	struct ieee80211_txq *txq = rtwtxq_to_txq(rtwtxq);
  	struct sk_buff *skb;
-@@ -650,6 +650,8 @@
+@@ -650,6 +652,8 @@
  	}
  
  	rcu_read_unlock();
@@ -91,7 +104,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  void __rtw_tx_work(struct rtw_dev *rtwdev)
-@@ -657,6 +659,8 @@
+@@ -657,6 +661,8 @@
  	struct rtw_txq *rtwtxq, *tmp;
  
  	spin_lock_bh(&rtwdev->txq_lock);
@@ -100,7 +113,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	list_for_each_entry_safe(rtwtxq, tmp, &rtwdev->txqs, list) {
  		struct ieee80211_txq *txq = rtwtxq_to_txq(rtwtxq);
-@@ -669,15 +673,85 @@
+@@ -669,15 +675,86 @@
  	}
  
  	rtw_hci_tx_kick_off(rtwdev);
@@ -177,6 +190,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +	while (budget--) {
 +		if (!rtw_txq_work_one(rtwdev))
 +			break;
++		cond_resched();
 +	}
 +
 +	spin_lock_bh(&rtwdev->txq_lock);
