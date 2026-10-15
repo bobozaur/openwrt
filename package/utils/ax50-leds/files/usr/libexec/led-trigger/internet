@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Sourced under the stock LED owner's lock. The observer takes over after
+# the policy operation completes; unknown reachability has neither color.
+case "$sysfs" in
+	blue:internet|orange:internet) ;;
+	*) return 1 ;;
+esac
+echo none > "/sys/class/leds/$sysfs/trigger" &&
+	echo 0 > "/sys/class/leds/$sysfs/brightness"

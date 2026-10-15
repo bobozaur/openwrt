@@ -1,0 +1,523 @@
+#!/usr/bin/ucode -S
+// SPDX-License-Identifier: GPL-2.0-only
+
+import * as fs from 'fs';
+import * as uci from 'uci';
+import { display_state, runtime_allowed } from '/usr/share/ax50-leds/wps.uc';
+
+const led = 'blue:power';
+const led_path = `/sys/class/leds/${led}/`;
+const state_path = '/var/run/ax50-leds.json';
+const valid_path = '/var/run/ax50-leds.valid';
+const lock_path = '/var/run/ax50-leds.lock';
+let admitted = false;
+
+function config_state()
+{
+	let c = uci.cursor();
+	let config = { valid: !!c?.load('system'), off: false, custom: false };
+	if (!config.valid)
+		return config;
+	c.foreach('system', 'system', (s) => { config.off = s.leds_off == '1'; });
+	c.foreach('system', 'led', (s) => { if (s.sysfs == led) config.custom = true; });
+	return config;
+}
+
+function read_state()
+{
+	let state;
+	try { state = json(fs.readfile(state_path)); } catch (e) { }
+	let trusted = type(state) == 'object' && !!fs.access(valid_path);
+	state = type(state) == 'object' ? state : { owned: false };
+	state.trusted = trusted;
+	if (!state.trusted) {
+		// Keep ownership for retry, but never revive an uncertain policy.
+		state.diagnostic = 'unknown';
+		state.policy = 'off';
+		state.enabled = false;
+		state.internet_enabled = false;
+	}
+	return state;
+}
+
+function write_file(path, data)
+{
+	let file = fs.open(path, 'we');
+	if (!file)
+		return false;
+	let written = file.write(data) == length(data);
+	// Sysfs rejects writes during flush; writefile() does not report those
+	// buffered errors. Check before closing or publishing a new state file.
+	let flushed = file.flush();
+	let closed = file.close();
+	return written && flushed && closed;
+}
+
+function write_state(state)
+{
+	let data = sprintf('%J\n', state);
+	let ok = write_file(state_path + '.new', data) &&
+		fs.rename(state_path + '.new', state_path);
+	if (ok) {
+		let valid = fs.open(valid_path, 'ae', 0600);
+		ok = !!valid;
+		if (valid)
+			valid.close();
+	}
+	state.trusted = !!ok;
+	if (!ok) {
+		// Invalidate without allocating space or erasing retry ownership.
+		fs.unlink(valid_path);
+		fs.unlink(state_path + '.new');
+	}
+	return !!ok;
+}
+
+function locked(fn)
+{
+	// CLOEXEC prevents a user LED trigger's background child retaining the lock.
+	let lock = fs.open(lock_path, 'ae');
+	if (!lock || !lock.lock('x'))
+		die('Unable to lock AX50 LED policy\n');
+	admitted = true;
+	let result;
+	try { result = fn(read_state()); }
+	catch (e) { lock.close(); die(e); }
+	lock.close();
+	return result;
+}
+
+function run_diag(phase)
+{
+	return system([ '/bin/sh', '-c',
+		'. /etc/diag.sh; set_led_state "$1"',
+		'ax50-leds', phase ]);
+}
+
+function run_led(action, args)
+{
+	return system([ '/bin/sh', '-c',
+		'. /lib/functions.sh; . /lib/functions/led-service.sh; led_apply "$@"',
+		'ax50-leds', action, ...(args ?? []) ]);
+}
+
+function attr(name, value)
+{
+	if (!write_file(led_path + name, `${value}\n`))
+		die(`Unable to set ${led} ${name}\n`);
+}
+
+function restore_power(state)
+{
+	let config = config_state();
+	if (!state.trusted || state.policy == 'off' || state.power_off || config.off) {
+		attr('trigger', 'none');
+		attr('brightness', 0);
+	} else if (state.diagnostic != 'done') {
+		return run_diag(state.diagnostic);
+	} else if (state.policy == 'blink') {
+		attr('trigger', 'none');
+		attr('brightness', 0);
+		attr('trigger', 'timer');
+	} else {
+		// Restore current policy through its existing owners, not captured
+		// brightness. The filter avoids touching any WLAN/LAN/USB LED.
+		let rc = run_diag('done');
+		return rc || run_led('start', [ led ]);
+	}
+	return 0;
+}
+
+function released(state)
+{
+	state.owned = false;
+	state.pattern = null;
+	if (write_state(state))
+		return 0;
+	// Only discard an old ownership record after the real display was
+	// restored. A later observer must not undo a successful global off/diag.
+	if (!state.internet_owned)
+		fs.unlink(state_path);
+	return 1;
+}
+
+function release(state)
+{
+	if (!state.owned)
+		return 0;
+	// A partial failed restore must not keep a completed-pattern marker.
+	let saved = state.trusted;
+	if (state.pattern != null) {
+		state.pattern = null;
+		saved = write_state(state);
+	}
+	let rc = restore_power(state);
+	if (!rc)
+		rc = released(state);
+	return rc || (saved ? 0 : 1);
+}
+
+function update_display(display)
+{
+	let rc = locked((state) => {
+		if (!runtime_allowed(state, config_state()) || display.mode == 'normal') {
+			return release(state);
+		}
+		if (state.owned && state.pattern == display.mode)
+			return;
+		state.owned = true;
+		state.pattern = null;
+		if (!write_state(state))
+			return 1;
+		attr('trigger', 'none');
+		attr('brightness', trim(fs.readfile(led_path + 'max_brightness') ?? '1'));
+		if (display.mode != 'success') {
+			attr('trigger', 'timer');
+			attr('delay_on', display.mode == 'progress' ? 2000 : 250);
+			attr('delay_off', display.mode == 'progress' ? 1000 : 250);
+		}
+		state.pattern = display.mode;
+		return write_state(state) ? 0 : 1;
+	});
+	if (rc)
+		die('Unable to update or restore WPS LED policy\n');
+}
+
+const internet_leds = [ 'blue:internet', 'orange:internet' ];
+
+function internet_config()
+{
+	let c = uci.cursor();
+	let result = { valid: !!c?.load('system'), off: false, managed: false };
+	if (!result.valid)
+		return result;
+	let counts = {}, custom = false;
+	c.foreach('system', 'system', (s) => { result.off = s.leds_off == '1'; });
+	c.foreach('system', 'led', (s) => {
+		if (index(internet_leds, s.sysfs) < 0)
+			return;
+		counts[s.sysfs] = (counts[s.sysfs] ?? 0) + 1;
+		custom ||= s.trigger != 'internet';
+	});
+	result.managed = !custom && counts[internet_leds[0]] == 1 && counts[internet_leds[1]] == 1;
+	return result;
+}
+
+function internet_dark()
+{
+	let rc = 0;
+	for (let name in internet_leds) {
+		let path = `/sys/class/leds/${name}/`;
+		if (!write_file(path + 'trigger', 'none\n')) rc = 1;
+		if (!write_file(path + 'brightness', '0\n')) rc = 1;
+	}
+	return rc;
+}
+
+function release_internet(state)
+{
+	if (!state.internet_owned)
+		return 0;
+	state.internet_pattern = null;
+	let saved = write_state(state);
+	let config = internet_config(), rc = 0;
+	if (!state.trusted || !config.valid || config.off || state.internet_paused || state.policy == 'off' || state.diagnostic != 'done')
+		rc = internet_dark();
+	else if (state.policy != 'blink') {
+		rc = internet_dark();
+		for (let name in internet_leds)
+			rc = run_led('start', [ name ]) || rc;
+	}
+	if (rc)
+		return rc;
+	state.internet_owned = false;
+	return write_state(state) && saved ? 0 : 1;
+}
+
+function update_internet(status)
+{
+	let rc = locked((state) => {
+		let config = internet_config();
+		if (!state.trusted && config.valid && config.managed)
+			return internet_dark();
+		if (!state.trusted || !state.internet_enabled || !config.valid || !config.managed ||
+		    config.off || state.internet_paused || state.policy != 'normal' || state.diagnostic != 'done')
+			return release_internet(state);
+		let pattern = status == 'ONLINE' ? 'online' : status == 'OFFLINE' ? 'offline' : 'unknown';
+		if (state.internet_owned && state.internet_pattern == pattern)
+			return 0;
+		state.internet_owned = true;
+		state.internet_pattern = null;
+		if (!write_state(state))
+			return 1;
+		if (internet_dark())
+			return 1;
+		if (pattern != 'unknown') {
+			let name = internet_leds[pattern == 'online' ? 0 : 1];
+			let path = `/sys/class/leds/${name}/`;
+			if (!write_file(path + 'brightness', fs.readfile(path + 'max_brightness')))
+				return 1;
+		}
+		state.internet_pattern = pattern;
+		return write_state(state) ? 0 : 1;
+	});
+	if (rc)
+		die('Unable to update Internet LEDs\n');
+}
+
+function watch_internet()
+{
+	let ubus = require('ubus'), uloop = require('uloop');
+	uloop.init();
+	let bus = ubus.connect(null, 1);
+	if (!bus) {
+		update_internet(null);
+		return 1;
+	}
+	let busy = false, dirty = false, stopping = false, timer;
+	function schedule() {
+		dirty = true;
+		if (!busy)
+			timer.set(1);
+	}
+	function update() {
+		busy = true;
+		dirty = false;
+		let snapshot = bus.call('pingcheck', 'status', {});
+		busy = false;
+		// A removed, timed-out or restarting producer never retains green.
+		update_internet(snapshot?.status);
+		timer.set(dirty ? 1 : 10000);
+	}
+	function stop() { stopping = true; uloop.end(); }
+	timer = uloop.timer(-1, update);
+	let events = bus.listener('pingcheck.state', schedule);
+	let objects = bus.listener('ubus.object.*', (type, data) => {
+		if (data.path == 'pingcheck') schedule();
+	});
+	let policy = bus.listener('led.policy', schedule);
+	let term = uloop.signal('SIGTERM', stop), intr = uloop.signal('SIGINT', stop);
+	if (!events || !objects || !policy || !term || !intr)
+		die('Unable to observe Internet status\n');
+	schedule();
+	uloop.run();
+	timer.cancel();
+	bus.disconnect();
+	let rc = locked(release_internet);
+	return rc || (stopping ? 0 : 1);
+}
+
+function policy_event()
+{
+	// No synchronous ubus operation is ever performed with the LED lock held.
+	let bus = require('ubus').connect(null, 1);
+	if (bus) {
+		bus.event('led.policy', {});
+		bus.disconnect();
+	}
+}
+
+function initialize(state)
+{
+	// Ordinary service start follows done95/led96, including live postinst.
+	// An existing failed/diagnostic record is never a first-use default.
+	if (fs.lstat(state_path))
+		return 0;
+	let config = config_state();
+	if (!config.valid)
+		return 1;
+	let first = fs.open(state_path, 'wx', 0600);
+	if (!first || !first.close())
+		return 1;
+	state.diagnostic = 'done';
+	state.policy = config.off ? 'off' : 'normal';
+	if (!write_state(state))
+		return 1;
+	// Apply the migrated mappings through the native configured LED owner.
+	for (let name in [ led, ...internet_leds ]) {
+		if (run_led('start', [ name ])) {
+			fs.unlink(valid_path);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+function policy_command(command, args)
+{
+	if (command == 'notify') {
+		policy_event();
+		return 0;
+	}
+	let result = locked((state) => {
+		let saved, rc;
+		switch (command) {
+		case 'internet-on':
+			if (initialize(state)) return 1;
+			state.internet_enabled = true;
+			return write_state(state) ? 0 : 1;
+		case 'internet-off':
+			state.internet_enabled = false;
+			saved = write_state(state);
+			return release_internet(state) || (saved ? 0 : 1);
+		case 'diag':
+			if (index([ 'preinit', 'preinit_regular', 'failsafe', 'upgrade', 'done' ], args[0]) < 0)
+				return run_diag(args[0]);
+			state.diagnostic = args[0];
+			let internet_rc = release_internet(state);
+			state.pattern = null;
+			saved = write_state(state);
+			rc = run_diag(args[0]);
+			if (!rc)
+				rc = released(state);
+			return rc || internet_rc || (saved ? 0 : 1);
+		case 'on':
+			if (initialize(state)) return 1;
+			state.enabled = true;
+			return write_state(state) ? 0 : 1;
+		case 'off':
+			state.enabled = false;
+			saved = write_state(state);
+			return release(state) || (saved ? 0 : 1);
+		case 'led':
+			let action = args[0];
+			let target = args[1];
+			if (index([ 'start', 'turnon', 'turnoff', 'blink' ], action) < 0)
+				return 1;
+			let global = !target || action == 'turnon' || action == 'blink';
+			let affects_internet = global || index(internet_leds, target) >= 0 || config_state().off;
+			saved = true;
+			if (affects_internet && state.internet_owned && (action == 'start' || action == 'turnon')) {
+				rc = release_internet(state);
+				if (rc && state.internet_owned) return rc;
+				saved = !rc;
+			}
+			if (affects_internet) {
+				state.internet_paused = !global && action == 'turnoff';
+				if (state.internet_paused) {
+					rc = release_internet(state);
+					if (rc && state.internet_owned) return rc;
+					saved = !rc && saved;
+				}
+			}
+			let affects_power = global || target == led || config_state().off;
+			if (affects_power) {
+				// Do this before load_led() can save a transient WPS trigger
+				// as the baseline of a newly configured power LED.
+				if (state.owned && (action == 'start' || action == 'turnon')) {
+					rc = release(state);
+					if (rc && state.owned)
+						return rc;
+					saved = !rc && saved;
+				}
+				state.power_off = !global && action == 'turnoff';
+				if (global || config_state().off) state.policy = action == 'turnoff' || config_state().off ? 'off' : action == 'blink' ? 'blink' : 'normal';
+				state.pattern = null;
+				saved = write_state(state) && saved;
+			}
+			rc = run_led(action, slice(args, 1));
+			if (affects_internet) {
+				state.internet_pattern = null;
+				if (!rc) state.internet_owned = false;
+				saved = write_state(state) && saved;
+			}
+			if (affects_power && (action == 'start' || action == 'turnon') &&
+			    state.diagnostic != 'done' && !config_state().off)
+				rc = run_diag(state.diagnostic) || rc;
+			if (!rc && affects_power)
+				rc = released(state);
+			return rc || (saved ? 0 : 1);
+		default:
+			return 1;
+		}
+	});
+	policy_event();
+	return result;
+}
+
+function watch()
+{
+	let ubus = require('ubus');
+	let uloop = require('uloop');
+	uloop.init();
+	let bus = ubus.connect(null, 1);
+	if (!bus) {
+		update_display({ mode: 'normal' });
+		return 1;
+	}
+	let busy = false, dirty = false, stopping = false;
+	let timer;
+	function schedule() {
+		dirty = true;
+		if (!busy)
+			timer.set(1);
+	}
+	function update() {
+		busy = true;
+		dirty = false;
+		// Subscribe first, then query. Both events and consumer restart read
+		// the same native state, including the age of terminal results.
+		let snapshot = bus.call('hostapd', 'wps_state', {});
+		let error = bus.error(true);
+		let display = display_state(snapshot);
+		busy = false;
+		update_display(display);
+		if (dirty)
+			timer.set(1);
+		else if (display.next)
+			timer.set(display.next);
+		else if (!snapshot && error != ubus.STATUS_NOT_FOUND && error != ubus.STATUS_METHOD_NOT_FOUND)
+			timer.set(1000);
+	}
+	function stop() {
+		stopping = true;
+		uloop.end();
+	}
+	// Keep resources referenced for the entire loop lifetime.
+	timer = uloop.timer(-1, update);
+	let subscriber = bus.subscriber((event) => {
+		if (event.type == 'wps.state' || index(event.type, 'bss.') == 0)
+			schedule();
+		return 0;
+	}, schedule, [ 'hostapd' ]);
+	let objects = bus.listener('ubus.object.*', (type, data) => {
+		if (data.path == 'hostapd')
+			schedule();
+	});
+	let policy = bus.listener('led.policy', schedule);
+	let term = uloop.signal('SIGTERM', stop);
+	let intr = uloop.signal('SIGINT', stop);
+	if (!subscriber || !objects || !policy || !term || !intr)
+		die('Unable to observe WPS LED owners\n');
+	subscriber.subscribe('hostapd');
+	schedule();
+	uloop.run();
+	timer.cancel();
+	bus.disconnect();
+	update_display({ mode: 'normal' });
+	return stopping ? 0 : 1;
+}
+
+let board = trim(fs.readfile('/tmp/sysinfo/board_name') ?? '');
+let compatible = split(fs.readfile('/proc/device-tree/compatible') ?? '', '\x00');
+let command = ARGV[0], args = slice(ARGV, 1);
+if (board != 'tplink,archer-ax50-v1' && index(compatible, 'tplink,archer-ax50-v1') < 0) {
+	exit(65);
+}
+
+try {
+	let rc = command == 'watch' ? watch() : command == 'watch-internet' ? watch_internet() : policy_command(command, args);
+	// Admitted operations retain ownership even after a partial failure.
+	// Generic callers must never repeat them outside the policy lock.
+	exit((command == 'diag' || command == 'led') && rc ? 64 : rc);
+}
+catch (e) {
+	warn(`ax50-leds: ${e}\n`);
+	if (command == 'watch-internet') {
+		try { locked(release_internet); } catch (e) { }
+	}
+	if (command == 'watch') {
+		try { update_display({ mode: 'normal' }); } catch (e) { }
+	}
+	exit(command == 'diag' || command == 'led' ? (admitted ? 64 : 65) : 1);
+}
