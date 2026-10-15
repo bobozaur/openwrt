@@ -1,0 +1,30 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] usb: dwc3: add GRX500 glue build support
+
+Register the GRX500 glue which prepares PHY, endian and VBUS resources
+before creating the ordinary DWC3 child.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/drivers/usb/dwc3/Makefile
++++ b/drivers/usb/dwc3/Makefile
+@@ -58,3 +58,5 @@
+ obj-$(CONFIG_USB_DWC3_OCTEON)		+= dwc3-octeon.o
+ obj-$(CONFIG_USB_DWC3_RTK)		+= dwc3-rtk.o
+ obj-$(CONFIG_USB_DWC3_GENERIC_PLAT)	+= dwc3-generic-plat.o
++
++obj-$(CONFIG_USB_DWC3_GRX500) += dwc3-grx500.o
+--- a/drivers/usb/dwc3/Kconfig
++++ b/drivers/usb/dwc3/Kconfig
+@@ -201,3 +201,9 @@
+ 	  Say 'Y' or 'M' here if your platform integrates DWC3 in a similar way.
+ 
+ endif
++
++config USB_DWC3_GRX500
++	tristate "Lantiq GRX500 DWC3 glue"
++	depends on MACH_GRX500 && USB_DWC3 && OF && GPIOLIB
++	select MFD_SYSCON
++	depends on RESET_CONTROLLER
