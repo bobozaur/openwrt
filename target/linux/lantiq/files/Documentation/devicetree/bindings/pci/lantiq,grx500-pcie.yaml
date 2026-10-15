@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/pci/lantiq,grx500-pcie.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Lantiq GRX500 paired PCIe controllers
+
+maintainers:
+  - OpenWrt Development List <openwrt-devel@lists.openwrt.org>
+
+description: |
+  The two root complexes share a reference PLL and endpoint startup sequence.
+  Both controllers must be configured before either endpoint leaves reset.
+  This node describes the paired controller owner, not a PCI bus. It creates
+  two PCI domains using the fixed SoC outbound apertures. The main controller
+  supplies the shared endpoint INTA interrupt; the auxiliary function is used
+  for configuration and initialization.
+
+properties:
+  compatible:
+    const: lantiq,grx500-pcie
+  reg:
+    minItems: 8
+    maxItems: 8
+  reg-names:
+    items:
+      - const: csr0
+      - const: config0
+      - const: app0
+      - const: phy0
+      - const: csr1
+      - const: config1
+      - const: app1
+      - const: phy1
+  interrupts:
+    maxItems: 1
+  clocks:
+    maxItems: 3
+  clock-names:
+    items:
+      - const: pcie0
+      - const: pcie1
+      - const: pll
+  resets:
+    minItems: 2
+    maxItems: 2
+  main-reset-gpios:
+    description: Main endpoint PERST line
+    maxItems: 1
+  aux-reset-gpios:
+    description: Auxiliary endpoint PERST line
+    maxItems: 1
+  lantiq,rcu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Reset and endian configuration syscon
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - clocks
+  - clock-names
+  - resets
+  - main-reset-gpios
+  - aux-reset-gpios
+  - lantiq,rcu
+
+additionalProperties: false

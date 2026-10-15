@@ -1,0 +1,30 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] PCI: add GRX500 paired controller build support
+
+Register the paired GRX500 controllers. Their driver owns shared PLL
+preparation and reset ordering before either endpoint is released.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/drivers/pci/controller/Makefile
++++ b/drivers/pci/controller/Makefile
+@@ -63,3 +63,5 @@
+ obj-$(CONFIG_ARM64) += pci-xgene.o
+ endif
+ endif
++
++obj-$(CONFIG_PCIE_GRX500) += pcie-grx500.o
+--- a/drivers/pci/controller/Kconfig
++++ b/drivers/pci/controller/Kconfig
+@@ -363,3 +363,9 @@
+ source "drivers/pci/controller/mobiveil/Kconfig"
+ source "drivers/pci/controller/plda/Kconfig"
+ endmenu
++
++config PCIE_GRX500
++	bool "Lantiq GRX500 paired PCIe controllers"
++	depends on MACH_GRX500 && PCI && OF && GPIOLIB
++	select MFD_SYSCON
++	depends on RESET_CONTROLLER
