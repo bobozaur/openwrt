@@ -1,0 +1,157 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: fence protocol notifications by setup generation
+
+Export an opaque NETIFD_PROTO_TOKEN to each setup and its commands. Reject
+notifications carrying a token from an earlier setup or daemon instance,
+and retire the token when teardown or failed setup releases that owner.
+
+Keep tokenless legacy callers compatible. Shell notifications forward the
+current generation automatically; APIs replacing owned state can require
+that token without introducing a second protocol lifetime.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/proto-ext.c
++++ b/proto-ext.c
+@@ -17,6 +17,7 @@
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <signal.h>
++#include <time.h>
+ 
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
+@@ -25,6 +26,8 @@
+ #include "system.h"
+ #include "handler.h"
+ 
++#define PROTO_TOKEN_ENV "NETIFD_PROTO_TOKEN="
++
+ static void
+ proto_ext_check_dependencies(struct proto_ext_state *state)
+ {
+@@ -183,6 +186,7 @@ proto_ext_task_finish(struct proto_ext_s
+ 		uloop_timeout_cancel(&state->teardown_timeout);
+ 		uloop_timeout_cancel(&state->checkup_timeout);
+ 		state->sm = S_IDLE;
++		state->token[0] = 0;
+ 		state->proto.proto_event(&state->proto, IFPEV_DOWN);
+ 		break;
+ 	}
+@@ -316,6 +320,7 @@ enum {
+ 	NOTIFY_DNS_SEARCH,
+ 	NOTIFY_NEIGHBORS,
+ 	NOTIFY_NEIGHBORS6,
++	NOTIFY_TOKEN,
+ 	__NOTIFY_LAST
+ };
+ 
+@@ -339,6 +344,7 @@ static const struct blobmsg_policy notif
+ 	[NOTIFY_DNS_SEARCH] = { .name = "dns_search", .type = BLOBMSG_TYPE_ARRAY },
+ 	[NOTIFY_NEIGHBORS]= {.name = "neighbor", .type = BLOBMSG_TYPE_ARRAY},
+ 	[NOTIFY_NEIGHBORS6]= {.name = "neighbor6", .type = BLOBMSG_TYPE_ARRAY},
++	[NOTIFY_TOKEN] = { .name = "proto-token", .type = BLOBMSG_TYPE_UNSPEC },
+ };
+ 
+ static int
+@@ -464,7 +470,9 @@ static int
+ proto_ext_run_command(struct proto_ext_state *state, struct blob_attr **tb)
+ {
+ 	static char *argv[64];
+-	static char *env[32];
++	static char *env[33];
++	char token_env[sizeof(PROTO_TOKEN_ENV) + sizeof(state->token)];
++	int i;
+ 
+ 	if (state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
+ 		return UBUS_STATUS_PERMISSION_DENIED;
+@@ -475,8 +483,12 @@ proto_ext_run_command(struct proto_ext_s
+ 	if (!fill_string_list(tb[NOTIFY_COMMAND], argv, ARRAY_SIZE(argv)))
+ 		goto error;
+ 
+-	if (!fill_string_list(tb[NOTIFY_ENV], env, ARRAY_SIZE(env)))
++	if (!fill_string_list(tb[NOTIFY_ENV], env, ARRAY_SIZE(env) - 1))
+ 		goto error;
++	for (i = 0; env[i]; i++);
++	snprintf(token_env, sizeof(token_env), PROTO_TOKEN_ENV "%s", state->token);
++	env[i++] = token_env;
++	env[i] = NULL;
+ 
+ 	state->proto_task_killed = false;
+ 	netifd_start_process((const char **) argv, (char **) env, &state->proto_task);
+@@ -630,6 +642,10 @@ proto_ext_notify(struct interface_proto_
+ 	blobmsg_parse_attr(notify_attr, __NOTIFY_LAST, tb, attr);
+ 	if (!tb[NOTIFY_ACTION])
+ 		return UBUS_STATUS_INVALID_ARGUMENT;
++	if (tb[NOTIFY_TOKEN] &&
++	    (blobmsg_type(tb[NOTIFY_TOKEN]) != BLOBMSG_TYPE_STRING ||
++	     !state->token[0] || strcmp(blobmsg_get_string(tb[NOTIFY_TOKEN]), state->token)))
++		return UBUS_STATUS_PERMISSION_DENIED;
+ 
+ 	switch(blobmsg_get_u32(tb[NOTIFY_ACTION])) {
+ 	case 0:
+@@ -723,7 +739,10 @@ proto_ext_run(struct proto_ext_state *st
+ {
+ 	struct interface_proto_state *proto = &state->proto;
+ 	static char error_buf[32];
+-	char *envp[2];
++	static unsigned long long sequence;
++	char token_env[sizeof(PROTO_TOKEN_ENV) + sizeof(state->token)];
++	char *envp[3];
++	struct timespec now = {};
+ 	const char *action;
+ 	char *config;
+ 	int ret, j = 0;
+@@ -734,6 +753,10 @@ proto_ext_run(struct proto_ext_state *st
+ 			action = "setup";
+ 			state->last_error = -1;
+ 			proto_ext_clear_host_dep(state);
++			/* Fence callbacks from earlier setups and daemon instances. */
++			clock_gettime(CLOCK_MONOTONIC, &now);
++			snprintf(state->token, sizeof(state->token), "%ld:%lld:%ld:%llu",
++				 (long)getpid(), (long long)now.tv_sec, now.tv_nsec, ++sequence);
+ 			state->sm = S_SETUP;
+ 			break;
+ 
+@@ -816,6 +839,8 @@ proto_ext_run(struct proto_ext_state *st
+ 		goto error;
+ 	}
+ 
++	snprintf(token_env, sizeof(token_env), PROTO_TOKEN_ENV "%s", state->token);
++	envp[j++] = token_env;
+ 	envp[j] = NULL;
+ 
+ 	ret = start_cb(state, action, config, envp);
+@@ -832,8 +857,10 @@ error:
+ 	 * came up does not reach the proto handler, so a stuck S_SETUP would
+ 	 * block every future setup attempt
+ 	 */
+-	if (cmd == PROTO_CMD_SETUP)
++	if (cmd == PROTO_CMD_SETUP) {
+ 		state->sm = S_IDLE;
++		state->token[0] = 0;
++	}
+ 
+ 	return ret;
+ }
+--- a/proto-ext.h
++++ b/proto-ext.h
+@@ -44,6 +44,7 @@ struct proto_ext_state {
+ 	bool restart_pending;
+ 
+ 	int last_error;
++	char token[80];
+ 
+ 	struct list_head deps;
+ };
+--- a/scripts/netifd-proto.sh
++++ b/scripts/netifd-proto.sh
+@@ -327,6 +327,7 @@ _proto_notify() {
+ 	local interface="$1"
+ 	local options="$2"
+ 	json_add_string "interface" "$interface"
++	[ -n "$NETIFD_PROTO_TOKEN" ] && json_add_string "proto-token" "$NETIFD_PROTO_TOKEN"
+ 	ubus $options call network.interface notify_proto "$(json_dump)"
+ }
+ 

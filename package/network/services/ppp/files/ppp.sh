@@ -152,6 +152,7 @@ ppp_generic_setup() {
 		${localip:+$localip:} \
 		${lcp_failure:+lcp-echo-interval $lcp_interval lcp-echo-failure $lcp_failure $lcp_adaptive} \
 		${ipv6:++ipv6} \
+		${NETIFD_PROTO_TOKEN:+set NETIFD_PROTO_TOKEN=$NETIFD_PROTO_TOKEN} \
 		${autoipv6:+set AUTOIPV6=1} \
 		${reqprefix:+set REQPREFIX=$reqprefix} \
 		${norelease:+set NORELEASE=1} \
@@ -223,6 +224,7 @@ proto_ppp_teardown() {
 
 proto_pppoe_init_config() {
 	ppp_generic_init_config
+	no_device_mtu=1
 	proto_config_add_string "ac"
 	proto_config_add_string "service"
 	proto_config_add_string "ac_mac"
