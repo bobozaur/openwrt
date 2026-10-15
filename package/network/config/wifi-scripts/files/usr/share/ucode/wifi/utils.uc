@@ -3,6 +3,9 @@
 import { readfile, realpath, lsdir } from "fs";
 import * as nl80211 from "nl80211";
 
+let wave;
+try { wave = require("wifi.wave"); } catch (e) {}
+
 function phy_filename(phy, name) {
 	return `/sys/class/ieee80211/${phy}/${name}`;
 }
@@ -126,6 +129,10 @@ function find_phy_by_name(phys, name, rename) {
 }
 
 export function find_phy(config, rename) {
+	// Paired WAVE roles share a physical identity independent of enumeration.
+	if (wave?.matches(config))
+		return wave.find_radio(config)?.ap.phy;
+
 	let phys = lsdir("/sys/class/ieee80211");
 
 	return find_phy_by_path(phys, config.path) ??
