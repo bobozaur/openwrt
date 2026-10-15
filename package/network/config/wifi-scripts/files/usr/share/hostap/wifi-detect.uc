@@ -3,6 +3,8 @@
 import { readfile, writefile, realpath, glob, basename, unlink, open, rename } from "fs";
 import { is_equal } from "/usr/share/hostap/common.uc";
 let nl = require("nl80211");
+let wave;
+try { wave = require("wifi.wave"); } catch (e) {}
 
 let base_file = "/etc/board-base.json";
 let board_file = "/tmp/sysinfo/board.json";
@@ -246,6 +248,13 @@ function wiphy_detect() {
 
 		let entry = wiphy_get_entry(name, path);
 		entry.info = info;
+		let group = wave?.phy_info(name);
+		if (group) {
+			entry.path = group.path;
+			entry.wave_role = group.role;
+			// Retain each role's own capabilities for ordinary iwinfo.
+			entry.skip_defaults = group.role != 'ap' || !wave.find_radio({ path: group.path });
+		}
 	}
 }
 
