@@ -3111,7 +3111,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +#endif
 --- a/wireless/driver/linux/wave_mc_policy.c
 +++ b/wireless/driver/linux/wave_mc_policy.c
-@@ -0,0 +1,1017 @@
+@@ -0,0 +1,1043 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +/* Native reporter state follows the IGMPv3/MLDv2 transition tables used by
 + * net/bridge/br_multicast.c. Firmware group IDs and packet ownership remain
@@ -3168,6 +3168,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  unsigned int groups;
 +  unsigned long qi, qri;
 +  unsigned long other_expires;
++  unsigned long activity_expires;
 +  unsigned long general_at;
 +  union wave_mc_ip querier_source;
 +  u8 rv, startup_queries;
@@ -3239,6 +3240,18 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  if (!p->gc_pending || time_before(when, p->gc_at)) {
 +    p->gc_at = when;
 +    p->gc_pending = true;
++  }
++}
++
++/* Untagged interface domains live until clear. Tagged domains remain active
++ * while real observed traffic refreshes their membership interval.
++ */
++static void mc_domain_activity(struct wave_mc_policy *p,
++                                struct wave_mc_domain *d, unsigned long now)
++{
++  if (d->activated && d->vlan) {
++    d->activity_expires = now + mc_gmi(d);
++    mc_gc_note(p, d->activity_expires);
 +  }
 +}
 +
@@ -3572,6 +3585,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +
 +  if (!mc_addr_size(proto))
 +    return -EINVAL;
++  wave_mc_policy_expire(p, now);
 +  d = mc_domain_find(p, &key);
 +  if (!d) {
 +    if (p->ndomains == WAVE_MC_MAX_DOMAINS)
@@ -3582,9 +3596,12 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +    list_add_tail(&d->list, &p->domains);
 +    p->ndomains++;
 +  }
-+  if (d->activated)
++  if (d->activated) {
++    mc_domain_activity(p, d, now);
 +    return 0;
++  }
 +  d->activated = true;
++  mc_domain_activity(p, d, now);
 +  return 1;
 +}
 +
@@ -3665,6 +3682,12 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +      mc_group_del(p, g);
 +  }
 +  list_for_each_entry_safe(d, dtmp, &p->domains, list) {
++    if (d->activated && d->vlan) {
++      if (time_after_eq(now, d->activity_expires))
++        d->activated = false;
++      else
++        mc_gc_note(p, d->activity_expires);
++    }
 +    if (d->other_active && time_after_eq(now, d->other_expires)) {
 +      d->other_active = false;
 +      memset(&d->querier_source, 0, sizeof(d->querier_source));
@@ -3863,6 +3886,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +    d->qi = mc_interval(qqi);
 +  if (general)
 +    d->qri = mc_interval(maxresp);
++  mc_domain_activity(p, d, now);
 +  d->other_active = true;
 +  d->other_expires = now + mc_other_interval(d);
 +  mc_gc_note(p, d->other_expires);
@@ -3916,6 +3940,8 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  bool found = false;
 +
 +  list_for_each_entry(d, &p->domains, list) {
++    if (d->activated && d->vlan)
++      mc_deadline(d->activity_expires, &found, deadline);
 +    if (d->other_active)
 +      mc_deadline(d->other_expires, &found, deadline);
 +    else if (d->activated || d->groups)
@@ -4131,7 +4157,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +}
 --- a/wireless/driver/linux/wave_mc_policy.h
 +++ b/wireless/driver/linux/wave_mc_policy.h
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,125 @@
 +/* SPDX-License-Identifier: GPL-2.0-only */
 +#ifndef _WAVE_MC_POLICY_H_
 +#define _WAVE_MC_POLICY_H_
@@ -4183,10 +4209,12 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +
 +/* Activate only a protocol/VLAN domain known to the caller's live interface or
 + * validated traffic. This starts general queries before any membership exists,
-+ * retaining the domain until clear/destroy. Repeated activation preserves its
-+ * deadlines, learned intervals and elected external querier. Returns 1 when
-+ * newly activated, 0 when already active, or a negative errno on failure,
-+ * without changing existing domains; it creates no reporter or station.
++ * retaining untagged interface domains until clear/destroy. Tagged activation
++ * expires one learned membership interval after its last observed activity;
++ * live membership or an external querier independently retains the domain.
++ * Repeated activation refreshes only activity, preserving query cadence,
++ * learned intervals and election. Returns 1 when newly activated, 0 when
++ * already active, or a negative errno on failure; creates no reporter/station.
 + */
 +int wave_mc_policy_activate(struct wave_mc_policy *policy, u32 vlan,
 +                            __be16 proto, unsigned long now);
