@@ -1,0 +1,151 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] tests: cover resource prototype graphs at VM teardown
+
+Exercise the production uc_vm_free path through the existing CTest suite.
+Cover rebuilt and old-module type declarations, off-pool object and array
+prototypes, duplicate registration, cycles, stack references, ordinary GC
+rooting, and exactly one native destructor while its type remains alive.
+Use an instrumented host build to detect stale reads and leaked allocations.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -4,3 +4,7 @@
+ #IF(CMAKE_C_COMPILER_ID STREQUAL "Clang")
+ #	ADD_SUBDIRECTORY(fuzz)
+ #ENDIF()
++
++ADD_EXECUTABLE(vm-resource-prototype vm-resource-prototype.c)
++TARGET_LINK_LIBRARIES(vm-resource-prototype uc_defines libucode)
++ADD_TEST(NAME vm-resource-prototype COMMAND vm-resource-prototype)
+--- /dev/null
++++ b/tests/vm-resource-prototype.c
+@@ -0,0 +1,125 @@
++/* Resource prototypes and their values must share the final GC lifetime. */
++#include <stdio.h>
++#include <string.h>
++
++#include "ucode/lib.h"
++
++struct destructor_state {
++	uc_resource_type_t *type;
++	unsigned int calls;
++	bool valid_type;
++};
++
++static void
++resource_free(void *data)
++{
++	struct destructor_state *state = data;
++
++	state->calls++;
++	state->valid_type = !strcmp(state->type->name, "test.resource") &&
++	                    state->type->free == resource_free;
++}
++
++static uc_value_t *
++resource_noop(uc_vm_t *vm, size_t nargs)
++{
++	return NULL;
++}
++
++static bool
++check_teardown(bool cycle, bool stack_reference)
++{
++	static const uc_function_list_t functions[] = {
++		{ "noop", resource_noop }
++	};
++	struct destructor_state state = { 0 };
++	uc_vm_t vm = { 0 };
++	uc_value_t *object, *array, *proto;
++	bool retained;
++
++	uc_vm_init(&vm, NULL);
++	state.type = uc_type_declare(&vm, "test.resource", functions, resource_free);
++	proto = state.type->proto;
++	object = ucv_object_new(&vm);
++	array = ucv_array_new(&vm);
++
++	ucv_object_add(proto, "data", object);
++	ucv_object_add(proto, "interfaces", array);
++	ucv_array_push(array, ucv_get(object));
++	ucv_object_add(object, "resource", uc_resource_new(state.type, &state));
++
++	if (cycle) {
++		ucv_object_add(object, "type", ucv_get(proto));
++		ucv_prototype_set(object, ucv_get(proto));
++		ucv_prototype_set(array, ucv_get(proto));
++	}
++
++	if (stack_reference)
++		uc_vm_stack_push(&vm, ucv_get(proto));
++
++	/* Type prototypes are roots during ordinary GC, including their values. */
++	ucv_gc(&vm);
++	retained = state.calls == 0 &&
++	           ucv_object_get(proto, "data", NULL) == object &&
++	           ucv_array_get(array, 0) == object;
++
++	/* Final GC must destroy the cycle and invoke the native destructor once
++	 * while its type descriptor is still allocated. */
++	uc_vm_free(&vm);
++
++	return retained && state.calls == 1 && state.valid_type &&
++	       vm.values.next == &vm.values && vm.values.prev == &vm.values;
++}
++
++static bool
++check_legacy_prototype(bool array_prototype)
++{
++	struct destructor_state state = { 0 }, duplicate_state = { 0 };
++	uc_vm_t vm = { 0 };
++	uc_value_t *proto, *array, *duplicate;
++	bool retained, reused;
++
++	uc_vm_init(&vm, NULL);
++	/* An old inline helper creates an off-pool object. The public type
++	 * registration API also accepts array prototypes. */
++	proto = array_prototype ? ucv_array_new(NULL) : ucv_object_new(NULL);
++	state.type = ucv_resource_type_add(&vm, "test.resource", proto, resource_free);
++	array = ucv_array_new(&vm);
++	if (array_prototype)
++		ucv_array_push(proto, array);
++	else
++		ucv_object_add(proto, "container", array);
++	ucv_array_push(array, ucv_get(proto));
++	ucv_array_push(array, uc_resource_new(state.type, &state));
++
++	/* Duplicate registration consumes its unused prototype while leaving
++	 * the original type and its native destructor available. */
++	duplicate_state.type = state.type;
++	duplicate = ucv_object_new(NULL);
++	ucv_object_add(duplicate, "resource", uc_resource_new(state.type, &duplicate_state));
++	reused = ucv_resource_type_add(&vm, "test.resource", duplicate, NULL) == state.type;
++
++	ucv_gc(&vm);
++	retained = state.calls == 0 && ucv_array_get(array, 0) == proto &&
++	           duplicate_state.calls == 1 && duplicate_state.valid_type;
++	uc_vm_free(&vm);
++
++	return retained && reused && state.calls == 1 && state.valid_type &&
++	       vm.values.next == &vm.values && vm.values.prev == &vm.values;
++}
++
++int
++main(void)
++{
++	if (!check_legacy_prototype(false) ||
++	    !check_legacy_prototype(true) ||
++	    !check_teardown(false, false) ||
++	    !check_teardown(false, true) ||
++	    !check_teardown(true, false) ||
++	    !check_teardown(true, true)) {
++		fputs("Resource prototype teardown failed\n", stderr);
++		return 1;
++	}
++
++	return 0;
++}
