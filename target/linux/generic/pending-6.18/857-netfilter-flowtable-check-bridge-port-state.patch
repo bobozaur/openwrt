@@ -1,0 +1,107 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netfilter: flowtable: honor current bridge port state
+
+A direct flow transmits through its cached lower device, bypassing the bridge
+forwarding-state check. After hardware invalidation, the surviving software
+flow could still deliver packets to a nonforwarding bridge port.
+
+Reject nonforwarding ports when resolving a bridge path and recheck ingress
+and direct-output state before either IP family modifies a cached packet.
+Keep a cached bridge output tied to its current master. Invalid paths use the
+existing flow teardown and ordinary stack, retaining the route and MTU checks.
+Allow the existing state accessor under RCU as well as RTNL, matching the
+native bridge-port flag accessor's lifetime rules.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -179,6 +179,7 @@
+ 				    __u16 vid);
+ void br_fdb_clear_offload(const struct net_device *dev, u16 vid);
+ bool br_port_flag_is_set(const struct net_device *dev, unsigned long flag);
++/* Caller must hold RCU or RTNL. */
+ u8 br_port_get_stp_state(const struct net_device *dev);
+ clock_t br_get_ageing_time(const struct net_device *br_dev);
+ #else
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -74,13 +74,11 @@
+ {
+ 	struct net_bridge_port *p;
+ 
+-	ASSERT_RTNL();
+-
+-	p = br_port_get_rtnl(dev);
++	p = br_port_get_rtnl_rcu(dev);
+ 	if (!p)
+ 		return BR_STATE_DISABLED;
+ 
+-	return p->state;
++	return READ_ONCE(p->state);
+ }
+ EXPORT_SYMBOL_GPL(br_port_get_stp_state);
+ 
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -401,7 +401,7 @@
+ 		return -1;
+ 
+ 	dst = READ_ONCE(f->dst);
+-	if (!dst)
++	if (!dst || READ_ONCE(dst->state) != BR_STATE_FORWARDING)
+ 		return -1;
+ 
+ 	if (br_vlan_fill_forward_path_mode(br, dst, path))
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -7,6 +7,7 @@
+ #include <linux/ip.h>
+ #include <linux/ipv6.h>
+ #include <linux/netdevice.h>
++#include <linux/if_bridge.h>
+ #include <linux/if_ether.h>
+ #include <net/gso.h>
+ #include <net/ip.h>
+@@ -260,12 +261,23 @@
+ 	return true;
+ }
+ 
++static bool nf_flow_bridge_port_forwarding(const struct net_device *dev)
++{
++	return !netif_is_bridge_port(dev) ||
++	       (IS_REACHABLE(CONFIG_BRIDGE) &&
++		br_port_get_stp_state(dev) == BR_STATE_FORWARDING);
++}
++
+ static inline bool nf_flow_dst_check(struct nf_flowtable *flow_table,
+ 				     struct flow_offload_tuple *tuple,
+ 				     struct nf_flowtable_ctx *ctx)
+ {
+ 	struct net_device *outdev;
+ 	unsigned int mtu;
++
++	/* The ingress hook runs before the ordinary bridge receive policy. */
++	if (!nf_flow_bridge_port_forwarding(ctx->in))
++		return false;
+ 
+ 	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH &&
+ 	    tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM &&
+@@ -290,6 +302,15 @@
+ 		outdev = dev_get_by_index_rcu(read_pnet(&flow_table->net),
+ 					     tuple->out.ifidx);
+ 		if (!outdev || READ_ONCE(outdev->mtu) < tuple->mtu)
++			return false;
++		/* Direct transmission bypasses br_forward(). Keep the cached
++		 * lower port tied to its bridge and current forwarding state.
++		 */
++		if (!nf_flow_bridge_port_forwarding(outdev))
++			return false;
++		if (netif_is_bridge_master(tuple->dst_cache->dev) &&
++		    outdev != tuple->dst_cache->dev &&
++		    netdev_master_upper_dev_get_rcu(outdev) != tuple->dst_cache->dev)
+ 			return false;
+ 		ctx->out = outdev;
+ 	}
