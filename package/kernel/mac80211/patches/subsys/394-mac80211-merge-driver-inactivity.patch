@@ -1,0 +1,95 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] mac80211: combine driver and software inactivity observations
+
+Firmware data offload can observe payload activity while mac80211 sees only
+management traffic. Preserve a filled driver inactivity value and combine it
+with the software observation by taking the shorter interval, for both link
+and station reporting. Connection lifetime remains owned by mac80211.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -4354,7 +4354,9 @@
+  *	the values (indicating which by setting the filled bitmap), but not
+  *	all of them make sense - see the source for which ones are possible.
+  *	Statistics that the driver doesn't fill will be filled by mac80211.
+- *	The callback can sleep.
++ *	A prefilled inactivity time is combined with mac80211's observations;
++ *	the most recent observed activity wins. Connection lifetime stays owned
++ *	by mac80211. The callback can sleep.
+  *
+  * @link_sta_statistics: Get link statistics for this station. For example with
+  *	beacon filtering, the statistics kept by mac80211 might not be
+@@ -4363,6 +4365,8 @@
+  *	bitmap), but not all of them make sense - see the source for which
+  *	ones are possible.
+  *	Statistics that the driver doesn't fill will be filled by mac80211.
++ *	A prefilled inactivity time is combined with the link's mac80211
++ *	observations, taking the most recent observed activity.
+  *	The callback can sleep.
+  *
+  * @conf_tx: Configure TX queue parameters (EDCF (aifs, cw_min, cw_max),
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -2854,6 +2854,18 @@
+ 				link_sta_info->pub,
+ 				link_sinfo);
+ 
++	/* Driver data offload and mac80211 management can observe different
++	 * activity. Report the freshest observation without changing MLME state. */
++	{
++		u32 inactive = jiffies_delta_to_msecs(
++			jiffies - ieee80211_sta_last_active(sta, link_id));
++
++		if (link_sinfo->filled & BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME))
++			link_sinfo->inactive_time = min(link_sinfo->inactive_time, inactive);
++		else
++			link_sinfo->inactive_time = inactive;
++	}
++
+ 	link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME) |
+ 			 BIT_ULL(NL80211_STA_INFO_BSS_PARAM) |
+ 			 BIT_ULL(NL80211_STA_INFO_RX_DROP_MISC);
+@@ -2864,10 +2876,6 @@
+ 		link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_BEACON_LOSS);
+ 	}
+ 
+-	link_sinfo->inactive_time =
+-		jiffies_delta_to_msecs(jiffies -
+-				       ieee80211_sta_last_active(sta,
+-								 link_id));
+ 
+ 	if (!(link_sinfo->filled & (BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
+ 				    BIT_ULL(NL80211_STA_INFO_TX_BYTES)))) {
+@@ -3107,6 +3115,18 @@
+ 		sinfo->rx_beacon = sdata->deflink.u.mgd.count_beacon_signal;
+ 
+ 	drv_sta_statistics(local, sdata, &sta->sta, sinfo);
++	/* Driver data offload and mac80211 management can observe different
++	 * activity. Report the freshest observation without changing MLME state. */
++	{
++		u32 inactive = jiffies_delta_to_msecs(
++			jiffies - ieee80211_sta_last_active(sta, -1));
++
++		if (sinfo->filled & BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME))
++			sinfo->inactive_time = min(sinfo->inactive_time, inactive);
++		else
++			sinfo->inactive_time = inactive;
++	}
++
+ 	sinfo->filled |= BIT_ULL(NL80211_STA_INFO_INACTIVE_TIME) |
+ 			 BIT_ULL(NL80211_STA_INFO_STA_FLAGS) |
+ 			 BIT_ULL(NL80211_STA_INFO_BSS_PARAM) |
+@@ -3122,9 +3142,6 @@
+ 
+ 	sinfo->connected_time = ktime_get_seconds() - sta->last_connected;
+ 	sinfo->assoc_at = sta->assoc_at;
+-	sinfo->inactive_time =
+-		jiffies_delta_to_msecs(jiffies -
+-				       ieee80211_sta_last_active(sta, -1));
+ 
+ 	if (!(sinfo->filled & (BIT_ULL(NL80211_STA_INFO_TX_BYTES64) |
+ 			       BIT_ULL(NL80211_STA_INFO_TX_BYTES)))) {
