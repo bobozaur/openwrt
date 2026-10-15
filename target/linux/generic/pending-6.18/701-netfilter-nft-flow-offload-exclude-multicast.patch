@@ -1,0 +1,40 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netfilter: reject multicast flowtable admission
+
+A cached unicast flow route cannot represent changing multicast outputs.
+IPv6 multicast UDP currently enters the flowtable and survives multicast
+route invalidation. Keep multicast and limited broadcast on their normal
+routing paths, before marking conntrack offloaded or caching a route.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -9,6 +9,7 @@
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_tables.h>
+ #include <net/ip.h>
++#include <net/ipv6.h>
+ #include <net/flow.h>
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_core.h>
+@@ -28,10 +29,17 @@
+ 	if (family == NFPROTO_IPV4) {
+ 		const struct ip_options *opt;
+ 
++		if (ipv4_is_multicast(ip_hdr(skb)->daddr) ||
++		    ipv4_is_lbcast(ip_hdr(skb)->daddr))
++			return true;
++
+ 		opt = &(IPCB(skb)->opt);
+ 
+ 		if (unlikely(opt->optlen))
+ 			return true;
++	} else if (family == NFPROTO_IPV6 &&
++		   ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr)) {
++		return true;
+ 	}
+ 
+ 	return false;
