@@ -1,0 +1,191 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wifi: rtw88: bound queued TX work under the TXQ lock
+
+The queued TX worker holds txq_lock while draining every frame counted in
+all active TXQs. mac80211 can perform software encryption during dequeue,
+so concurrent wake_tx_queue callers spin behind an entire encryption batch.
+
+Limit each worker invocation to its initial frame-depth budget, with one
+attempt for each initially empty queue. Handle one frame per lock hold and
+rotate nonempty queues for fairness. Select each queue under the lock again
+instead of carrying a TXQ or station pointer across unlock. Empty or failed
+dequeues remove their node, retaining the existing wake/retry behavior.
+
+Serialize wake admission, worker continuation and the RUNNING transition
+with txq_lock. Cancel queued TX work after releasing the device mutex and
+before powering off. The synchronous VO path checks RUNNING under the same
+lock before draining, preserving EAPOL ordering for active devices. Frame
+handling, TXQ cleanup and the final HCI kick retain their lock protection.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/drivers/net/wireless/realtek/rtw88/mac80211.c
++++ b/drivers/net/wireless/realtek/rtw88/mac80211.c
+@@ -35,19 +35,21 @@
+ 	struct rtw_dev *rtwdev = hw->priv;
+ 	struct rtw_txq *rtwtxq = (struct rtw_txq *)txq->drv_priv;
+ 
+-	if (!test_bit(RTW_FLAG_RUNNING, rtwdev->flags))
++	spin_lock_bh(&rtwdev->txq_lock);
++	if (!test_bit(RTW_FLAG_RUNNING, rtwdev->flags)) {
++		spin_unlock_bh(&rtwdev->txq_lock);
+ 		return;
+-
+-	spin_lock_bh(&rtwdev->txq_lock);
++	}
++
+ 	if (list_empty(&rtwtxq->list))
+ 		list_add_tail(&rtwtxq->list, &rtwdev->txqs);
++	if (txq->ac != IEEE80211_AC_VO)
++		queue_work(rtwdev->tx_wq, &rtwdev->tx_work);
+ 	spin_unlock_bh(&rtwdev->txq_lock);
+ 
+ 	/* ensure to dequeue EAPOL (4/4) at the right time */
+ 	if (txq->ac == IEEE80211_AC_VO)
+ 		__rtw_tx_work(rtwdev);
+-	else
+-		queue_work(rtwdev->tx_wq, &rtwdev->tx_work);
+ }
+ 
+ static int rtw_ops_start(struct ieee80211_hw *hw)
+--- a/drivers/net/wireless/realtek/rtw88/main.c
++++ b/drivers/net/wireless/realtek/rtw88/main.c
+@@ -1569,11 +1569,14 @@
+ {
+ 	struct rtw_coex *coex = &rtwdev->coex;
+ 
++	spin_lock_bh(&rtwdev->txq_lock);
+ 	clear_bit(RTW_FLAG_RUNNING, rtwdev->flags);
++	spin_unlock_bh(&rtwdev->txq_lock);
+ 	clear_bit(RTW_FLAG_FW_RUNNING, rtwdev->flags);
+ 
+ 	mutex_unlock(&rtwdev->mutex);
+ 
++	cancel_work_sync(&rtwdev->tx_work);
+ 	cancel_work_sync(&rtwdev->c2h_work);
+ 	cancel_work_sync(&rtwdev->update_beacon_work);
+ 	cancel_delayed_work_sync(&rtwdev->watch_dog_work);
+--- a/drivers/net/wireless/realtek/rtw88/tx.c
++++ b/drivers/net/wireless/realtek/rtw88/tx.c
+@@ -625,9 +625,9 @@
+ 	return 0;
+ }
+ 
+-static void rtw_txq_push(struct rtw_dev *rtwdev,
+-			 struct rtw_txq *rtwtxq,
+-			 unsigned long frames)
++static unsigned long rtw_txq_push(struct rtw_dev *rtwdev,
++				  struct rtw_txq *rtwtxq,
++				  unsigned long frames)
+ {
+ 	struct ieee80211_txq *txq = rtwtxq_to_txq(rtwtxq);
+ 	struct sk_buff *skb;
+@@ -650,6 +650,8 @@
+ 	}
+ 
+ 	rcu_read_unlock();
++
++	return i;
+ }
+ 
+ void __rtw_tx_work(struct rtw_dev *rtwdev)
+@@ -657,6 +659,8 @@
+ 	struct rtw_txq *rtwtxq, *tmp;
+ 
+ 	spin_lock_bh(&rtwdev->txq_lock);
++	if (!test_bit(RTW_FLAG_RUNNING, rtwdev->flags))
++		goto out;
+ 
+ 	list_for_each_entry_safe(rtwtxq, tmp, &rtwdev->txqs, list) {
+ 		struct ieee80211_txq *txq = rtwtxq_to_txq(rtwtxq);
+@@ -669,15 +673,85 @@
+ 	}
+ 
+ 	rtw_hci_tx_kick_off(rtwdev);
+-
++out:
+ 	spin_unlock_bh(&rtwdev->txq_lock);
+ }
+ 
++static unsigned long rtw_txq_work_budget(struct rtw_dev *rtwdev)
++{
++	struct rtw_txq *rtwtxq;
++	unsigned long budget = 0;
++
++	if (!test_bit(RTW_FLAG_RUNNING, rtwdev->flags))
++		return 0;
++
++	list_for_each_entry(rtwtxq, &rtwdev->txqs, list) {
++		struct ieee80211_txq *txq = rtwtxq_to_txq(rtwtxq);
++		unsigned long frame_cnt;
++
++		ieee80211_txq_get_depth(txq, &frame_cnt, NULL);
++		/* Empty queues still need one attempt to retire their node. */
++		budget += max(frame_cnt, 1UL);
++	}
++
++	return budget;
++}
++
++static bool rtw_txq_work_one(struct rtw_dev *rtwdev)
++{
++	struct ieee80211_txq *txq;
++	struct rtw_txq *rtwtxq;
++	unsigned long frame_cnt;
++	bool attempted = false;
++
++	spin_lock_bh(&rtwdev->txq_lock);
++	if (!test_bit(RTW_FLAG_RUNNING, rtwdev->flags) ||
++	    list_empty(&rtwdev->txqs))
++		goto out;
++
++	/* Select afresh: cleanup can retire any TXQ between attempts. */
++	rtwtxq = list_first_entry(&rtwdev->txqs, struct rtw_txq, list);
++	txq = rtwtxq_to_txq(rtwtxq);
++	attempted = true;
++
++	if (!rtw_txq_push(rtwdev, rtwtxq, 1)) {
++		list_del_init(&rtwtxq->list);
++		goto out;
++	}
++
++	ieee80211_txq_get_depth(txq, &frame_cnt, NULL);
++	if (frame_cnt)
++		list_move_tail(&rtwtxq->list, &rtwdev->txqs);
++	else
++		list_del_init(&rtwtxq->list);
++out:
++	spin_unlock_bh(&rtwdev->txq_lock);
++
++	return attempted;
++}
++
+ void rtw_tx_work(struct work_struct *w)
+ {
+ 	struct rtw_dev *rtwdev = container_of(w, struct rtw_dev, tx_work);
+-
+-	__rtw_tx_work(rtwdev);
++	unsigned long budget;
++
++	/* Bound this invocation even when producers keep adding frames. */
++	spin_lock_bh(&rtwdev->txq_lock);
++	budget = rtw_txq_work_budget(rtwdev);
++	spin_unlock_bh(&rtwdev->txq_lock);
++
++	while (budget--) {
++		if (!rtw_txq_work_one(rtwdev))
++			break;
++	}
++
++	spin_lock_bh(&rtwdev->txq_lock);
++	if (test_bit(RTW_FLAG_RUNNING, rtwdev->flags)) {
++		rtw_hci_tx_kick_off(rtwdev);
++		if (!list_empty(&rtwdev->txqs))
++			queue_work(rtwdev->tx_wq, &rtwdev->tx_work);
++	}
++	spin_unlock_bh(&rtwdev->txq_lock);
+ }
+ 
+ void rtw_txq_init(struct rtw_dev *rtwdev, struct ieee80211_txq *txq)
