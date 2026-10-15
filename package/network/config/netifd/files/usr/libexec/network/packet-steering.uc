@@ -151,11 +151,14 @@ for (let dev in netdevs) {
 	if (length(glob(`/sys/class/net/${dev}/lower_*`)) > 0)
 		continue;
 
-	let pdev = phys_devs[pdev_path];
+	let driver = basename(readlink(`${pdev_path}/driver`));
+	/* GRX500 netdevs own independent DMA pollers despite sharing a pdev. */
+	let group = driver == "grx500-ethernet" ? `${pdev_path}/${dev}` : pdev_path;
+	let pdev = phys_devs[group];
 	if (!pdev) {
-		pdev = phys_devs[pdev_path] = {
+		pdev = phys_devs[group] = {
 			path: pdev_path,
-			driver: basename(readlink(`${pdev_path}/driver`)),
+			driver: driver,
 			netdev: [],
 			phy: [],
 			tasks: [],
