@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+ax50_preinit_ethernet() {
+	[ "$(board_name)" = tplink,archer-ax50-v1 ] || return 0
+	# initd's modules-boot pass precedes sysinfo and firmware hotplug. Decode
+	# here so the ordinary driver also supplies stock wired failsafe networking.
+	FIRMWARE=lantiq/grx500-phy11g-a21.bin \
+		/bin/sh /etc/hotplug.d/firmware/10-ax50-caldata || return 1
+	[ -s /lib/firmware/lantiq/grx500-phy11g-a21.bin ] || return 1
+	modprobe tag_grx500 && modprobe grx500_switch && modprobe grx500_eth || return 1
+	[ -e /sys/class/net/lan1 ] && [ -e /sys/class/net/wan ]
+}
+
+boot_hook_add preinit_main ax50_preinit_ethernet
