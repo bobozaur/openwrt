@@ -19,6 +19,7 @@ wpas.data.config = {};
 wpas.data.iface_phy = {};
 wpas.data.iface_ubus = {};
 wpas.data.dpp_hooks = {};
+wpas.data.config_generation = 0;
 
 function iface_stop(iface)
 {
@@ -57,8 +58,9 @@ function iface_start(phydev, iface)
 {
 	let phy = phydev.name;
 
-	if (iface.running)
-		return;
+	if (iface.running && wpas.interfaces[iface.config.iface])
+		return true;
+	iface.running = false;
 
 	let ifname = iface.config.iface;
 	let macaddr = phy_macaddr_get(phydev, ifname, iface.macaddr, {
@@ -66,7 +68,7 @@ function iface_start(phydev, iface)
 		macaddr: iface.config.macaddr,
 	});
 	if (!macaddr)
-		return;
+		return false;
 
 	iface.macaddr = macaddr;
 	let wdev_config = { ...iface.config, macaddr };
@@ -75,19 +77,30 @@ function iface_start(phydev, iface)
 	let ret = phydev.wdev_add(ifname, wdev_config);
 	if (ret) {
 		wpas.printf(`Failed to create device ${ifname}: ${ret}`);
-		return;
+		delete wpas.data.iface_phy[ifname];
+		return false;
 	}
 
 	ret = wdev_set_up(ifname, true);
 	if (ret) {
 		wpas.printf(`Failed to bring up device ${ifname}: ${ret}`);
+		delete wpas.data.iface_phy[ifname];
 		wdev_remove(ifname);
-		return;
+		return false;
 	}
 
 	wpas.data.iface_phy[ifname] = phy;
-	wpas.add_iface(iface.config);
+	if (wpas.add_iface(iface.config) < 0 || !wpas.interfaces[ifname]) {
+		wpas.printf(`Failed to start supplicant interface ${ifname}`);
+		delete wpas.data.iface_phy[ifname];
+		wdev_remove(ifname);
+		return false;
+	}
+	let transition = wpas.data.config[phydev.name]?.transition;
+	if (transition?.phase == 'resuming' && transition.frequency > 0)
+		wpas.interfaces[ifname].config('freq_list', [ transition.frequency ]);
 	iface.running = true;
+	return true;
 }
 
 // a change of these lines needs no new netdev
@@ -146,13 +159,14 @@ function iface_network_apply(ifname, old_data, new_data, freq_list)
 	return true;
 }
 
-function iface_cb(new_if, old_if)
+function iface_cb(new_if, old_if, generation)
 {
 	if (old_if && new_if)
 		new_if.macaddr = old_if.macaddr;
 
 	if (old_if && new_if && is_equal(old_if.config, new_if.config)) {
 		new_if.running = old_if.running;
+		new_if.macaddr = old_if.macaddr;
 		return;
 	}
 
@@ -194,7 +208,7 @@ function phy_dev_open(phy_name)
 function start_pending(phy_name)
 {
 	let phy = wpas.data.config[phy_name];
-	if (!phy || !phy.data)
+	if (!phy || !phy.data || phy.transition?.phase == 'paused')
 		return;
 
 	let phydev = phy_dev_open(phy_name);
@@ -503,7 +517,36 @@ function mld_bss_allowed(data, bss) {
 	return index(data.freq_list, bss.freq) >= 0;
 }
 
-function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_base, config_list)
+function phy_transition_finish(phy)
+{
+	let transition = phy.transition;
+	if (!transition)
+		return;
+	if (transition.lease)
+		transition.lease.cancel();
+	delete phy.transition;
+	for (let ifname, freqs in transition.freq_list) {
+		let iface = wpas.interfaces[ifname];
+		if (iface)
+			iface.config('freq_list', freqs);
+	}
+}
+
+function phy_transition_lease(name, phy, milliseconds)
+{
+	let transition = phy.transition;
+	if (transition.lease)
+		transition.lease.cancel();
+	transition.lease = uloop.timer(milliseconds, () => {
+		if (phy.transition != transition)
+			return;
+		wpas.printf(`AP/STA transition on ${name} expired; restoring station operation`);
+		phy_transition_finish(phy);
+		start_pending(name);
+	});
+}
+
+function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_base, config_list, ap_phy)
 {
 	let phy = wpas.data.config[config_name];
 
@@ -517,6 +560,10 @@ function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_ba
 	}
 
 	phy.radio = radio;
+	phy_transition_finish(phy);
+	let previous_generation = phy.generation;
+	phy.generation = ++wpas.data.config_generation;
+	phy.ap_phy = ap_phy;
 	phy.num_global_macaddr = num_global_macaddr;
 	phy.macaddr_base = macaddr_base;
 
@@ -529,7 +576,7 @@ function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_ba
 			push(values, [ config.iface, prepare_config(config) ]);
 
 	mld_update_phy(phy, mlo_ifaces);
-	phy.update(values);
+	phy.update(values, previous_generation);
 
 	macaddr_sync_defer(ubus, "wpa_supplicant", config_name, macaddr_keep(keys(phy.data)));
 }
@@ -717,6 +764,71 @@ function dpp_rx_via_channel(ifname, method, data, no_reply)
 }
 
 let main_obj = {
+	phy_transition: {
+		args: { phy: '', owner: '', token: '', replaces: '', action: '', frequency: 0, lease_ms: 0 },
+		call: function(req) {
+			let phy = wpas.data.config[req.args.phy];
+			if (!phy || !req.args.token || phy.ap_phy != req.args.owner)
+				return libubus.STATUS_NOT_FOUND;
+			let transition = phy.transition;
+			if (req.args.action == 'pause') {
+				if (transition && transition.token != req.args.token &&
+				    transition.token != req.args.replaces)
+					return libubus.STATUS_PERMISSION_DENIED;
+				if (transition?.token == req.args.token)
+					return { generation: phy.generation, token: transition.token };
+				let previous_freqs = transition?.freq_list;
+				phy_transition_finish(phy);
+				transition = phy.transition = {
+					token: req.args.token, owner: req.args.owner,
+					generation: phy.generation, phase: 'paused', freq_list: {},
+				};
+				for (let ifname, entry in phy.data) {
+					let iface = wpas.interfaces[ifname];
+					let previous = previous_freqs && index(keys(previous_freqs), ifname) >= 0;
+					transition.freq_list[ifname] = previous ? previous_freqs[ifname] :
+						(iface ? iface.config('freq_list') : null);
+					iface_stop(entry);
+					if (wpas.interfaces[ifname]) {
+						phy_transition_finish(phy);
+						start_pending(req.args.phy);
+						return libubus.STATUS_UNKNOWN_ERROR;
+					}
+				}
+				phy_transition_lease(req.args.phy, phy, 30000);
+				return { generation: phy.generation, token: transition.token };
+			}
+			if (!transition && req.args.action == 'cancel')
+				return 0;
+			if (!transition || transition.token != req.args.token ||
+			    transition.generation != phy.generation)
+				return libubus.STATUS_NOT_FOUND;
+			if (req.args.action == 'cancel') {
+				phy_transition_finish(phy);
+				start_pending(req.args.phy);
+				return 0;
+			}
+			if (req.args.action == 'renew') {
+				if (req.args.lease_ms <= 0)
+					return libubus.STATUS_INVALID_ARGUMENT;
+				phy_transition_lease(req.args.phy, phy, req.args.lease_ms);
+				return 0;
+			}
+			if (req.args.action != 'resume' || req.args.frequency < 0)
+				return libubus.STATUS_INVALID_ARGUMENT;
+			transition.phase = 'resuming';
+			transition.frequency = req.args.frequency;
+			if (!transition.frequency)
+				phy_transition_finish(phy);
+			else
+				phy_transition_lease(req.args.phy, phy, 35000);
+			start_pending(req.args.phy);
+			for (let ifname in phy.data)
+				if (!wpas.interfaces[ifname])
+					return libubus.STATUS_UNKNOWN_ERROR;
+			return 0;
+		}
+	},
 	phy_set_state: {
 		args: {
 			phy: "",
@@ -731,6 +843,8 @@ let main_obj = {
 			let phy = wpas.data.config[name];
 			if (!phy)
 				return libubus.STATUS_NOT_FOUND;
+			if (phy.transition)
+				return libubus.STATUS_PERMISSION_DENIED;
 
 			let radio_mask = phy.radio != null ? (1 << phy.radio) : 0;
 			if (req.args.stop) {
@@ -867,6 +981,7 @@ let main_obj = {
 			radio: 0,
 			num_global_macaddr: 0,
 			macaddr_base: "",
+			ap_phy: '',
 			config: [],
 			defer: true,
 		},
@@ -877,10 +992,16 @@ let main_obj = {
 
 			wpas.printf(`Set new config for phy ${phy}`);
 			if (req.args.config)
-				set_config(phy, req.args.phy, req.args.radio, req.args.num_global_macaddr, req.args.macaddr_base, req.args.config);
+				set_config(phy, req.args.phy, req.args.radio, req.args.num_global_macaddr, req.args.macaddr_base, req.args.config, req.args.ap_phy);
 
-			if (!req.args.defer)
-				uloop.timer(100, () => start_pending(phy));
+			if (!req.args.defer) {
+				let owner = wpas.data.config[phy];
+				let generation = owner?.generation;
+				uloop.timer(100, () => {
+					if (wpas.data.config[phy] == owner && owner?.generation == generation)
+						start_pending(phy);
+				});
+			}
 
 			return {
 				pid: wpas.getpid()
@@ -1020,6 +1141,23 @@ let main_obj = {
 
 wpas.data.ubus = ubus;
 wpas.data.obj = ubus.publish("wpa_supplicant", main_obj);
+
+wpas.data.hostapd_watch = ubus.subscriber(() => 0, () => {
+	// A vanished AP owner cannot retain a station pause or frequency pin.
+	let lost = [];
+	for (let name, phy in wpas.data.config)
+		if (phy.transition)
+			push(lost, { name, phy, transition: phy.transition });
+	uloop.timer(0, () => {
+		for (let entry in lost) {
+			if (entry.phy.transition != entry.transition)
+				continue;
+			phy_transition_finish(entry.phy);
+			start_pending(entry.name);
+		}
+	});
+}, [ 'hostapd' ]);
+wpas.data.hostapd_watch.subscribe('hostapd');
 wpas.udebug_set("wpa_supplicant", wpas.data.ubus);
 
 function iface_event(type, name, data) {
@@ -1038,7 +1176,7 @@ function iface_hostapd_notify(ifname, iface, state)
 {
 	let status = iface.status();
 	let ubus = wpas.data.ubus;
-	let msg = {};
+	let msg = { station_state: state };
 
 	let mld = wpas.data.mld[ifname];
 	switch (state) {
@@ -1056,6 +1194,8 @@ function iface_hostapd_notify(ifname, iface, state)
 		if (!mld) {
 			msg.frequency = status.frequency;
 			msg.sec_chan_offset = status.sec_chan_offset;
+			if (status.chandef)
+				msg.chandef = status.chandef;
 		}
 		break;
 	default:
@@ -1068,7 +1208,15 @@ function iface_hostapd_notify(ifname, iface, state)
 			wpas.printf(`no PHY for ifname ${ifname}`);
 			return;
 		}
+		let phy = wpas.data.config[msg.phy];
+		msg.phy = phy?.ap_phy ?? msg.phy;
+		let transition = phy?.transition;
+		if (transition)
+			msg.transition_token = transition.token;
 		ubus.call("hostapd", "apsta_state", msg);
+		if (state == 'COMPLETED' && transition && phy.transition == transition &&
+		    transition.phase == 'resuming')
+			phy_transition_finish(phy);
 		return;
 	}
 
@@ -1109,6 +1257,8 @@ function iface_channel_switch(ifname, iface, info)
 		frequency: info.frequency,
 		sec_chan_offset: info.sec_chan_offset,
 	};
+	if (info.chandef)
+		msg.chandef = info.chandef;
 
 	let mld = wpas.data.mld[ifname];
 	if (mld) {
@@ -1124,6 +1274,10 @@ function iface_channel_switch(ifname, iface, info)
 			wpas.printf(`no PHY for ifname ${ifname}`);
 			return;
 		}
+		let phy = wpas.data.config[msg.phy];
+		msg.phy = phy?.ap_phy ?? msg.phy;
+		if (phy?.transition)
+			msg.transition_token = phy.transition.token;
 	}
 
 	ubus.call("hostapd", "apsta_state", msg);
@@ -1223,6 +1377,11 @@ return {
 		wpas.data.ubus.disconnect();
 	},
 	bss_allowed: function(ifname, bss) {
+		let phy = wpas.data.config[wpas.data.iface_phy[ifname]];
+		let transition = phy?.transition;
+		if (transition?.phase == 'resuming' && transition.frequency > 0 &&
+		    bss.freq != transition.frequency)
+			return false;
 		let mld = wpas.data.mld[ifname];
 		if (!mld)
 			return true;
