@@ -1,0 +1,42 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] net: dsa: publish the requested ageing time before notification
+
+The switch-wide ageing calculation includes every port's cached value.
+Notifying before updating the requesting port lets its old shorter value
+win the minimum. After STP changes a four-port bridge from 300 seconds to
+30 seconds and back, the last restoring port still keeps hardware at
+30 seconds even though all cached values become 300 seconds afterward.
+
+Publish the proposed value before the synchronous notifier and restore
+the old value on error. Keep the switch-wide minimum across ports intact.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/net/dsa/port.c
++++ b/net/dsa/port.c
+@@ -877,15 +877,20 @@
+ 	unsigned long ageing_jiffies = clock_t_to_jiffies(ageing_clock);
+ 	unsigned int ageing_time = jiffies_to_msecs(ageing_jiffies);
+ 	struct dsa_notifier_ageing_time_info info;
++	unsigned int old_ageing_time = dp->ageing_time;
+ 	int err;
+ 
+ 	info.ageing_time = ageing_time;
+ 
++	/* The switch-wide minimum must include this port's new value, even
++	 * when it is the last port restoring a longer ageing time.
++	 */
++	dp->ageing_time = ageing_time;
+ 	err = dsa_port_notify(dp, DSA_NOTIFIER_AGEING_TIME, &info);
+-	if (err)
++	if (err) {
++		dp->ageing_time = old_ageing_time;
+ 		return err;
+-
+-	dp->ageing_time = ageing_time;
++	}
+ 
+ 	return 0;
+ }
