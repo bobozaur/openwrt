@@ -700,6 +700,22 @@ endef
 $(eval $(call KernelPackage,dsa))
 
 
+define KernelPackage/grx500-eth
+  SUBMENU:=$(NETWORK_DEVICES_MENU)
+  TITLE:=Lantiq GRX500 Ethernet and GSWIP3 switch
+  DEPENDS:=@TARGET_lantiq_grx500 +kmod-dsa +kmod-nf-flow
+  KCONFIG:=CONFIG_NET_GRX500 \
+	CONFIG_NET_DSA_GRX500 \
+	CONFIG_NET_DSA_TAG_GRX500
+  FILES:=$(LINUX_DIR)/drivers/net/ethernet/grx500_eth.ko \
+	$(LINUX_DIR)/drivers/net/dsa/grx500_switch.ko \
+	$(LINUX_DIR)/net/dsa/tag_grx500.ko
+  AUTOLOAD:=$(call AutoProbe,tag_grx500 grx500_switch grx500_eth)
+endef
+
+$(eval $(call KernelPackage,grx500-eth))
+
+
 define KernelPackage/dsa-notag
   SUBMENU:=$(NETWORK_DEVICES_MENU)
   TITLE:=DSA No-op tag driver
