@@ -1,0 +1,39 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: resolve paired WAVE wiphys by physical radio ID
+
+Use the persistent native radio ID and AP role rather than current wiphy
+registration order. Station interfaces continue to resolve through ifindex.
+The suffix matches the native wave-scripts physical topology contract.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/iwinfo_nl80211.c
++++ b/iwinfo_nl80211.c
+@@ -287,6 +287,26 @@
+ 	prefix_len = strlen(prefix);
+ 	if (!strncmp(link, prefix, prefix_len) && strstr(link, "/pci"))
+ 		link += prefix_len;
++
++	/* A WAVE radio has separate AP and station wiphys. Its physical radio
++	 * ID is stable across registration order; only the AP view owns this
++	 * UCI alias. Active station interfaces still resolve by ifindex.
++	 */
++	{
++		char attr[512], role[16];
++		int radio_id;
++
++		snprintf(attr, sizeof(attr), "/sys/class/ieee80211/%s/wave_radio_id", phyname);
++		radio_id = nl80211_readint(attr);
++		if (radio_id >= 0) {
++			snprintf(attr, sizeof(attr), "/sys/class/ieee80211/%s/wave_role", phyname);
++			if (nl80211_readstr(attr, role, sizeof(role)) <= 0 || strcmp(role, "ap"))
++				return NULL;
++			offset = link - path + strlen(link);
++			snprintf(path + offset, sizeof(path) - offset, "+wave%d", radio_id);
++			return link;
++		}
++	}
+ 
+ 	snprintf(buf + buf_len, sizeof(buf) - buf_len, "/ieee80211");
+ 	d = opendir(buf);
