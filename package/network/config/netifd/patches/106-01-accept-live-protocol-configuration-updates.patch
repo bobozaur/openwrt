@@ -1,0 +1,145 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: accept opt-in live protocol configuration updates
+
+Let an up, idle ucode protocol compare its old and new serialized configs
+with a pure config_update callback. Accept only explicit true, copy desired
+state and use the existing renew queue; incompatible interface or device
+changes still use normal teardown/setup.
+
+Admission schedules renewal; it is not proof that asynchronous apply
+succeeded. The protocol retains responsibility for error reporting and its
+normal resulting address, route and link publication.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/interface.c
++++ b/interface.c
+@@ -1572,6 +1572,7 @@ interface_change_config(struct interface
+ {
+ 	struct blob_attr *old_config = if_old->config;
+ 	bool reload = if_old->config_state == IFC_REMOVE;
++	bool proto_changed = false;
+ 	bool reload_ip = false, update_prefix_delegation = false;
+ 
+ 	/*
+@@ -1607,7 +1608,7 @@ interface_change_config(struct interface
+ 		  if_old->name);
+ 	else if (!uci_blob_check_equal(if_old->config, if_new->config,
+ 				       if_old->proto_handler->config_params))
+-		reload = true;
++		proto_changed = true;
+ 
+ #define UPDATE(field, __var) ({						\
+ 		bool __changed = (if_old->field != if_new->field);	\
+@@ -1676,7 +1677,12 @@ interface_change_config(struct interface
+ 		reload = if_old->main_dev.dev != old_dev;
+ 	}
+ 
+-	if (reload) {
++	if (!reload && proto_changed && if_old->proto &&
++	    if_old->state == IFS_UP && if_old->config_state == IFC_NORMAL &&
++	    if_old->proto->config_update)
++		proto_changed = !if_old->proto->config_update(if_old->proto, if_old->config);
++
++	if (reload || proto_changed) {
+ 		D(INTERFACE, "Reload interface '%s' because of config changes",
+ 		  if_old->name);
+ 		interface_clear_errors(if_old);
+--- a/proto-ucode.c
++++ b/proto-ucode.c
+@@ -116,6 +116,56 @@ proto_ucode_handler(struct interface_pro
+ 	return proto_ext_run(state, cmd, force, proto_ucode_start);
+ }
+ 
++static bool
++proto_ucode_config_update(struct interface_proto_state *proto, struct blob_attr *config)
++{
++	struct proto_ext_state *state = container_of(proto, struct proto_ext_state, proto);
++	struct proto_ucode_handler *handler = container_of(proto->handler, struct proto_ucode_handler, proto);
++	struct blob_attr *old, *new, *copy, *previous;
++	uc_value_t *fn, *result;
++	bool accepted;
++
++	if (state->sm != S_IDLE || !(proto->handler->flags & PROTO_FLAG_RENEW_AVAILABLE))
++		return false;
++
++	fn = ucv_resource_value_get(handler->res, 1);
++	if (!ucv_is_callable(fn))
++		return false;
++
++	blobmsg_parse_attr(&proto_ucode_policy, 1, &old, state->config);
++	blobmsg_parse_attr(&proto_ucode_policy, 1, &new, config);
++	if (!old || !new)
++		return false;
++
++	/* A pure callback decides which changes can use the existing instance.
++	 * Pass the serialized configs so no shell or device operation runs here.
++	 */
++	uc_vm_stack_push(&vm, ucv_get(fn));
++	uc_vm_stack_push(&vm, ucv_string_new(blobmsg_get_string(old)));
++	uc_vm_stack_push(&vm, ucv_string_new(blobmsg_get_string(new)));
++	if (uc_vm_call(&vm, false, 2) != EXCEPTION_NONE)
++		return false;
++	result = uc_vm_stack_pop(&vm);
++	accepted = ucv_type(result) == UC_BOOLEAN && ucv_boolean_get(result);
++	ucv_put(result);
++	if (!accepted)
++		return false;
++
++	copy = malloc(blob_pad_len(config));
++	if (!copy)
++		return false;
++	memcpy(copy, config, blob_pad_len(config));
++	previous = state->config;
++	state->config = copy;
++	if (proto->cb(proto, PROTO_CMD_RENEW, false)) {
++		state->config = previous;
++		free(copy);
++		return false;
++	}
++	free(previous);
++	return true;
++}
++
+ static struct interface_proto_state *
+ proto_ucode_attach(const struct proto_handler *h, struct interface *iface,
+ 		   struct blob_attr *attr)
+@@ -133,6 +183,7 @@ proto_ucode_attach(const struct proto_ha
+ 	}
+ 
+ 	state->proto.cb = proto_ucode_handler;
++	state->proto.config_update = proto_ucode_config_update;
+ 
+ 	return &state->proto;
+ }
+@@ -182,7 +233,7 @@ uc_netifd_add_proto_fn(uc_vm_t *vm, size
+ 		return NULL;
+ 
+ 	res = ucv_resource_create_ex(vm, "netifd.proto_handler",
+-				     (void **)&handler, 1,
++				     (void **)&handler, 2,
+ 				     sizeof(*handler) + strlen(name) + 1 +
+ 				     strlen(script_path) + 1);
+ 	if (!res)
+@@ -204,6 +255,9 @@ uc_netifd_add_proto_fn(uc_vm_t *vm, size
+ 	if (ucv_is_callable(config_val)) {
+ 		ucv_resource_value_set(res, 0, ucv_get(config_val));
+ 	}
++	config_val = ucv_object_get(obj, "config_update", NULL);
++	if (ucv_is_callable(config_val))
++		ucv_resource_value_set(res, 1, ucv_get(config_val));
+ 
+ 	flag_val = ucv_object_get(obj, "no-device", NULL);
+ 	if (ucv_is_truish(flag_val))
+--- a/proto.h
++++ b/proto.h
+@@ -59,6 +59,8 @@ struct interface_proto_state {
+ 	/* filled in by the protocol handler */
+ 	int (*notify)(struct interface_proto_state *, struct blob_attr *data);
+ 	int (*cb)(struct interface_proto_state *, enum interface_proto_cmd cmd, bool force);
++	/* Accept a configuration update without tearing down the live instance. */
++	bool (*config_update)(struct interface_proto_state *, struct blob_attr *config);
+ 	void (*free)(struct interface_proto_state *);
+ };
+ 
