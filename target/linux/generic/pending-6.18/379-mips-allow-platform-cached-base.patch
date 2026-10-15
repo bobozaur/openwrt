@@ -1,0 +1,23 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] MIPS: allow a platform to define the cached segment base
+
+The generic spaces header already permits platforms to override IO_BASE.
+Give CAC_BASE the same treatment so an EVA platform can use its mapped
+cached alias without redefining the generic header.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/arch/mips/include/asm/mach-generic/spaces.h
++++ b/arch/mips/include/asm/mach-generic/spaces.h
+@@ -30,7 +30,9 @@
+ #endif /* __ASSEMBLER__ */
+ 
+ #ifdef CONFIG_32BIT
++#ifndef CAC_BASE
+ #define CAC_BASE		_AC(0x80000000, UL)
++#endif
+ #ifndef IO_BASE
+ #define IO_BASE			_AC(0xa0000000, UL)
+ #endif
