@@ -1,0 +1,514 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wifi: rtw88: preserve transport buffer and frame ownership
+
+Keep a USB aggregation container separate from the original MPDUs. Only
+original frames may receive mac80211 TX status; retire the transport
+container on every submission, completion and cancellation path. Remove the
+transport descriptor before returning rejected/aborted original frames to
+mac80211. Include inter-frame padding in aggregation admission and reject unmapped endpoints
+before changing the caller-owned skb. Retire failed TXQ frames and undo a
+failed PCI mapping's descriptor push before returning ownership.
+
+Retain bounded USB worker batches but requeue remaining work after exhausting
+the existing batch limit. Serialize TX requeue with the established key/stop
+admission gate; explicit key drains continue to drive their own batches. Poison
+RX producers and retire deferred RX work before terminal unregistration.
+
+Pass each transport's valid RX extent to the shared descriptor parser before
+it reads PHY/header data. Reject truncated payloads and headers, while
+accepting a valid full-size USB transfer. Ordinary USB completion does not
+supply data ACK/retry totals, so retain requested firmware reports but mark
+incomplete data statistics using the existing mac80211 contract.
+
+This does not establish an RX key-generation fence or attribute a measured
+wireless delay to these source defects.
+
+Retire USB endpoints, RX/TX producers and pending recovery before mac80211
+unregistration. Terminal key/flush callbacks must not restart a disconnected
+transport. Preserve usbcore authorization across disconnect. Withhold PTK0
+replacement capability until RX has a key-generation contract; neither USB
+completion nor a firmware TX report supplies that contract.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/drivers/net/wireless/realtek/rtw88/mac80211.c
++++ b/drivers/net/wireless/realtek/rtw88/mac80211.c
+@@ -597,6 +597,14 @@
+ 
+ 	mutex_lock(&rtwdev->mutex);
+ 
++	/* USB endpoints have already been disabled by the bus owner. Keys are
++	 * being retired with the hardware, not made available for reuse.
++	 */
++	if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags)) {
++		ret = cmd == DISABLE_KEY ? 0 : -ENODEV;
++		goto out;
++	}
++
+ 	rtw_leave_lps_deep(rtwdev);
+ 
+ 	if (cmd == SET_KEY) {
+@@ -760,6 +768,10 @@
+ 	struct rtw_dev *rtwdev = hw->priv;
+ 
+ 	mutex_lock(&rtwdev->mutex);
++	if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags)) {
++		mutex_unlock(&rtwdev->mutex);
++		return;
++	}
+ 	rtw_leave_lps_deep(rtwdev);
+ 
+ 	rtw_hci_flush_queues(rtwdev, queues, drop);
+--- a/drivers/net/wireless/realtek/rtw88/main.c
++++ b/drivers/net/wireless/realtek/rtw88/main.c
+@@ -633,7 +633,8 @@
+ 
+ void rtw_fw_recovery(struct rtw_dev *rtwdev)
+ {
+-	if (!test_bit(RTW_FLAG_RESTARTING, rtwdev->flags))
++	if (!test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags) &&
++	    !test_bit(RTW_FLAG_RESTARTING, rtwdev->flags))
+ 		ieee80211_queue_work(rtwdev->hw, &rtwdev->fw_recovery_work);
+ }
+ EXPORT_SYMBOL(rtw_fw_recovery);
+@@ -683,10 +684,15 @@
+ 					      fw_recovery_work);
+ 
+ 	mutex_lock(&rtwdev->mutex);
++	if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags)) {
++		mutex_unlock(&rtwdev->mutex);
++		return;
++	}
+ 	__fw_recovery_work(rtwdev);
+ 	mutex_unlock(&rtwdev->mutex);
+ 
+-	ieee80211_restart_hw(rtwdev->hw);
++	if (!test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags))
++		ieee80211_restart_hw(rtwdev->hw);
+ }
+ 
+ struct rtw_txq_ba_iter_data {
+@@ -1384,6 +1390,9 @@
+ 	bool wifi_only;
+ 	int ret;
+ 
++	if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags))
++		return -ENODEV;
++
+ 	ret = rtw_hci_setup(rtwdev);
+ 	if (ret) {
+ 		rtw_err(rtwdev, "failed to setup hci\n");
+@@ -1521,6 +1530,9 @@
+ int rtw_core_start(struct rtw_dev *rtwdev)
+ {
+ 	int ret;
++
++	if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags))
++		return -ENODEV;
+ 
+ 	ret = rtwdev->chip->ops->power_on(rtwdev);
+ 	if (ret)
+@@ -2280,6 +2292,9 @@
+ 	ieee80211_hw_set(hw, AMPDU_AGGREGATION);
+ 	ieee80211_hw_set(hw, MFP_CAPABLE);
+ 	ieee80211_hw_set(hw, REPORTS_TX_ACK_STATUS);
++	/* USB completion only confirms transport delivery for ordinary data. */
++	if (rtwdev->hci.type == RTW_HCI_TYPE_USB)
++		ieee80211_hw_set(hw, NO_DATA_TX_STATUS);
+ 	ieee80211_hw_set(hw, SUPPORTS_PS);
+ 	ieee80211_hw_set(hw, SUPPORTS_DYNAMIC_PS);
+ 	ieee80211_hw_set(hw, SUPPORT_FAST_XMIT);
+@@ -2307,7 +2322,9 @@
+ 		hw->wiphy->n_iface_combinations = ARRAY_SIZE(rtw_iface_combs);
+ 	}
+ 
+-	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
++	/* USB RX completion does not fence plaintext from the preceding key. */
++	if (rtw_hci_type(rtwdev) != RTW_HCI_TYPE_USB)
++		wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+ 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_SCAN_RANDOM_SN);
+ 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_SET_SCAN_DWELL);
+ 
+--- a/drivers/net/wireless/realtek/rtw88/main.h
++++ b/drivers/net/wireless/realtek/rtw88/main.h
+@@ -377,6 +377,7 @@
+ 	RTW_FLAG_RESTARTING,
+ 	RTW_FLAG_RESTART_TRIGGERING,
+ 	RTW_FLAG_FORCE_LOWEST_RATE,
++	RTW_FLAG_UNREGISTERING,
+ 
+ 	NUM_OF_RTW_FLAGS,
+ };
+--- a/drivers/net/wireless/realtek/rtw88/pci.c
++++ b/drivers/net/wireless/realtek/rtw88/pci.c
+@@ -829,8 +829,10 @@
+ 	rtw_tx_fill_tx_desc(rtwdev, pkt_info, skb);
+ 	dma = dma_map_single(&rtwpci->pdev->dev, skb->data, skb->len,
+ 			     DMA_TO_DEVICE);
+-	if (dma_mapping_error(&rtwpci->pdev->dev, dma))
++	if (dma_mapping_error(&rtwpci->pdev->dev, dma)) {
++		skb_pull(skb, chip->tx_pkt_desc_sz);
+ 		return -EBUSY;
++	}
+ 
+ 	/* after this we got dma mapped, there is no way back */
+ 	buf_desc = get_tx_buffer_desc(ring, tx_buf_desc_sz);
+@@ -1068,7 +1070,7 @@
+ 		dma_sync_single_for_cpu(rtwdev->dev, dma, RTK_PCI_RX_BUF_SIZE,
+ 					DMA_FROM_DEVICE);
+ 		rx_desc = skb->data;
+-		ret = rtw_rx_query_rx_desc(rtwdev, rx_desc,
++		ret = rtw_rx_query_rx_desc(rtwdev, rx_desc, RTK_PCI_RX_BUF_SIZE,
+ 					   &pkt_stat, &rx_status);
+ 		if (ret)
+ 			goto next_rp;
+--- a/drivers/net/wireless/realtek/rtw88/rx.c
++++ b/drivers/net/wireless/realtek/rtw88/rx.c
+@@ -262,7 +262,7 @@
+ 	}
+ }
+ 
+-int rtw_rx_query_rx_desc(struct rtw_dev *rtwdev, void *rx_desc8,
++int rtw_rx_query_rx_desc(struct rtw_dev *rtwdev, void *rx_desc8, size_t len,
+ 			 struct rtw_rx_pkt_stat *pkt_stat,
+ 			 struct ieee80211_rx_status *rx_status)
+ {
+@@ -271,6 +271,9 @@
+ 	struct ieee80211_hdr *hdr;
+ 	u32 enc_type, swdec;
+ 	void *phy_status;
++
++	if (unlikely(len < desc_sz || len < sizeof(*rx_desc)))
++		return -EINVAL;
+ 
+ 	memset(pkt_stat, 0, sizeof(*pkt_stat));
+ 
+@@ -311,16 +314,23 @@
+ 
+ 	/* drv_info_sz is in unit of 8-bytes */
+ 	pkt_stat->drv_info_sz *= 8;
++	/* Validate the completed transport buffer before touching PHY/header data. */
++	if (unlikely(desc_sz + pkt_stat->shift + pkt_stat->drv_info_sz +
++		     pkt_stat->pkt_len > len))
++		return -EINVAL;
+ 
+ 	/* c2h cmd pkt's rx/phy status is not interested */
+ 	if (pkt_stat->is_c2h)
+-		return 0;
+-
+-	if (unlikely(pkt_stat->pkt_len <= FCS_LEN))
++		return pkt_stat->pkt_len < sizeof(struct rtw_c2h_cmd) ? -EINVAL : 0;
++
++	if (unlikely(pkt_stat->pkt_len < sizeof(hdr->frame_control) + FCS_LEN))
+ 		return -EINVAL;
+ 
+ 	phy_status = rx_desc8 + desc_sz + pkt_stat->shift;
+ 	hdr = phy_status + pkt_stat->drv_info_sz;
++	if (unlikely(pkt_stat->pkt_len < ieee80211_hdrlen(hdr->frame_control) +
++		     FCS_LEN))
++		return -EINVAL;
+ 	pkt_stat->hdr = hdr;
+ 
+ 	if (pkt_stat->phy_status)
+--- a/drivers/net/wireless/realtek/rtw88/rx.h
++++ b/drivers/net/wireless/realtek/rtw88/rx.h
+@@ -45,7 +45,7 @@
+ 
+ void rtw_rx_stats(struct rtw_dev *rtwdev, struct ieee80211_vif *vif,
+ 		  struct sk_buff *skb);
+-int rtw_rx_query_rx_desc(struct rtw_dev *rtwdev, void *rx_desc8,
++int rtw_rx_query_rx_desc(struct rtw_dev *rtwdev, void *rx_desc8, size_t len,
+ 			 struct rtw_rx_pkt_stat *pkt_stat,
+ 			 struct ieee80211_rx_status *rx_status);
+ void rtw_update_rx_freq_from_ie(struct rtw_dev *rtwdev, struct sk_buff *skb,
+--- a/drivers/net/wireless/realtek/rtw88/sdio.c
++++ b/drivers/net/wireless/realtek/rtw88/sdio.c
+@@ -995,7 +995,7 @@
+ 
+ 	while (true) {
+ 		rx_desc = skb->data;
+-		ret = rtw_rx_query_rx_desc(rtwdev, rx_desc,
++		ret = rtw_rx_query_rx_desc(rtwdev, rx_desc, rx_len,
+ 					   &pkt_stat, &rx_status);
+ 		if (ret) {
+ 			dev_kfree_skb_any(skb);
+--- a/drivers/net/wireless/realtek/rtw88/tx.c
++++ b/drivers/net/wireless/realtek/rtw88/tx.c
+@@ -687,7 +687,8 @@
+ 
+ 		ret = rtw_txq_push_skb(rtwdev, rtwtxq, skb);
+ 		if (ret) {
+-			rtw_err(rtwdev, "failed to pusk skb, ret %d\n", ret);
++			rtw_err(rtwdev, "failed to push skb, ret %d\n", ret);
++			ieee80211_free_txskb(rtwdev->hw, skb);
+ 			break;
+ 		}
+ 	}
+--- a/drivers/net/wireless/realtek/rtw88/usb.c
++++ b/drivers/net/wireless/realtek/rtw88/usb.c
+@@ -29,6 +29,7 @@
+ struct rtw_usb_txcb {
+ 	struct rtw_dev *rtwdev;
+ 	struct sk_buff_head tx_ack_queue;
++	struct sk_buff *aggregate;
+ };
+ 
+ static void rtw_usb_fill_tx_checksum(struct rtw_usb *rtwusb,
+@@ -320,6 +321,17 @@
+ 	return 0;
+ }
+ 
++static void rtw_usb_free_tx_queue(struct rtw_dev *rtwdev,
++				struct sk_buff_head *queue)
++{
++	struct sk_buff *skb;
++
++	while ((skb = skb_dequeue(queue))) {
++		skb_pull(skb, rtwdev->chip->tx_pkt_desc_sz);
++		ieee80211_free_txskb(rtwdev->hw, skb);
++	}
++}
++
+ static void rtw_usb_write_port_tx_complete(struct urb *urb)
+ {
+ 	struct rtw_usb_txcb *txcb = urb->context;
+@@ -364,6 +376,8 @@
+ 		ieee80211_tx_status_irqsafe(hw, skb);
+ 	}
+ 
++	/* An aggregate is a USB container, not another transmitted MPDU. */
++	dev_kfree_skb_any(txcb->aggregate);
+ 	kfree(txcb);
+ }
+ 
+@@ -425,25 +439,29 @@
+ 		return false;
+ 
+ 	txcb->rtwdev = rtwdev;
++	txcb->aggregate = NULL;
+ 	skb_queue_head_init(&txcb->tx_ack_queue);
+ 
+ 	skb_iter = skb_dequeue(list);
+ 
+ 	if (skb_queue_empty(list)) {
+ 		skb_head = skb_iter;
++		skb_queue_tail(&txcb->tx_ack_queue, skb_iter);
+ 		goto queue;
+ 	}
+ 
+ 	skb_head = dev_alloc_skb(RTW_USB_MAX_XMITBUF_SZ);
+ 	if (!skb_head) {
+ 		skb_head = skb_iter;
++		skb_queue_tail(&txcb->tx_ack_queue, skb_iter);
+ 		goto queue;
+ 	}
++	txcb->aggregate = skb_head;
+ 
+ 	while (skb_iter) {
+ 		unsigned long flags;
+ 
+-		skb_put(skb_head, align_next);
++		skb_put_zero(skb_head, align_next);
+ 		skb_put_data(skb_head, skb_iter->data, skb_iter->len);
+ 
+ 		align_next = ALIGN(skb_iter->len, 8) - skb_iter->len;
+@@ -457,7 +475,8 @@
+ 		skb_iter = skb_peek(list);
+ 
+ 		if (skb_iter &&
+-		    skb_iter->len + skb_head->len <= RTW_USB_MAX_XMITBUF_SZ &&
++		    skb_iter->len + skb_head->len + align_next <=
++						RTW_USB_MAX_XMITBUF_SZ &&
+ 		    agg_num < rtwdev->chip->usb_tx_agg_desc_num)
+ 			__skb_unlink(skb_iter, list);
+ 		else
+@@ -469,7 +488,6 @@
+ 		rtw_usb_fill_tx_checksum(rtwusb, skb_head, agg_num);
+ 
+ queue:
+-	skb_queue_tail(&txcb->tx_ack_queue, skb_head);
+ 	tx_desc = (struct rtw_tx_desc *)skb_head->data;
+ 	qsel = le32_get_bits(tx_desc->w1, RTW_TX_DESC_W1_QSEL);
+ 
+@@ -480,7 +498,8 @@
+ 		 * the key-update caller mistakes an empty queue for delivery.
+ 		 */
+ 		atomic_cmpxchg(&rtwusb->tx_error, 0, ret);
+-		ieee80211_purge_tx_queue(rtwdev->hw, &txcb->tx_ack_queue);
++		rtw_usb_free_tx_queue(rtwdev, &txcb->tx_ack_queue);
++		dev_kfree_skb_any(txcb->aggregate);
+ 		kfree(txcb);
+ 		return false;
+ 	}
+@@ -491,6 +510,7 @@
+ static void rtw_usb_tx_handler(struct work_struct *work)
+ {
+ 	struct rtw_usb *rtwusb = container_of(work, struct rtw_usb, tx_work);
++	bool pending = false;
+ 	int i, limit;
+ 
+ 	for (i = ARRAY_SIZE(rtwusb->tx_queue) - 1; i >= 0; i--) {
+@@ -500,7 +520,15 @@
+ 			if (!rtw_usb_tx_agg_skb(rtwusb, list))
+ 				break;
+ 		}
+-	}
++		if (limit == 200 && !skb_queue_empty(&rtwusb->tx_queue[i]))
++			pending = true;
++	}
++
++	/* A producer kick may have coalesced with this bounded invocation. */
++	spin_lock_bh(&rtwusb->tx_lock);
++	if (pending && !rtwusb->tx_paused)
++		queue_work(rtwusb->txwq, &rtwusb->tx_work);
++	spin_unlock_bh(&rtwusb->tx_lock);
+ }
+ 
+ static void rtw_usb_tx_queue_purge(struct rtw_usb *rtwusb)
+@@ -509,7 +537,7 @@
+ 	int i;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(rtwusb->tx_queue); i++)
+-		ieee80211_purge_tx_queue(rtwdev->hw, &rtwusb->tx_queue[i]);
++		rtw_usb_free_tx_queue(rtwdev, &rtwusb->tx_queue[i]);
+ }
+ 
+ static void rtw_usb_pause_tx(struct rtw_usb *rtwusb)
+@@ -590,6 +618,8 @@
+ 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
+ 
+ 	lockdep_assert_held(&rtwdev->mutex);
++	if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags))
++		return -ENODEV;
+ 	if (rtwusb->tx_failed)
+ 		return -EIO;
+ 	rtw_usb_pause_tx(rtwusb);
+@@ -601,6 +631,8 @@
+ 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
+ 
+ 	lockdep_assert_held(&rtwdev->mutex);
++	if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags))
++		return;
+ 	if (!success) {
+ 		/* DISABLE_KEY errors do not prevent mac80211 trying SET_KEY.
+ 		 * Keep data and subsequent CAM updates blocked until restart.
+@@ -782,9 +814,11 @@
+ 	int ep;
+ 
+ 	pkt_info->qsel = rtw_usb_tx_queue_mapping_to_qsel(rtwusb, skb);
++	ep = qsel_to_ep(rtwusb, pkt_info->qsel);
++	if (ep < 0)
++		return ep;
+ 	pkt_desc = skb_push(skb, chip->tx_pkt_desc_sz);
+ 	memset(pkt_desc, 0, chip->tx_pkt_desc_sz);
+-	ep = qsel_to_ep(rtwusb, pkt_info->qsel);
+ 	rtw_tx_fill_tx_desc(rtwdev, pkt_info, skb);
+ 	rtw_tx_fill_txdesc_checksum(rtwdev, pkt_info, skb->data);
+ 	tx_data = rtw_usb_get_tx_data(skb);
+@@ -824,7 +858,7 @@
+ 	u32 pkt_desc_sz = rtwdev->chip->rx_pkt_desc_sz;
+ 	u32 max_skb_len = pkt_desc_sz + PHY_STATUS_SIZE * 8 +
+ 			  IEEE80211_MAX_MPDU_LEN_VHT_11454;
+-	u32 pkt_offset, next_pkt, skb_len;
++	u32 pkt_offset, next_pkt, skb_len, remaining;
+ 	int limit, ret;
+ 	u8 *rx_desc;
+ 
+@@ -840,9 +874,10 @@
+ 		}
+ 
+ 		rx_desc = rx_skb->data;
++		remaining = rx_skb->len;
+ 
+ 		do {
+-			ret = rtw_rx_query_rx_desc(rtwdev, rx_desc,
++			ret = rtw_rx_query_rx_desc(rtwdev, rx_desc, remaining,
+ 						   &pkt_stat, &rx_status);
+ 			if (ret)
+ 				break;
+@@ -882,14 +917,20 @@
+ 
+ skip_packet:
+ 			next_pkt = round_up(skb_len, 8);
++			if (next_pkt > remaining)
++				break;
+ 			rx_desc += next_pkt;
+-		} while (rx_desc + pkt_desc_sz < rx_skb->data + rx_skb->len);
++			remaining -= next_pkt;
++		} while (remaining >= pkt_desc_sz);
+ 
+ 		if (skb_queue_len(&rtwusb->rx_free_queue) >= RTW_USB_RX_SKB_NUM)
+ 			dev_kfree_skb_any(rx_skb);
+ 		else
+ 			skb_queue_tail(&rtwusb->rx_free_queue, rx_skb);
+ 	}
++
++	if (limit == 200 && !skb_queue_empty(&rtwusb->rx_queue))
++		queue_work(rtwusb->rxwq, &rtwusb->rx_work);
+ }
+ 
+ static void rtw_usb_read_port_complete(struct urb *urb);
+@@ -960,7 +1001,7 @@
+ 	struct sk_buff *skb = rxcb->rx_skb;
+ 
+ 	if (urb->status == 0) {
+-		if (urb->actual_length >= RTW_USB_MAX_RECVBUF_SZ ||
++		if (urb->actual_length > RTW_USB_MAX_RECVBUF_SZ ||
+ 		    urb->actual_length < 24) {
+ 			rtw_err(rtwdev, "failed to get urb length:%d\n",
+ 				urb->actual_length);
+@@ -1001,8 +1042,11 @@
+ 
+ 	for (i = 0; i < RTW_USB_RXCB_NUM; i++) {
+ 		rxcb = &rtwusb->rx_cb[i];
+-		usb_kill_urb(rxcb->rx_urb);
+-	}
++		/* Disconnect is terminal, including deferred allocation retries. */
++		usb_poison_urb(rxcb->rx_urb);
++	}
++	cancel_work_sync(&rtwusb->rx_urb_work);
++	cancel_work_sync(&rtwusb->rx_work);
+ }
+ 
+ static void rtw_usb_free_rx_bufs(struct rtw_usb *rtwusb)
+@@ -1047,6 +1091,9 @@
+ 	struct rtw_usb *rtwusb = rtw_get_usb_priv(rtwdev);
+ 	struct rtw_sec_desc *sec = &rtwdev->sec;
+ 	unsigned long idx;
++
++	if (test_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags))
++		return -ENODEV;
+ 
+ 	/* Only a hardware restart may reopen a failed key transition. */
+ 	if (rtwusb->tx_failed || test_bit(RTW_FLAG_RESTARTING, rtwdev->flags)) {
+@@ -1611,13 +1658,27 @@
+ 	rtwdev = hw->priv;
+ 	rtwusb = rtw_get_usb_priv(rtwdev);
+ 
++	/* usbcore disables endpoints before disconnect unless soft_unbind is
++	 * requested. Do not treat the ensuing mac80211 key/flush retirement as
++	 * an active transport failure or schedule firmware recovery for it.
++	 */
++	set_bit(RTW_FLAG_UNREGISTERING, rtwdev->flags);
+ 	rtw_usb_cancel_rx_bufs(rtwusb);
++	mutex_lock(&rtwdev->mutex);
++	rtw_usb_pause_tx(rtwusb);
++	rtw_usb_abort_tx(rtwusb);
++	mutex_unlock(&rtwdev->mutex);
++	cancel_work_sync(&rtwdev->fw_recovery_work);
+ 
+ 	rtw_unregister_hw(rtwdev, hw);
+ 	rtw_usb_deinit_tx(rtwdev);
+ 	rtw_usb_deinit_rx(rtwdev);
+ 
+-	if (rtwusb->udev->state != USB_STATE_NOTATTACHED)
++	/* A deauthorized device must remain owned by usbcore's authorization
++	 * policy. Reset failure can otherwise re-enumerate it as authorized.
++	 */
++	if (rtwusb->udev->authorized &&
++	    rtwusb->udev->state != USB_STATE_NOTATTACHED)
+ 		usb_reset_device(rtwusb->udev);
+ 
+ 	rtw_usb_free_rx_bufs(rtwusb);
