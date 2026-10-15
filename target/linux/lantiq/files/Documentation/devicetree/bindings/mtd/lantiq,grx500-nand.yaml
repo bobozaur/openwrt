@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/mtd/lantiq,grx500-nand.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Lantiq GRX500 EBU NAND interface
+
+maintainers:
+  - OpenWrt Development List <openwrt-devel@lists.openwrt.org>
+
+description: |
+  A single NAND chip shares this node with its EBU controller. The NAND access
+  window includes the command/address latch aliases; the second window holds
+  the EBU timing and ready/busy registers. Supported flash geometry is 2048-byte
+  pages, 64-byte OOB and 128-KiB eraseblocks, with software BCH4 per 512 bytes.
+  Fixed partitions describe bootloader and per-device data as well as UBI.
+
+allOf:
+  - $ref: nand-chip.yaml#
+
+properties:
+  compatible:
+    const: lantiq,grx500-nand
+  reg:
+    items:
+      - description: NAND data and command/address latch window
+      - description: EBU configuration registers
+  reg-names:
+    items:
+      - const: nand
+      - const: ebu
+  nand-bus-width:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 8
+  nand-use-soft-ecc-engine: true
+  nand-ecc-algo:
+    const: bch
+  nand-ecc-step-size:
+    const: 512
+  nand-ecc-strength:
+    const: 4
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - nand-bus-width
+  - nand-use-soft-ecc-engine
+  - nand-ecc-algo
+  - nand-ecc-step-size
+  - nand-ecc-strength
+
+unevaluatedProperties: false
