@@ -51,6 +51,18 @@
 #define MDIO_DATA	(GSW_TOP + 0x14)
 #define MDIO_POLL	(GSW_TOP + 0x1c)
 #define PHY_ADDR(i)	(GSW_TOP + 0x110 + (i) * 0x10)
+#define PHY_ADDR_FCON_TX	GENMASK(8, 7)
+#define PHY_ADDR_FCON_RX	GENMASK(6, 5)
+#define PHY_ADDR_FCON_TX_EN BIT(8)
+#define PHY_ADDR_FCON_RX_EN BIT(6)
+#define MAC_CTRL0	(0x903 * 4)
+#define MAC_CTRL0_FCON	GENMASK(6, 4)
+#define MAC_CTRL0_FCON_RX	BIT(4)
+#define MAC_CTRL0_FCON_TX	BIT(5)
+#define MAC_CTRL0_FCON_OFF BIT(6)
+#define SDMA_PCTRL(p)	((0xbc0 + 6 * (p)) * 4)
+#define SDMA_PCTRL_FCEN	BIT(1)
+#define GRX500_PAUSE_REGS_COUNT 43
 #define PHY_FW_ADDR(i)	(GSW_TOP + 0x228 + (i) * 0x10)
 #define PCE_TABLE_CTRL	(0x44f * 4)
 #define PCE_TABLE_ADDR	(0x44e * 4)
@@ -247,6 +259,10 @@ struct grx500_eth {
 	struct grx500_tx_buffer tx_buffer[TX_COUNT];
 	struct mii_bus *mdio;
 	struct phy_device *phydev;
+	/* Requested WAN policy; PHY locking also serializes its MAC updates. */
+	bool pause_autoneg;
+	bool tx_pause;
+	bool rx_pause;
 	bool wan;
 	struct napi_struct napi;
 	struct delayed_work recheck_work;
@@ -718,10 +734,128 @@ static int grx500_bus_write(struct mii_bus *bus, int address, int reg, u16 data)
 				5, 10000, true, eth->gsw + MDIO_CTRL);
 }
 
+static void grx500_wan_set_pause(struct grx500_eth *eth, bool tx, bool rx)
+{
+	u32 mac = (tx ? MAC_CTRL0_FCON_TX : 0) |
+		  (rx ? MAC_CTRL0_FCON_RX : 0);
+	u32 phy = (tx ? PHY_ADDR_FCON_TX_EN : PHY_ADDR_FCON_TX) |
+		  (rx ? PHY_ADDR_FCON_RX_EN : PHY_ADDR_FCON_RX);
+	u32 value;
+
+	lockdep_assert_held(&eth->phydev->lock);
+	if (!mac)
+		mac = MAC_CTRL0_FCON_OFF;
+	/* WAN logical port 15 is physical MAC/PHY bank 0. GSWIP3 uses force
+	 * value 2 for enable and 3 for disable; polling still owns speed/duplex.
+	 */
+	value = __raw_readl(eth->gsw + MAC_CTRL0);
+	grx500_writel(eth->gsw, MAC_CTRL0, (value & ~MAC_CTRL0_FCON) | mac);
+	value = __raw_readl(eth->gsw + PHY_ADDR(0));
+	grx500_writel(eth->gsw, PHY_ADDR(0),
+		      (value & ~(PHY_ADDR_FCON_TX | PHY_ADDR_FCON_RX)) | phy);
+	value = __raw_readl(eth->gsw + SDMA_PCTRL(15));
+	grx500_writel(eth->gsw, SDMA_PCTRL(15),
+		      (value & ~SDMA_PCTRL_FCEN) | (tx ? SDMA_PCTRL_FCEN : 0));
+}
+
+static void grx500_wan_apply_pause(struct grx500_eth *eth)
+{
+	struct phy_device *phydev = eth->phydev;
+	bool tx = false, rx = false;
+
+	lockdep_assert_held(&phydev->lock);
+	if (READ_ONCE(eth->running) && phydev->link &&
+	    phydev->duplex == DUPLEX_FULL) {
+		if (!eth->pause_autoneg) {
+			tx = eth->tx_pause;
+			rx = eth->rx_pause;
+		} else if (phydev->autoneg == AUTONEG_ENABLE &&
+			   phydev->autoneg_complete) {
+			phy_get_pause(phydev, &tx, &rx);
+		}
+	}
+	grx500_wan_set_pause(eth, tx, rx);
+}
+
 static void grx500_wan_adjust_link(struct net_device *netdev)
 {
-	/* The switch's MDIO polling updates MAC speed/duplex automatically. */
+	grx500_wan_apply_pause(netdev_priv(netdev));
 	phy_print_status(netdev->phydev);
+}
+
+static void grx500_wan_get_pauseparam(struct net_device *netdev,
+				    struct ethtool_pauseparam *pause)
+{
+	struct grx500_eth *eth = netdev_priv(netdev);
+
+	mutex_lock(&eth->phydev->lock);
+	pause->autoneg = eth->pause_autoneg;
+	pause->tx_pause = eth->tx_pause;
+	pause->rx_pause = eth->rx_pause;
+	mutex_unlock(&eth->phydev->lock);
+}
+
+static int grx500_wan_set_pauseparam(struct net_device *netdev,
+				   struct ethtool_pauseparam *pause)
+{
+	struct grx500_eth *eth = netdev_priv(netdev);
+	struct phy_device *phydev = eth->phydev;
+
+	if (!phy_validate_pause(phydev, pause))
+		return -EINVAL;
+
+	mutex_lock(&phydev->lock);
+	eth->pause_autoneg = !!pause->autoneg;
+	eth->tx_pause = !!pause->tx_pause;
+	eth->rx_pause = !!pause->rx_pause;
+	mutex_unlock(&phydev->lock);
+
+	/* Like phylink, let phylib restart negotiation when advertising changes.
+	 * A manual-policy change also needs applying without a link transition.
+	 */
+	phy_set_asym_pause(phydev, pause->rx_pause, pause->tx_pause);
+	mutex_lock(&phydev->lock);
+	grx500_wan_apply_pause(eth);
+	mutex_unlock(&phydev->lock);
+	return 0;
+}
+
+static int grx500_wan_get_regs_len(struct net_device *netdev)
+{
+	return GRX500_PAUSE_REGS_COUNT * sizeof(u32);
+}
+
+static void grx500_wan_get_regs(struct net_device *netdev,
+				struct ethtool_regs *regs, void *data)
+{
+	struct grx500_eth *eth = netdev_priv(netdev);
+	u32 *values = data;
+	unsigned int bank, port, mac, reg;
+	void __iomem *base;
+
+	/* Version 1: native-endian u32 words, GSW-L then GSW-R. Each bank
+	 * starts with SDMA_FCTHR1..4, followed by physical ports 2..5 (L) or
+	 * 15 (R). Each port contributes MAC_CTRL0, MAC_PSTAT, PHY_ADDR,
+	 * MDIO_STAT, SDMA_PCTRL, SDMA_PFCTHR8, SDMA_PFCTHR9, in that order.
+	 * These are ordinary read-only snapshots, without read-clear fields;
+	 * link/configuration changes can occur between individual reads.
+	 */
+	regs->version = 1;
+	for (bank = 0; bank < ARRAY_SIZE(eth->board->gsw); bank++) {
+		base = eth->board->gsw[bank];
+		for (reg = 0xb41; reg <= 0xb44; reg++)
+			*values++ = __raw_readl(base + reg * 4);
+		for (port = bank ? 15 : 2; port <= (bank ? 15 : 5); port++) {
+			mac = bank ? 0 : port - 1;
+			*values++ = __raw_readl(base + MAC_CTRL0 + mac * 12 * 4);
+			*values++ = __raw_readl(base + (0x900 + mac * 12) * 4);
+			*values++ = __raw_readl(base + PHY_ADDR(mac));
+			*values++ = __raw_readl(base + PHY_ADDR(mac) + 4);
+			*values++ = __raw_readl(base + SDMA_PCTRL(port));
+			*values++ = __raw_readl(base + (0xb80 + port * 2) * 4);
+			*values++ = __raw_readl(base + (0xb81 + port * 2) * 4);
+		}
+	}
 }
 
 static int grx500_rmon_read32(struct grx500_eth *eth, u8 table, u8 offset,
@@ -887,6 +1021,10 @@ static const struct ethtool_ops grx500_wan_ethtool_ops = {
 	.get_link_ksettings = phy_ethtool_get_link_ksettings,
 	.set_link_ksettings = phy_ethtool_set_link_ksettings,
 	.nway_reset = phy_ethtool_nway_reset,
+	.get_pauseparam = grx500_wan_get_pauseparam,
+	.set_pauseparam = grx500_wan_set_pauseparam,
+	.get_regs_len = grx500_wan_get_regs_len,
+	.get_regs = grx500_wan_get_regs,
 	.get_strings = grx500_wan_get_strings,
 	.get_sset_count = grx500_wan_get_sset_count,
 	.get_ethtool_stats = grx500_wan_get_ethtool_stats,
@@ -932,6 +1070,10 @@ static int grx500_mdio_register(struct grx500_eth *eth)
 		of_node_put(phy);
 		if (!eth->phydev)
 			return -ENODEV;
+		eth->pause_autoneg = true;
+		eth->tx_pause = true;
+		eth->rx_pause = true;
+		phy_support_asym_pause(eth->phydev);
 		eth->netdev->ethtool_ops = &grx500_wan_ethtool_ops;
 	}
 	return 0;

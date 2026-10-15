@@ -63,6 +63,17 @@
 #define FDMA_VLANMOD_MASK GENMASK(4, 3)
 #define FDMA_VLANMOD_BOTH (3 << 3)
 #define SDMA_PCTRL(p)	(0xbc0 + 6 * (p))
+#define SDMA_PCTRL_FCEN	BIT(1)
+#define MAC_CTRL0(p)	(0x903 + 12 * ((p) - 1))
+#define MAC_CTRL0_FCON	GENMASK(6, 4)
+#define MAC_CTRL0_FCON_RX	BIT(4)
+#define MAC_CTRL0_FCON_TX	BIT(5)
+#define MAC_CTRL0_FCON_OFF BIT(6)
+#define PHY_ADDR(p)	(0xf44 + 4 * ((p) - 1))
+#define PHY_ADDR_FCON_TX	GENMASK(8, 7)
+#define PHY_ADDR_FCON_RX	GENMASK(6, 5)
+#define PHY_ADDR_FCON_TX_EN BIT(8)
+#define PHY_ADDR_FCON_RX_EN BIT(6)
 #define TABLE_BUSY	BIT(15)
 #define TABLE_VALID	BIT(12)
 #define TABLE_WRITE	BIT(5)
@@ -1462,6 +1473,30 @@ static void grx500_phylink_get_caps(struct dsa_switch *ds, int port,
 {
 	__set_bit(PHY_INTERFACE_MODE_INTERNAL, config->supported_interfaces);
 	config->mac_capabilities = port ? MAC_10 | MAC_100 | MAC_1000FD : MAC_1000FD;
+	if (GRX500_LAN_PORTS & BIT(port))
+		config->mac_capabilities |= MAC_SYM_PAUSE | MAC_ASYM_PAUSE;
+}
+
+static void grx500_port_set_pause(struct grx500_switch *sw, int port,
+				  bool tx, bool rx)
+{
+	u32 mac = (tx ? MAC_CTRL0_FCON_TX : 0) |
+		  (rx ? MAC_CTRL0_FCON_RX : 0);
+	u32 phy = (tx ? PHY_ADDR_FCON_TX_EN : PHY_ADDR_FCON_TX) |
+		  (rx ? PHY_ADDR_FCON_RX_EN : PHY_ADDR_FCON_RX);
+
+	lockdep_assert_held(&sw->pce_lock);
+	if (!(GRX500_LAN_PORTS & BIT(port)))
+		return;
+	if (!mac)
+		mac = MAC_CTRL0_FCON_OFF;
+	/* GSW-L PHY ports use bank port - 1, with GSWIP3 force values 2/3
+	 * for enable/disable. CPU/P2P and speed/duplex polling stay unchanged.
+	 */
+	grx500_update(sw, MAC_CTRL0(port), MAC_CTRL0_FCON, mac);
+	grx500_update(sw, PHY_ADDR(port), PHY_ADDR_FCON_TX | PHY_ADDR_FCON_RX, phy);
+	grx500_update(sw, SDMA_PCTRL(port), SDMA_PCTRL_FCEN,
+		       tx ? SDMA_PCTRL_FCEN : 0);
 }
 
 static void grx500_mac_config(struct phylink_config *config, unsigned int mode,
@@ -1477,6 +1512,7 @@ static void grx500_mac_link_down(struct phylink_config *config, unsigned int mod
 	struct grx500_switch *sw = dp->ds->priv;
 
 	mutex_lock(&sw->pce_lock);
+	grx500_port_set_pause(sw, dp->index, false, false);
 	if (sw->invalidate_flows)
 		sw->invalidate_flows(sw->flow_owner);
 	sw->ports[dp->index].link = false;
@@ -1492,6 +1528,8 @@ static void grx500_mac_link_up(struct phylink_config *config, struct phy_device 
 	struct grx500_switch *sw = dp->ds->priv;
 
 	mutex_lock(&sw->pce_lock);
+	grx500_port_set_pause(sw, dp->index, duplex == DUPLEX_FULL && tx_pause,
+			      duplex == DUPLEX_FULL && rx_pause);
 	sw->ports[dp->index].link = true;
 	grx500_port_gate(sw, dp->index, !sw->failed || !dp->index);
 	mutex_unlock(&sw->pce_lock);
