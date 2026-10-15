@@ -1,0 +1,4412 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wave: publish acknowledged native radio policy
+
+Keep WMM, power, RTS, TXOP and airtime policy transactional. Admit the existing
+firmware corrections by exact loaded spans, preserve native error propagation
+and retain the final observational GET and rollback semantics.
+
+This is the final native integration against the pinned vendor source.
+Firmware-dependent policy remains downstream with exact image admission.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+---
+--- a/wireless/driver/linux/core_ab.c
++++ b/wireless/driver/linux/core_ab.c
+@@ -73,6 +73,7 @@
+ };
+ 
+ static const mtlk_ability_id_t _core_ap_general_abilities[] = {
++  WAVE_CORE_REQ_STA_ROLE,
+   WAVE_CORE_REQ_AP_CONNECT_STA,
+   WAVE_CORE_REQ_AP_DISCONNECT_STA,
+   WAVE_CORE_REQ_AP_DISCONNECT_ALL,
+@@ -85,6 +86,7 @@
+   WAVE_CORE_REQ_GET_UNCONNECTED_STATION,
+   WAVE_CORE_REQ_SET_RTLOG_CFG,
+   WAVE_CORE_REQ_SET_ATF_QUOTAS,
++  WAVE_CORE_REQ_SET_AIRTIME_WEIGHT,
+   WAVE_CORE_REQ_GET_TX_POWER,
+   WAVE_CORE_REQ_SET_HT_PROTECTION,
+   WAVE_CORE_REQ_GET_HT_PROTECTION
+@@ -106,6 +108,7 @@
+   WAVE_CORE_REQ_GET_AUTH_CFG,
+   WAVE_CORE_REQ_GET_ENCEXT_CFG,
+   WAVE_CORE_REQ_SET_ENCEXT_CFG,
++  WAVE_CORE_REQ_REVOKE_KEY,
+   WAVE_CORE_REQ_SET_DEFAULT_KEY_CFG
+ };
+ 
+@@ -117,6 +120,7 @@
+ };
+ 
+ static const mtlk_ability_id_t _core_sta_connect_abilities[] = {
++  WAVE_CORE_REQ_STA_ROLE,
+   WAVE_CORE_REQ_AP_CONNECT_STA,
+   WAVE_CORE_REQ_AP_DISCONNECT_STA,
+   WAVE_CORE_REQ_AP_DISCONNECT_ALL,
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -17,8 +17,14 @@
+  *
+  */
+ #include "mtlkinc.h"
++#include <linux/slab.h>
+ #include "core.h"
+ #include "core_config.h"
++#include "fw_recovery.h"
++#include "fixed_data_power.h"
++#include "rts_threshold.h"
++#include "mtlk_psdb.h"
++#include "bitrate.h"
+ #include "mtlk_df_nbuf.h"
+ #include "mtlk_vap_manager.h"
+ #include "eeprom.h"
+@@ -69,7 +75,7 @@
+     *status = pPollClient->isActive;
+ 
+     if (*status) {
+-      sta->activity_timestamp = mtlk_osal_timestamp();
++      mtlk_sta_record_activity(sta);
+     }
+   }
+   else {
+@@ -106,38 +112,12 @@
+     sta = mtlk_stadb_find_sta(&core->slow_ctx->stadb, addr->au8Addr);
+     if(NULL == sta) {
+       WLOG_DY("CID-%04x: station %Y not found", mtlk_vap_get_oid(core->vap_handle), addr->au8Addr);
+-      MTLK_CLPB_EXIT(MTLK_ERR_UNKNOWN);
++      MTLK_CLPB_EXIT(MTLK_ERR_NO_ENTRY);
+     }
+ 
+     res = poll_client_req(core->vap_handle, sta, &status);
+ 
+-    /* reset "filled"  bitstring (update it after each new variable is filled in the station info structure) */
+-    info_data->stinfo->filled = 0;
+-
+-    /* connected time (in seconds) */
+-    info_data->stinfo->connected_time = mtlk_sta_get_age(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-    info_data->stinfo->filled |= STATION_INFO_CONNECTED_TIME;
+-#else
+-    info_data->stinfo->filled |= BIT(NL80211_STA_INFO_CONNECTED_TIME);
+-#endif
+-
+-    /* inactive time (in milliseconds) */
+-    info_data->stinfo->inactive_time = mtlk_sta_get_inactive_time(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-    info_data->stinfo->filled |= STATION_INFO_INACTIVE_TIME;
+-#else
+-    info_data->stinfo->filled |= BIT(NL80211_STA_INFO_INACTIVE_TIME);
+-#endif
+-
+-    /* the value is signed, therefore decided to use signal
+-       field of station_info structure, not max_rssi, which is unsigned */
+-    info_data->stinfo->signal = mtlk_sta_get_mgmt_max_rssi(sta);
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 0, 0)
+-    info_data->stinfo->filled |= STATION_INFO_SIGNAL;
+-#else
+-    info_data->stinfo->filled |= BIT(NL80211_STA_INFO_SIGNAL);
+-#endif
++    mtlk_sta_fill_station_info(sta, info_data->stinfo);
+ 
+     mtlk_sta_decref(sta); /* De-reference of find */
+ 
+@@ -147,174 +127,123 @@
+   MTLK_CLPB_END
+ }
+ 
+-/* Send current WMM params to FW and set vap_in_fw_is_active to TRUE if sending succeeded */
++/* Each VAP owns its complete EDCA table. The master serializer orders both
++ * initial application and individual native queue updates. */
+ static int
+-_mtlk_core_cfg_wmm_param_send(mtlk_core_t *core)
+-{
++_mtlk_core_cfg_wmm_param_get(mtlk_core_t *core,
++                           struct mtlk_txq_params table[UMI_AC_NUM_ACS])
++{
++  mtlk_pdb_t *pdb = mtlk_vap_get_param_db(core->vap_handle);
++  int i, res;
++
++  for (i = 0; i < UMI_AC_NUM_ACS; i++) {
++    mtlk_pdb_size_t size = sizeof(table[i]);
++
++    res = wave_pdb_get_binary(pdb, PARAM_DB_CORE_WMM_PARAMS_BE + i, &table[i], &size);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++  return MTLK_ERR_OK;
++}
++
++static int
++_mtlk_core_cfg_wmm_param_send(mtlk_core_t *core,
++                            const struct mtlk_txq_params table[UMI_AC_NUM_ACS])
++{
++  mtlk_txmm_msg_t man_msg;
++  mtlk_txmm_data_t *man_entry;
++  UMI_SET_WMM_PARAMETERS *req;
++  int i, res;
++  bool uncertain;
++
++  man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg,
++                  mtlk_vap_get_txmm(core->vap_handle), &res);
++  if (!man_entry)
++    return MTLK_ERR_NO_RESOURCES;
++
++  man_entry->id = UM_MAN_SET_WMM_PARAMETERS_REQ;
++  man_entry->payload_size = sizeof(*req);
++  req = (UMI_SET_WMM_PARAMETERS *)man_entry->payload;
++  memset(req, 0, sizeof(*req));
++  req->vapId = mtlk_vap_get_id(core->vap_handle);
++  for (i = 0; i < UMI_AC_NUM_ACS; i++) {
++    req->wmmParamsPerAc[i].u16CWmin = HOST_TO_MAC16(table[i].cwmin);
++    req->wmmParamsPerAc[i].u16CWmax = HOST_TO_MAC16(table[i].cwmax);
++    req->wmmParamsPerAc[i].u16TXOPlimit = HOST_TO_MAC16(table[i].txop);
++    req->wmmParamsPerAc[i].u8Aifsn = table[i].aifs;
++    req->wmmParamsPerAc[i].acm_flag = table[i].acm_flag;
++  }
++
++  res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  uncertain = res != MTLK_ERR_OK;
++  if (!uncertain && req->u8Status != UMI_OK) {
++    ELOG_DD("CID-%04x: SET_WMM rejected, status=%u",
++            mtlk_vap_get_oid(core->vap_handle), req->u8Status);
++    res = MTLK_ERR_MAC;
++  }
++  mtlk_txmm_msg_cleanup(&man_msg);
++
++  /* A rejected request preserves the previous table. A missing confirmation
++   * leaves firmware ownership uncertain and uses the existing terminal stop. */
++  if (uncertain)
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++  return res;
++}
++
++int core_cfg_wmm_param_init(mtlk_core_t *core)
++{
++  struct mtlk_txq_params table[UMI_AC_NUM_ACS];
+   int res;
+-  mtlk_txmm_msg_t   man_msg;
+-  mtlk_txmm_data_t *man_entry;
+-  mtlk_pdb_t       *param_db_core;
+-  UMI_SET_WMM_PARAMETERS *req;
+-  unsigned  oid;
+-  int       i;
+-
+-  oid = mtlk_vap_get_oid(core->vap_handle);
+-  ILOG1_D("CID-%04x: Send WMM params", oid);
+-
+-  /* prepare msg for the FW */
+-  if (!(man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(core->vap_handle), &res)))
+-  {
+-    ELOG_DD("CID-%04x: UM_MAN_SET_WMM_PARAMETERS_REQ init failed, err=%i", oid, res);
+-    return MTLK_ERR_NO_RESOURCES;
+-  }
+-
+-  man_entry->id                  = UM_MAN_SET_WMM_PARAMETERS_REQ;
+-  man_entry->payload_size        = sizeof(*req);
+-
+-  req = (UMI_SET_WMM_PARAMETERS *) man_entry->payload;
+-  memset(req, 0, sizeof(*req));
+-
+-  /* Read WMM settings from the Master VAP ParamDB and fill the message */
+-  param_db_core = mtlk_vap_get_param_db(mtlk_core_get_master(core)->vap_handle);
+-
+-  for (i = 0; i < UMI_AC_NUM_ACS; i++)
+-  {
+-    struct mtlk_txq_params mtp;
+-    mtlk_pdb_size_t mtp_len = sizeof(mtp);
+-    wave_pdb_get_binary(param_db_core, PARAM_DB_CORE_WMM_PARAMS_BE + i, &mtp, &mtp_len);
+-    req->wmmParamsPerAc[i].u16CWmin = HOST_TO_MAC16(mtp.cwmin);
+-    req->wmmParamsPerAc[i].u16CWmax = HOST_TO_MAC16(mtp.cwmax);
+-    req->wmmParamsPerAc[i].u16TXOPlimit = HOST_TO_MAC16(mtp.txop);
+-    req->wmmParamsPerAc[i].u8Aifsn = mtp.aifs;
+-    req->wmmParamsPerAc[i].acm_flag = mtp.acm_flag;
+-    ILOG2_DDDDDD("[%d]: txop %d, cwmin %d, cwmax %d, aifs %d, acm_flag %d",
+-                i, mtp.txop, mtp.cwmin, mtp.cwmax, mtp.aifs, mtp.acm_flag);
+-  }
+-
+-  /* Set VAP ID and send the message */
+-  req->vapId = mtlk_vap_get_id(core->vap_handle);
+-  mtlk_dump(3, req, sizeof(*req), "dump of UMI_SET_WMM_PARAMETERS:");
+-
+-  res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+-  if (MTLK_ERR_OK != res) {
+-    ELOG_DD("CID-%04x: UM_MAN_SET_WMM_PARAMETERS_REQ send failed, err=%i", oid, res);
+-  } else {
++
++  res = _mtlk_core_cfg_wmm_param_get(core, table);
++  if (res == MTLK_ERR_OK)
++    res = _mtlk_core_cfg_wmm_param_send(core, table);
++  if (res == MTLK_ERR_OK)
+     core->vap_in_fw_is_active = TRUE;
+-  }
+-
+-  mtlk_txmm_msg_cleanup(&man_msg);
+   return res;
+ }
+ 
+ static int
+-_mtlk_core_cfg_wmm_param_set_sta(mtlk_core_t *core)
+-{
+-  ILOG1_D("CID-%04x", mtlk_vap_get_oid(core->vap_handle));
+-  return _mtlk_core_cfg_wmm_param_send(core);
+-}
+-
+-static int
+-_mtlk_core_cfg_wmm_param_set_ap(mtlk_core_t *master_core)
+-{
+-    mtlk_vap_handle_t   vap_handle;
+-    mtlk_core_t        *vap_core;
+-    mtlk_vap_manager_t *vap_mgr;
+-    int                 i, vap_res, max_vaps_count;
+-    int                 res = MTLK_ERR_OK;
+-
+-    MTLK_ASSERT(NULL != master_core);
+-
+-    /* Send a msg with all WMM params to each VAP */
+-    vap_mgr = mtlk_vap_get_manager(master_core->vap_handle);
+-    max_vaps_count = mtlk_vap_manager_get_max_vaps_count(vap_mgr);
+-
+-    for (i = 0; i < max_vaps_count; i++)
+-    {
+-      if (MTLK_ERR_OK != mtlk_vap_manager_get_vap_handle(vap_mgr, i, &vap_handle))
+-      {
+-        ILOG5_D("VAP#%d doesn't exist, goto next", i);
+-        continue;
+-      }
+-
+-      ILOG1_DD("VAP id %d, is_ap %d", i, (int)mtlk_vap_is_ap(vap_handle));
+-
+-      if (!mtlk_vap_is_ap(vap_handle))
+-        continue;
+-
+-      vap_core = mtlk_vap_get_core(vap_handle);
+-
+-      /* Don't send if ADD_VAP has not yet been sent */
+-      if (vap_core->is_stopped)
+-        continue;
+-      
+-      /* Don't send for the same VAP if already sent */
+-      if (vap_core->vap_in_fw_is_active)
+-        continue;
+-      
+-      ILOG1_D("CID-%04x: Sending UMI_SET_WMM_PARAMETERS", mtlk_vap_get_oid(vap_handle));
+-      vap_res = _mtlk_core_cfg_wmm_param_send(vap_core);
+-      if (vap_res != MTLK_ERR_OK) {
+-        res = vap_res;
+-      }
+-    }
+-
++core_cfg_wmm_param_set_by_params(mtlk_core_t *master_core,
++                                const struct mtlk_wmm_settings *settings)
++{
++  const struct mtlk_txq_params *params = &settings->txq_params;
++  struct mtlk_txq_params table[UMI_AC_NUM_ACS];
++  mtlk_vap_handle_t vap;
++  mtlk_core_t *core;
++  int res;
++
++  MTLK_ASSERT(master_core == mtlk_core_get_master(master_core));
++  if (params->ac >= UMI_AC_NUM_ACS)
++    return MTLK_ERR_PARAMS;
++  res = mtlk_vap_manager_get_vap_handle(mtlk_vap_get_manager(master_core->vap_handle),
++                                        settings->vap_id, &vap);
++  if (res != MTLK_ERR_OK)
+     return res;
+-}
+-
+-/* Should be called from master serializer context */
+-int core_cfg_wmm_param_set_by_params(mtlk_core_t *master_core, struct mtlk_wmm_settings *wmm_settings)
+-{
+-  mtlk_vap_handle_t          vap_handle;
+-  unsigned                   oid;
+-  int                        res = MTLK_ERR_OK;
+-
+-  MTLK_ASSERT(master_core == mtlk_core_get_master(master_core));
+-
+-  oid = mtlk_vap_get_oid(master_core->vap_handle);
+-
+-  /* Prevent setting WMM while waiting for beacons */
+-  if (mtlk_core_is_block_tx_mode(master_core)) {
+-    res = MTLK_ERR_NOT_READY;
+-    goto end;
+-  }
+-
+-  /* Prevent setting WMM while in scan */
+-  if (mtlk_core_is_in_scan_mode(master_core)) {
+-    res = MTLK_ERR_RETRY;
+-    goto end;
+-  }
+-
+-  /* FIXME: 1) what is vap_id for STA mode ?   2) does this checking needed or not ? */
+-  if (MTLK_ERR_OK != mtlk_vap_manager_get_vap_handle(mtlk_vap_get_manager(master_core->vap_handle),
+-                                                             wmm_settings->vap_id, &vap_handle)) {
+-    res = MTLK_ERR_VALUE;
+-    goto end;
+-  }
+-
+-  /* AP's will call this every queue
+-   * while STA's will only call this once for passing all queues data to fw */
+-  if (mtlk_vap_is_ap(vap_handle)) {
+-    struct mtlk_txq_params    *tp = &wmm_settings->txq_params;
+-    ILOG2_DDD("CID-%04x: Saving WMM params for VAP %i and queue %i", oid, wmm_settings->vap_id, tp->ac);
+-    res = wave_pdb_set_binary(mtlk_vap_get_param_db(vap_handle),
+-                              PARAM_DB_CORE_WMM_PARAMS_BE + tp->ac, tp, sizeof(*tp));
+-    if (MTLK_ERR_OK != res) {
+-      WLOG_DDD("CID-%04x: Saving WMM params for queue %i failure (%d)."
+-               " Continue with default settings.", oid, tp->ac, res);
+-    }
+-
+-    if (tp->ac != UMI_AC_BK) /* not the last queue to be refered to by hostapd */
+-      goto end;
+-
+-    res = _mtlk_core_cfg_wmm_param_set_ap(master_core);
+-
+-  } else { /* STA */
+-    res = _mtlk_core_cfg_wmm_param_set_sta(mtlk_vap_get_core (vap_handle));
+-  }
+-
+-end:
+-  return res;
++  core = mtlk_vap_get_core(vap);
++  if (!wave_hw_mmb_ready(mtlk_vap_get_hw(vap)))
++    return MTLK_ERR_NOT_READY;
++
++  /* Before SET_BSS, native callbacks fill the initial table without sending
++   * an activation command. Every later callback is a complete transaction. */
++  if (core->vap_in_fw_is_active) {
++    if (mtlk_core_is_block_tx_mode(master_core))
++      return MTLK_ERR_NOT_READY;
++    if (mtlk_core_is_in_scan_mode(master_core))
++      return MTLK_ERR_RETRY;
++    res = _mtlk_core_cfg_wmm_param_get(core, table);
++    if (res != MTLK_ERR_OK)
++      return res;
++    table[params->ac] = *params;
++    res = _mtlk_core_cfg_wmm_param_send(core, table);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++
++  /* All entries are allocated at this exact size during PDB initialization;
++   * committing one entry does not allocate or expose an unacknowledged table. */
++  return wave_pdb_set_binary(mtlk_vap_get_param_db(vap),
++             PARAM_DB_CORE_WMM_PARAMS_BE + params->ac, params, sizeof(*params));
+ }
+ 
+ /* Should be called from master serializer context */
+@@ -325,15 +254,50 @@
+   struct mtlk_wmm_settings *wmm_settings;
+   unsigned wmm_settings_size;
+   int res = MTLK_ERR_OK;
++  int *reply;
+ 
+   MTLK_ASSERT(sizeof(mtlk_clpb_t *) == data_size);
+ 
+   wmm_settings = mtlk_clpb_enum_get_next(clpb, &wmm_settings_size);
++  /* Allocate the reply before committing a firmware/PDB transaction. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
+   MTLK_CLPB_TRY(wmm_settings, wmm_settings_size)
+     res = core_cfg_wmm_param_set_by_params(master_core, wmm_settings);
+   MTLK_CLPB_FINALLY(res)
+-    return mtlk_clpb_push_res(clpb, res);
++    *reply = res;
++    return MTLK_ERR_OK;
+   MTLK_CLPB_END
++}
++
++int wave_core_set_txq_params(mtlk_df_t *df, const struct mtlk_txq_params *params)
++{
++  mtlk_vap_handle_t vap = mtlk_df_get_vap_handle(df);
++  mtlk_df_t *master_df = mtlk_vap_manager_get_master_df(mtlk_vap_get_manager(vap));
++  struct mtlk_wmm_settings settings = {
++    .vap_id = mtlk_vap_get_id(vap),
++    .txq_params = *params,
++  };
++  unsigned attempt;
++  int res;
++
++  for (attempt = 0; attempt < MAX_SCAN_WAIT_RETRIES; attempt++) {
++    mtlk_clpb_t *clpb = NULL;
++
++    res = _mtlk_df_user_invoke_core(master_df, WAVE_CORE_REQ_SET_WMM_PARAM,
++                                   &clpb, &settings, sizeof(settings));
++    res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_SET_WMM_PARAM, TRUE);
++    if (res != MTLK_ERR_RETRY)
++      return res;
++    mtlk_osal_msleep(50);
++  }
++  return res;
+ }
+ 
+ int core_cfg_set_calibration_mask(mtlk_handle_t hcore, const void* data, uint32 data_size)
+@@ -395,10 +359,12 @@
+   return res;
+ }
+ 
+-int core_cfg_send_set_chan_by_msg(mtlk_txmm_msg_t *man_msg)
++int core_cfg_send_set_chan_by_msg(mtlk_core_t *core, mtlk_txmm_msg_t *man_msg, bool station)
+ {
+   mtlk_txmm_data_t *man_entry = man_msg->data;
+   UM_SET_CHAN_PARAMS *req = (UM_SET_CHAN_PARAMS *) man_entry->payload;
++  u32 timeout = MTLK_MM_BLOCKED_SEND_TIMEOUT;
++  bool airtime_paused;
+   int res;
+ 
+   /* FW expects bg_scan as a flag 0 or 1, make sure it is the case */
+@@ -414,7 +380,20 @@
+               req->bg_scan);
+   mtlk_dump(2, req, sizeof(*req), "dump of UM_SET_CHAN_PARAMS:");
+ 
+-  res = mtlk_txmm_msg_send_blocked(man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  res = wave_radio_dfs_record_channel(wave_vap_radio_get(core->vap_handle),
++          req->low_chan_num, req->chan_width, req->primary_chan_idx,
++          req->isRadarDetectionNeeded);
++  if (res != MTLK_ERR_OK)
++    return res;
++  /* CSA confirmation follows the firmware-owned countdown and switch. */
++  if (req->switch_type == ST_CSA)
++    timeout += MAC_TO_HOST16(req->chan_switch_time);
++  /* Native channel setup can replace per-peer scheduling fields. Withdraw
++   * and reapply the owned whole vector before publishing channel success. */
++  res = wave_core_airtime_pause(core, &airtime_paused);
++  if (res != MTLK_ERR_OK)
++    return res;
++  res = mtlk_txmm_msg_send_blocked(man_msg, timeout);
+ 
+   if (res != MTLK_ERR_OK)
+   {
+@@ -426,6 +405,14 @@
+     res = MTLK_ERR_MAC;
+   }
+ 
++  if (airtime_paused) {
++    if (res == MTLK_ERR_OK)
++      res = wave_core_airtime_resume(core, DB_UNKNOWN_SID);
++    else
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++  }
++  if (res == MTLK_ERR_OK)
++    wave_radio_channel_station_set(wave_vap_radio_get(core->vap_handle), station);
+   return res;
+ }
+ 
+@@ -499,20 +486,390 @@
+   return wv_cfg80211_get_chans_dfs_required(wiphy, cd->center_freq2, cw);
+ }
+ 
+-/* cpd may be NULL, only needed for the CSA stuff */
+-int core_cfg_send_set_chan(mtlk_core_t *core,
+-                           const struct mtlk_chan_def *cd, struct set_chan_param_data *cpd)
++static int
++_core_cfg_apply_tx_power(mtlk_core_t *core, unsigned center_freq,
++                        enum chanWidth cfg_width, unsigned cf_primary,
++                        mtlk_country_code_t req_country_code,
++                        unsigned user_limit, unsigned mac_limit,
++                        BOOL reload_calibration, BOOL intersect_previous);
++
++static BOOL
++_core_cfg_tpc_limits_are_deferred(mtlk_core_t *core)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++
++  /* Gen6 A0 SET_TPC_CONFIG stages limits. The native SET_CHANNEL phase
++   * consumes them before its confirmation; the config ACK alone does not. */
++  return mtlk_hw_type_is_gen6(hw) && !mtlk_hw_type_is_gen6_b0(hw);
++}
++
++/* Master-serializer helpers for the paired A0 firmware implementation.
++ * The feature helper admits actual loaded bytes/PSD, never the ABI header
++ * or a version string. Old firmware and all other chips retain their
++ * existing AUTOMATIC/LIMITED path and reject standard FIXED.
++ */
++/* Admit the actual retained platform tables that this hardware owner parsed
++ * and sends, not a PSD filename or an assumed dictionary meaning. The new
++ * calculator uses the conservative UEVM anchor only when every native rate
++ * offset is nonnegative with zero EVM backoff and the external floor is0.
++ * The internal adaptive floor table is deliberately not a FIXED constraint.
++ */
++static BOOL
++_core_cfg_fixed_data_psd(mtlk_hw_t *hw)
++{
++  static const struct {
++    uint32 id, rows, columns;
++  } domain[] = {
++    {0x1b0000, 3, 1},
++    {0x140000, 1, 2},
++    {0x150000, 8, 2},
++    {0x160000, 33, 2},
++    {0x170000, 10, 8},
++    {0x300000, 12, 8},
++  };
++  const hw_psdb_t *psdb = mtlk_hw_get_psdb(hw);
++  uint32 i, j, k, words, seen = 0;
++
++  if (!psdb || !psdb->tables || !psdb->rate_pw_table)
++    return FALSE;
++  for (i = 0; i < psdb->nof_tables; i++) {
++    const psdb_any_table_t *table = psdb->tables[i];
++    if (!table)
++      return FALSE;
++    for (j = 0; j < ARRAY_SIZE(domain); j++)
++      if (table->id == domain[j].id)
++        break;
++    if (j == ARRAY_SIZE(domain))
++      continue;
++    if (seen & BIT(j))
++      return FALSE;
++    words = domain[j].rows * domain[j].columns;
++    if (table->nrows != domain[j].rows || table->ncols != domain[j].columns ||
++        table->nof_words != words + 2)
++      return FALSE;
++    if (j == 0) {
++      for (k = 0; k < words; k++)
++        if (MAC_TO_HOST32(table->data.words[k]) != 0)
++          return FALSE;
++    } else {
++      for (k = 0; k < words; k += 2) {
++        int32 offset = (int32)MAC_TO_HOST32(table->data.words[k]);
++        /* The host's signed8 conversion to1/8dBm must not wrap either. */
++        if (offset < 0 || offset > 31 ||
++            MAC_TO_HOST32(table->data.words[k + 1]) != 0)
++          return FALSE;
++      }
++    }
++    seen |= BIT(j);
++  }
++  return seen == (BIT(ARRAY_SIZE(domain)) - 1);
++}
++
++static BOOL
++_core_cfg_fixed_data_firmware(mtlk_core_t *core)
++{
++  return wave_hw_fw_feature_supported(mtlk_vap_get_hw(core->vap_handle),
++                                      WAVE_FW_FEATURE_FIXED_DATA);
++}
++
++static BOOL
++_core_cfg_fixed_data_supported(mtlk_core_t *core)
++{
++  return _core_cfg_fixed_data_firmware(core) &&
++         _core_cfg_fixed_data_psd(mtlk_vap_get_hw(core->vap_handle));
++}
++
++static int
++_core_cfg_fixed_data_command(mtlk_core_t *core, uint8 operation, uint8 flags,
++                             uint8 half_dbm, struct ax50_fixed_data_request *reply)
++{
++  mtlk_txmm_msg_t msg;
++  mtlk_txmm_data_t *entry;
++  struct ax50_fixed_data_request *req;
++  int res;
++
++  MTLK_STATIC_ASSERT(sizeof(*req) == 8);
++  /* QUERY and DISABLE remain available even if a diagnostic changed
++   * the PSD domain. Losing FIXED eligibility must not prevent its undo. */
++  if (!_core_cfg_fixed_data_firmware(core))
++    return MTLK_ERR_NOT_SUPPORTED;
++  entry = mtlk_txmm_msg_init_with_empty_data(&msg,
++              mtlk_vap_get_txmm(core->vap_handle), NULL);
++  if (!entry)
++    return MTLK_ERR_NO_RESOURCES;
++  entry->id = UM_MAN_FIXED_POWER_REQ;
++  entry->payload_size = sizeof(*req);
++  req = (void *)entry->payload;
++  memset(req, 0, sizeof(*req));
++  req->policy_flags = flags;
++  req->magic = AX50_FIXED_DATA_MAGIC;
++  req->half_dbm = half_dbm;
++  req->operation = operation;
++  req->status = 0xff;
++  req->abi = AX50_FIXED_DATA_ABI;
++  res = mtlk_txmm_msg_send_blocked(&msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  if (res == MTLK_ERR_OK) {
++    if (req->magic != AX50_FIXED_DATA_MAGIC || req->abi != AX50_FIXED_DATA_ABI ||
++        req->operation != operation || req->policy_flags > AX50_FIXED_DATA_INCLUDE_11B ||
++        req->active > 1 || req->admissible_half_dbm > AX50_FIXED_DATA_MAX_HALF_DBM) {
++      res = MTLK_ERR_UNKNOWN;
++    } else {
++      switch (req->status) {
++      case AX50_FIXED_DATA_OK:
++        if (reply)
++          *reply = *req;
++        break;
++      case AX50_FIXED_DATA_BAD_REQUEST:
++        res = MTLK_ERR_PARAMS;
++        break;
++      case AX50_FIXED_DATA_CONFLICT:
++        res = MTLK_ERR_BUSY;
++        break;
++      case AX50_FIXED_DATA_UNREPRESENTABLE:
++        res = MTLK_ERR_NOT_SUPPORTED;
++        break;
++      case AX50_FIXED_DATA_NOT_READY:
++        res = MTLK_ERR_NOT_READY;
++        break;
++      default:
++        res = MTLK_ERR_UNKNOWN;
++      }
++    }
++  }
++  mtlk_txmm_msg_cleanup(&msg);
++  return res;
++}
++
++static uint8
++_core_cfg_fixed_data_flags(const struct mtlk_chan_def *cd)
++{
++  return cd->chan.band == MTLK_HW_BAND_2_4_GHZ ? AX50_FIXED_DATA_INCLUDE_11B : 0;
++}
++
++static int
++_core_cfg_fixed_data_begin(mtlk_core_t *core, const struct mtlk_chan_def *cd,
++                           BOOL fixed, unsigned user_limit, BOOL new_request,
++                           unsigned switch_type, BOOL *submitted)
++{
++  struct ax50_fixed_data_request applied_state;
++  uint8 operation;
++  int res;
++
++  *submitted = FALSE;
++  if (!_core_cfg_fixed_data_firmware(core))
++    return fixed ? MTLK_ERR_NOT_SUPPORTED : MTLK_ERR_OK;
++  if (fixed && !_core_cfg_fixed_data_supported(core))
++    return MTLK_ERR_NOT_SUPPORTED;
++  res = _core_cfg_fixed_data_command(core, AX50_FIXED_DATA_QUERY, 0, 0, &applied_state);
++  /* A legacy/DUT policy is a distinct owner. Preserve that existing path
++   * for a normal non-FIXED transaction; do not silently replace it. */
++  if (res == MTLK_ERR_BUSY && !fixed)
++    return MTLK_ERR_OK;
++  if (res != MTLK_ERR_OK)
++    return res;
++  if (!fixed && !applied_state.active)
++    return MTLK_ERR_OK;
++  /* Includes a disable of an existing applied policy. Refuse before
++   * submission if this channel operation cannot run native212. */
++  if (switch_type > ST_NORMAL_AFTER_RSSI)
++    return MTLK_ERR_BUSY;
++  if (fixed && (user_limit % 4 ||
++       user_limit < AX50_FIXED_DATA_MIN_HALF_DBM * 4 ||
++       user_limit > AX50_FIXED_DATA_MAX_HALF_DBM * 4))
++    return MTLK_ERR_PARAMS;
++  operation = !fixed ? AX50_FIXED_DATA_DISABLE :
++              new_request ? AX50_FIXED_DATA_STAGE : AX50_FIXED_DATA_REPLAY;
++  /* Intent precedes submission. Even a lost stage reply may leave a native
++   * pending tuple, so every later failure invokes the existing quiesce and
++   * recovery path. The last-ACK radio PDB has not changed. */
++  *submitted = TRUE;
++  return _core_cfg_fixed_data_command(core, operation,
++            _core_cfg_fixed_data_flags(cd), fixed ? user_limit / 4 : 0, NULL);
++}
++
++static int
++_core_cfg_fixed_data_finish(mtlk_core_t *core, const struct mtlk_chan_def *cd,
++                            BOOL fixed, unsigned user_limit)
++{
++  struct ax50_fixed_data_request applied_state;
++  int res = _core_cfg_fixed_data_command(core, AX50_FIXED_DATA_QUERY, 0, 0, &applied_state);
++
++  if (res != MTLK_ERR_OK)
++    return res;
++  if (applied_state.active != !!fixed)
++    return MTLK_ERR_UNKNOWN;
++  if (fixed && (applied_state.half_dbm != user_limit / 4 ||
++      applied_state.policy_flags != _core_cfg_fixed_data_flags(cd) ||
++      applied_state.admissible_half_dbm < AX50_FIXED_DATA_MIN_HALF_DBM))
++    return MTLK_ERR_UNKNOWN;
++  return MTLK_ERR_OK;
++}
++
++static int
++_core_cfg_fixed_data_get(mtlk_core_t *core, unsigned user_limit, int *dbm)
++{
++  struct ax50_fixed_data_request applied_state;
++  int res;
++
++  if (!_core_cfg_fixed_data_supported(core))
++    return MTLK_ERR_NOT_SUPPORTED;
++  res = _core_cfg_fixed_data_command(core, AX50_FIXED_DATA_QUERY, 0, 0, &applied_state);
++  if (res != MTLK_ERR_OK)
++    return res;
++  if (!applied_state.active || applied_state.half_dbm != user_limit / 4 ||
++      applied_state.admissible_half_dbm < AX50_FIXED_DATA_MIN_HALF_DBM ||
++      applied_state.policy_flags != _core_cfg_fixed_data_flags(__wave_core_chandef_get(core)))
++    return MTLK_ERR_NOT_READY;
++  /* nl80211's get_tx_power callback returns integer dBm. The firmware
++   * request remains exact half-dBm; report the bounded configured value
++   * rounded downward, without labeling it RF telemetry. */
++  *dbm = MIN(applied_state.half_dbm, applied_state.admissible_half_dbm) / 2;
++  return MTLK_ERR_OK;
++}
++
++static BOOL
++_core_cfg_rts_supported(mtlk_core_t *core)
++{
++  return wave_hw_fw_feature_supported(mtlk_vap_get_hw(core->vap_handle),
++                                      WAVE_FW_FEATURE_RTS_THRESHOLD);
++}
++
++static int
++_core_cfg_rts_command(mtlk_core_t *core, uint8 operation, uint16 threshold,
++                      struct wave_rts_request *reply)
++{
++  mtlk_txmm_msg_t msg;
++  mtlk_txmm_data_t *entry;
++  struct wave_rts_request *req;
++  int res;
++
++  MTLK_STATIC_ASSERT(sizeof(*req) == 8);
++  if (!_core_cfg_rts_supported(core))
++    return MTLK_ERR_NOT_SUPPORTED;
++  entry = mtlk_txmm_msg_init_with_empty_data(&msg,
++              mtlk_vap_get_txmm(core->vap_handle), NULL);
++  if (!entry)
++    return MTLK_ERR_NO_RESOURCES;
++  entry->id = UM_MAN_FIXED_POWER_REQ;
++  entry->payload_size = sizeof(*req);
++  req = (void *)entry->payload;
++  memset(req, 0, sizeof(*req));
++  req->threshold = HOST_TO_MAC16(threshold);
++  req->magic = WAVE_RTS_MAGIC;
++  req->operation = operation;
++  req->status = 0xff;
++  req->abi = WAVE_RTS_ABI;
++  res = mtlk_txmm_msg_send_blocked(&msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  if (res == MTLK_ERR_OK) {
++    if (req->magic != WAVE_RTS_MAGIC || req->abi != WAVE_RTS_ABI ||
++        req->operation != operation || req->active > 1 ||
++        MAC_TO_HOST16(req->threshold) > WAVE_RTS_MAX ||
++        (req->pending && req->pending != WAVE_RTS_STAGE &&
++                         req->pending != WAVE_RTS_DISABLE)) {
++      res = MTLK_ERR_UNKNOWN;
++    } else {
++      switch (req->status) {
++      case 0:
++        if (req->pending ||
++            (operation != WAVE_RTS_QUERY &&
++             (req->active || MAC_TO_HOST16(req->threshold) != threshold)) ||
++            (operation == WAVE_RTS_QUERY && !req->active && req->threshold))
++          res = MTLK_ERR_UNKNOWN;
++        else if (reply)
++          *reply = *req;
++        break;
++      case 1:
++        res = MTLK_ERR_PARAMS;
++        break;
++      case 2:
++        res = MTLK_ERR_BUSY;
++        break;
++      case 4:
++        res = MTLK_ERR_NOT_READY;
++        break;
++      default:
++        res = MTLK_ERR_UNKNOWN;
++      }
++    }
++  }
++  mtlk_txmm_msg_cleanup(&msg);
++  return res;
++}
++
++static int
++_core_cfg_rts_begin(mtlk_core_t *core, uint32 threshold, unsigned switch_type,
++                    BOOL *submitted)
++{
++  struct wave_rts_request state;
++  BOOL enabled = threshold != WAVE_RTS_DISABLED;
++  int res;
++
++  *submitted = FALSE;
++  if (!_core_cfg_rts_supported(core))
++    return enabled ? MTLK_ERR_NOT_SUPPORTED : MTLK_ERR_OK;
++  res = _core_cfg_rts_command(core, WAVE_RTS_QUERY, 0, &state);
++  if (res != MTLK_ERR_OK)
++    return res;
++  if (!enabled && !state.active)
++    return MTLK_ERR_OK;
++  if (switch_type > ST_NORMAL_AFTER_RSSI)
++    return MTLK_ERR_BUSY;
++  /* Even a lost stage reply may leave a native pending tuple. */
++  *submitted = TRUE;
++  return _core_cfg_rts_command(core, enabled ? WAVE_RTS_STAGE : WAVE_RTS_DISABLE,
++                                enabled ? threshold : 0, NULL);
++}
++
++static int
++_core_cfg_rts_finish(mtlk_core_t *core, uint32 threshold)
++{
++  struct wave_rts_request state;
++  BOOL enabled = threshold != WAVE_RTS_DISABLED;
++  int res = _core_cfg_rts_command(core, WAVE_RTS_QUERY, 0, &state);
++
++  if (res != MTLK_ERR_OK)
++    return res;
++  if (state.active != enabled ||
++      MAC_TO_HOST16(state.threshold) != (enabled ? threshold : 0))
++    return MTLK_ERR_UNKNOWN;
++  return MTLK_ERR_OK;
++}
++
++/* Explicit limits let a power update use the native channel transaction
++ * without publishing an unacknowledged USER/MAC policy in the radio PDB.
++ * cpd may be NULL for an ordinary channel transaction. */
++static int
++_core_cfg_send_set_chan(mtlk_core_t *core, const struct mtlk_chan_def *cd,
++                       struct set_chan_param_data *cpd,
++                       unsigned user_limit, unsigned mac_limit, BOOL power_refresh,
++                       BOOL fixed, BOOL new_fixed_request, uint32 rts_threshold)
+ {
+   mtlk_txmm_msg_t       man_msg;
+   mtlk_txmm_data_t      *man_entry;
+   UM_SET_CHAN_PARAMS    *req;
+   struct mtlk_chan_def  *ccd = __wave_core_chandef_get(core);
++  struct mtlk_chan_def   destination = *cd;
+   wave_radio_t          *radio = wave_vap_radio_get(core->vap_handle);
+   unsigned              primary_chan_num, old_freq1;
++  u32                   radar_generation = wave_radio_dfs_generation(radio);
++  mtlk_country_code_t    country;
+   int                   res = MTLK_ERR_OK;
+-
++  BOOL                  power_staged = FALSE;
++  BOOL                  fixed_submitted = FALSE;
++  BOOL                  rts_submitted = FALSE;
++  unsigned              firmware_user_limit = fixed ? 0 : user_limit;
++
++  if (wave_hw_monitor_held(mtlk_vap_get_hw(core->vap_handle)) && !(cpd && cpd->monitor) &&
++      wave_rcvry_type_current_get(mtlk_vap_get_hw(core->vap_handle)) == RCVRY_TYPE_UNDEF)
++    return MTLK_ERR_BUSY;
++  /* Recovery and scan completion may pass the mutable current chandef. */
++  cd = &destination;
+   ILOG2_DDDD("band=%u, center_freq=%hu, flags=0x%08x, nl_width=%u",
+              cd->chan.band, cd->chan.center_freq, cd->chan.flags, cd->width);
++
++  res = wave_radio_dfs_channel_check(radio, cd, cpd);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   /* prepare msg for the FW */
+   if (!(man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(core->vap_handle), &res)))
+@@ -557,7 +914,9 @@
+   primary_chan_num = ieee80211_frequency_to_channel(cd->chan.center_freq);
+   req->primary_chan_idx = (primary_chan_num - req->low_chan_num) / CHANNUMS_PER_20MHZ;
+ 
+-  if (!wave_radio_get_sta_vifs_exist(radio) && _is_radar_det_needed(radio, cd)) {
++  if (!(cpd && cpd->monitor) && !wave_radio_channel_uses_sta_rules(radio,
++        cpd ? cpd->station : wave_radio_channel_is_station(radio)) &&
++      _is_radar_det_needed(radio, cd)) {
+     req->isRadarDetectionNeeded = 1;
+   } else {
+     req->isRadarDetectionNeeded = 0;
+@@ -585,16 +944,57 @@
+     req->u16SID = HOST_TO_MAC16(cpd->sid);
+   }
+ 
+-  /* leave result and reserved as 0 */
++  /* Native HDK mask10fad4 includes212 for switch types0..4; type5
++   * does not own that completion. Never leave a staged policy in it. */
++  if (fixed && req->switch_type > ST_NORMAL_AFTER_RSSI) {
++    res = MTLK_ERR_BUSY;
++    goto end;
++  }
++  res = _core_cfg_fixed_data_begin(core, cd, fixed, user_limit,
++                                    new_fixed_request, req->switch_type, &fixed_submitted);
++  if (res != MTLK_ERR_OK)
++    goto end;
++
++  res = _core_cfg_rts_begin(core, rts_threshold, req->switch_type, &rts_submitted);
++  if (res != MTLK_ERR_OK)
++    goto end;
++
++  /* SET_TPC precedes SET_CHAN. An active power refresh keeps this exact
++   * channel and must consume the new table, including an increased limit.
++   * Actual channel changes retain the existing safe intersection. */
++  core_cfg_country_code_get(core, &country);
++  res = _core_cfg_apply_tx_power(core, cd->center_freq1, cd->width,
++                                cd->chan.center_freq, country,
++                                firmware_user_limit, mac_limit, TRUE, !power_refresh);
++  if (res != MTLK_ERR_OK)
++    goto end;
++  power_staged = TRUE;
+ 
+   old_freq1 = ccd->center_freq1;
+   ccd->center_freq1 = 0; /* this marks that channel is "uncertain" (in this case changing) */
+ 
+   wmb(); /* so that channel gets marked uncertain well before we start switching it */
+ 
+-  (void)mtlk_core_radio_enable_if_needed(core);
+-
+-  res = core_cfg_send_set_chan_by_msg(&man_msg);
++  if (WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MODE_CURRENT) == WAVE_RADIO_OFF) {
++    res = wave_core_radio_set_mode(core, WAVE_RADIO_ON);
++    if (res != MTLK_ERR_OK) {
++      ccd->center_freq1 = old_freq1;
++      goto end;
++    }
++  }
++
++  res = core_cfg_send_set_chan_by_msg(core, &man_msg,
++              cpd ? cpd->station : wave_radio_channel_is_station(radio));
++  if (res == MTLK_ERR_OK)
++    res = _core_cfg_apply_tx_power(core, cd->center_freq1, cd->width,
++                                  cd->chan.center_freq, country,
++                                  firmware_user_limit, mac_limit, FALSE, TRUE);
++  if (res == MTLK_ERR_OK && fixed_submitted)
++    res = _core_cfg_fixed_data_finish(core, cd, fixed, user_limit);
++  if (res == MTLK_ERR_OK && rts_submitted)
++    res = _core_cfg_rts_finish(core, rts_threshold);
++  if (res != MTLK_ERR_OK)
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
+ 
+   /* Send CCA threshold on every set channel */
+   if (MTLK_ERR_OK == res) {
+@@ -643,6 +1043,15 @@
+     ccd->center_freq1 = ccd != cd ? cd->center_freq1 : old_freq1;
+   }
+ 
++  res = wave_radio_dfs_channel_done(radio, cd, cpd, req->switch_type, radar_generation);
++  if (res != MTLK_ERR_OK) {
++    /* The channel command was acknowledged, but a newer radar/NOP invalidated
++     * its permission to transmit. RF-off must be acknowledged before returning
++     * failure; a host data fence does not stop autonomous beacon transmission. */
++    if (wave_core_radio_set_mode(core, WAVE_RADIO_OFF) != MTLK_ERR_OK)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++    goto end;
++  }
+   mtlk_core_cfg_update_antenna_mask(core, req->antennaMask);
+ 
+   /* Set these params after setting operating channel */
+@@ -652,15 +1061,29 @@
+   }
+ 
+ end:
++  /* Staging may already have replaced the firmware/PDB table even when a
++   * later step (including RF-on) fails. Do not expose an unapplied table
++   * as an operating power policy. Recovery reapplies the old USER/MAC
++   * request, which the active-update caller has not committed. */
++  if (res != MTLK_ERR_OK &&
++      ((power_refresh && power_staged) || fixed_submitted || rts_submitted))
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
+   (void)mtlk_core_radio_disable_if_needed(core);
+ 
+   mtlk_txmm_msg_cleanup(&man_msg);
+   return res;
+ }
+ 
+-int core_recovery_cfg_wmm_param_set(mtlk_core_t *core)
+-{
+-  return _mtlk_core_cfg_wmm_param_send(core);
++int core_cfg_send_set_chan(mtlk_core_t *core,
++                           const struct mtlk_chan_def *cd, struct set_chan_param_data *cpd)
++{
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++
++  return _core_cfg_send_set_chan(core, cd, cpd,
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER),
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MAC_TX_POWER), FALSE,
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER_FIXED), FALSE,
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_RTS_THRESH));
+ }
+ 
+ /* CFG80211: set_ap_chanwidth(), start_radar_detection() and channel_switch() */
+@@ -678,7 +1101,7 @@
+   wave_radio_t          *radio = wave_vap_radio_get(core->vap_handle);
+   mtlk_scan_support_t   *ss = __wave_core_scan_support_get(core);
+   mtlk_vap_handle_t     vap_handle;
+-  int res = MTLK_ERR_OK;
++  int res = MTLK_ERR_OK, *reply = NULL;
+ 
+   MTLK_ASSERT(core == mtlk_core_get_master(core));
+   MTLK_ASSERT(sizeof(mtlk_clpb_t *) == data_size);
+@@ -696,7 +1119,24 @@
+     }
+ 
+     if (MTLK_ERR_OK != mtlk_vap_manager_get_vap_handle(mtlk_df_get_vap_manager(df), cpd->vap_id, &vap_handle)) {
++      MTLK_CLPB_EXIT(MTLK_ERR_NO_ENTRY);
++    }
++    /* An idle station wiphy has no operating-channel claim. Its next
++     * transition out of IDLE reapplies the requested channel below. */
++    if (cpd->station_idle && wave_radio_ap_active(radio))
+       MTLK_CLPB_EXIT(MTLK_ERR_OK);
++    if (!cpd->cac_transition) {
++      res = wave_radio_role_check(radio, cpd->station);
++      if (res != MTLK_ERR_OK)
++        MTLK_CLPB_EXIT(res);
++      if (cpd->station ? wave_radio_ap_active(radio) : wave_radio_sta_active(radio)) {
++        struct mtlk_chan_def *home = is_scan_running(ss) ? &ss->orig_chandef : ccd;
++
++        /* A shared radio changes channel only through its coordinated CSA
++         * owner. Ordinary setup/reconnect must match the current home channel. */
++        if (!cpd->station_csa && !mtlk_core_is_chandef_identical(&cpd->chandef, home))
++          MTLK_CLPB_EXIT(MTLK_ERR_BUSY);
++      }
+     }
+ 
+     if (cpd->cac_time)
+@@ -704,8 +1144,25 @@
+     else if (cpd->chan_switch_time) /* ditto */
+       cpd->switch_type = ST_CSA;
+ 
++    res = wave_radio_dfs_channel_check(radio, &cpd->chandef, cpd);
++    if (res != MTLK_ERR_OK)
++      MTLK_CLPB_EXIT(res);
++
++    /* Reserve the reply before channel, scan or CAC ownership changes. */
++    reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++    if (!reply)
++      return MTLK_ERR_NO_MEM;
++    res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++    if (res != MTLK_ERR_OK) {
++      mtlk_osal_mem_free(reply);
++      return res;
++    }
++
+     if (!mtlk_core_get_scan_support(core)->dfs_debug_params.debug_chan /* Skip this already set channel check if dfs_debug_chan used */
+         && ccd->chan.center_freq /* we already have a channel set */
++        && cpd->station == wave_radio_channel_is_station(radio)
++        && !cpd->cac_time && !wave_radio_dfs_tx_blocked(radio)
++        && WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MODE_CURRENT) != WAVE_RADIO_OFF
+         && cpd->switch_type == __wave_core_chan_switch_type_get(core) /* with the same switch type as the new request */
+         && mtlk_core_is_chandef_identical(&cpd->chandef, ccd)) /* and all the channel params match */
+     {
+@@ -721,10 +1178,7 @@
+       /* Notify cfg80211, AP mode VAP. MAC80211 will call cfg80211_ch_switch_notify
+        * for Station role interfaces */
+       if (!cpd->dont_notify_kernel) {
+-        if (wave_radio_get_sta_vifs_exist(radio) && is_channel_certain(ccd))
+-          wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, TRUE);
+-        else
+-          wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, FALSE);
++        wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, FALSE);
+       }
+ 
+       ILOG1_DDDD("Avoiding setting channel %u--%u (width %u, primary at %u) that is already set",
+@@ -764,9 +1218,16 @@
+ 
+     /* don't allow to set 2.4GHz channel's width to 40 MHz if Multi-Radio Co-Existence is enabled */
+     core_cfg_change_chan_width_if_coex_en(core, &cpd->chandef);
++    if (cpd->cac_time) {
++      res = wave_radio_cac_begin(radio, cpd);
++      if (res != MTLK_ERR_OK)
++        MTLK_CLPB_EXIT(res);
++    }
+     /* set channel */
+     res = core_cfg_set_chan(core, &cpd->chandef, cpd);
+ 
++    if (cpd->cac_time)
++      wave_radio_cac_arm(radio, cpd->cac_time, res != MTLK_ERR_OK);
+     if (res != MTLK_ERR_OK) {
+       ccd->wait_for_beacon = TRUE;
+       MTLK_CLPB_EXIT(res);
+@@ -779,28 +1240,24 @@
+       core->slow_ctx->is_block_tx = FALSE;
+     }
+ 
+-    if (is_scan_running(ss))
++    if (is_scan_running(ss)) {
+       /* save what we just set so the scan can return to it when it finishes */
+       ss->orig_chandef = *ccd;
++      ss->orig_station = wave_radio_channel_uses_sta_rules(radio, cpd->station);
++    }
++
++    /* One firmware CSA applies to all VAPs. Publish the confirmed channel
++     * to the paired AP owner without submitting a second timed retune. */
++    if (cpd->station_csa && !cpd->block_tx_post)
++      wave_radio_ap_channel_changed(radio, ccd);
+ 
+     /* In case of a successful NORMAL or CSA switch, notify the kernel, too, because hostapd need to know */
+     if (!cpd->dont_notify_kernel && (cpd->switch_type == ST_NORMAL || cpd->switch_type == ST_CSA))
+     {
+-      /* Workaround for kernel to allow to do CAC after SCA on DFS required channels.
+-      * Previously dfs state was set as AVAILABLE in radar_event to allow switching back to DFS channels
+-      * It is set to USABLE because HostAPD only allows to do CAC on USABLE channels. */
+-      if (cpd->switch_type == ST_CSA && mtlk_core_get_scan_support(core)->dfs_debug_params.debug_chan) {
+-        struct wireless_dev *wdev = cpd->ndev->ieee80211_ptr;
+-        wv_cfg80211_debug_change_kernel_dfs_state(wdev->wiphy, NL80211_DFS_USABLE);
+-      }
+-
+       ILOG0_DD("Notifying the kernel about the channel switch (width %u, primary at %u)",
+                MHZS_PER_20MHZ << cpd->chandef.width, ieee80211_frequency_to_channel(cpd->chandef.chan.center_freq));
+ 
+-      if (wave_radio_get_sta_vifs_exist(radio) && is_channel_certain(ccd))
+-        wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, TRUE);
+-      else
+-        wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, FALSE);
++      wv_cfg80211_ch_switch_notify(cpd->ndev, ccd, FALSE);
+     }
+   MTLK_CLPB_FINALLY(res)
+     if (paused_scan)
+@@ -808,6 +1265,10 @@
+       ILOG0_V("Resuming the paused scan");
+       resume_or_allow_scan(core);
+     }
++    if (reply) {
++      *reply = res;
++      return MTLK_ERR_OK;
++    }
+     return mtlk_clpb_push_res(clpb, res);
+   MTLK_CLPB_END
+ }
+@@ -832,12 +1293,10 @@
+ /* cpd may be NULL for normal and scan switches; only needed for CSA */
+ int __MTLK_IFUNC core_cfg_set_chan (mtlk_core_t *core, const struct mtlk_chan_def *cd, struct set_chan_param_data *cpd)
+ {
+-  struct scan_support *ss = __wave_core_scan_support_get(core);
+   wave_radio_t  *radio;
+   uint32 param_algomask;
+   uint32 param_oalgomask;
+   int res = MTLK_ERR_OK;
+-  mtlk_country_code_t country_code;
+ 
+   MTLK_ASSERT(core == mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(core->vap_handle)));
+ 
+@@ -861,29 +1320,14 @@
+     return res;
+   }
+ 
+-  core_cfg_country_code_get(core, &country_code);
+-
+-  /* set TX power limits */
+-  core_cfg_set_tx_power_limit(core, cd->center_freq1, cd->width, cd->chan.center_freq, country_code);
+-
+   res = core_cfg_send_set_chan(core, cd, cpd);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   /* Store channel parameters for Recovery purpose */
+   if (res == MTLK_ERR_OK && cpd) {
+     wave_rcvry_chanparam_set(mtlk_vap_get_hw(core->vap_handle),
+                              mtlk_vap_get_manager(core->vap_handle), (mtlk_handle_t*)cpd);
+-  }
+-
+-  if (res == MTLK_ERR_OK && cpd && cpd->switch_type == ST_SCAN && cpd->cac_time)
+-  {
+-    ILOG0_D("Setting the CAC timer for %i ms", cpd->cac_time);
+-    mtlk_osal_timer_set(&core->slow_ctx->cac_timer, cpd->cac_time);
+-
+-    if (ss->dfs_debug_params.debug_chan)
+-      ss->dfs_debug_params.switch_in_progress = FALSE;
+-  } else {
+-    mtlk_osal_timer_cancel_sync(&core->slow_ctx->cac_timer);
+-    mtlk_core_cfg_set_block_tx(core, 0);
+   }
+ 
+   /* PHY_RX_STATUS */
+@@ -1106,35 +1550,55 @@
+ {
+   mtlk_core_t *nic = HANDLE_T_PTR(mtlk_core_t, hcore);
+   mtlk_clpb_t *clpb = *(mtlk_clpb_t **) data;
+-  int res = MTLK_ERR_OK;
++  int res, *reply;
+   IEEE_ADDR *addr;
+   uint32 addr_size;
+-  uint16 sid;
++  uint16 *sid;
+ 
+   MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
+ 
+   addr = mtlk_clpb_enum_get_next(clpb, &addr_size);
+-  MTLK_CLPB_TRY(addr, addr_size)
+-    if (mtlk_vap_is_ap(nic->vap_handle) && !mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
+-      ILOG1_D("CID-%04x: HOSTAPD STA database is not synced", mtlk_vap_get_oid(nic->vap_handle));
+-      MTLK_CLPB_EXIT(MTLK_ERR_NOT_READY);
+-    }
+-
+-    /* Check that station is not connected */
+-    if (_core_cfg_check_sid_connected(nic, addr)) {
+-      MTLK_CLPB_EXIT(MTLK_ERR_ALREADY_EXISTS);
+-    }
+-
+-    res = core_cfg_internal_request_sid(nic, addr, &sid);
+-
+-  MTLK_CLPB_FINALLY(res)
+-    return mtlk_clpb_push_res_data(clpb, res, &sid, sizeof(sid));
+-  MTLK_CLPB_END
++  if (!addr || addr_size != sizeof(*addr))
++    return MTLK_ERR_PARAMS;
++
++  /* Reserve both reply records before firmware can allocate the SID. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++  sid = mtlk_osal_mem_alloc(sizeof(*sid), MTLK_MEM_TAG_CLPB);
++  if (!sid)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, sid, sizeof(*sid));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(sid);
++    return res;
++  }
++  *sid = DB_UNKNOWN_SID;
++
++  if (mtlk_vap_is_ap(nic->vap_handle) &&
++      !mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
++    *reply = MTLK_ERR_NOT_READY;
++  } else if (_core_cfg_check_sid_connected(nic, addr)) {
++    *reply = MTLK_ERR_ALREADY_EXISTS;
++  } else {
++    *reply = core_cfg_internal_request_sid(nic, addr, sid);
++    /* Lost command acknowledgement cannot permit a new SID admission. */
++    if (*reply != MTLK_ERR_OK && *reply != MTLK_ERR_NO_MEM &&
++        *reply != MTLK_ERR_MAC)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(nic->vap_handle));
++  }
++
++  return MTLK_ERR_OK;
+ }
+ 
+ int __MTLK_IFUNC core_cfg_remove_sid (mtlk_handle_t hcore, const void *data, uint32 data_size)
+ {
+-  int res;
++  int res, *reply;
+ 
+   uint16 *sid;
+   uint32 sid_size;
+@@ -1145,15 +1609,27 @@
+   MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
+ 
+   sid = mtlk_clpb_enum_get_next(clpb, &sid_size);
+-  MTLK_CLPB_TRY(sid, sid_size)
+-    if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
+-      ILOG1_D("CID-%04x: HOSTAPD STA database is not synced", mtlk_vap_get_oid(nic->vap_handle));
+-      MTLK_CLPB_EXIT(MTLK_ERR_NOT_READY);
+-    }
+-    res = core_remove_sid(nic, *sid);
+-  MTLK_CLPB_FINALLY(res)
+-    return mtlk_clpb_push_res(clpb, res);
+-  MTLK_CLPB_END
++  if (!sid || sid_size != sizeof(*sid))
++    return MTLK_ERR_PARAMS;
++
++  /* Never lose a successful release to a later clipboard allocation. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++  if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
++    *reply = MTLK_ERR_NOT_READY;
++  } else {
++    *reply = core_remove_sid(nic, *sid);
++    if (*reply != MTLK_ERR_OK && *reply != MTLK_ERR_NO_MEM &&
++        *reply != MTLK_ERR_MAC)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(nic->vap_handle));
++  }
++  return MTLK_ERR_OK;
+ }
+ 
+ int core_cfg_ap_disconnect_all (mtlk_handle_t hcore, const void* data, uint32 data_size)
+@@ -1318,6 +1794,29 @@
+ }
+ 
+ 
++static int _core_cfg_refresh_radio_policy(mtlk_core_t *core, unsigned user_limit,
++                                      unsigned mac_limit, BOOL fixed, BOOL new_fixed_request,
++                                      uint32 rts_threshold);
++
++/* Both role wiphys use the existing master serializer for regulatory changes. */
++int core_cfg_regulatory(mtlk_handle_t hcore, const void *data, uint32 data_size)
++{
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  mtlk_clpb_t *clpb = *(mtlk_clpb_t **)data;
++  const mtlk_country_code_t *country;
++  unsigned size;
++  int res;
++
++  MTLK_ASSERT(data_size == sizeof(mtlk_clpb_t *));
++  if (!wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_NOT_READY);
++  country = mtlk_clpb_enum_get_next(clpb, &size);
++  if (!country || size != sizeof(*country))
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_PARAMS);
++  res = core_cfg_country_code_set(core, country);
++  return mtlk_clpb_push_res(clpb, res);
++}
++
+ /* Processing of Country Code */
+ int __MTLK_IFUNC
+ core_cfg_country_code_set (mtlk_core_t *core, const mtlk_country_code_t *country_code)
+@@ -1325,9 +1824,20 @@
+   int res;
+   res = _core_cfg_store_country_code(core, country_code);
+ 
+-  if(MTLK_ERR_OK == res)
+-    res = _core_send_reg_domain_config(core);
+-
++  if (res != MTLK_ERR_OK)
++    return res;
++  res = _core_send_reg_domain_config(core);
++
++  if (res == MTLK_ERR_OK) {
++    wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++    res = _core_cfg_refresh_radio_policy(mtlk_core_get_master(core),
++      WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER),
++      WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MAC_TX_POWER),
++      WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER_FIXED), FALSE,
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_RTS_THRESH));
++  }
++  if (res != MTLK_ERR_OK)
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
+   return res;
+ }
+ 
+@@ -1663,7 +2173,34 @@
+   }
+ }
+ 
+-void core_cfg_set_tx_power_limit (mtlk_core_t *core, unsigned center_freq, enum chanWidth cfg_width, unsigned cf_primary, mtlk_country_code_t req_country_code)
++static void
++_core_cfg_limit_tx_power(psdb_pw_limits_t *table, unsigned user, unsigned mac)
++{
++  unsigned i, limit = user;
++  if (mac && (!limit || mac < limit))
++    limit = mac;
++  if (limit)
++    for (i = 0; i < ARRAY_SIZE(table->pw_limits); i++)
++      if (table->pw_limits[i] > limit)
++        table->pw_limits[i] = limit;
++}
++
++static void
++_core_cfg_intersect_tx_power(psdb_pw_limits_t *target, const psdb_pw_limits_t *previous)
++{
++  unsigned i;
++  for (i = 0; i < ARRAY_SIZE(target->pw_limits); i++)
++    if (previous->pw_limits[i] && (!target->pw_limits[i] ||
++        previous->pw_limits[i] < target->pw_limits[i]))
++      target->pw_limits[i] = previous->pw_limits[i];
++}
++
++static int
++_core_cfg_apply_tx_power(mtlk_core_t *core, unsigned center_freq,
++                        enum chanWidth cfg_width, unsigned cf_primary,
++                        mtlk_country_code_t req_country_code,
++                        unsigned user_limit, unsigned mac_limit,
++                        BOOL reload_calibration, BOOL intersect_previous)
+ {
+   mtlk_df_t *df               = mtlk_vap_get_df(core->vap_handle); /* this checks vap_handle and df, cannot return NULL */
+   mtlk_df_user_t *df_user     = mtlk_df_get_user(df);
+@@ -1686,7 +2223,7 @@
+       (req_country_code.country[1] != country_code.country[1]) ) {
+        ILOG1_SS("req_country_code(%s) is different from current country_code(%s)",
+                 req_country_code.country, country_code.country);
+-       return;
++       return MTLK_ERR_NOT_READY;
+   }
+ 
+   cfg_width = _wave_chan_width_validate(cfg_width);
+@@ -1696,6 +2233,7 @@
+ 
+   MTLK_ASSERT(phy_cw < ARRAY_SIZE(cfg_pwl.pw_limits));
+   memset(&cfg_pwl, 0, sizeof(cfg_pwl));
++  memset(&psd_pwl, 0, sizeof(psd_pwl));
+ 
+   MTLK_STATIC_ASSERT((PSDB_PHY_CW_OFDM_20 + 1) == PSDB_PHY_CW_OFDM_40);
+   MTLK_STATIC_ASSERT((PSDB_PHY_CW_OFDM_40 + 1) == PSDB_PHY_CW_OFDM_80);
+@@ -1749,38 +2287,378 @@
+     if (!cfg_pwl.pw_limits[ofdm_idx]) {
+       ELOG_DD("PSD/REG power limits are not set! center_freq %u bandwidth %u", center_freq, sub_bw);
+       MTLK_ASSERT(FALSE);
+-      return;
+-    }
+-  }
++      return MTLK_ERR_PARAMS;
++    }
++  }
++
++  /* All native ceilings further restrict the country and calibrated PSDB
++   * table. Reserved/unused zero entries remain zero.
++   */
++  _core_cfg_limit_tx_power(&cfg_pwl, user_limit, mac_limit);
++
++  if (reload_calibration) {
++    psdb_pw_limits_t previous;
++    mtlk_pdb_size_t size = sizeof(previous);
++    res = WAVE_RADIO_PDB_GET_BINARY(radio, PARAM_DB_RADIO_TPC_PW_LIMITS_CFG,
++                                    &previous, &size);
++    if (res != MTLK_ERR_OK || size != sizeof(previous) ||
++        (is_channel_certain(__wave_core_chandef_get(core)) &&
++         !previous.pw_limits[PSDB_PHY_CW_OFDM_20]))
++      return MTLK_ERR_NOT_READY;
++    /* The active-refresh caller owns the unchanged channel. Keeping an
++     * older lower table in that transaction would leave the former limit
++     * active after an increase. All ordinary channel/scan callers retain
++     * their existing intersection. */
++    if (intersect_previous)
++      _core_cfg_intersect_tx_power(&cfg_pwl, &previous);
++    _core_cfg_limit_tx_power(&cfg_pwl, user_limit, mac_limit);
++    return mtlk_reload_tpc_wrapper(core, ieee80211_frequency_to_channel(center_freq), &cfg_pwl);
++  }
++  res = mtlk_core_set_tpc_config(core, &cfg_pwl);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_TX_POWER_REG_LIM, reg_pw_lim);
+-  WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_TX_POWER_PSD, psd_pwl.pw_limits[phy_cw]); /* power units */
+-
+-  /* Store values of tx power PSD limits of 11b and non-11b (OFDM) phy modes.
+-   * They are not depended of current value of Tx Power PSD in parameters DB. */
+-  res = WAVE_RADIO_PDB_SET_BINARY(radio, PARAM_DB_RADIO_TPC_PW_LIMITS_PSD, &psd_pwl, pw_limits_size); /* power units */
++  WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_TX_POWER_PSD, psd_pwl.pw_limits[phy_cw]);
++  WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_TX_POWER_CFG, cfg_pwl.pw_limits[phy_cw]);
++  res = WAVE_RADIO_PDB_SET_BINARY(radio, PARAM_DB_RADIO_TPC_PW_LIMITS_PSD,
++                                  &psd_pwl, pw_limits_size);
+   if (res != MTLK_ERR_OK)
+-  {
+-    ELOG_D("Can't update PSD power limits in PDB, res: %d", res);
+-    /* MTLK_ASSERT(FALSE); */
+-  }
+-
+-  /* call TPC wrapper */
+-  res = mtlk_reload_tpc_wrapper(core, ieee80211_frequency_to_channel(center_freq), &cfg_pwl);
+-  if (MTLK_ERR_OK != res) {
+-    ELOG_D("Failed to reload TPC wrapper, res: %d", res);
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++  return res;
++}
++
++int core_cfg_set_tx_power_limit(mtlk_core_t *core, unsigned center_freq,
++                               enum chanWidth width, unsigned primary,
++                               mtlk_country_code_t country, BOOL prepare_channel)
++{
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  return _core_cfg_apply_tx_power(core, center_freq, width, primary, country,
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER_FIXED) ? 0 :
++      WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER),
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MAC_TX_POWER), prepare_channel, TRUE);
++}
++
++/* The caller owns the master serializer. Before a channel is activated only
++ * the requested ceiling exists; the channel path must apply it before TX.
++ */
++static int
++_core_cfg_refresh_radio_policy(mtlk_core_t *core, unsigned user_limit, unsigned mac_limit,
++                            BOOL fixed, BOOL new_fixed_request, uint32 rts_threshold)
++{
++  struct mtlk_chan_def *cd = __wave_core_chandef_get(core);
++  mtlk_country_code_t country;
++
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++
++  if (fixed && !_core_cfg_fixed_data_supported(core))
++    return MTLK_ERR_NOT_SUPPORTED;
++  /* ADD_VAP precedes the first mac80211 channel configuration. A cold STA
++   * therefore counts as active while the native channel is still the
++   * zeroed ST_NONE state. Cache its requested ceiling just as before VAP
++   * activation: core_cfg_send_set_chan() consumes it before allowing TX.
++   * Do not confuse this with an in-progress/failed channel transition,
++   * whose previous primary channel or switch type is still present.
++   */
++  if (!cd->chan.center_freq && !cd->center_freq1 &&
++      __wave_core_chan_switch_type_get(core) == ST_NONE)
++    return MTLK_ERR_OK;
++  /* Inactive state is requested policy. The normal activation/recovery
++   * channel owner stages and completes it before native DATA admission. */
++  if (!mtlk_vap_manager_get_active_vaps_number(mtlk_vap_get_manager(core->vap_handle)))
++    return MTLK_ERR_OK;
++
++  if (_core_cfg_tpc_limits_are_deferred(core)) {
++    MTLK_ASSERT(core == mtlk_core_get_master(core));
++    /* A scan/CSA/CAC owns its channel and TX fence. A power request must
++     * not turn that operation into a normal same-channel transaction or
++     * publish a policy which it has not applied. The caller can retry
++     * after that native owner completes. Regulatory failure retains its
++     * existing quiesce path. */
++    if (mtlk_core_scan_is_running(core) || mtlk_core_is_in_scan_mode(core) ||
++        __mtlk_core_is_chan_switch_type_csa_with_block_tx(core) ||
++        wave_radio_cac_active(radio) || wave_radio_dfs_tx_blocked(radio) ||
++        (core->slow_ctx->is_block_tx && cd->wait_for_beacon))
++      return MTLK_ERR_BUSY;
++    if (!is_channel_certain(cd))
++      return MTLK_ERR_NOT_READY;
++
++    /* The current channel is copied inside the common owner before it is
++     * marked uncertain. Its checked SET_CHANNEL completion follows the
++     * calibrated-limit and peer DATA refresh, unlike SET_TPC_CONFIG alone.
++     * USER/MAC caches are committed by the caller only after this returns. */
++    return _core_cfg_send_set_chan(core, cd, NULL, user_limit, mac_limit, TRUE,
++                                    fixed, new_fixed_request, rts_threshold);
++  }
++
++  if (!is_channel_certain(cd))
++    return MTLK_ERR_OK;
++  core_cfg_country_code_get(core, &country);
++  return _core_cfg_apply_tx_power(core, cd->center_freq1, cd->width,
++                                  cd->chan.center_freq, country,
++                                  user_limit, mac_limit, FALSE, TRUE);
++}
++
++/* Maximum eligible rate target, in 1/8 dBm. The firmware calibration value
++ * and the acknowledged country/user table both bound the reported power.
++ */
++static unsigned
++_mtlk_tx_power_target_max(const mtlk_tx_power_data_t *power,
++                          const psdb_rate_pw_table_t *rates,
++                          BOOL bf, BOOL mu, BOOL he_mu)
++{
++  unsigned i, width, maximum = 0;
++
++  if (!power->power_hw.pw_size || power->power_hw.pw_size > PHY_STAT_RATE_CBW_NUM ||
++      power->cur_cbw >= power->power_hw.pw_size ||
++      !power->cur_antennas || power->cur_antennas > PHY_STAT_RATE_NSS_MAX)
++    return 0;
++
++  for (i = 0; i < ARRAY_SIZE(rates->rates_all); i++) {
++    const mtlk_rate_pw_entry_t *rate = &rates->rates_all[i];
++    int base, target;
++    unsigned last = power->cur_cbw;
++
++    if (!rate->nss || rate->nss > power->cur_antennas ||
++        (rate->phy_mode == PHY_MODE_B && power->cur_band != MTLK_HW_BAND_2_4_GHZ) ||
++        (rate->phy_mode == PHY_MODE_AC && power->cur_band != MTLK_HW_BAND_5_2_GHZ))
++      continue;
++    base = IS_QAM256_OR_HIGHER(rate->phy_mode, rate->mcs) ?
++      power->power_hw.pw_min_ant[power->cur_cbw] :
++      power->power_hw.pw_max_ant[power->cur_cbw];
++    /* pw_size is set before statistics arrive; zero data is not a sample. */
++    if (!base)
++      continue;
++    target = base + power->cur_ant_gain + rate->pw_offs;
++    if (target <= 0)
++      continue;
++    if (rate->phy_mode == PHY_MODE_B || rate->phy_mode == PHY_MODE_AG)
++      last = CW_20;
++    else if (rate->phy_mode == PHY_MODE_N)
++      last = min_t(unsigned, last, CW_40);
++    for (width = CW_20; width <= last; width++) {
++      unsigned idx = rate->phy_mode == PHY_MODE_B ? PSDB_PHY_CW_11B :
++                     PSDB_PHY_CW_OFDM_20 + width;
++      unsigned limit = power->power_tpc_cfg.pw_limits[idx];
++      /* The single PSDB 11b entry represents all 11b rates. */
++      if (rate->phy_mode != PHY_MODE_B &&
++          !mtlk_bitrate_params_supported(rate->phy_mode, width, 0, rate->mcs, rate->nss))
++        continue;
++      if (bf && rate->phy_mode >= PHY_MODE_N)
++        limit = max_t(unsigned, limit, power->power_tpc_cfg.pw_limits[PSDB_PHY_CW_BF_20 + width]);
++      if ((mu && rate->phy_mode == PHY_MODE_AC) ||
++          (he_mu && rate->phy_mode == PHY_MODE_AX))
++        limit = max_t(unsigned, limit, power->power_tpc_cfg.pw_limits[PSDB_PHY_CW_MU_20 + width]);
++      if (limit <= power->power_usr_offs)
++        continue;
++      limit -= power->power_usr_offs;
++      maximum = max_t(unsigned, maximum, min_t(unsigned, limit, target));
++    }
++  }
++  return maximum;
++}
++
++int mtlk_core_get_tx_power(mtlk_core_t *core, int *dbm)
++{
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  hw_psdb_t *psdb = mtlk_core_get_psdb(core);
++  mtlk_tx_power_data_t power = {};
++  mtlk_pdb_size_t size = sizeof(power.power_tpc_cfg);
++  unsigned maximum;
++  int res;
++
++  if (!psdb || !psdb->rate_pw_table)
++    return MTLK_ERR_NOT_READY;
++  res = WAVE_RADIO_PDB_GET_BINARY(radio, PARAM_DB_RADIO_TPC_PW_LIMITS_CFG,
++                                  &power.power_tpc_cfg, &size);
++  if (res != MTLK_ERR_OK || size != sizeof(power.power_tpc_cfg))
++    return MTLK_ERR_NOT_READY;
++  mtlk_hw_mhi_get_tx_power(mtlk_vap_get_hw(core->vap_handle),
++                          &power.power_hw, wave_radio_id_get(radio));
++  power.cur_band = core_cfg_get_freq_band_cfg(core);
++  power.cur_cbw = __wave_core_chandef_get(core)->width;
++  power.cur_antennas = mtlk_coc_get_current_params(__wave_core_coc_mgmt_get(core))->num_tx_antennas;
++  if (!power.cur_antennas || power.cur_antennas > PHY_STAT_RATE_NSS_MAX)
++    return MTLK_ERR_NOT_READY;
++  power.cur_ant_gain = mtlk_antennas_factor(power.cur_antennas);
++  power.power_usr_offs = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TX_POWER_LIMIT_OFFSET);
++  /* Unsupported legacy MU control cannot exclude VHT MU from this power
++   * envelope. Keep its limits eligible without claiming an enabled mode. */
++  maximum = _mtlk_tx_power_target_max(&power, psdb->rate_pw_table,
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_BF_MODE) != BF_STATE_NON_BF,
++    !mtlk_core_mu_operation_supported(core) ||
++      WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MU_OPERATION) != 0,
++    WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_HE_MU_OPERATION) != 0);
++  if (!maximum)
++    return MTLK_ERR_NOT_READY;
++  *dbm = maximum / 8;
++  return MTLK_ERR_OK;
++}
++
++int core_cfg_tx_power(mtlk_handle_t hcore, const void *data, uint32 data_size)
++{
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  mtlk_clpb_t *clpb = *(mtlk_clpb_t **)data;
++  const struct wave_tx_power_request *request;
++  unsigned size, user_limit, mac_limit;
++  BOOL fixed, new_fixed_request = FALSE;
++  int res = MTLK_ERR_OK, dbm = 0, *reply;
++
++  MTLK_ASSERT(data_size == sizeof(mtlk_clpb_t *));
++  if (!wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_NOT_READY);
++  request = mtlk_clpb_enum_get_next(clpb, &size);
++  if (!request || size != sizeof(*request) || request->limit > 32767)
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_PARAMS);
++
++  if (request->operation == WAVE_TX_POWER_GET) {
++    if (!is_channel_certain(__wave_core_chandef_get(core)) ||
++        !mtlk_vap_manager_get_active_vaps_number(mtlk_vap_get_manager(core->vap_handle)))
++      return mtlk_clpb_push_res(clpb, MTLK_ERR_NOT_READY);
++    if (WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER_FIXED))
++      res = _core_cfg_fixed_data_get(core,
++        WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER), &dbm);
++    else
++      res = mtlk_core_get_tx_power(core, &dbm);
++    return mtlk_clpb_push_res_data(clpb, res, &dbm, sizeof(dbm));
++  }
++
++  user_limit = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER);
++  mac_limit = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MAC_TX_POWER);
++  fixed = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER_FIXED);
++  if (request->operation == WAVE_TX_POWER_USER) {
++    user_limit = request->limit;
++    fixed = FALSE;
++  } else if (request->operation == WAVE_TX_POWER_USER_FIXED) {
++    if (request->limit % 4 || request->limit < AX50_FIXED_DATA_MIN_HALF_DBM * 4 ||
++        request->limit > AX50_FIXED_DATA_MAX_HALF_DBM * 4)
++      return mtlk_clpb_push_res(clpb, MTLK_ERR_NOT_SUPPORTED);
++    user_limit = request->limit;
++    fixed = TRUE;
++    new_fixed_request = TRUE;
++  } else if (request->operation == WAVE_TX_POWER_MAC) {
++    /* mac80211 initializes an idle STA with its existing unset ceiling.
++     * A repeated constraint is not a power change and must not initiate
++     * a same-channel transaction while scan/CSA or initial channel setup
++     * owns that operation. Every channel commit independently reapplies
++     * the saved ceiling; errors in real changes keep the quiesce path.
++     */
++    if (mac_limit == request->limit)
++      return mtlk_clpb_push_res(clpb, MTLK_ERR_OK);
++    mac_limit = request->limit;
+   } else {
+-      /* Store value of current tx power limit (it depends from network mode and channel width)
+-       * as a current value of Tx Power in parameters DB */
+-      WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_TX_POWER_CFG, cfg_pwl.pw_limits[phy_cw]); /* power units */
+-  }
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_PARAMS);
++  }
++
++  /* Reserve the result before changing acknowledged radio policy. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++  res = _core_cfg_refresh_radio_policy(core, user_limit, mac_limit, fixed, new_fixed_request,
++                     WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_RTS_THRESH));
++  if (res == MTLK_ERR_OK) {
++    WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER, user_limit);
++    WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_MAC_TX_POWER, mac_limit);
++    WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER_FIXED, fixed);
++  }
++  *reply = res;
++  return MTLK_ERR_OK;
++}
++
++/* Both role wiphys submit to one radio policy and master serializer. Cold
++ * policy is replayed by the ordinary channel owner before TX. Active updates
++ * commit the cache only after the complete stage/channel/query transaction.
++ */
++int core_cfg_rts_threshold(mtlk_handle_t hcore, const void *data, uint32 data_size)
++{
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  mtlk_clpb_t *clpb = *(mtlk_clpb_t **)data;
++  const uint32 *threshold;
++  unsigned size;
++  int res, *reply;
++
++  MTLK_ASSERT(data_size == sizeof(mtlk_clpb_t *));
++  if (!wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_NOT_READY);
++  threshold = mtlk_clpb_enum_get_next(clpb, &size);
++  if (!threshold || size != sizeof(*threshold) ||
++      (*threshold != WAVE_RTS_DISABLED && *threshold > WAVE_RTS_MAX))
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_PARAMS);
++  if ((uint32)WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_RTS_THRESH) == *threshold)
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_OK);
++  if (!_core_cfg_rts_supported(core))
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_NOT_SUPPORTED);
++  /* Reserve the result before changing acknowledged radio policy. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++  res = _core_cfg_refresh_radio_policy(core,
++      WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER),
++      WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_MAC_TX_POWER),
++      WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_USER_TX_POWER_FIXED), FALSE,
++      *threshold);
++  if (res == MTLK_ERR_OK)
++    WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_RTS_THRESH, *threshold);
++  *reply = res;
++  return MTLK_ERR_OK;
++}
++
++void
++core_cfg_apply_assoc_four_addr(mtlk_core_t *core,
++                               struct wave_peer_connect_request *request)
++{
++  /* The request carries peer declarations, not a policy decision made before
++   * entering the master serializer. STATIC/LIST/WDS-WPA are applied by the
++   * native station owner immediately after this association-time decision. */
++  if ((MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_4ADDR_MODE) == MTLK_CORE_4ADDR_DYNAMIC &&
++       request->four_addr) ||
++      (request->multi_ap_backhaul_sta &&
++       wave_df_multi_ap_backhaul(mtlk_df_get_user(mtlk_vap_get_df(core->vap_handle)))))
++    request->peer.WDS_client_type = FOUR_ADDRESSES_STATION;
++}
++
++/* The radio master serializes policy with STA_ADD, key operations and removal.
++ * STADB publication ends only after STOP_TRAFFIC, STA_REMOVE and native SID
++ * release have completed. An uncertain native lifetime quiesces the hardware;
++ * an empty host database alone must not authorize a new policy in that state.
++ */
++static int
++_core_cfg_four_addr_change_ready(mtlk_core_t *core, const IEEE_ADDR *addr)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  sta_entry *sta;
++
++  if (!wave_hw_mmb_ready(hw) || mtlk_core_rcvry_is_running(core) ||
++      wave_rcvry_mac_fatal_pending_get(hw) || core->slow_ctx->sta_connecting)
++    return MTLK_ERR_BUSY;
++  if (!addr)
++    return mtlk_stadb_get_sta_cnt(&core->slow_ctx->stadb) ?
++           MTLK_ERR_BUSY : MTLK_ERR_OK;
++
++  sta = mtlk_stadb_find_sta(&core->slow_ctx->stadb, addr->au8Addr);
++  if (!sta)
++    return MTLK_ERR_OK;
++  mtlk_sta_decref(sta);
++  return MTLK_ERR_BUSY;
+ }
+ 
+ static int
+ _mtlk_core_store_four_addr_mode (mtlk_core_t *core, const uint32 four_addr_mode)
+ {
+     uint32 four_addr_mode_old;
+-    s32 flush;
++    int res;
+ 
+     MTLK_ASSERT(core != NULL);
+     if (four_addr_mode >= MTLK_CORE_4ADDR_LAST)
+@@ -1789,9 +2667,12 @@
+     four_addr_mode_old = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_4ADDR_MODE);
+ 
+     if (four_addr_mode != four_addr_mode_old) {
++      res = _core_cfg_four_addr_change_ready(core, NULL);
++      if (res != MTLK_ERR_OK)
++        return res;
++      /* Configure the next association, never an installed peer. The old
++       * vendor flush event has no acknowledged station/key retirement. */
+       MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_4ADDR_MODE, four_addr_mode);
+-      flush = mtlk_vap_get_id(core->vap_handle);
+-      wv_cfg80211_handle_flush_stations(core->vap_handle, &flush, sizeof(flush));
+     }
+     return MTLK_ERR_OK;
+ }
+@@ -1801,6 +2682,13 @@
+ {
+   ieee_addr_entry_t *ieee_addr_entry = NULL;
+   MTLK_HASH_ENTRY_T(ieee_addr) *h;
++  int res;
++
++  if (core_cfg_four_addr_entry_exists(nic, addr))
++    return MTLK_ERR_OK;
++  res = _core_cfg_four_addr_change_ready(nic, addr);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   ILOG2_DY("CID-%04x: four address list entry add %Y",
+     mtlk_vap_get_oid(nic->vap_handle), addr->au8Addr);
+@@ -1837,6 +2725,13 @@
+ mtlk_core_del_four_addr_entry (mtlk_core_t *nic, const IEEE_ADDR *addr)
+ {
+   MTLK_HASH_ENTRY_T(ieee_addr) *h;
++  int res;
++
++  if (!core_cfg_four_addr_entry_exists(nic, addr))
++    return MTLK_ERR_OK;
++  res = _core_cfg_four_addr_change_ready(nic, addr);
++  if (res != MTLK_ERR_OK)
++    return res;
+ 
+   ILOG2_DY("CID-%04x: four address list entry delete %Y",
+     mtlk_vap_get_oid(nic->vap_handle), addr->au8Addr);
+@@ -1891,9 +2786,10 @@
+   h = mtlk_hash_find_ieee_addr(&nic->four_addr_sta_list.hash, addr);
+   mtlk_osal_lock_release(&nic->four_addr_sta_list.ieee_addr_lock);
+ 
+-  if (!h)
++  if (!h) {
+     ILOG3_DY("CID-%04x: four address station list entry NOT found %Y",
+       mtlk_vap_get_oid(nic->vap_handle), addr->au8Addr);
++  }
+ 
+   return (h != NULL);
+ }
+@@ -2030,8 +2926,8 @@
+     return res;
+ }
+ 
+-int __MTLK_IFUNC
+-mtlk_core_cfg_set_static_plan (mtlk_handle_t hcore, const void *data, uint32 data_size)
++static int __MTLK_IFUNC
++_wave_core_cfg_set_static_plan (mtlk_handle_t hcore, const void *data, uint32 data_size)
+ {
+     int res = MTLK_ERR_OK;
+     mtlk_core_t *core = (mtlk_core_t *) hcore;
+@@ -2052,6 +2948,21 @@
+     MTLK_CLPB_FINALLY(res)
+       return mtlk_clpb_push_res(clpb, res); /* push result into clipboard */
+     MTLK_CLPB_END
++}
++
++int __MTLK_IFUNC
++mtlk_core_cfg_set_static_plan(mtlk_handle_t hcore, const void *data, uint32 size)
++{
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  int res;
++
++  wave_hw_airtime_lock(hw);
++  res = wave_hw_airtime_owned(hw) ?
++    mtlk_clpb_push_res(*(mtlk_clpb_t **)data, MTLK_ERR_BUSY) :
++    _wave_core_cfg_set_static_plan(hcore, data, size);
++  wave_hw_airtime_unlock(hw);
++  return res;
+ }
+ 
+ /* End of Static Planner processing */
+@@ -3062,6 +3973,547 @@
+     return res;
+ }
+ 
++static int __MTLK_IFUNC
++_mtlk_core_set_he_mu_operation(mtlk_core_t *core, BOOL he_mu_operation)
++{
++  mtlk_txmm_msg_t                 man_msg;
++  mtlk_txmm_data_t               *man_entry = NULL;
++  UMI_HE_MU_OPERATION_CONFIG     *mu_operation_config = NULL;
++  mtlk_vap_handle_t               vap_handle = core->vap_handle;
++  wave_radio_t                   *radio = wave_vap_radio_get(vap_handle);
++  int                             res;
++
++  ILOG2_V("Sending UMI_HE_MU_OPERATION_CONFIG");
++
++  man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
++  if (NULL == man_entry) {
++    ELOG_D("CID-%04x: No man entry available", mtlk_vap_get_oid(vap_handle));
++    return MTLK_ERR_NO_RESOURCES;
++  }
++
++  man_entry->id = UM_MAN_HE_MU_OPERATION_CONFIG_REQ;
++  man_entry->payload_size = sizeof(UMI_HE_MU_OPERATION_CONFIG);
++
++  mu_operation_config = (UMI_HE_MU_OPERATION_CONFIG *)(man_entry->payload);
++  mu_operation_config->enableHeMuOperation = he_mu_operation;
++  mu_operation_config->getSetOperation = API_SET_OPERATION;
++
++  res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++
++  if (MTLK_ERR_OK != res) {
++    ELOG_DD("CID-%04x: Set UMI_HE_MU_OPERATION_CONFIG failed (res = %d)", mtlk_vap_get_oid(vap_handle), res);
++  }
++  else {
++    WAVE_RADIO_PDB_SET_INT(radio, PARAM_DB_RADIO_HE_MU_OPERATION, he_mu_operation);
++  }
++
++  mtlk_txmm_msg_cleanup(&man_msg);
++  return res;
++}
++
++
++int __MTLK_IFUNC
++mtlk_core_set_he_mu_operation(mtlk_core_t *core, BOOL enabled)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  int res;
++
++  wave_hw_airtime_lock(hw);
++  res = enabled && wave_hw_airtime_owned(hw) ? MTLK_ERR_BUSY :
++          _mtlk_core_set_he_mu_operation(core, enabled);
++  wave_hw_airtime_unlock(hw);
++  return res;
++}
++
++/* Native A0 ATF is one policy per radio. The radio master serializer owns
++ * peer ADD/REMOVE and SID reservation; the card lock excludes global MU and
++ * numeric-SID TXOP writers. A host MAC lookup supplies identity, never AID.
++ */
++#define WAVE_AIRTIME_DEFAULT_WEIGHT 256
++
++struct wave_airtime_vector {
++  u16 grant[GEN6_MAX_SID];
++  u16 count;
++};
++
++static bool wave_airtime_peer_supported(const sta_info *info)
++{
++  return MTLK_BFIELD_GET(info->flags, STA_FLAGS_11ax) ||
++    !MTLK_BFIELD_GET(info->flags, STA_FLAGS_11ac) ||
++    !(MAC_TO_HOST32(info->vht_cap_info) & IEEE80211_VHT_CAP_MU_BEAMFORMEE_CAPABLE);
++}
++
++int wave_core_airtime_sta_admit(mtlk_core_t *core, const sta_info *info)
++{
++  /* The same master serializer owns both this predicate and first claim. */
++  if (!mtlk_core_get_master(core)->airtime_standard && !info->airtime_weight)
++    return MTLK_ERR_OK;
++  return mtlk_vap_is_ap(core->vap_handle) && wave_airtime_peer_supported(info) ?
++    MTLK_ERR_OK : MTLK_ERR_NOT_SUPPORTED;
++}
++
++static int wave_airtime_insert(struct wave_airtime_vector *vector,
++                               const sta_info *info, unsigned weight,
++                               unsigned capacity)
++{
++  unsigned sid = info->sid;
++
++  /* The native VHT GroupManager admits only non-HE MU beamformees to the
++   * override-producing state. Its per-peer override is not the saved policy
++   * returned by the public TXOP query, so these peers cannot join this owner.
++   * HE group admission is independently gated by the actual global GET below.
++   */
++  if (!wave_airtime_peer_supported(info))
++    return MTLK_ERR_NOT_SUPPORTED;
++  if (sid >= GEN6_MAX_SID || sid >= capacity || vector->grant[sid] ||
++      !weight || weight > U16_MAX)
++    return MTLK_ERR_PARAMS;
++  vector->grant[sid] = weight;
++  vector->count++;
++  return MTLK_ERR_OK;
++}
++
++static int wave_airtime_snapshot(mtlk_core_t *core,
++                                 struct wave_airtime_vector *vector,
++                                 const sta_info *replace, unsigned weight,
++                                 const sta_info *extra, unsigned excluded_sid)
++{
++  mtlk_vap_manager_t *manager = mtlk_vap_get_manager(core->vap_handle);
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  unsigned v, maximum = 0, capacity = wave_hw_max_sid_get(hw);
++  int res = MTLK_ERR_OK;
++
++  memset(vector, 0, sizeof(*vector));
++  for (v = 0; v < mtlk_vap_manager_get_max_vaps_count(manager); v++) {
++    mtlk_vap_handle_t vap;
++    mtlk_core_t *peer_core;
++    mtlk_stadb_iterator_t iter = { 0 };
++    const sta_entry *sta;
++
++    if (mtlk_vap_manager_get_vap_handle(manager, v, &vap) != MTLK_ERR_OK)
++      continue;
++    peer_core = mtlk_vap_get_core(vap);
++    sta = mtlk_stadb_iterate_first(&peer_core->slow_ctx->stadb, &iter);
++    if (!sta) {
++      if (iter.size)
++        return MTLK_ERR_NO_MEM;
++      continue;
++    }
++    do {
++      const sta_info *info = &sta->info;
++
++      if (info->sid == excluded_sid)
++        continue;
++      if (!mtlk_vap_is_ap(vap)) {
++        res = MTLK_ERR_NOT_SUPPORTED;
++        break;
++      }
++      res = wave_airtime_insert(vector, info,
++        info == replace ? weight :
++          (info->airtime_weight ?: WAVE_AIRTIME_DEFAULT_WEIGHT), capacity);
++      if (res != MTLK_ERR_OK)
++        break;
++    } while ((sta = mtlk_stadb_iterate_next(&iter)) != NULL);
++    mtlk_stadb_iterate_done(&iter);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++  if (extra) {
++    res = wave_airtime_insert(vector, extra,
++      extra->airtime_weight ?: WAVE_AIRTIME_DEFAULT_WEIGHT, capacity);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++  for (v = 0; v < GEN6_MAX_SID; v++)
++    maximum = MAX(maximum, vector->grant[v]);
++  for (v = 0; v < GEN6_MAX_SID; v++) {
++    unsigned quantum;
++
++    if (!vector->grant[v])
++      continue;
++    /* The native weighted producer divides by the maximum, not the sum.
++     * Preserve its <1 quantum floor rounding, but reject the lower clamp
++     * instead of accepting a ratio the firmware would silently flatten.
++     */
++    quantum = ((u32)32767 * vector->grant[v] / maximum) >> 7;
++    if (quantum < 20)
++      return MTLK_ERR_NOT_SUPPORTED;
++  }
++  return MTLK_ERR_OK;
++}
++
++static int wave_airtime_check_modes(mtlk_core_t *core,
++                                    const struct wave_airtime_vector *vector)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  mtlk_txmm_msg_t mu_msg;
++  mtlk_txmm_data_t *mu_entry;
++  UMI_HE_MU_OPERATION_CONFIG *mu;
++  unsigned sid;
++  int status;
++
++  if (!wave_hw_fw_feature_supported(hw, WAVE_FW_FEATURE_TXOP_READ))
++    return MTLK_ERR_NOT_SUPPORTED;
++  /* Native GET stays nonzero while HE groups are enabled or draining. Do
++   * not change that policy here: the caller must disable it explicitly.
++   * The held card lock excludes enable/static-plan writes until release of
++   * the last standard owner, including from the other radio's serializer.
++   */
++  mu_entry = mtlk_txmm_msg_init_with_empty_data(&mu_msg,
++    mtlk_vap_get_txmm(core->vap_handle), NULL);
++  if (!mu_entry)
++    return MTLK_ERR_NO_RESOURCES;
++  mu_entry->id = UM_MAN_HE_MU_OPERATION_CONFIG_REQ;
++  mu_entry->payload_size = sizeof(*mu);
++  mu = (UMI_HE_MU_OPERATION_CONFIG *)mu_entry->payload;
++  memset(mu, 0, sizeof(*mu));
++  mu->getSetOperation = API_GET_OPERATION;
++  status = mtlk_txmm_msg_send_blocked(&mu_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  if (status == MTLK_ERR_OK &&
++      (mu->getSetOperation != API_GET_OPERATION || mu->enableHeMuOperation))
++    status = MTLK_ERR_NOT_SUPPORTED;
++  mtlk_txmm_msg_cleanup(&mu_msg);
++  if (status != MTLK_ERR_OK)
++    return status;
++  /* Read the saved individual policy only after excluding both native MU
++   * override producers. The ATF SET still checks its effective native mode.
++   */
++  for (sid = 0; sid < GEN6_MAX_SID; sid++) {
++    mtlk_txmm_msg_t msg;
++    mtlk_txmm_data_t *entry;
++    UMI_SET_TXOP_CONFIG_t *req;
++    int res;
++
++    if (!vector->grant[sid])
++      continue;
++    entry = mtlk_txmm_msg_init_with_empty_data(&msg,
++      mtlk_vap_get_txmm(core->vap_handle), NULL);
++    if (!entry)
++      return MTLK_ERR_NO_RESOURCES;
++    entry->id = UM_MAN_SET_TXOP_CONFIG_REQ;
++    entry->payload_size = sizeof(*req);
++    req = (UMI_SET_TXOP_CONFIG_t *)entry->payload;
++    memset(req, 0, sizeof(*req));
++    req->staId = HOST_TO_MAC32(sid);
++    req->getSetOperation = API_GET_OPERATION;
++    res = mtlk_txmm_msg_send_blocked(&msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++    if (res == MTLK_ERR_OK &&
++        (MAC_TO_HOST32(req->staId) != sid ||
++         req->getSetOperation != API_GET_OPERATION ||
++         (req->mode != UMI_TXOP_MODE_FORCED &&
++          req->mode != UMI_TXOP_MODE_DYNAMIC)))
++      res = MTLK_ERR_NOT_SUPPORTED;
++    mtlk_txmm_msg_cleanup(&msg);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++  return MTLK_ERR_OK;
++}
++
++static int wave_airtime_send(mtlk_core_t *core,
++                             const struct wave_airtime_vector *vector,
++                             bool *submitted)
++{
++  mtlk_txmm_msg_t msg;
++  mtlk_txmm_data_t *entry;
++  UMI_ATF_QUOTAS *req;
++  unsigned sid;
++  int res;
++
++  *submitted = false;
++  entry = mtlk_txmm_msg_init_with_empty_data(&msg,
++    mtlk_vap_get_txmm(core->vap_handle), NULL);
++  if (!entry)
++    return MTLK_ERR_NO_RESOURCES;
++  entry->id = UM_MAN_ATF_QUOTAS_REQ;
++  entry->payload_size = sizeof(*req);
++  req = (UMI_ATF_QUOTAS *)entry->payload;
++  memset(req, 0, sizeof(*req));
++  req->u32interval = HOST_TO_MAC32(ATF_MIN_INTERVAL_TIME_MS);
++  req->u8AtmAlgorithemType = ATM_ALGORITHM_TYPE_WEIGHTED;
++  req->u8AtmWeightedType = ATM_WEIGHTED_TYPE_PER_STATION;
++  /* This A0 handler selects a radio from the originating VAP and consumes
++   * distribution[0] for its entire current-SID membership bitmap. */
++  req->u8nof_vaps = 1;
++  if (vector && vector->count) {
++    req->AtmDistributionType[0] = ATM_DISTRIBUTION_TYPE_DYNAMIC;
++    req->u16nof_sta = HOST_TO_MAC16(vector->count);
++    for (sid = 0; sid < GEN6_MAX_SID; sid++)
++      req->stationGrant[sid] = HOST_TO_MAC16(vector->grant[sid]);
++  }
++  *submitted = true;
++  res = mtlk_txmm_msg_send_blocked(&msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  if (res != MTLK_ERR_OK) {
++    /* The previous policy may already be withdrawn. An uncertain write
++     * cannot be rolled back by submitting another unowned transaction. */
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++  } else if (req->u8error_code != ATF_NO_ERRORS) {
++    res = req->u8error_code == ATF_MULTIPLE_DATA_IS_DISABLED ?
++            MTLK_ERR_NOT_SUPPORTED : MTLK_ERR_MAC;
++  }
++  mtlk_txmm_msg_cleanup(&msg);
++  return res;
++}
++
++static int wave_airtime_ready(mtlk_core_t *core)
++{
++  mtlk_core_t *master = mtlk_core_get_master(core);
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++
++  if (!mtlk_vap_is_ap(core->vap_handle) ||
++      !wave_hw_fw_feature_supported(hw, WAVE_FW_FEATURE_TXOP_READ))
++    return MTLK_ERR_NOT_SUPPORTED;
++  if (!wave_hw_mmb_ready(hw) || mtlk_core_rcvry_is_running(core) ||
++      wave_rcvry_mac_fatal_pending_get(hw) || master->airtime_vendor)
++    return MTLK_ERR_BUSY;
++  return MTLK_ERR_OK;
++}
++
++static int _wave_core_airtime_weight(mtlk_handle_t hcore, const void *data, uint32 data_size)
++{
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  mtlk_core_t *master = mtlk_core_get_master(core);
++  mtlk_clpb_t *clpb = *(mtlk_clpb_t **)data;
++  const struct wave_airtime_weight_request *request;
++  struct wave_airtime_vector *old = NULL, *next = NULL;
++  sta_entry *sta = NULL;
++  unsigned size;
++  int res, rollback, *reply;
++  bool submitted, old_applied, old_standard;
++
++  MTLK_ASSERT(data_size == sizeof(mtlk_clpb_t *));
++  request = mtlk_clpb_enum_get_next(clpb, &size);
++  if (!request || size != sizeof(*request) || !request->weight)
++    return mtlk_clpb_push_res(clpb, MTLK_ERR_PARAMS);
++  /* Reserve the result before a firmware update can commit. */
++  reply = mtlk_osal_mem_alloc(sizeof(*reply), MTLK_MEM_TAG_CLPB);
++  if (!reply)
++    return MTLK_ERR_NO_MEM;
++  res = mtlk_clpb_push_nocopy(clpb, reply, sizeof(*reply));
++  if (res != MTLK_ERR_OK) {
++    mtlk_osal_mem_free(reply);
++    return res;
++  }
++  res = wave_airtime_ready(core);
++  if (res != MTLK_ERR_OK)
++    goto end;
++  sta = mtlk_stadb_find_sta(&core->slow_ctx->stadb, request->addr.au8Addr);
++  if (!sta) {
++    res = MTLK_ERR_NO_ENTRY;
++    goto end;
++  }
++  if (master->airtime_standard &&
++      smp_load_acquire(&master->airtime_applied) &&
++      (sta->info.airtime_weight ?: WAVE_AIRTIME_DEFAULT_WEIGHT) == request->weight) {
++    res = MTLK_ERR_OK;
++    goto end;
++  }
++  old = kzalloc(sizeof(*old), GFP_KERNEL);
++  next = kzalloc(sizeof(*next), GFP_KERNEL);
++  if (!old || !next) {
++    res = MTLK_ERR_NO_MEM;
++    goto end;
++  }
++  res = wave_airtime_snapshot(core, old, NULL, 0, NULL, DB_UNKNOWN_SID);
++  if (res == MTLK_ERR_OK)
++    res = wave_airtime_snapshot(core, next, &sta->info, request->weight,
++                                NULL, DB_UNKNOWN_SID);
++  if (res == MTLK_ERR_OK)
++    res = wave_airtime_check_modes(master, next);
++  if (res != MTLK_ERR_OK)
++    goto end;
++
++  old_standard = master->airtime_standard;
++  old_applied = master->airtime_applied;
++  WRITE_ONCE(master->airtime_applied, false);
++  res = wave_airtime_send(master, next, &submitted);
++  if (res == MTLK_ERR_OK) {
++    WRITE_ONCE(sta->info.airtime_weight, request->weight);
++    master->airtime_standard = true;
++    wave_hw_airtime_mark(mtlk_vap_get_hw(core->vap_handle),
++                        wave_vap_radio_id_get(core->vap_handle), true);
++    smp_store_release(&master->airtime_applied, true);
++  } else if (!submitted) {
++    smp_store_release(&master->airtime_applied, old_applied);
++  } else if (wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle))) {
++    /* An acknowledged rejection can already have disabled the old vector.
++     * Restore its whole mapping; do not merely roll back a host cache. */
++    rollback = wave_airtime_send(master, old_standard ? old : NULL, &submitted);
++    if (rollback != MTLK_ERR_OK)
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++    else
++      smp_store_release(&master->airtime_applied, old_standard);
++  }
++end:
++  if (sta)
++    mtlk_sta_decref(sta);
++  kfree(next);
++  kfree(old);
++  *reply = res;
++  return MTLK_ERR_OK;
++}
++
++static int _wave_core_airtime_sta_added(mtlk_core_t *core, const sta_info *info)
++{
++  mtlk_core_t *master = mtlk_core_get_master(core);
++  struct wave_airtime_vector *next;
++  bool submitted, old_applied;
++  int res;
++
++  if (!master->airtime_standard && !info->airtime_weight)
++    return MTLK_ERR_OK;
++  res = wave_airtime_ready(core);
++  if (res != MTLK_ERR_OK)
++    return res;
++  next = kzalloc(sizeof(*next), GFP_KERNEL);
++  if (!next)
++    return MTLK_ERR_NO_MEM;
++  res = wave_airtime_snapshot(core, next, NULL, 0, info, DB_UNKNOWN_SID);
++  if (res == MTLK_ERR_OK)
++    res = wave_airtime_check_modes(master, next);
++  if (res == MTLK_ERR_OK) {
++    old_applied = master->airtime_applied;
++    WRITE_ONCE(master->airtime_applied, false);
++    res = wave_airtime_send(master, next, &submitted);
++    if (res == MTLK_ERR_OK) {
++      master->airtime_standard = true;
++      wave_hw_airtime_mark(mtlk_vap_get_hw(core->vap_handle),
++                          wave_vap_radio_id_get(core->vap_handle), true);
++      smp_store_release(&master->airtime_applied, true);
++    } else if (!submitted) {
++      smp_store_release(&master->airtime_applied, old_applied);
++    } else if (!master->airtime_standard &&
++               wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle))) {
++      bool disabled;
++
++      if (wave_airtime_send(master, NULL, &disabled) != MTLK_ERR_OK)
++        wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++    }
++    /* The caller owns rollback of this just-added native peer. When a
++     * previous standard policy existed, its REMOVE hook restores the old
++     * vector only after the new SID has left native ATF membership. */
++  }
++  kfree(next);
++  return res;
++}
++
++static int _wave_core_airtime_pause(mtlk_core_t *core, bool *paused)
++{
++  mtlk_core_t *master = mtlk_core_get_master(core);
++  bool submitted;
++  int res;
++
++  *paused = false;
++  if (!master->airtime_standard)
++    return MTLK_ERR_OK;
++  if (!wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))
++    return MTLK_ERR_NOT_READY;
++  res = wave_airtime_send(master, NULL, &submitted);
++  if (res == MTLK_ERR_OK) {
++    WRITE_ONCE(master->airtime_applied, false);
++    *paused = true;
++  } else if (submitted) {
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++  }
++  return res;
++}
++
++static int _wave_core_airtime_resume(mtlk_core_t *core, unsigned excluded_sid)
++{
++  mtlk_core_t *master = mtlk_core_get_master(core);
++  struct wave_airtime_vector *next;
++  bool submitted;
++  int res;
++
++  if (!master->airtime_standard)
++    return MTLK_ERR_OK;
++  if (!wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))
++    return MTLK_ERR_NOT_READY;
++  WRITE_ONCE(master->airtime_applied, false);
++  next = kzalloc(sizeof(*next), GFP_KERNEL);
++  if (!next) {
++    res = MTLK_ERR_NO_MEM;
++    goto failed;
++  }
++  res = wave_airtime_snapshot(core, next, NULL, 0, NULL, excluded_sid);
++  if (res == MTLK_ERR_OK && next->count)
++    res = wave_airtime_check_modes(master, next);
++  if (res == MTLK_ERR_OK && next->count)
++    res = wave_airtime_send(master, next, &submitted);
++  if (res == MTLK_ERR_OK) {
++    master->airtime_standard = next->count != 0;
++    wave_hw_airtime_mark(mtlk_vap_get_hw(core->vap_handle),
++                        wave_vap_radio_id_get(core->vap_handle), next->count != 0);
++    smp_store_release(&master->airtime_applied, next->count != 0);
++  }
++  kfree(next);
++failed:
++  if (res != MTLK_ERR_OK)
++    wave_hw_mmb_quiesce(mtlk_vap_get_hw(core->vap_handle));
++  return res;
++}
++
++void wave_core_airtime_reset(mtlk_core_t *core)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++
++  if (!mtlk_vap_is_master(core->vap_handle))
++    return;
++  /* Recovery has retired the old firmware and every STADB incarnation.
++   * New peer admission/hostapd supplies new weights; never reuse old SIDs. */
++  wave_hw_airtime_lock(hw);
++  wave_hw_airtime_mark(hw, wave_vap_radio_id_get(core->vap_handle), false);
++  core->airtime_standard = false;
++  core->airtime_vendor = false;
++  smp_store_release(&core->airtime_applied, false);
++  wave_hw_airtime_unlock(hw);
++}
++
++int wave_core_airtime_weight(mtlk_handle_t hcore, const void *data, uint32 data_size)
++{
++  mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  int res;
++
++  wave_hw_airtime_lock(hw);
++  res = _wave_core_airtime_weight(hcore, data, data_size);
++  wave_hw_airtime_unlock(hw);
++  return res;
++}
++
++int wave_core_airtime_sta_added(mtlk_core_t *core, const sta_info *info)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  int res;
++
++  wave_hw_airtime_lock(hw);
++  res = _wave_core_airtime_sta_added(core, info);
++  wave_hw_airtime_unlock(hw);
++  return res;
++}
++
++int wave_core_airtime_pause(mtlk_core_t *core, bool *paused)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  int res;
++
++  wave_hw_airtime_lock(hw);
++  res = _wave_core_airtime_pause(core, paused);
++  wave_hw_airtime_unlock(hw);
++  return res;
++}
++
++int wave_core_airtime_resume(mtlk_core_t *core, unsigned excluded_sid)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  int res;
++
++  wave_hw_airtime_lock(hw);
++  res = _wave_core_airtime_resume(core, excluded_sid);
++  wave_hw_airtime_unlock(hw);
++  return res;
++}
++
+ static int
+ _mtlk_core_cfg_send_atf_quotas (mtlk_core_t *core,
+                                 const struct mtlk_atf_quotas *mtlk_quotas,
+@@ -3144,7 +4596,7 @@
+ mtlk_core_cfg_set_atf_quotas (mtlk_handle_t hcore, const void *data, uint32 data_size)
+ {
+   int res;
+-  uint8 atf_op_res;
++  uint8 atf_op_res = ATF_INPUT_IS_INVALID;
+   uint32 mtlk_quotas_size, expected_size;
+   uint32 max_vaps, max_stas, max_sid;
+   mtlk_core_t *core = HANDLE_T_PTR(mtlk_core_t, hcore);
+@@ -3174,12 +4626,18 @@
+     return MTLK_ERR_UNKNOWN;
+   }
+ 
++  /* The variable payload is exactly one SID/grant pair per declared entry.
++   * Validate its extent before either loop reads or serializes a grant. */
++  if (mtlk_quotas->data_len !=
++      (uint32)mtlk_quotas->nof_grants * sizeof(mtlk_quotas->sta_grant[0]))
++    return MTLK_ERR_PARAMS;
++
+   /* Data in UMI_ATF_QUOTAS contain arrays whose dimensions are HW-dependent */
+   radio = wave_vap_radio_get(core->vap_handle);
+   max_vaps = wave_radio_max_vaps_get(radio);
+   max_stas = wave_radio_max_stas_get(radio);
+ 
+-  if (mtlk_quotas->nof_bss > max_vaps) {
++  if (mtlk_quotas->nof_bss > max_vaps || mtlk_quotas->nof_bss > GEN6_MAX_VAP) {
+     ELOG_DD("nof_bss (%d) > max_vaps (%d)", mtlk_quotas->nof_bss, max_vaps);
+     return MTLK_ERR_PARAMS;
+   }
+@@ -3189,12 +4647,18 @@
+     return MTLK_ERR_PARAMS;
+   }
+ 
++  if (mtlk_quotas->nof_grants > mtlk_quotas->nof_sta ||
++      mtlk_quotas->nof_grants > GEN6_MAX_SID)
++    return MTLK_ERR_PARAMS;
++
+   max_sid = wave_hw_max_sid_get(mtlk_vap_get_hw(core->vap_handle));
+ 
+   {
+     int i;
+     for (i = 0; i < mtlk_quotas->nof_grants; i++) {
+-      if (mtlk_quotas->sta_grant[i].sid > max_sid) {
++      /* max_sid is a capacity, not the last valid array index. */
++      if (mtlk_quotas->sta_grant[i].sid >= max_sid ||
++          mtlk_quotas->sta_grant[i].sid >= GEN6_MAX_SID) {
+         ELOG_DDD("SID (%d) number (%d) more than max SID (%d)",
+                  mtlk_quotas->sta_grant[i].sid, i, max_sid);
+         return MTLK_ERR_PARAMS;
+@@ -3202,8 +4666,17 @@
+     }
+   }
+ 
+-  /* send configuration to the FW */
++  /* The vendor vector and standard station-weight owner cannot replace
++   * each other. An unsuccessful vendor write retains its ownership until
++   * a confirmed disable or a new firmware lifetime. */
++  if (mtlk_core_get_master(core)->airtime_standard)
++    return mtlk_clpb_push_res_data(clpb, MTLK_ERR_BUSY,
++                                   &atf_op_res, sizeof(atf_op_res));
++  mtlk_core_get_master(core)->airtime_vendor = true;
+   res = _mtlk_core_cfg_send_atf_quotas(core, mtlk_quotas, max_sid, &atf_op_res);
++  if (res == MTLK_ERR_OK && atf_op_res == ATF_NO_ERRORS)
++    mtlk_core_get_master(core)->airtime_vendor =
++      mtlk_quotas->distr_type != ATM_DISTRIBUTION_TYPE_DISABLED;
+ 
+   /* push result and response from FW into clipboard */
+   return mtlk_clpb_push_res_data(clpb, res, &atf_op_res, sizeof(atf_op_res));
+@@ -3900,11 +5373,25 @@
+ 
+ int mtlk_core_cfg_add_wds_wpa_entry (mtlk_core_t* nic, const IEEE_ADDR *addr)
+ {
++  int res;
++
++  if (mtlk_core_cfg_wds_wpa_entry_exists(nic, addr))
++    return MTLK_ERR_OK;
++  res = _core_cfg_four_addr_change_ready(nic, addr);
++  if (res != MTLK_ERR_OK)
++    return res;
+   return _mtlk_core_add_ieee_addr_entry(nic, addr, &nic->wds_wpa_sta_list, "WDS WPA");
+ }
+ 
+ int mtlk_core_cfg_del_wds_wpa_entry (mtlk_core_t* nic, const IEEE_ADDR *addr)
+ {
++  int res;
++
++  if (!mtlk_core_cfg_wds_wpa_entry_exists(nic, addr))
++    return MTLK_ERR_OK;
++  res = _core_cfg_four_addr_change_ready(nic, addr);
++  if (res != MTLK_ERR_OK)
++    return res;
+   return _mtlk_core_del_ieee_addr_entry(nic, addr, &nic->wds_wpa_sta_list, "WDS WPA",
+     TRUE);
+ }
+@@ -4843,6 +6330,16 @@
+     return res;
+ }
+ 
++BOOL __MTLK_IFUNC
++mtlk_core_mu_operation_supported (mtlk_core_t *core)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++
++  /* Gen6 A0 acknowledges MU_OPERATION without consuming its payload.
++   * Do not infer the same limitation for other chip generations. */
++  return !mtlk_hw_type_is_gen6(hw) || mtlk_hw_type_is_gen6_b0(hw);
++}
++
+ int __MTLK_IFUNC
+ mtlk_core_set_mu_operation (mtlk_core_t *core, uint8 mu_operation)
+ {
+@@ -4853,6 +6350,9 @@
+   int                             res;
+   wave_radio_t                   *radio = wave_vap_radio_get(vap_handle);
+ 
++  if (!mtlk_core_mu_operation_supported(core))
++    return MTLK_ERR_NOT_SUPPORTED;
++
+   ILOG2_V("Sending UMI_MU_OPERATION_CONFIG");
+ 
+   man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+@@ -4888,6 +6388,9 @@
+   UMI_MU_OPERATION_CONFIG        *mu_operation_config = NULL;
+   mtlk_vap_handle_t               vap_handle = core->vap_handle;
+   int                             res;
++
++  if (!mtlk_core_mu_operation_supported(core))
++    return MTLK_ERR_NOT_SUPPORTED;
+ 
+   man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+   if (NULL == man_entry) {
+@@ -4956,36 +6459,21 @@
+ int __MTLK_IFUNC
+ mtlk_core_receive_rts_mode (mtlk_core_t *core, mtlk_core_rts_mode_t *rts_params)
+ {
+-  mtlk_txmm_msg_t      man_msg;
+-  mtlk_txmm_data_t    *man_entry = NULL;
+-  UMI_RTS_MODE_CONFIG *rts_mode_config = NULL;
+-  mtlk_vap_handle_t    vap_handle = core->vap_handle;
+-  int                  res;
+-
+-  man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+-  if (NULL == man_entry) {
+-    ELOG_D("CID-%04x: No man entry available", mtlk_vap_get_oid(vap_handle));
+-    return MTLK_ERR_NO_RESOURCES;
+-  }
+-
+-  man_entry->id = UM_MAN_RTS_MODE_CONFIG_REQ;
+-  man_entry->payload_size = sizeof(UMI_RTS_MODE_CONFIG);
+-
+-  rts_mode_config = (UMI_RTS_MODE_CONFIG *)(man_entry->payload);
+-  rts_mode_config->getSetOperation = API_GET_OPERATION;
+-
+-  res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+-
+-  if (MTLK_ERR_OK == res) {
+-    rts_params->dynamic_bw = rts_mode_config->dynamicBw;
+-    rts_params->static_bw  = rts_mode_config->staticBw;
+-  }
+-  else {
+-    ELOG_D("CID-%04x: Receive UMI_RTS_MODE_CONFIG failed", mtlk_vap_get_oid(vap_handle));
+-  }
+-
+-  mtlk_txmm_msg_cleanup(&man_msg);
+-  return res;
++  wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
++  uint32 dynamic_bw = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_RTS_DYNAMIC_BW);
++  uint32 static_bw = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_RTS_STATIC_BW);
++
++  /* The matching A0 RTS_MODE handler ignores getSetOperation and applies
++   * both payload flags. A zeroed GET request therefore disables signalling.
++   * Report only the last acknowledged host configuration. The setter
++   * publishes this pair after its confirmation and recovery replays it;
++   * this is not an independent observation of current firmware state. */
++  if (dynamic_bw > 1 || static_bw > 1)
++    return MTLK_ERR_NOT_SUPPORTED;
++
++  rts_params->dynamic_bw = (uint8)dynamic_bw;
++  rts_params->static_bw = (uint8)static_bw;
++  return MTLK_ERR_OK;
+ }
+ 
+ int __MTLK_IFUNC
+@@ -4999,7 +6487,8 @@
+ 
+   MTLK_ASSERT(vap_handle != 0);
+ 
+-  MTLK_CORE_PDB_SET_INT(core, PARAM_DB_CORE_RELIABLE_MCAST, flag);
++  if (flag != ENABLE_RELIABLE_MULTICAST && flag != DISABLE_RELIABLE_MULTICAST)
++    return MTLK_ERR_PARAMS;
+ 
+   man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+   if (NULL == man_entry) {
+@@ -5012,16 +6501,22 @@
+   man_entry->payload_size = sizeof(UMI_MULTICAST_MODE);
+ 
+   pMcastMode = (UMI_MULTICAST_MODE *)(man_entry->payload);
++  memset(pMcastMode, 0, sizeof(*pMcastMode));
++  pMcastMode->getSetOperation = API_SET_OPERATION;
+   pMcastMode->u8Action = flag;
+   pMcastMode->u8VapID = mtlk_vap_get_id(vap_handle);
+ 
+   ILOG2_DSD("CID-%04x: Multicast FW request: Set %s mode for VAP %d", mtlk_vap_get_oid(vap_handle), flag ? "Reliable Multicast" : "Regular Multicast", pMcastMode->u8VapID);
+ 
++  /* A submitted but unacknowledged mode is not an aggregate-air fallback. */
++  mtlk_mc_publish_reliable_mode(core, -1);
+   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+   if (MTLK_ERR_OK != res) {
+     ELOG_DD("CID-%04x: Set Reliable Multicast failure (%i)", mtlk_vap_get_oid(vap_handle), res);
+     goto FINISH;
+   }
++
++  mtlk_mc_publish_reliable_mode(core, flag);
+ 
+ FINISH:
+   if (man_entry) {
+@@ -5050,12 +6545,20 @@
+   man_entry->payload_size = sizeof(UMI_MULTICAST_MODE);
+ 
+   pMcastMode = (UMI_MULTICAST_MODE *)(man_entry->payload);
++  memset(pMcastMode, 0, sizeof(*pMcastMode));
+   pMcastMode->getSetOperation = API_GET_OPERATION;
+   pMcastMode->u8VapID = mtlk_vap_get_id(vap_handle);
+ 
+   res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+   if (MTLK_ERR_OK == res) {
+-    *flag = pMcastMode->u8Action;
++    if (pMcastMode->u8Action != ENABLE_RELIABLE_MULTICAST &&
++        pMcastMode->u8Action != DISABLE_RELIABLE_MULTICAST) {
++      res = MTLK_ERR_MAC;
++      mtlk_mc_publish_reliable_mode(core, -1);
++    } else {
++      *flag = pMcastMode->u8Action;
++      mtlk_mc_publish_reliable_mode(core, *flag);
++    }
+   }
+   else {
+     ELOG_D("CID-%04x: Receive UM_MAN_SET_MULTICAST_MODE_REQ failed", mtlk_vap_get_oid(vap_handle));
+@@ -5331,8 +6834,8 @@
+ 
+ #define TXOP_LAST_STATE MAX(UMI_TXOP_MODE_DISABLED, MAX(UMI_TXOP_MODE_FORCED, UMI_TXOP_MODE_DYNAMIC))
+ 
+-int __MTLK_IFUNC
+-mtlk_core_send_txop_mode (mtlk_core_t *core, uint32 sid, uint32 txop_mode)
++static int __MTLK_IFUNC
++_wave_core_send_txop_mode (mtlk_core_t *core, uint32 sid, uint32 txop_mode)
+ {
+   mtlk_txmm_msg_t                 man_msg;
+   mtlk_txmm_data_t               *man_entry = NULL;
+@@ -5382,49 +6885,71 @@
+   return res;
+ }
+ 
+-/* Returns last STA ID set, if not set then ALL STA ID */
++int __MTLK_IFUNC
++mtlk_core_send_txop_mode(mtlk_core_t *core, uint32 sid, uint32 mode)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(core->vap_handle);
++  int res;
++
++  wave_hw_airtime_lock(hw);
++  res = wave_hw_airtime_owned(hw) ? MTLK_ERR_BUSY :
++          _wave_core_send_txop_mode(core, sid, mode);
++  wave_hw_airtime_unlock(hw);
++  return res;
++}
++
++/* Query the last selected SID; ALL and older firmware remain configured-only. */
+ int __MTLK_IFUNC
+ mtlk_core_receive_txop_mode (mtlk_core_t *core, mtlk_core_txop_mode_t *txop_mode)
+ {
+-  mtlk_txmm_msg_t        man_msg;
+-  mtlk_txmm_data_t      *man_entry = NULL;
+-  UMI_SET_TXOP_CONFIG_t *txop_config = NULL;
+-  mtlk_vap_handle_t      vap_handle = core->vap_handle;
+-  int                    res;
+-  wave_radio_t          *radio = wave_vap_radio_get(vap_handle);
+-  uint32                 sta_id = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TXOP_SID);
+-
+-  /* Cannot request TXOP mode for ALL STA SID from FW */
+-  if (mtlk_hw_is_sid_all_sta_sid(mtlk_vap_get_hw(vap_handle), sta_id)) {
+-    txop_mode->sid  = sta_id;
+-    txop_mode->mode = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TXOP_MODE);
+-    return MTLK_ERR_OK;
+-  }
+-
+-  man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
+-  if (NULL == man_entry) {
+-    ELOG_D("CID-%04x: No man entry available", mtlk_vap_get_oid(vap_handle));
+-    return MTLK_ERR_NO_RESOURCES;
+-  }
+-
+-  man_entry->id = UM_MAN_SET_TXOP_CONFIG_REQ;
+-  man_entry->payload_size = sizeof(UMI_SET_TXOP_CONFIG_t);
+-  txop_config = (UMI_SET_TXOP_CONFIG_t *)(man_entry->payload);
+-  txop_config->getSetOperation = API_GET_OPERATION;
+-  txop_config->staId = HOST_TO_MAC32(sta_id);
+-
+-  res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+-
+-  if (MTLK_ERR_OK == res) {
+-    txop_mode->sid  = sta_id;
+-    txop_mode->mode = txop_config->mode;
+-  }
+-  else {
+-    ELOG_D("CID-%04x: Receive UM_MAN_SET_TXOP_CONFIG_REQ failed", mtlk_vap_get_oid(vap_handle));
+-  }
+-
+-  mtlk_txmm_msg_cleanup(&man_msg);
+-  return res;
++  mtlk_vap_handle_t vap = core->vap_handle;
++  mtlk_hw_t *hw = mtlk_vap_get_hw(vap);
++  wave_radio_t *radio = wave_vap_radio_get(vap);
++  uint32 sid = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TXOP_SID);
++  uint32 mode = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TXOP_MODE);
++
++  if (mode > TXOP_LAST_STATE ||
++      !mtlk_hw_is_sid_valid_or_all_sta_sid(hw, sid))
++    return MTLK_ERR_NOT_SUPPORTED;
++
++  /* The original A0 GET mutates the upper mode table. Only the complete
++   * loaded correction admits a native read. ALL is not an aggregate GET:
++   * firmware selects slot0, so preserve its acknowledged configured pair.
++   * A numeric SID query is not a MAC/peer-incarnation statistics witness.
++   */
++  if (!mtlk_hw_is_sid_all_sta_sid(hw, sid) &&
++      wave_hw_fw_feature_supported(hw, WAVE_FW_FEATURE_TXOP_READ)) {
++    mtlk_txmm_msg_t msg;
++    mtlk_txmm_data_t *entry;
++    UMI_SET_TXOP_CONFIG_t *req;
++    int res;
++
++    entry = mtlk_txmm_msg_init_with_empty_data(&msg, mtlk_vap_get_txmm(vap), NULL);
++    if (!entry)
++      return MTLK_ERR_NO_RESOURCES;
++    entry->id = UM_MAN_SET_TXOP_CONFIG_REQ;
++    entry->payload_size = sizeof(*req);
++    req = (UMI_SET_TXOP_CONFIG_t *)entry->payload;
++    memset(req, 0, sizeof(*req));
++    req->staId = HOST_TO_MAC32(sid);
++    req->getSetOperation = API_GET_OPERATION;
++    res = mtlk_txmm_msg_send_blocked(&msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++    if (res == MTLK_ERR_OK) {
++      if (MAC_TO_HOST32(req->staId) != sid ||
++          req->getSetOperation != API_GET_OPERATION ||
++          req->mode > TXOP_LAST_STATE)
++        res = MTLK_ERR_MAC;
++      else
++        mode = req->mode;
++    }
++    mtlk_txmm_msg_cleanup(&msg);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++
++  txop_mode->sid = sid;
++  txop_mode->mode = mode;
++  return MTLK_ERR_OK;
+ }
+ 
+ int __MTLK_IFUNC
+@@ -5840,9 +7365,7 @@
+   if (res != MTLK_ERR_OK)
+     return res;
+ 
+-  /* wdev_lock not needed, lock taken by nl80211_set_beacon */
+-  wave_memcpy(wdev->ssid, sizeof(wdev->ssid), ssid, ssid_len);
+-  wdev->ssid_len = ssid_len;
++  /* cfg80211 updates its AP SSID after start_ap succeeds. */
+   return MTLK_ERR_OK;
+ }
+ 
+--- a/wireless/driver/linux/core_config.h
++++ b/wireless/driver/linux/core_config.h
+@@ -29,7 +29,6 @@
+ 
+ int __MTLK_IFUNC core_cfg_get_station (mtlk_handle_t hcore, const void* data, uint32 data_size);
+ int __MTLK_IFUNC core_cfg_wmm_param_set (mtlk_handle_t hcore, const void* data, uint32 data_size);
+-int __MTLK_IFUNC core_cfg_wmm_param_set_by_params (mtlk_core_t *master_core, struct mtlk_wmm_settings *wmm_settings);
+ int __MTLK_IFUNC core_cfg_set_chan_clpb (mtlk_handle_t hcore, const void* data, uint32 data_size);
+ int __MTLK_IFUNC finish_and_prevent_fw_set_chan_clpb (mtlk_handle_t hcore, const void* data, uint32 data_size);
+ int __MTLK_IFUNC core_cfg_request_sid (mtlk_handle_t hcore, const void *data, uint32 data_size);
+@@ -59,7 +58,7 @@
+ int core_cfg_set_calibration_mask(mtlk_handle_t hcore, const void* data, uint32 data_size);
+ int core_cfg_get_calibration_mask(mtlk_handle_t hcore, const void* data, uint32 data_size);
+ 
+-int core_cfg_send_set_chan_by_msg(mtlk_txmm_msg_t *man_msg);
++int core_cfg_send_set_chan_by_msg(mtlk_core_t *core, mtlk_txmm_msg_t *man_msg, bool station);
+ int poll_client_req(mtlk_vap_handle_t vap_handle, sta_entry *sta, int *status);
+ 
+ uint32 __MTLK_IFUNC wave_regd_code_to_regd_region(uint32 regd_code);
+@@ -76,9 +75,32 @@
+ void   __MTLK_IFUNC core_cfg_sta_country_code_set_default_on_activate(mtlk_core_t* core);
+ void   __MTLK_IFUNC core_cfg_sta_country_code_update_on_connect(mtlk_core_t *core, mtlk_country_code_t *country_code);
+ 
+-void core_cfg_set_tx_power_limit(mtlk_core_t *core, unsigned center_freq, enum chanWidth width, unsigned cf_primary, mtlk_country_code_t req_country_code);
+-
+-int core_recovery_cfg_wmm_param_set(mtlk_core_t *core);
++enum wave_tx_power_operation {
++  WAVE_TX_POWER_USER,
++  WAVE_TX_POWER_USER_FIXED,
++  WAVE_TX_POWER_MAC,
++  WAVE_TX_POWER_GET,
++};
++
++/* Master serializer request; limit is in 1/8 dBm, zero removes a ceiling. */
++struct wave_tx_power_request {
++  enum wave_tx_power_operation operation;
++  unsigned int limit;
++};
++int core_cfg_tx_power(mtlk_handle_t hcore, const void *data, uint32 data_size);
++int core_cfg_rts_threshold(mtlk_handle_t hcore, const void *data, uint32 data_size);
++int core_cfg_regulatory(mtlk_handle_t hcore, const void *data, uint32 data_size);
++
++int core_cfg_set_tx_power_limit(mtlk_core_t *core, unsigned center_freq, enum chanWidth width, unsigned cf_primary, mtlk_country_code_t req_country_code, BOOL prepare_channel);
++
++/* Master serializer, after SET_BSS has reached CONNECTED. */
++int core_cfg_wmm_param_init(mtlk_core_t *core);
++/* Native AP/STA frontend; submits the target queue on the master serializer. */
++int wave_core_set_txq_params(mtlk_df_t *df, const struct mtlk_txq_params *params);
++
++struct wave_peer_connect_request;
++void core_cfg_apply_assoc_four_addr(mtlk_core_t *core,
++                                    struct wave_peer_connect_request *request);
+ 
+ int __MTLK_IFUNC core_cfg_set_four_addr_cfg (mtlk_handle_t hcore, const void *data, uint32 data_size);
+ int __MTLK_IFUNC core_cfg_get_four_addr_cfg (mtlk_handle_t hcore, const void *data, uint32 data_size);
+@@ -118,6 +140,7 @@
+ int __MTLK_IFUNC mtlk_core_set_ssb_mode (mtlk_handle_t hcore, const void *data, uint32 data_size);
+ int __MTLK_IFUNC mtlk_core_get_ssb_mode (mtlk_handle_t hcore, const void *data, uint32 data_size);
+ int __MTLK_IFUNC mtlk_core_cfg_set_atf_quotas (mtlk_handle_t hcore, const void *data, uint32 data_size);
++int __MTLK_IFUNC mtlk_core_set_he_mu_operation(mtlk_core_t *core, BOOL enabled);
+ int __MTLK_IFUNC mtlk_core_cfg_send_slow_probing_mask (mtlk_core_t *core, uint32 mask);
+ int __MTLK_IFUNC mtlk_core_receive_slow_probing_mask (mtlk_core_t *core, uint32 *mask);
+ 
+@@ -171,6 +194,7 @@
+ void __MTLK_IFUNC mtlk_core_read_fixed_ltf_and_gi (mtlk_core_t *core, mtlk_fixed_ltf_and_gi_t *fixed_ltf_and_gi, uint32 *data_size);
+ 
+ int __MTLK_IFUNC mtlk_core_receive_coex_config (mtlk_core_t *core, uint8 *enabled, uint8 *mode);
++BOOL __MTLK_IFUNC mtlk_core_mu_operation_supported (mtlk_core_t *core);
+ int __MTLK_IFUNC mtlk_core_set_mu_operation (mtlk_core_t *core, uint8 mu_operation);
+ int __MTLK_IFUNC mtlk_core_receive_mu_operation (mtlk_core_t *core, BOOL *mu_operation);
+ int __MTLK_IFUNC mtlk_core_set_rts_mode (mtlk_core_t *core, uint8 dynamic_bw, uint8 static_bw);
+--- a/wireless/driver/linux/fixed_data_power.h
++++ b/wireless/driver/linux/fixed_data_power.h
+@@ -0,0 +1,61 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Private, unselected W15 candidate. This is a NEW paired host/firmware ABI.
++ * It is not the four-byte OEM FixedPower_t ABI and must never be submitted
++ * unless the exact loaded firmware implementation has been admitted.
++ */
++#ifndef AX50_FIXED_DATA_ABI_H
++#define AX50_FIXED_DATA_ABI_H
++
++#define AX50_FIXED_DATA_ABI             1
++#define AX50_FIXED_DATA_MAGIC           0xa5
++#define AX50_FIXED_DATA_STAGE           0x80
++#define AX50_FIXED_DATA_DISABLE         0x81
++#define AX50_FIXED_DATA_QUERY           0x82
++#define AX50_FIXED_DATA_REPLAY          0x83
++#define AX50_FIXED_DATA_INCLUDE_11B     0x01
++
++#define AX50_FIXED_DATA_OK              0
++#define AX50_FIXED_DATA_BAD_REQUEST     1
++#define AX50_FIXED_DATA_CONFLICT        2
++#define AX50_FIXED_DATA_UNREPRESENTABLE 3
++#define AX50_FIXED_DATA_NOT_READY       4
++
++/* Byte units are one half dBm. This first ABI admits6..31.5dBm, exactly
++ * representable without rounding. Its minimum covers the maximum admitted
++ * two-chain/calibration correction12 and keeps the native unsigned DL-group
++ * byte nonnegative. It does not assume an unproved signed group encoding.
++ * These are protocol limits, not a claim about RF measurement resolution.
++ */
++#define AX50_FIXED_DATA_MIN_HALF_DBM    12
++#define AX50_FIXED_DATA_MAX_HALF_DBM    63
++
++struct ax50_fixed_data_request {
++  /* Only INCLUDE_11B is defined. The host derives it from the admitted
++   * destination channel; the original UMI header still owns VAP/radio
++   * routing. A zero/unconfigured 11b table on 5 GHz is not a power ceiling.
++   */
++  unsigned char policy_flags;
++  unsigned char magic;
++  unsigned char half_dbm;
++  unsigned char operation;
++  unsigned char status;
++  unsigned char abi;
++  unsigned char active;
++  /* Zero in every request; returned current admissible aggregate ceiling
++   * in QUERY. It is a configured/calibrated bound, not measured RF power.
++   */
++  unsigned char admissible_half_dbm;
++};
++
++/* 0x147c acknowledges only validated staging. The host may acknowledge a
++ * standard FIXED change only after the existing full ST_NORMAL channel
++ * transaction has completed, including the lower 0x212 refresh and paired
++ * group publication. A stage timeout or later refresh failure must retain
++ * the previous host policy and quiesce/recover the affected native owner.
++ * QUERY is an explicit new non-mutating operation, not OEM getSetOperation.
++ * REPLAY is for the host's last acknowledged policy during the existing
++ * channel/recovery owner. A later lower legal/calibration ceiling may clamp
++ * that policy; a new user STAGE above the ceiling is rejected after212 and
++ * invokes the host's existing quiesce/recovery path, without a cache commit.
++ */
++#endif
+--- a/wireless/driver/linux/rts_threshold.h
++++ b/wireless/driver/linux/rts_threshold.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef WAVE_RTS_THRESHOLD_H
++#define WAVE_RTS_THRESHOLD_H
++
++/* A separately typed extension of the persistent host/lower transport.
++ * Admit the actual upper route and both lower implementations before use.
++ */
++#define WAVE_RTS_ABI       1
++#define WAVE_RTS_MAGIC     0xa6
++#define WAVE_RTS_STAGE     0x90
++#define WAVE_RTS_DISABLE   0x91
++#define WAVE_RTS_QUERY     0x92
++#define WAVE_RTS_MAX       IEEE80211_MAX_RTS_THRESHOLD
++#define WAVE_RTS_DISABLED ((uint32)-1)
++struct wave_rts_request {
++  uint16 threshold; /* little endian */
++  uint8 magic;
++  uint8 operation;
++  uint8 status;
++  uint8 abi;
++  uint8 active;
++  uint8 pending;
++};
++/* STAGE publishes only pending state. Native212/45 and QUERY precede user
++ * success. Lost replies retain last-ACK radio policy and quiesce/recover.
++ * Enable selects paired RTS/CTS size protection, retaining native FORCE;
++ * disable restores latest native methods and the original selector.
++ */
++#endif
+--- a/wireless/driver/shared/fixed_data_fw.h
++++ b/wireless/driver/shared/fixed_data_fw.h
+@@ -0,0 +1,907 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Generated from the exact root-linked UMAC and both corrected lower images.
++ * Capability depends on every actual loaded instruction/ABI span,
++ * never a package name, configured flag, or firmware GET response. */
++#ifndef WAVE_FIXED_DATA_FW_H
++#define WAVE_FIXED_DATA_FW_H
++
++/* transport .fixed_umac_entry at0x4f830. */
++static const u8 wave_fixed_data_span_0[] = {
++  0x59, 0x05, 0x80, 0x0b,
++};
++
++/* transport .fixed_umac_done_entry at0x62eb4. */
++static const u8 wave_fixed_data_span_1[] = {
++  0x05, 0x07, 0xc0, 0x01,
++};
++
++/* transport .fixed_umac_version at0x66d48. */
++static const u8 wave_fixed_data_span_2[] = {
++  0x40, 0x40, 0x40, 0x20, 0x56, 0x45, 0x52, 0x53, 0x49, 0x4f, 0x4e, 0x20,
++  0x49, 0x4e, 0x46, 0x4f, 0x20, 0x40, 0x40, 0x40, 0x20, 0x76, 0x65, 0x72,
++  0x73, 0x69, 0x6f, 0x6e, 0x20, 0x6e, 0x75, 0x6d, 0x62, 0x65, 0x72, 0x3a,
++  0x20, 0x41, 0x58, 0x35, 0x30, 0x2d, 0x44, 0x41, 0x54, 0x41, 0x2d, 0x46,
++  0x49, 0x58, 0x31, 0x40, 0x40, 0x40, 0x20, 0x45, 0x4e, 0x44, 0x20, 0x40,
++  0x40, 0x40, 0x00, 0x00,
++};
++
++/* transport .fixed_umac_transport at0x66d88. */
++static const u8 wave_fixed_data_span_3[] = {
++  0x13, 0x10, 0x8c, 0x00, 0x23, 0x0c, 0xd6, 0x11, 0x00, 0x42, 0xc3, 0x41,
++  0x0b, 0x00, 0x94, 0x49, 0x00, 0x91, 0x04, 0x71, 0x00, 0xb1, 0x0c, 0x12,
++  0x84, 0x00, 0x8a, 0x20, 0xc8, 0x03, 0x2c, 0x73, 0xf5, 0x00, 0xef, 0xf3,
++  0x6c, 0x70, 0xe2, 0xc2, 0x08, 0x45, 0x85, 0x02, 0x4f, 0xf4, 0xe0, 0x78,
++  0x25, 0x88, 0x1f, 0x09, 0x10, 0x00, 0x00, 0x41, 0xc3, 0x42, 0x0b, 0x00,
++  0x68, 0x4a, 0x00, 0x92, 0x04, 0x71, 0x00, 0xb2, 0xc3, 0x40, 0x00, 0x00,
++  0x7c, 0x14, 0x45, 0x04, 0x8f, 0xfe, 0xe0, 0x7e,
++};
++
++/* lm0 .fixed_su_entry at0xe3748. */
++static const u8 wave_fixed_data_span_4[] = {
++  0xbd, 0x05, 0x00, 0x04,
++};
++
++/* lm0 .fixed_su_log_return at0xe37cc. */
++static const u8 wave_fixed_data_span_5[] = {
++  0x03, 0x14, 0x80, 0x30, 0xd6, 0xc7,
++};
++
++/* lm0 .fixed_recalc_gate at0xe37d4. */
++static const u8 wave_fixed_data_span_6[] = {
++  0x23, 0x15, 0x80, 0x10, 0x15, 0x08, 0x91, 0x00, 0x00, 0x16, 0x80, 0x70,
++  0x11, 0x00, 0xb9, 0x26, 0x0f, 0x08, 0x80, 0x0f, 0x00, 0x00, 0x80, 0x00,
++  0xe0, 0x7f, 0x26, 0x15, 0x80, 0x10, 0xe0, 0x7f, 0x0c, 0x70,
++};
++
++/* lm0 .fixed_peer_bounds_log_return at0xebc56. */
++static const u8 wave_fixed_data_span_7[] = {
++  0xc2, 0xc6,
++};
++
++/* lm0 .fixed_reset_guard at0xebc58. */
++static const u8 wave_fixed_data_span_8[] = {
++  0x61, 0x90, 0x23, 0x0b, 0x81, 0x0f, 0x00, 0x00, 0x46, 0x58, 0x65, 0x88,
++  0x1b, 0x0b, 0x80, 0x0f, 0x00, 0x00, 0x80, 0x00, 0x69, 0x88, 0x82, 0x23,
++  0x02, 0x00, 0x0b, 0x0b, 0x55, 0x01, 0x0b, 0x0b, 0x91, 0x00, 0x21, 0x02,
++  0x40, 0x0b, 0xe0, 0x7e,
++};
++
++/* lm0 .fixed_clamp_log_return at0xebd00. */
++static const u8 wave_fixed_data_span_9[] = {
++  0xa1, 0x40, 0xce, 0xc7,
++};
++
++/* lm0 .fixed_su_dispatch at0xebd04. */
++static const u8 wave_fixed_data_span_10[] = {
++  0x09, 0x0c, 0x91, 0x00, 0x69, 0x06, 0xc0, 0x0d, 0xf6, 0xc3, 0xa1, 0xc1,
++  0x3d, 0x02, 0xcf, 0xfb,
++};
++
++/* lm0 .fixed_native_bounds at0xebd14. */
++static const u8 wave_fixed_data_span_11[] = {
++  0xf4, 0xc2, 0x10, 0x42, 0x8a, 0x20, 0x05, 0x05, 0x50, 0x43, 0x1f, 0x22,
++  0x02, 0x20, 0xcb, 0x45, 0x00, 0x00, 0x64, 0x34, 0x28, 0x47, 0x70, 0x44,
++  0xa0, 0x62, 0x2c, 0x10, 0x81, 0x00, 0x11, 0x09, 0x80, 0x0f, 0x00, 0x00,
++  0xff, 0x00, 0x5d, 0x65, 0x30, 0xad, 0x32, 0xf0, 0x0a, 0x21, 0x80, 0x24,
++  0x53, 0x22, 0x15, 0x21, 0xd3, 0x40, 0x11, 0x00, 0xfc, 0x3b, 0xad, 0x21,
++  0x41, 0x21, 0x0c, 0x71, 0x00, 0x28, 0x4e, 0x05, 0x15, 0x20, 0x40, 0x24,
++  0x18, 0x80, 0xcb, 0x78, 0x05, 0xf2, 0x5d, 0x65, 0x10, 0x15, 0xc1, 0x10,
++  0x1c, 0xf0, 0x5f, 0x22, 0x80, 0x22, 0x32, 0x20, 0x96, 0x0f, 0x11, 0x00,
++  0x0d, 0x42, 0xbe, 0x0d, 0x60, 0x0d, 0x62, 0x40, 0xf0, 0x20, 0x41, 0x24,
++  0x24, 0x7e, 0x33, 0x26, 0x82, 0x2f, 0x11, 0x00, 0x84, 0x06, 0x01, 0x2e,
++  0x41, 0x15, 0x2f, 0x79, 0x29, 0x7a, 0x0f, 0x79, 0x42, 0x40, 0x9f, 0x20,
++  0x05, 0x05, 0xb8, 0x60, 0x59, 0x61, 0x30, 0xa8, 0x00, 0x27, 0x8d, 0x1f,
++  0x11, 0x00, 0x9c, 0x3c, 0x2e, 0x08, 0xef, 0xfa, 0x42, 0x40, 0x00, 0x20,
++  0x8e, 0x06, 0xde, 0x0c, 0x60, 0x05, 0x62, 0x40, 0xab, 0x16, 0x81, 0x10,
++  0x38, 0x60, 0x00, 0x27, 0x81, 0x16, 0xb0, 0x11, 0x81, 0x00, 0x10, 0x49,
++  0x2f, 0x24, 0x05, 0x00, 0x88, 0x24, 0x3f, 0x0d, 0x04, 0x1d, 0x02, 0x11,
++  0x8e, 0x0f, 0xaf, 0xfa, 0x62, 0x40, 0x43, 0x70, 0xab, 0x10, 0x8e, 0x00,
++  0xae, 0x0c, 0x60, 0x05, 0x62, 0x40, 0xc3, 0x41, 0x11, 0x00, 0x38, 0x06,
++  0xfa, 0x61, 0x15, 0x0c, 0x10, 0x20, 0x08, 0x12, 0xc2, 0x00, 0x33, 0x27,
++  0x41, 0x10, 0x09, 0x21, 0x81, 0x00, 0x03, 0xf0, 0x29, 0x67, 0xd8, 0x60,
++  0x10, 0x49, 0x0d, 0x78, 0x49, 0x20, 0xc0, 0x0f, 0x00, 0xad, 0xd4, 0xc6,
++};
++
++/* lm0 .fixed_mask_value at0xebe10. */
++static const u8 wave_fixed_data_span_12[] = {
++  0xe4, 0xc2, 0x08, 0x45, 0x4e, 0x0f, 0x8f, 0xfa, 0x43, 0x70, 0xab, 0x10,
++  0x8e, 0x00, 0x72, 0x0c, 0x60, 0x05, 0xa1, 0x40, 0xcb, 0x44, 0x11, 0x00,
++  0xb4, 0x26, 0x24, 0x8c, 0x46, 0x8c, 0x09, 0x21, 0x81, 0x00, 0x10, 0x49,
++  0xc2, 0x78, 0xc1, 0x41, 0xc4, 0xc6,
++};
++
++/* lm0 .fixed_calibration_log_skip at0xefc42. */
++static const u8 wave_fixed_data_span_13[] = {
++  0x70, 0x40, 0x15, 0x00, 0x00, 0x00,
++};
++
++/* lm0 .fixed_cal_automatic at0xefc48. */
++static const u8 wave_fixed_data_span_14[] = {
++  0x0c, 0x70, 0x00, 0xad, 0x01, 0xad, 0x04, 0xad, 0x05, 0xad, 0x06, 0xad,
++  0xc8, 0xc6,
++};
++
++/* lm0 .fixed_vap_callback_pointer at0xefdcc. */
++static const u8 wave_fixed_data_span_15[] = {
++  0xc3, 0x43, 0x10, 0x00, 0xfc, 0x80,
++};
++
++/* lm0 .fixed_vap_context at0xefdda. */
++static const u8 wave_fixed_data_span_16[] = {
++  0x00, 0x1c, 0x82, 0x34,
++};
++
++/* lm0 .fixed_vap_template_align at0xefdf6. */
++static const u8 wave_fixed_data_span_17[] = {
++  0xe0, 0x78,
++};
++
++/* lm0 .fixed_vap_templates at0xefdf8. */
++static const u8 wave_fixed_data_span_18[] = {
++  0xaf, 0x79, 0x3b, 0x08, 0x44, 0x20, 0x42, 0x40, 0x32, 0x26, 0x42, 0x10,
++  0x0e, 0x0d, 0xc0, 0x0b, 0x1f, 0x22, 0x81, 0x2f, 0x00, 0x00, 0x80, 0x01,
++  0x00, 0x21, 0x81, 0x0f, 0x33, 0xa0, 0x0c, 0xba, 0x00, 0x21, 0x41, 0x03,
++  0x00, 0x19, 0x02, 0x00, 0x34, 0x19, 0x02, 0x00, 0x68, 0x19, 0x02, 0x00,
++  0x9c, 0x19, 0x02, 0x00, 0xa5, 0x71, 0xcd, 0x07, 0xcf, 0xff, 0xcc, 0xc7,
++};
++
++/* lm0 .fixed_query_error at0xefe34. */
++static const u8 wave_fixed_data_span_19[] = {
++  0x2c, 0x70, 0x6c, 0x70, 0x8c, 0x70, 0xe0, 0x7f, 0x4c, 0x70,
++};
++
++/* lm0 .fixed_reset_hook at0x101066. */
++static const u8 wave_fixed_data_span_20[] = {
++  0xf6, 0x0b, 0x6f, 0xf5, 0x0a, 0xda,
++};
++
++/* lm0 .fixed_calibration_hook at0x101540. */
++static const u8 wave_fixed_data_span_21[] = {
++  0xd2, 0x0d, 0xa0, 0x04, 0x82, 0x40,
++};
++
++/* lm0 .fixed_completion_hook at0x10156c. */
++static const u8 wave_fixed_data_span_22[] = {
++  0x22, 0x0c, 0xa0, 0x04, 0xc0, 0xb8,
++};
++
++/* lm0 .fixed_lower_entry at0x101688. */
++static const u8 wave_fixed_data_span_23[] = {
++  0xad, 0x02, 0x80, 0x04, 0xe0, 0x78,
++};
++
++/* lm0 .fixed_recalc_hook at0x1027f2. */
++static const u8 wave_fixed_data_span_24[] = {
++  0xe6, 0x0f, 0x4f, 0xf0,
++};
++
++/* lm0 .fixed_feedback_log_skip at0x10281a. */
++static const u8 wave_fixed_data_span_25[] = {
++  0x13, 0x00, 0x00, 0x00,
++};
++
++/* lm0 .fixed_group_native at0x102820. */
++static const u8 wave_fixed_data_span_26[] = {
++  0x08, 0x85, 0x6d, 0x20, 0x80, 0x0a, 0xa9, 0x01, 0x80, 0x02,
++};
++
++/* lm0 .fixed_group_entry at0x1079b4. */
++static const u8 wave_fixed_data_span_27[] = {
++  0x15, 0x04, 0x80, 0x00,
++};
++
++/* lm0 .fixed_lower_complete at0x1079b8. */
++static const u8 wave_fixed_data_span_28[] = {
++  0xa1, 0x42, 0x0c, 0x15, 0x84, 0x10, 0xf7, 0xd8, 0x07, 0xd9, 0xba, 0x09,
++  0xef, 0xf4, 0x6c, 0x70, 0xc6, 0xc6,
++};
++
++/* lm0 .fixed_group_mgmt_copy at0x1079e0. */
++static const u8 wave_fixed_data_span_29[] = {
++  0x08, 0x47, 0x9f, 0x26, 0x06, 0x10, 0x00, 0x26, 0x8e, 0x1f, 0x33, 0xa0,
++  0xa0, 0xb9, 0x40, 0x25, 0x00, 0x17, 0x46, 0x0f, 0xa0, 0x03, 0xc1, 0x41,
++  0xe1, 0x40, 0x7d, 0x00, 0x00, 0x00,
++};
++
++/* lm0 .fixed_group_refresh at0x107a00. */
++static const u8 wave_fixed_data_span_30[] = {
++  0xea, 0xc2, 0xcb, 0x44, 0x11, 0x00, 0xb4, 0x26, 0x01, 0x94, 0x69, 0x08,
++  0x81, 0x0f, 0x00, 0x00, 0x46, 0x58, 0x05, 0x8c, 0x0f, 0x08, 0x80, 0x0f,
++  0x00, 0x00, 0x80, 0x00, 0x09, 0x8c, 0x55, 0x08, 0x10, 0x00, 0xad, 0x70,
++  0x0a, 0x26, 0x80, 0x1f, 0x01, 0x00, 0xd1, 0x9c, 0x0a, 0x27, 0x80, 0x1f,
++  0x01, 0x00, 0x4c, 0x9e, 0x00, 0x8e, 0x1d, 0x08, 0x91, 0x00, 0x00, 0x17,
++  0x10, 0x10, 0x18, 0x10, 0x11, 0x20, 0xa6, 0x0e, 0xa0, 0x03, 0x02, 0x40,
++  0x20, 0x18, 0x02, 0x20, 0x20, 0x19, 0x02, 0x20, 0xa5, 0x71, 0x00, 0x26,
++  0x8e, 0x1f, 0x00, 0x00, 0xc4, 0x16, 0x00, 0x27, 0x8f, 0x1f, 0x00, 0x00,
++  0xc4, 0x16, 0xd5, 0x0d, 0x14, 0x94, 0x0c, 0x70, 0x00, 0x1e, 0x02, 0x70,
++  0x11, 0x00, 0xbd, 0x26, 0xca, 0xc6,
++};
++
++/* lm0 .fixed_group_aux_copy at0x107af2. */
++static const u8 wave_fixed_data_span_31[] = {
++  0x08, 0x47, 0x9f, 0x26, 0x06, 0x10, 0x00, 0x26, 0x8e, 0x1f, 0x33, 0xa0,
++  0xa0, 0xb9, 0x40, 0x25, 0x00, 0x1f, 0x32, 0x0e, 0xa0, 0x03, 0xc1, 0x41,
++  0xe1, 0x40, 0x7b, 0x00, 0x00, 0x00,
++};
++
++/* lm0 .fixed_vap_value at0x107b10. */
++static const u8 wave_fixed_data_span_32[] = {
++  0x00, 0x16, 0x8c, 0x70, 0x11, 0x00, 0xb9, 0x26, 0x53, 0x0c, 0x81, 0x1f,
++  0x00, 0x00, 0x80, 0x00, 0xea, 0xc2, 0x08, 0x45, 0x28, 0x46, 0x9a, 0x0a,
++  0xcf, 0xec, 0xea, 0x0a, 0x0f, 0xf2, 0x10, 0x41, 0x30, 0x40, 0xa1, 0x40,
++  0x2c, 0x72, 0x1e, 0x0d, 0x6f, 0xef, 0xc1, 0x42, 0x5f, 0x20, 0x00, 0x07,
++  0x00, 0x16, 0x81, 0x70, 0x11, 0x00, 0x7e, 0x26, 0xc3, 0x42, 0x10, 0x00,
++  0x18, 0xe4, 0x0d, 0x09, 0x14, 0x01, 0xc3, 0x42, 0x10, 0x00, 0xd8, 0xdc,
++  0x32, 0x22, 0x00, 0x00, 0x09, 0x08, 0x51, 0x00, 0x00, 0x21, 0x11, 0x24,
++  0x2f, 0x20, 0x47, 0x04, 0xca, 0xc6, 0xe0, 0x7f, 0x40, 0x40,
++};
++
++/* lm0 .fixed_su_mode at0x107b70. */
++static const u8 wave_fixed_data_span_33[] = {
++  0x00, 0x16, 0x8c, 0x70, 0x11, 0x00, 0xb9, 0x26, 0x8c, 0x24, 0x02, 0x90,
++  0x03, 0xf4, 0x11, 0x02, 0x80, 0x00, 0x8d, 0x01, 0x0f, 0xf2,
++};
++
++/* lm0 .fixed_dl_dump_retire at0x10804a. */
++static const u8 wave_fixed_data_span_34[] = {
++  0xca, 0xc6,
++};
++
++/* lm0 .fixed_lower_stage at0x10804c. */
++static const u8 wave_fixed_data_span_35[] = {
++  0xe6, 0xc2, 0x08, 0x45, 0xcb, 0x46, 0x11, 0x00, 0xb4, 0x26, 0x0c, 0x71,
++  0x14, 0xad, 0x11, 0x8d, 0x9d, 0x08, 0x81, 0x0f, 0x00, 0x00, 0xa5, 0x00,
++  0xad, 0x44, 0x95, 0x08, 0x81, 0x0f, 0x00, 0x00, 0x01, 0x01, 0x10, 0x8d,
++  0x89, 0x08, 0x95, 0x00, 0xf3, 0x8d, 0x2d, 0x0f, 0x80, 0x1f, 0x00, 0x00,
++  0x82, 0x00, 0x2d, 0x0f, 0x80, 0x1f, 0x00, 0x00, 0x81, 0x00, 0x13, 0x0f,
++  0x80, 0x1f, 0x00, 0x00, 0x80, 0x00, 0x6d, 0x0f, 0x81, 0x1f, 0x00, 0x00,
++  0x83, 0x00, 0x12, 0x8d, 0x6c, 0xb8, 0x61, 0x08, 0x15, 0x0d, 0x09, 0xf0,
++  0x12, 0x8d, 0x59, 0x08, 0x11, 0x00, 0x22, 0xf0, 0x12, 0x8d, 0x51, 0x08,
++  0x11, 0x00, 0x05, 0x8e, 0x17, 0x08, 0x10, 0x00, 0x21, 0x96, 0x2f, 0x09,
++  0x81, 0x0f, 0x00, 0x00, 0x46, 0x58, 0x27, 0x08, 0x81, 0x0f, 0x00, 0x00,
++  0x80, 0x00, 0x09, 0x8e, 0x1b, 0x08, 0x11, 0x00, 0x10, 0x8d, 0x07, 0xae,
++  0xc3, 0x40, 0x00, 0x00, 0x46, 0x58, 0x01, 0xb6, 0x09, 0x95, 0x04, 0xb6,
++  0x0c, 0x70, 0x14, 0xad, 0x0c, 0xf0, 0x0c, 0x72, 0x14, 0xad, 0x0a, 0xf0,
++  0x5e, 0x0c, 0x40, 0x00, 0x10, 0x1d, 0x02, 0x11, 0x14, 0xad, 0x36, 0xad,
++  0x52, 0xad, 0x77, 0xad, 0xc1, 0x00, 0xcf, 0xff,
++};
++
++/* lm0 .fixed_vap_callback at0x1080fc. */
++static const u8 wave_fixed_data_span_36[] = {
++  0xea, 0xc2, 0x08, 0x45, 0x28, 0x46, 0xe9, 0x8e, 0x08, 0x16, 0x90, 0x10,
++  0x0a, 0x16, 0x91, 0x10, 0x47, 0x0f, 0x15, 0x11, 0x43, 0x08, 0xc4, 0x23,
++  0x42, 0x21, 0x40, 0x20, 0x1d, 0x08, 0x95, 0x00, 0x00, 0x8e, 0xe1, 0x41,
++  0xcd, 0x42, 0x32, 0x22, 0xc2, 0x03, 0xee, 0x09, 0xcf, 0xff, 0x55, 0x25,
++  0x41, 0x10, 0x14, 0x21, 0xc1, 0x03, 0x00, 0xa9, 0x45, 0x21, 0x80, 0x20,
++  0x15, 0x08, 0xd1, 0x00, 0xcd, 0x40, 0x32, 0x20, 0xc0, 0x03, 0x40, 0x25,
++  0x01, 0x15, 0x14, 0x21, 0xc1, 0x03, 0x00, 0xa9, 0xe5, 0x71, 0xc1, 0x07,
++  0xcf, 0xff, 0xca, 0xc6,
++};
++
++/* lm0 .fixed_query at0x108d44. */
++static const u8 wave_fixed_data_span_37[] = {
++  0xcb, 0x44, 0x11, 0x00, 0xb4, 0x26, 0x41, 0x94, 0x2f, 0x0a, 0x81, 0x0f,
++  0x00, 0x00, 0x46, 0x58, 0x09, 0x8c, 0x31, 0x08, 0x11, 0x00, 0x01, 0x8c,
++  0x2b, 0x08, 0x11, 0x00, 0x45, 0x8c, 0x27, 0x0a, 0x10, 0x00, 0x21, 0x0a,
++  0x81, 0x0f, 0x00, 0x00, 0x80, 0x00, 0x2c, 0x71, 0x00, 0x14, 0x84, 0x10,
++  0x44, 0x8c, 0xe0, 0x7f, 0x66, 0x8c, 0x05, 0x8c, 0x0b, 0x08, 0x10, 0x00,
++  0x0c, 0x72, 0x03, 0xf0, 0x0c, 0x74, 0xb1, 0x00, 0x8f, 0xf3,
++};
++
++/* lm0 .fixed_su_value at0x108d8c. */
++static const u8 wave_fixed_data_span_38[] = {
++  0xec, 0xc2, 0x08, 0x45, 0x48, 0x47, 0x82, 0x08, 0xaf, 0xf1, 0xa0, 0x40,
++  0x10, 0x42, 0x30, 0x41, 0x1f, 0x25, 0x80, 0x1f, 0x00, 0x00, 0x54, 0x01,
++  0x00, 0x20, 0x80, 0x0f, 0x00, 0x00, 0x90, 0x33, 0x22, 0x0d, 0x8f, 0xf9,
++  0x5f, 0x27, 0x01, 0x17, 0x32, 0x20, 0x40, 0x00, 0x09, 0x08, 0x51, 0x00,
++  0x00, 0x22, 0x52, 0x24, 0x2f, 0x20, 0x87, 0x04, 0xcc, 0xc6,
++};
++
++/* lm0 .fixed_group_dispatch at0x108dc8. */
++static const u8 wave_fixed_data_span_39[] = {
++  0x00, 0x16, 0x80, 0x70, 0x11, 0x00, 0xb9, 0x26, 0x8c, 0x20, 0x02, 0x80,
++  0x03, 0xf4, 0xf5, 0x02, 0xc0, 0x00, 0x49, 0x02, 0xcf, 0xfc,
++};
++
++/* lm0 .fixed_group_rate_log_a at0x10a8c2. */
++static const u8 wave_fixed_data_span_40[] = {
++  0x89, 0x00, 0x00, 0x00,
++};
++
++/* lm0 .fixed_group_active at0x10a8c8. */
++static const u8 wave_fixed_data_span_41[] = {
++  0x1e, 0x08, 0x60, 0x02, 0xa1, 0x40, 0x20, 0x1d, 0x02, 0x10, 0xc8, 0xc7,
++};
++
++/* lm0 .fixed_group_rate_log_b at0x10a8fa. */
++static const u8 wave_fixed_data_span_42[] = {
++  0x51, 0x00, 0x00, 0x00,
++};
++
++/* lm0 .fixed_cal_unrepresentable at0x10a900. */
++static const u8 wave_fixed_data_span_43[] = {
++  0x0c, 0x73, 0x01, 0xad, 0x0c, 0x70, 0x05, 0xad, 0x06, 0xad, 0xc8, 0xc6,
++};
++
++/* lm0 .fixed_group_rate_log_c at0x10a930. */
++static const u8 wave_fixed_data_span_44[] = {
++  0x19, 0x00, 0x00, 0x00,
++};
++
++/* lm0 .fixed_lower_dispatch at0x10a934. */
++static const u8 wave_fixed_data_span_45[] = {
++  0x25, 0x88, 0x0b, 0x09, 0x10, 0x00, 0x15, 0x07, 0x8f, 0xfe, 0xe8, 0xc2,
++  0x5f, 0x12, 0x0f, 0x37, 0x4b, 0x05, 0x4f, 0xfb,
++};
++
++/* lm0 .fixed_group_rate_log_d at0x10a986. */
++static const u8 wave_fixed_data_span_46[] = {
++  0x15, 0x00, 0x00, 0x00,
++};
++
++/* lm0 .fixed_channel_complete at0x10a98c. */
++static const u8 wave_fixed_data_span_47[] = {
++  0xe2, 0xc2, 0xbe, 0x0b, 0x0f, 0xf4, 0x72, 0x08, 0x8f, 0xfe, 0xc2, 0xc6,
++};
++
++/* lm0 .fixed_ul_dump_retire at0x10ab0e. */
++static const u8 wave_fixed_data_span_48[] = {
++  0xcc, 0xc6,
++};
++
++/* lm0 .fixed_after_calibration at0x10ab10. */
++static const u8 wave_fixed_data_span_49[] = {
++  0xe8, 0xc2, 0x26, 0x09, 0x8f, 0xf2, 0xcb, 0x45, 0x11, 0x00, 0xb4, 0x26,
++  0x01, 0x95, 0x73, 0x08, 0x81, 0x0f, 0x00, 0x00, 0x46, 0x58, 0x09, 0x15,
++  0x90, 0x10, 0x63, 0x08, 0x80, 0x2f, 0x00, 0x00, 0x81, 0x00, 0x29, 0x08,
++  0x80, 0x2f, 0x00, 0x00, 0x80, 0x00, 0x21, 0x08, 0x80, 0x2f, 0x00, 0x00,
++  0x83, 0x00, 0x05, 0x8d, 0x4b, 0x08, 0x81, 0x0f, 0x00, 0x00, 0x80, 0x00,
++  0x84, 0xd8, 0x09, 0xad, 0xc0, 0x8d, 0xe4, 0x8d, 0x09, 0x00, 0x00, 0x00,
++  0xc7, 0x8d, 0xe8, 0x8d, 0x36, 0x08, 0x20, 0x00, 0xc1, 0x40, 0x27, 0x08,
++  0x12, 0x03, 0x06, 0xad, 0xc0, 0xad, 0xe4, 0xad, 0x2c, 0x70, 0x11, 0x08,
++  0x81, 0x2f, 0x00, 0x00, 0x80, 0x00, 0x09, 0x08, 0xc5, 0x03, 0x2c, 0x73,
++  0x21, 0xad, 0x80, 0xd8, 0x05, 0xad, 0x0f, 0x00, 0x00, 0x00, 0x7d, 0x05,
++  0xcf, 0xff, 0xc1, 0x00, 0x8f, 0xf2, 0xc8, 0xc6,
++};
++
++/* lm0 .fixed_cap at0x10ab90. */
++static const u8 wave_fixed_data_span_50[] = {
++  0xe8, 0xc2, 0x10, 0x40, 0x2a, 0x0a, 0x4f, 0xeb, 0xca, 0x09, 0x4f, 0xeb,
++  0x09, 0x68, 0x6d, 0x08, 0x95, 0x00, 0x00, 0x16, 0x8f, 0x70, 0x11, 0x00,
++  0xb0, 0x26, 0x61, 0x0f, 0x15, 0x11, 0xad, 0x70, 0x3f, 0xde, 0x00, 0x22,
++  0x40, 0x33, 0xb0, 0x10, 0xc1, 0x00, 0x51, 0x09, 0x11, 0x00, 0x00, 0x25,
++  0x80, 0x1f, 0x11, 0x00, 0x38, 0x06, 0x00, 0x10, 0xc1, 0x00, 0x09, 0x26,
++  0x4e, 0x10, 0x08, 0x10, 0xc1, 0x00, 0x09, 0x26, 0x4e, 0x10, 0x04, 0x10,
++  0xc1, 0x00, 0x09, 0x26, 0x4e, 0x10, 0x33, 0x26, 0x40, 0x73, 0x11, 0x00,
++  0xa4, 0x3c, 0x09, 0x26, 0x0e, 0x10, 0xa5, 0x71, 0xc7, 0x0f, 0x45, 0x93,
++  0x11, 0x08, 0x10, 0x20, 0x00, 0x16, 0xc0, 0x70, 0x11, 0x00, 0x8c, 0x05,
++  0x09, 0x26, 0x0e, 0x10, 0x09, 0x0e, 0x12, 0x13, 0xc1, 0x40, 0xc8, 0xc6,
++  0x8a, 0x20, 0xff, 0x0f, 0xc8, 0xc6,
++};
++
++/* lm0 .fixed_lower_version at0x10f0b0. */
++static const u8 wave_fixed_data_span_51[] = {
++  0x40, 0x40, 0x40, 0x20, 0x56, 0x45, 0x52, 0x53, 0x49, 0x4f, 0x4e, 0x20,
++  0x49, 0x4e, 0x46, 0x4f, 0x20, 0x40, 0x40, 0x40, 0x20, 0x76, 0x65, 0x72,
++  0x73, 0x69, 0x6f, 0x6e, 0x20, 0x6e, 0x75, 0x6d, 0x62, 0x65, 0x72, 0x3a,
++  0x20, 0x46, 0x31, 0x40, 0x40, 0x40, 0x20, 0x45, 0x4e, 0x44, 0x20, 0x40,
++  0x40, 0x40, 0x00, 0x00,
++};
++
++/* lm0 .fixed_group_value at0x10f0e4. */
++static const u8 wave_fixed_data_span_52[] = {
++  0xe8, 0xc2, 0x08, 0x45, 0x00, 0x16, 0x80, 0x70, 0x11, 0x00, 0xb9, 0x26,
++  0x37, 0x08, 0x80, 0x0f, 0x00, 0x00, 0x80, 0x00, 0x08, 0x85, 0x6d, 0x20,
++  0x8e, 0x0a, 0xad, 0x44, 0x0f, 0x08, 0x57, 0x02, 0xea, 0x09, 0xaf, 0xf6,
++  0xc1, 0x40, 0x0d, 0x00, 0x00, 0x00, 0x0a, 0x0f, 0x6f, 0xf6, 0xc1, 0x40,
++  0x08, 0x47, 0x1a, 0x0f, 0xef, 0xf9, 0xc1, 0x40, 0x0f, 0x78, 0xef, 0x7f,
++  0x09, 0x20, 0xc0, 0x03, 0xc8, 0xc6, 0x9a, 0x0c, 0x0f, 0xe9, 0xea, 0x0c,
++  0x4f, 0xee, 0x0f, 0x78, 0xc8, 0xc6,
++};
++
++/* lm0 .fixed_copy_vap_tcr_fields at0x10f134. */
++static const u8 wave_fixed_data_span_53[] = {
++  0x04, 0x42, 0x24, 0x43, 0x6c, 0x22, 0xc2, 0x05, 0x53, 0x23, 0xc3, 0x05,
++  0x65, 0x7a, 0x40, 0xa0, 0x04, 0x46, 0x34, 0x47, 0xbf, 0xba, 0xbd, 0xba,
++  0xbc, 0xba, 0x84, 0x23, 0x02, 0x0c, 0x18, 0xbb, 0x65, 0x7a, 0xe0, 0x7f,
++  0x44, 0xa0,
++};
++
++/* lm1 .fixed_su_entry at0x133724. */
++static const u8 wave_fixed_data_span_54[] = {
++  0x81, 0x04, 0x00, 0x04,
++};
++
++/* lm1 .fixed_su_log_return at0x1337a8. */
++static const u8 wave_fixed_data_span_55[] = {
++  0x03, 0x14, 0x80, 0x30, 0xd6, 0xc7,
++};
++
++/* lm1 .fixed_recalc_gate at0x1337b0. */
++static const u8 wave_fixed_data_span_56[] = {
++  0x23, 0x15, 0x80, 0x10, 0x15, 0x08, 0x91, 0x00, 0x00, 0x16, 0x80, 0x70,
++  0x16, 0x00, 0x29, 0x23, 0x0f, 0x08, 0x80, 0x0f, 0x00, 0x00, 0x80, 0x00,
++  0xe0, 0x7f, 0x26, 0x15, 0x80, 0x10, 0xe0, 0x7f, 0x0c, 0x70,
++};
++
++/* lm1 .fixed_peer_bounds_log_return at0x13baf6. */
++static const u8 wave_fixed_data_span_57[] = {
++  0xc2, 0xc6,
++};
++
++/* lm1 .fixed_reset_guard at0x13baf8. */
++static const u8 wave_fixed_data_span_58[] = {
++  0x61, 0x90, 0x23, 0x0b, 0x81, 0x0f, 0x00, 0x00, 0x46, 0x58, 0x65, 0x88,
++  0x1b, 0x0b, 0x80, 0x0f, 0x00, 0x00, 0x80, 0x00, 0x69, 0x88, 0x82, 0x23,
++  0x02, 0x00, 0x0b, 0x0b, 0x55, 0x01, 0x0b, 0x0b, 0x91, 0x00, 0x11, 0x01,
++  0x40, 0x0b, 0xe0, 0x7e,
++};
++
++/* lm1 .fixed_clamp_log_return at0x13bba0. */
++static const u8 wave_fixed_data_span_59[] = {
++  0xa1, 0x40, 0xce, 0xc7,
++};
++
++/* lm1 .fixed_su_dispatch at0x13bba4. */
++static const u8 wave_fixed_data_span_60[] = {
++  0x09, 0x0c, 0x91, 0x00, 0x59, 0x05, 0xc0, 0x0d, 0xf6, 0xc3, 0xa1, 0xc1,
++  0x79, 0x03, 0xcf, 0xfb,
++};
++
++/* lm1 .fixed_native_bounds at0x13bbb4. */
++static const u8 wave_fixed_data_span_61[] = {
++  0xf4, 0xc2, 0x10, 0x42, 0x8a, 0x20, 0x05, 0x05, 0x50, 0x43, 0x1f, 0x22,
++  0x02, 0x20, 0xcb, 0x45, 0x00, 0x00, 0x64, 0x34, 0x28, 0x47, 0x70, 0x44,
++  0xa0, 0x62, 0x2c, 0x10, 0x81, 0x00, 0x11, 0x09, 0x80, 0x0f, 0x00, 0x00,
++  0xff, 0x00, 0x5d, 0x65, 0x30, 0xad, 0x32, 0xf0, 0x0a, 0x21, 0x80, 0x24,
++  0x53, 0x22, 0x15, 0x21, 0xd3, 0x40, 0x16, 0x00, 0x6c, 0x38, 0xad, 0x21,
++  0x41, 0x21, 0x0c, 0x71, 0x00, 0x28, 0x4e, 0x05, 0x15, 0x20, 0x40, 0x24,
++  0x18, 0x80, 0xcb, 0x78, 0x05, 0xf2, 0x5d, 0x65, 0x10, 0x15, 0xc1, 0x10,
++  0x1c, 0xf0, 0x5f, 0x22, 0x80, 0x22, 0x32, 0x20, 0x96, 0x0f, 0x16, 0x00,
++  0x7d, 0x3e, 0xae, 0x0c, 0x60, 0x0d, 0x62, 0x40, 0xf0, 0x20, 0x41, 0x24,
++  0x24, 0x7e, 0x33, 0x26, 0x82, 0x2f, 0x16, 0x00, 0xf8, 0x02, 0x01, 0x2e,
++  0x41, 0x15, 0x2f, 0x79, 0x29, 0x7a, 0x0f, 0x79, 0x42, 0x40, 0x9f, 0x20,
++  0x05, 0x05, 0xb8, 0x60, 0x59, 0x61, 0x30, 0xa8, 0x00, 0x27, 0x8d, 0x1f,
++  0x16, 0x00, 0x0c, 0x39, 0x8e, 0x09, 0xef, 0xfa, 0x42, 0x40, 0x00, 0x20,
++  0x8e, 0x06, 0xea, 0x0b, 0x60, 0x05, 0x62, 0x40, 0xab, 0x16, 0x81, 0x10,
++  0x38, 0x60, 0x00, 0x27, 0x81, 0x16, 0xb0, 0x11, 0x81, 0x00, 0x10, 0x49,
++  0x2f, 0x24, 0x05, 0x00, 0x88, 0x24, 0x3f, 0x0d, 0x04, 0x1d, 0x02, 0x11,
++  0xee, 0x08, 0xef, 0xfa, 0x62, 0x40, 0x43, 0x70, 0xab, 0x10, 0x8e, 0x00,
++  0xba, 0x0b, 0x60, 0x05, 0x62, 0x40, 0xc3, 0x41, 0x16, 0x00, 0xac, 0x02,
++  0xfa, 0x61, 0x15, 0x0c, 0x10, 0x20, 0x08, 0x12, 0xc2, 0x00, 0x33, 0x27,
++  0x41, 0x10, 0x09, 0x21, 0x81, 0x00, 0x03, 0xf0, 0x29, 0x67, 0xd8, 0x60,
++  0x10, 0x49, 0x0d, 0x78, 0x49, 0x20, 0xc0, 0x0f, 0x00, 0xad, 0xd4, 0xc6,
++};
++
++/* lm1 .fixed_mask_value at0x13bcb0. */
++static const u8 wave_fixed_data_span_62[] = {
++  0xe4, 0xc2, 0x08, 0x45, 0xae, 0x08, 0xcf, 0xfa, 0x43, 0x70, 0xab, 0x10,
++  0x8e, 0x00, 0x7e, 0x0b, 0x60, 0x05, 0xa1, 0x40, 0xcb, 0x44, 0x16, 0x00,
++  0x24, 0x23, 0x24, 0x8c, 0x46, 0x8c, 0x09, 0x21, 0x81, 0x00, 0x10, 0x49,
++  0xc2, 0x78, 0xc1, 0x41, 0xc4, 0xc6,
++};
++
++/* lm1 .fixed_calibration_log_skip at0x13fad6. */
++static const u8 wave_fixed_data_span_63[] = {
++  0x70, 0x40, 0x15, 0x00, 0x00, 0x00,
++};
++
++/* lm1 .fixed_cal_automatic at0x13fadc. */
++static const u8 wave_fixed_data_span_64[] = {
++  0x0c, 0x70, 0x00, 0xad, 0x01, 0xad, 0x04, 0xad, 0x05, 0xad, 0x06, 0xad,
++  0xc8, 0xc6,
++};
++
++/* lm1 .fixed_vap_callback_pointer at0x13fc60. */
++static const u8 wave_fixed_data_span_65[] = {
++  0xc3, 0x43, 0x15, 0x00, 0x8c, 0x7e,
++};
++
++/* lm1 .fixed_vap_context at0x13fc6e. */
++static const u8 wave_fixed_data_span_66[] = {
++  0x00, 0x1c, 0x82, 0x34,
++};
++
++/* lm1 .fixed_vap_template_align at0x13fc8a. */
++static const u8 wave_fixed_data_span_67[] = {
++  0xe0, 0x78,
++};
++
++/* lm1 .fixed_vap_templates at0x13fc8c. */
++static const u8 wave_fixed_data_span_68[] = {
++  0xaf, 0x79, 0x3b, 0x08, 0x44, 0x20, 0x42, 0x40, 0x32, 0x26, 0x42, 0x10,
++  0x0a, 0x0c, 0xc0, 0x0b, 0x1f, 0x22, 0x81, 0x2f, 0x00, 0x00, 0x80, 0x01,
++  0x00, 0x21, 0x81, 0x0f, 0x33, 0xa0, 0x0c, 0xba, 0x00, 0x21, 0x41, 0x03,
++  0x00, 0x19, 0x02, 0x00, 0x34, 0x19, 0x02, 0x00, 0x68, 0x19, 0x02, 0x00,
++  0x9c, 0x19, 0x02, 0x00, 0xa5, 0x71, 0xcd, 0x07, 0xcf, 0xff, 0xcc, 0xc7,
++};
++
++/* lm1 .fixed_query_error at0x13fcc8. */
++static const u8 wave_fixed_data_span_69[] = {
++  0x2c, 0x70, 0x6c, 0x70, 0x8c, 0x70, 0xe0, 0x7f, 0x4c, 0x70,
++};
++
++/* lm1 .fixed_reset_hook at0x150e12. */
++static const u8 wave_fixed_data_span_70[] = {
++  0xea, 0x0c, 0x6f, 0xf5, 0x0a, 0xda,
++};
++
++/* lm1 .fixed_calibration_hook at0x1512ec. */
++static const u8 wave_fixed_data_span_71[] = {
++  0xb6, 0x0d, 0xa0, 0x04, 0x82, 0x40,
++};
++
++/* lm1 .fixed_completion_hook at0x151318. */
++static const u8 wave_fixed_data_span_72[] = {
++  0x06, 0x0c, 0xa0, 0x04, 0xc0, 0xb8,
++};
++
++/* lm1 .fixed_lower_entry at0x151434. */
++static const u8 wave_fixed_data_span_73[] = {
++  0x91, 0x02, 0x80, 0x04, 0xe0, 0x78,
++};
++
++/* lm1 .fixed_recalc_hook at0x152582. */
++static const u8 wave_fixed_data_span_74[] = {
++  0x32, 0x0a, 0x8f, 0xf0,
++};
++
++/* lm1 .fixed_feedback_log_skip at0x1525aa. */
++static const u8 wave_fixed_data_span_75[] = {
++  0x13, 0x00, 0x00, 0x00,
++};
++
++/* lm1 .fixed_group_native at0x1525b0. */
++static const u8 wave_fixed_data_span_76[] = {
++  0x08, 0x85, 0x6d, 0x20, 0x80, 0x0a, 0xa9, 0x01, 0x80, 0x02,
++};
++
++/* lm1 .fixed_group_entry at0x157744. */
++static const u8 wave_fixed_data_span_77[] = {
++  0x15, 0x04, 0x80, 0x00,
++};
++
++/* lm1 .fixed_lower_complete at0x157748. */
++static const u8 wave_fixed_data_span_78[] = {
++  0xa1, 0x42, 0x0c, 0x15, 0x84, 0x10, 0xf7, 0xd8, 0x07, 0xd9, 0x96, 0x09,
++  0xef, 0xf4, 0x6c, 0x70, 0xc6, 0xc6,
++};
++
++/* lm1 .fixed_group_mgmt_copy at0x157770. */
++static const u8 wave_fixed_data_span_79[] = {
++  0x08, 0x47, 0x9f, 0x26, 0x06, 0x10, 0x00, 0x26, 0x8e, 0x1f, 0x33, 0xa0,
++  0xa0, 0xb9, 0x40, 0x25, 0x00, 0x17, 0x2a, 0x0e, 0xa0, 0x03, 0xc1, 0x41,
++  0xe1, 0x40, 0x7d, 0x00, 0x00, 0x00,
++};
++
++/* lm1 .fixed_group_refresh at0x157790. */
++static const u8 wave_fixed_data_span_80[] = {
++  0xea, 0xc2, 0xcb, 0x44, 0x16, 0x00, 0x24, 0x23, 0x01, 0x94, 0x69, 0x08,
++  0x81, 0x0f, 0x00, 0x00, 0x46, 0x58, 0x05, 0x8c, 0x0f, 0x08, 0x80, 0x0f,
++  0x00, 0x00, 0x80, 0x00, 0x09, 0x8c, 0x55, 0x08, 0x10, 0x00, 0xad, 0x70,
++  0x0a, 0x26, 0x80, 0x1f, 0x01, 0x00, 0xd1, 0x9c, 0x0a, 0x27, 0x80, 0x1f,
++  0x01, 0x00, 0x4c, 0x9e, 0x00, 0x8e, 0x1d, 0x08, 0x91, 0x00, 0x00, 0x17,
++  0x10, 0x10, 0x18, 0x10, 0x11, 0x20, 0x8a, 0x0d, 0xa0, 0x03, 0x02, 0x40,
++  0x20, 0x18, 0x02, 0x20, 0x20, 0x19, 0x02, 0x20, 0xa5, 0x71, 0x00, 0x26,
++  0x8e, 0x1f, 0x00, 0x00, 0xc4, 0x16, 0x00, 0x27, 0x8f, 0x1f, 0x00, 0x00,
++  0xc4, 0x16, 0xd5, 0x0d, 0x14, 0x94, 0x0c, 0x70, 0x00, 0x1e, 0x02, 0x70,
++  0x16, 0x00, 0x2d, 0x23, 0xca, 0xc6,
++};
++
++/* lm1 .fixed_group_aux_copy at0x157882. */
++static const u8 wave_fixed_data_span_81[] = {
++  0x08, 0x47, 0x9f, 0x26, 0x06, 0x10, 0x00, 0x26, 0x8e, 0x1f, 0x33, 0xa0,
++  0xa0, 0xb9, 0x40, 0x25, 0x00, 0x1f, 0x16, 0x0d, 0xa0, 0x03, 0xc1, 0x41,
++  0xe1, 0x40, 0x7b, 0x00, 0x00, 0x00,
++};
++
++/* lm1 .fixed_vap_value at0x1578a0. */
++static const u8 wave_fixed_data_span_82[] = {
++  0x00, 0x16, 0x8c, 0x70, 0x16, 0x00, 0x29, 0x23, 0x53, 0x0c, 0x81, 0x1f,
++  0x00, 0x00, 0x80, 0x00, 0xea, 0xc2, 0x08, 0x45, 0x28, 0x46, 0x0a, 0x0d,
++  0xcf, 0xec, 0xfa, 0x0b, 0x0f, 0xf2, 0x10, 0x41, 0x30, 0x40, 0xa1, 0x40,
++  0x2c, 0x72, 0x46, 0x0f, 0x6f, 0xef, 0xc1, 0x42, 0x5f, 0x20, 0x00, 0x07,
++  0x00, 0x16, 0x81, 0x70, 0x16, 0x00, 0xee, 0x22, 0xc3, 0x42, 0x15, 0x00,
++  0x8c, 0xe0, 0x0d, 0x09, 0x14, 0x01, 0xc3, 0x42, 0x15, 0x00, 0x4c, 0xd9,
++  0x32, 0x22, 0x00, 0x00, 0x09, 0x08, 0x51, 0x00, 0x00, 0x21, 0x11, 0x24,
++  0x2f, 0x20, 0x47, 0x04, 0xca, 0xc6, 0xe0, 0x7f, 0x40, 0x40,
++};
++
++/* lm1 .fixed_su_mode at0x157900. */
++static const u8 wave_fixed_data_span_83[] = {
++  0x00, 0x16, 0x8c, 0x70, 0x16, 0x00, 0x29, 0x23, 0x8c, 0x24, 0x02, 0x90,
++  0x03, 0xf4, 0x11, 0x02, 0x80, 0x00, 0x9d, 0x02, 0x0f, 0xf2,
++};
++
++/* lm1 .fixed_dl_dump_retire at0x157dda. */
++static const u8 wave_fixed_data_span_84[] = {
++  0xca, 0xc6,
++};
++
++/* lm1 .fixed_lower_stage at0x157ddc. */
++static const u8 wave_fixed_data_span_85[] = {
++  0xe6, 0xc2, 0x08, 0x45, 0xcb, 0x46, 0x16, 0x00, 0x24, 0x23, 0x0c, 0x71,
++  0x14, 0xad, 0x11, 0x8d, 0x9d, 0x08, 0x81, 0x0f, 0x00, 0x00, 0xa5, 0x00,
++  0xad, 0x44, 0x95, 0x08, 0x81, 0x0f, 0x00, 0x00, 0x01, 0x01, 0x10, 0x8d,
++  0x89, 0x08, 0x95, 0x00, 0xf3, 0x8d, 0x2d, 0x0f, 0x80, 0x1f, 0x00, 0x00,
++  0x82, 0x00, 0x2d, 0x0f, 0x80, 0x1f, 0x00, 0x00, 0x81, 0x00, 0x13, 0x0f,
++  0x80, 0x1f, 0x00, 0x00, 0x80, 0x00, 0x6d, 0x0f, 0x81, 0x1f, 0x00, 0x00,
++  0x83, 0x00, 0x12, 0x8d, 0x6c, 0xb8, 0x61, 0x08, 0x15, 0x0d, 0x09, 0xf0,
++  0x12, 0x8d, 0x59, 0x08, 0x11, 0x00, 0x22, 0xf0, 0x12, 0x8d, 0x51, 0x08,
++  0x11, 0x00, 0x05, 0x8e, 0x17, 0x08, 0x10, 0x00, 0x21, 0x96, 0x2f, 0x09,
++  0x81, 0x0f, 0x00, 0x00, 0x46, 0x58, 0x27, 0x08, 0x81, 0x0f, 0x00, 0x00,
++  0x80, 0x00, 0x09, 0x8e, 0x1b, 0x08, 0x11, 0x00, 0x10, 0x8d, 0x07, 0xae,
++  0xc3, 0x40, 0x00, 0x00, 0x46, 0x58, 0x01, 0xb6, 0x09, 0x95, 0x04, 0xb6,
++  0x0c, 0x70, 0x14, 0xad, 0x0c, 0xf0, 0x0c, 0x72, 0x14, 0xad, 0x0a, 0xf0,
++  0x5e, 0x0c, 0x40, 0x00, 0x10, 0x1d, 0x02, 0x11, 0x14, 0xad, 0x36, 0xad,
++  0x52, 0xad, 0x77, 0xad, 0xc1, 0x00, 0xcf, 0xff,
++};
++
++/* lm1 .fixed_vap_callback at0x157e8c. */
++static const u8 wave_fixed_data_span_86[] = {
++  0xea, 0xc2, 0x08, 0x45, 0x28, 0x46, 0xe9, 0x8e, 0x08, 0x16, 0x90, 0x10,
++  0x0a, 0x16, 0x91, 0x10, 0x47, 0x0f, 0x15, 0x11, 0x43, 0x08, 0xc4, 0x23,
++  0x42, 0x21, 0x40, 0x20, 0x1d, 0x08, 0x95, 0x00, 0x00, 0x8e, 0xe1, 0x41,
++  0xcd, 0x42, 0x32, 0x22, 0xc2, 0x03, 0xee, 0x09, 0xcf, 0xff, 0x55, 0x25,
++  0x41, 0x10, 0x14, 0x21, 0xc1, 0x03, 0x00, 0xa9, 0x45, 0x21, 0x80, 0x20,
++  0x15, 0x08, 0xd1, 0x00, 0xcd, 0x40, 0x32, 0x20, 0xc0, 0x03, 0x40, 0x25,
++  0x01, 0x15, 0x14, 0x21, 0xc1, 0x03, 0x00, 0xa9, 0xe5, 0x71, 0xc1, 0x07,
++  0xcf, 0xff, 0xca, 0xc6,
++};
++
++/* lm1 .fixed_query at0x158ad4. */
++static const u8 wave_fixed_data_span_87[] = {
++  0xcb, 0x44, 0x16, 0x00, 0x24, 0x23, 0x41, 0x94, 0x2f, 0x0a, 0x81, 0x0f,
++  0x00, 0x00, 0x46, 0x58, 0x09, 0x8c, 0x31, 0x08, 0x11, 0x00, 0x01, 0x8c,
++  0x2b, 0x08, 0x11, 0x00, 0x45, 0x8c, 0x27, 0x0a, 0x10, 0x00, 0x21, 0x0a,
++  0x81, 0x0f, 0x00, 0x00, 0x80, 0x00, 0x2c, 0x71, 0x00, 0x14, 0x84, 0x10,
++  0x44, 0x8c, 0xe0, 0x7f, 0x66, 0x8c, 0x05, 0x8c, 0x0b, 0x08, 0x10, 0x00,
++  0x0c, 0x72, 0x03, 0xf0, 0x0c, 0x74, 0xb5, 0x01, 0x8f, 0xf3,
++};
++
++/* lm1 .fixed_su_value at0x158b1c. */
++static const u8 wave_fixed_data_span_88[] = {
++  0xec, 0xc2, 0x08, 0x45, 0x48, 0x47, 0x92, 0x09, 0xaf, 0xf1, 0xa0, 0x40,
++  0x10, 0x42, 0x30, 0x41, 0x1f, 0x25, 0x80, 0x1f, 0x00, 0x00, 0x54, 0x01,
++  0x00, 0x20, 0x80, 0x0f, 0x00, 0x00, 0x90, 0x33, 0x3e, 0x0d, 0x8f, 0xf9,
++  0x5f, 0x27, 0x01, 0x17, 0x32, 0x20, 0x40, 0x00, 0x09, 0x08, 0x51, 0x00,
++  0x00, 0x22, 0x52, 0x24, 0x2f, 0x20, 0x87, 0x04, 0xcc, 0xc6,
++};
++
++/* lm1 .fixed_group_dispatch at0x158b58. */
++static const u8 wave_fixed_data_span_89[] = {
++  0x00, 0x16, 0x80, 0x70, 0x16, 0x00, 0x29, 0x23, 0x8c, 0x20, 0x02, 0x80,
++  0x03, 0xf4, 0xf5, 0x02, 0xc0, 0x00, 0x49, 0x02, 0xcf, 0xfc,
++};
++
++/* lm1 .fixed_group_rate_log_a at0x15a652. */
++static const u8 wave_fixed_data_span_90[] = {
++  0x89, 0x00, 0x00, 0x00,
++};
++
++/* lm1 .fixed_group_active at0x15a658. */
++static const u8 wave_fixed_data_span_91[] = {
++  0x02, 0x0f, 0x20, 0x02, 0xa1, 0x40, 0x20, 0x1d, 0x02, 0x10, 0xc8, 0xc7,
++};
++
++/* lm1 .fixed_group_rate_log_b at0x15a68a. */
++static const u8 wave_fixed_data_span_92[] = {
++  0x51, 0x00, 0x00, 0x00,
++};
++
++/* lm1 .fixed_cal_unrepresentable at0x15a690. */
++static const u8 wave_fixed_data_span_93[] = {
++  0x0c, 0x73, 0x01, 0xad, 0x0c, 0x70, 0x05, 0xad, 0x06, 0xad, 0xc8, 0xc6,
++};
++
++/* lm1 .fixed_group_rate_log_c at0x15a6c0. */
++static const u8 wave_fixed_data_span_94[] = {
++  0x19, 0x00, 0x00, 0x00,
++};
++
++/* lm1 .fixed_lower_dispatch at0x15a6c4. */
++static const u8 wave_fixed_data_span_95[] = {
++  0x25, 0x88, 0x0b, 0x09, 0x10, 0x00, 0x15, 0x07, 0x8f, 0xfe, 0xe8, 0xc2,
++  0x5f, 0x12, 0x0f, 0x37, 0x67, 0x05, 0x4f, 0xfb,
++};
++
++/* lm1 .fixed_group_rate_log_d at0x15a716. */
++static const u8 wave_fixed_data_span_96[] = {
++  0x15, 0x00, 0x00, 0x00,
++};
++
++/* lm1 .fixed_channel_complete at0x15a71c. */
++static const u8 wave_fixed_data_span_97[] = {
++  0xe2, 0xc2, 0xda, 0x0b, 0x0f, 0xf4, 0x72, 0x08, 0x8f, 0xfe, 0xc2, 0xc6,
++};
++
++/* lm1 .fixed_ul_dump_retire at0x15a89e. */
++static const u8 wave_fixed_data_span_98[] = {
++  0xcc, 0xc6,
++};
++
++/* lm1 .fixed_after_calibration at0x15a8a0. */
++static const u8 wave_fixed_data_span_99[] = {
++  0xe8, 0xc2, 0x2a, 0x0a, 0x8f, 0xf2, 0xcb, 0x45, 0x16, 0x00, 0x24, 0x23,
++  0x01, 0x95, 0x73, 0x08, 0x81, 0x0f, 0x00, 0x00, 0x46, 0x58, 0x09, 0x15,
++  0x90, 0x10, 0x63, 0x08, 0x80, 0x2f, 0x00, 0x00, 0x81, 0x00, 0x29, 0x08,
++  0x80, 0x2f, 0x00, 0x00, 0x80, 0x00, 0x21, 0x08, 0x80, 0x2f, 0x00, 0x00,
++  0x83, 0x00, 0x05, 0x8d, 0x4b, 0x08, 0x81, 0x0f, 0x00, 0x00, 0x80, 0x00,
++  0x84, 0xd8, 0x09, 0xad, 0xc0, 0x8d, 0xe4, 0x8d, 0x09, 0x00, 0x00, 0x00,
++  0xc7, 0x8d, 0xe8, 0x8d, 0x36, 0x08, 0x20, 0x00, 0xc1, 0x40, 0x27, 0x08,
++  0x12, 0x03, 0x06, 0xad, 0xc0, 0xad, 0xe4, 0xad, 0x2c, 0x70, 0x11, 0x08,
++  0x81, 0x2f, 0x00, 0x00, 0x80, 0x00, 0x09, 0x08, 0xc5, 0x03, 0x2c, 0x73,
++  0x21, 0xad, 0x80, 0xd8, 0x05, 0xad, 0x0f, 0x00, 0x00, 0x00, 0x7d, 0x05,
++  0xcf, 0xff, 0xc5, 0x01, 0x8f, 0xf2, 0xc8, 0xc6,
++};
++
++/* lm1 .fixed_cap at0x15a920. */
++static const u8 wave_fixed_data_span_100[] = {
++  0xe8, 0xc2, 0x10, 0x40, 0x9a, 0x0c, 0x4f, 0xeb, 0x3a, 0x0c, 0x4f, 0xeb,
++  0x09, 0x68, 0x6d, 0x08, 0x95, 0x00, 0x00, 0x16, 0x8f, 0x70, 0x16, 0x00,
++  0x20, 0x23, 0x61, 0x0f, 0x15, 0x11, 0xad, 0x70, 0x3f, 0xde, 0x00, 0x22,
++  0x40, 0x33, 0xb0, 0x10, 0xc1, 0x00, 0x51, 0x09, 0x11, 0x00, 0x00, 0x25,
++  0x80, 0x1f, 0x16, 0x00, 0xac, 0x02, 0x00, 0x10, 0xc1, 0x00, 0x09, 0x26,
++  0x4e, 0x10, 0x08, 0x10, 0xc1, 0x00, 0x09, 0x26, 0x4e, 0x10, 0x04, 0x10,
++  0xc1, 0x00, 0x09, 0x26, 0x4e, 0x10, 0x33, 0x26, 0x40, 0x73, 0x16, 0x00,
++  0x14, 0x39, 0x09, 0x26, 0x0e, 0x10, 0xa5, 0x71, 0xc7, 0x0f, 0x45, 0x93,
++  0x11, 0x08, 0x10, 0x20, 0x00, 0x16, 0xc0, 0x70, 0x16, 0x00, 0x00, 0x02,
++  0x09, 0x26, 0x0e, 0x10, 0x09, 0x0e, 0x12, 0x13, 0xc1, 0x40, 0xc8, 0xc6,
++  0x8a, 0x20, 0xff, 0x0f, 0xc8, 0xc6,
++};
++
++/* lm1 .fixed_lower_version at0x15ed24. */
++static const u8 wave_fixed_data_span_101[] = {
++  0x40, 0x40, 0x40, 0x20, 0x56, 0x45, 0x52, 0x53, 0x49, 0x4f, 0x4e, 0x20,
++  0x49, 0x4e, 0x46, 0x4f, 0x20, 0x40, 0x40, 0x40, 0x20, 0x76, 0x65, 0x72,
++  0x73, 0x69, 0x6f, 0x6e, 0x20, 0x6e, 0x75, 0x6d, 0x62, 0x65, 0x72, 0x3a,
++  0x20, 0x46, 0x31, 0x40, 0x40, 0x40, 0x20, 0x45, 0x4e, 0x44, 0x20, 0x40,
++  0x40, 0x40, 0x00, 0x00,
++};
++
++/* lm1 .fixed_group_value at0x15ed58. */
++static const u8 wave_fixed_data_span_102[] = {
++  0xe8, 0xc2, 0x08, 0x45, 0x00, 0x16, 0x80, 0x70, 0x16, 0x00, 0x29, 0x23,
++  0x37, 0x08, 0x80, 0x0f, 0x00, 0x00, 0x80, 0x00, 0x08, 0x85, 0x6d, 0x20,
++  0x8e, 0x0a, 0xad, 0x44, 0x0f, 0x08, 0x57, 0x02, 0x22, 0x0b, 0xaf, 0xf6,
++  0xc1, 0x40, 0x0d, 0x00, 0x00, 0x00, 0x42, 0x08, 0xaf, 0xf6, 0xc1, 0x40,
++  0x08, 0x47, 0x36, 0x08, 0x2f, 0xfa, 0xc1, 0x40, 0x0f, 0x78, 0xef, 0x7f,
++  0x09, 0x20, 0xc0, 0x03, 0xc8, 0xc6, 0x26, 0x08, 0x4f, 0xe9, 0x16, 0x0f,
++  0x4f, 0xee, 0x0f, 0x78, 0xc8, 0xc6,
++};
++
++/* lm1 .fixed_copy_vap_tcr_fields at0x15eda8. */
++static const u8 wave_fixed_data_span_103[] = {
++  0x04, 0x42, 0x24, 0x43, 0x6c, 0x22, 0xc2, 0x05, 0x53, 0x23, 0xc3, 0x05,
++  0x65, 0x7a, 0x40, 0xa0, 0x04, 0x46, 0x34, 0x47, 0xbf, 0xba, 0xbd, 0xba,
++  0xbc, 0xba, 0x84, 0x23, 0x02, 0x0c, 0x18, 0xbb, 0x65, 0x7a, 0xe0, 0x7f,
++  0x44, 0xa0,
++};
++
++static bool
++wave_fixed_data_fw_matches(const void *buffer, size_t size)
++{
++  static const struct {
++    u32 offset;
++    u32 length;
++    const u8 *bytes;
++  } spans[] = {
++    { 0x4f830, sizeof(wave_fixed_data_span_0), wave_fixed_data_span_0 },
++    { 0x62eb4, sizeof(wave_fixed_data_span_1), wave_fixed_data_span_1 },
++    { 0x66d48, sizeof(wave_fixed_data_span_2), wave_fixed_data_span_2 },
++    { 0x66d88, sizeof(wave_fixed_data_span_3), wave_fixed_data_span_3 },
++    { 0xe3748, sizeof(wave_fixed_data_span_4), wave_fixed_data_span_4 },
++    { 0xe37cc, sizeof(wave_fixed_data_span_5), wave_fixed_data_span_5 },
++    { 0xe37d4, sizeof(wave_fixed_data_span_6), wave_fixed_data_span_6 },
++    { 0xebc56, sizeof(wave_fixed_data_span_7), wave_fixed_data_span_7 },
++    { 0xebc58, sizeof(wave_fixed_data_span_8), wave_fixed_data_span_8 },
++    { 0xebd00, sizeof(wave_fixed_data_span_9), wave_fixed_data_span_9 },
++    { 0xebd04, sizeof(wave_fixed_data_span_10), wave_fixed_data_span_10 },
++    { 0xebd14, sizeof(wave_fixed_data_span_11), wave_fixed_data_span_11 },
++    { 0xebe10, sizeof(wave_fixed_data_span_12), wave_fixed_data_span_12 },
++    { 0xefc42, sizeof(wave_fixed_data_span_13), wave_fixed_data_span_13 },
++    { 0xefc48, sizeof(wave_fixed_data_span_14), wave_fixed_data_span_14 },
++    { 0xefdcc, sizeof(wave_fixed_data_span_15), wave_fixed_data_span_15 },
++    { 0xefdda, sizeof(wave_fixed_data_span_16), wave_fixed_data_span_16 },
++    { 0xefdf6, sizeof(wave_fixed_data_span_17), wave_fixed_data_span_17 },
++    { 0xefdf8, sizeof(wave_fixed_data_span_18), wave_fixed_data_span_18 },
++    { 0xefe34, sizeof(wave_fixed_data_span_19), wave_fixed_data_span_19 },
++    { 0x101066, sizeof(wave_fixed_data_span_20), wave_fixed_data_span_20 },
++    { 0x101540, sizeof(wave_fixed_data_span_21), wave_fixed_data_span_21 },
++    { 0x10156c, sizeof(wave_fixed_data_span_22), wave_fixed_data_span_22 },
++    { 0x101688, sizeof(wave_fixed_data_span_23), wave_fixed_data_span_23 },
++    { 0x1027f2, sizeof(wave_fixed_data_span_24), wave_fixed_data_span_24 },
++    { 0x10281a, sizeof(wave_fixed_data_span_25), wave_fixed_data_span_25 },
++    { 0x102820, sizeof(wave_fixed_data_span_26), wave_fixed_data_span_26 },
++    { 0x1079b4, sizeof(wave_fixed_data_span_27), wave_fixed_data_span_27 },
++    { 0x1079b8, sizeof(wave_fixed_data_span_28), wave_fixed_data_span_28 },
++    { 0x1079e0, sizeof(wave_fixed_data_span_29), wave_fixed_data_span_29 },
++    { 0x107a00, sizeof(wave_fixed_data_span_30), wave_fixed_data_span_30 },
++    { 0x107af2, sizeof(wave_fixed_data_span_31), wave_fixed_data_span_31 },
++    { 0x107b10, sizeof(wave_fixed_data_span_32), wave_fixed_data_span_32 },
++    { 0x107b70, sizeof(wave_fixed_data_span_33), wave_fixed_data_span_33 },
++    { 0x10804a, sizeof(wave_fixed_data_span_34), wave_fixed_data_span_34 },
++    { 0x10804c, sizeof(wave_fixed_data_span_35), wave_fixed_data_span_35 },
++    { 0x1080fc, sizeof(wave_fixed_data_span_36), wave_fixed_data_span_36 },
++    { 0x108d44, sizeof(wave_fixed_data_span_37), wave_fixed_data_span_37 },
++    { 0x108d8c, sizeof(wave_fixed_data_span_38), wave_fixed_data_span_38 },
++    { 0x108dc8, sizeof(wave_fixed_data_span_39), wave_fixed_data_span_39 },
++    { 0x10a8c2, sizeof(wave_fixed_data_span_40), wave_fixed_data_span_40 },
++    { 0x10a8c8, sizeof(wave_fixed_data_span_41), wave_fixed_data_span_41 },
++    { 0x10a8fa, sizeof(wave_fixed_data_span_42), wave_fixed_data_span_42 },
++    { 0x10a900, sizeof(wave_fixed_data_span_43), wave_fixed_data_span_43 },
++    { 0x10a930, sizeof(wave_fixed_data_span_44), wave_fixed_data_span_44 },
++    { 0x10a934, sizeof(wave_fixed_data_span_45), wave_fixed_data_span_45 },
++    { 0x10a986, sizeof(wave_fixed_data_span_46), wave_fixed_data_span_46 },
++    { 0x10a98c, sizeof(wave_fixed_data_span_47), wave_fixed_data_span_47 },
++    { 0x10ab0e, sizeof(wave_fixed_data_span_48), wave_fixed_data_span_48 },
++    { 0x10ab10, sizeof(wave_fixed_data_span_49), wave_fixed_data_span_49 },
++    { 0x10ab90, sizeof(wave_fixed_data_span_50), wave_fixed_data_span_50 },
++    { 0x10f0b0, sizeof(wave_fixed_data_span_51), wave_fixed_data_span_51 },
++    { 0x10f0e4, sizeof(wave_fixed_data_span_52), wave_fixed_data_span_52 },
++    { 0x10f134, sizeof(wave_fixed_data_span_53), wave_fixed_data_span_53 },
++    { 0x133724, sizeof(wave_fixed_data_span_54), wave_fixed_data_span_54 },
++    { 0x1337a8, sizeof(wave_fixed_data_span_55), wave_fixed_data_span_55 },
++    { 0x1337b0, sizeof(wave_fixed_data_span_56), wave_fixed_data_span_56 },
++    { 0x13baf6, sizeof(wave_fixed_data_span_57), wave_fixed_data_span_57 },
++    { 0x13baf8, sizeof(wave_fixed_data_span_58), wave_fixed_data_span_58 },
++    { 0x13bba0, sizeof(wave_fixed_data_span_59), wave_fixed_data_span_59 },
++    { 0x13bba4, sizeof(wave_fixed_data_span_60), wave_fixed_data_span_60 },
++    { 0x13bbb4, sizeof(wave_fixed_data_span_61), wave_fixed_data_span_61 },
++    { 0x13bcb0, sizeof(wave_fixed_data_span_62), wave_fixed_data_span_62 },
++    { 0x13fad6, sizeof(wave_fixed_data_span_63), wave_fixed_data_span_63 },
++    { 0x13fadc, sizeof(wave_fixed_data_span_64), wave_fixed_data_span_64 },
++    { 0x13fc60, sizeof(wave_fixed_data_span_65), wave_fixed_data_span_65 },
++    { 0x13fc6e, sizeof(wave_fixed_data_span_66), wave_fixed_data_span_66 },
++    { 0x13fc8a, sizeof(wave_fixed_data_span_67), wave_fixed_data_span_67 },
++    { 0x13fc8c, sizeof(wave_fixed_data_span_68), wave_fixed_data_span_68 },
++    { 0x13fcc8, sizeof(wave_fixed_data_span_69), wave_fixed_data_span_69 },
++    { 0x150e12, sizeof(wave_fixed_data_span_70), wave_fixed_data_span_70 },
++    { 0x1512ec, sizeof(wave_fixed_data_span_71), wave_fixed_data_span_71 },
++    { 0x151318, sizeof(wave_fixed_data_span_72), wave_fixed_data_span_72 },
++    { 0x151434, sizeof(wave_fixed_data_span_73), wave_fixed_data_span_73 },
++    { 0x152582, sizeof(wave_fixed_data_span_74), wave_fixed_data_span_74 },
++    { 0x1525aa, sizeof(wave_fixed_data_span_75), wave_fixed_data_span_75 },
++    { 0x1525b0, sizeof(wave_fixed_data_span_76), wave_fixed_data_span_76 },
++    { 0x157744, sizeof(wave_fixed_data_span_77), wave_fixed_data_span_77 },
++    { 0x157748, sizeof(wave_fixed_data_span_78), wave_fixed_data_span_78 },
++    { 0x157770, sizeof(wave_fixed_data_span_79), wave_fixed_data_span_79 },
++    { 0x157790, sizeof(wave_fixed_data_span_80), wave_fixed_data_span_80 },
++    { 0x157882, sizeof(wave_fixed_data_span_81), wave_fixed_data_span_81 },
++    { 0x1578a0, sizeof(wave_fixed_data_span_82), wave_fixed_data_span_82 },
++    { 0x157900, sizeof(wave_fixed_data_span_83), wave_fixed_data_span_83 },
++    { 0x157dda, sizeof(wave_fixed_data_span_84), wave_fixed_data_span_84 },
++    { 0x157ddc, sizeof(wave_fixed_data_span_85), wave_fixed_data_span_85 },
++    { 0x157e8c, sizeof(wave_fixed_data_span_86), wave_fixed_data_span_86 },
++    { 0x158ad4, sizeof(wave_fixed_data_span_87), wave_fixed_data_span_87 },
++    { 0x158b1c, sizeof(wave_fixed_data_span_88), wave_fixed_data_span_88 },
++    { 0x158b58, sizeof(wave_fixed_data_span_89), wave_fixed_data_span_89 },
++    { 0x15a652, sizeof(wave_fixed_data_span_90), wave_fixed_data_span_90 },
++    { 0x15a658, sizeof(wave_fixed_data_span_91), wave_fixed_data_span_91 },
++    { 0x15a68a, sizeof(wave_fixed_data_span_92), wave_fixed_data_span_92 },
++    { 0x15a690, sizeof(wave_fixed_data_span_93), wave_fixed_data_span_93 },
++    { 0x15a6c0, sizeof(wave_fixed_data_span_94), wave_fixed_data_span_94 },
++    { 0x15a6c4, sizeof(wave_fixed_data_span_95), wave_fixed_data_span_95 },
++    { 0x15a716, sizeof(wave_fixed_data_span_96), wave_fixed_data_span_96 },
++    { 0x15a71c, sizeof(wave_fixed_data_span_97), wave_fixed_data_span_97 },
++    { 0x15a89e, sizeof(wave_fixed_data_span_98), wave_fixed_data_span_98 },
++    { 0x15a8a0, sizeof(wave_fixed_data_span_99), wave_fixed_data_span_99 },
++    { 0x15a920, sizeof(wave_fixed_data_span_100), wave_fixed_data_span_100 },
++    { 0x15ed24, sizeof(wave_fixed_data_span_101), wave_fixed_data_span_101 },
++    { 0x15ed58, sizeof(wave_fixed_data_span_102), wave_fixed_data_span_102 },
++    { 0x15eda8, sizeof(wave_fixed_data_span_103), wave_fixed_data_span_103 },
++  };
++  const u8 *image = buffer;
++  unsigned i;
++
++  if (size != 0x180000U)
++    return false;
++  for (i = 0; i < ARRAY_SIZE(spans); i++) {
++    if (spans[i].offset > size || spans[i].length > size - spans[i].offset ||
++        memcmp(image + spans[i].offset, spans[i].bytes, spans[i].length))
++      return false;
++  }
++  return true;
++}
++
++#endif
+--- a/wireless/driver/shared/mtlk_coreui.h
++++ b/wireless/driver/shared/mtlk_coreui.h
+@@ -85,8 +85,10 @@
+ /* adjust according to maximum SID supported by available platforms */
+ #define WAVE_MAX_SID                MAX(GEN5_MAX_SID, GEN6_MAX_SID)
+ 
++/* Consumes nbuf and any reserved descriptor, including on early discard. */
+ void __MTLK_IFUNC
+-mtlk_core_handle_tx_data(mtlk_vap_handle_t vap_handle, mtlk_nbuf_t *nbuf);
++mtlk_core_handle_tx_data(mtlk_vap_handle_t vap_handle, mtlk_nbuf_t *nbuf,
++                        mtlk_hw_msg_t *msg);
+ 
+ void __MTLK_IFUNC
+ mtlk_core_handle_tx_ctrl(mtlk_vap_handle_t    vap_handle,
+@@ -148,7 +150,8 @@
+   WAVE_CORE_REQ_SET_AUTH_CFG,                   /*!< Configure authentication parameters */
+   WAVE_CORE_REQ_GET_AUTH_CFG,                   /*!< Get authentication parameters */
+   WAVE_CORE_REQ_GET_ENCEXT_CFG,                 /*!< Get Extended encoding data structure */
+-  WAVE_CORE_REQ_SET_ENCEXT_CFG,                 /*!< Set Extended encoding parmeters */
++  WAVE_CORE_REQ_SET_ENCEXT_CFG,
++  WAVE_CORE_REQ_REVOKE_KEY,                 /*!< Set Extended encoding parmeters */
+   WAVE_CORE_REQ_SET_DEFAULT_KEY_CFG,            /*!< Set default key parmeters */
+   WAVE_CORE_REQ_GET_SERIALIZER_INFO,            /*!< Get Serializer Info */
+   WAVE_CORE_REQ_SET_COEX_20_40_MODE_CFG,        /*!< Set Coex 20/40 mode configuration */
+@@ -180,6 +183,7 @@
+   WAVE_CORE_REQ_GET_FOUR_ADDR_CFG,              /*!< Get four address configuration */
+   WAVE_CORE_REQ_GET_FOUR_ADDR_STA_LIST,         /*!< Get four address station list */
+   WAVE_CORE_REQ_SET_ATF_QUOTAS,                 /*!< Set ATF quotas per station and per VAP */
++  WAVE_CORE_REQ_SET_AIRTIME_WEIGHT,             /*!< Standard MAC-selected station weight */
+   WAVE_CORE_REQ_SET_MCAST_RANGE,                /*!< Set mcast range (for both IPv4 and IPv6) */
+   WAVE_CORE_REQ_GET_MCAST_RANGE_IPV4,           /*!< Get mcast range (IPv4) */
+   WAVE_CORE_REQ_GET_MCAST_RANGE_IPV6,           /*!< Get mcast range (IPv6) */
+@@ -207,6 +211,9 @@
+   WAVE_RADIO_REQ_STOP_LM,               /*!< Stop Lower MAC */
+   WAVE_RADIO_REQ_SET_DBG_CLI,                   /*!< Send debug data to FW */
+   WAVE_RADIO_REQ_SET_FW_LOG_SEVERITY,           /*!< Set FW Log Severity */
++  WAVE_RADIO_REQ_TX_POWER,
++  WAVE_RADIO_REQ_RTS_THRESHOLD,
++  WAVE_RADIO_REQ_SET_REGULATORY,                      /*!< Native radio power control */
+   WAVE_RADIO_REQ_SET_CHAN,                      /*!< Set channel */
+   WAVE_RADIO_REQ_DO_SCAN,                       /*!< Do scan */
+   WAVE_RADIO_REQ_START_SCHED_SCAN,              /*!< Start scheduled scan */
+@@ -291,6 +298,7 @@
+   WAVE_RADIO_REQ_GET_SSB_MODE,                  /*!< Get SSB Mode */
+   WAVE_RADIO_REQ_SET_COEX_CFG,                  /*!< Set 2.4 GHz BT, BLE, ZigBee Coex config */
+   WAVE_RADIO_REQ_GET_COEX_CFG,                  /*!< Get 2.4 GHz BT, BLE, ZigBee Coex config */
++  WAVE_CORE_REQ_STA_ROLE,                      /*!< Native STA connection admission */
+   WAVE_RADIO_REQ_STA_CHANGE_BSS,                /*!< STA mode - Change BSS */
+   WAVE_RADIO_REQ_SET_FREQ_JUMP_MODE,            /*!< Set Frequency Jump Mode */
+   WAVE_RADIO_REQ_SET_RESTRICTED_AC_MODE,        /*!< Set Restricted AC Mode */
+@@ -862,12 +870,7 @@
+   MTLK_MC_STADB_UPD     /*!< Update MAC's list in Multicast STA DB */
+ } mc_stadb_action_t;
+ 
+-typedef struct _mtlk_core_ui_mc_action_t {
+-  mc_action_t         action;
+-  uint8               grp_id;
+-  IEEE_ADDR           sta_mac_addr;
+-  mtlk_mc_addr_t      mc_addr;
+-} mtlk_core_ui_mc_action_t;
++
+ 
+ typedef struct _mtlk_core_ui_mc_grid_action_t {
+   mc_grid_action_t    action;
+@@ -1660,6 +1663,11 @@
+   u32 rate;
+   u8 rf_gain[PHY_STATISTICS_MAX_RX_ANT];
+   BOOL dont_notify_kernel;
++  bool station; /* The paired STA wiphy uses the protected AP master for control. */
++  bool monitor; /* Card-exclusive passive receiver, internal owner only. */
++  bool station_idle; /* No active STA claim; radio may serve its paired AP. */
++  bool station_csa; /* Native upstream-CSA callback owns the shared switch. */
++  u8 cac_transition; /* Internal ACK-owned completion/abort, never userspace input. */
+ };
+ 
+ enum mtlk_hidden_ssid
+@@ -1669,8 +1677,14 @@
+   MTLK_HIDDEN_SSID_ZERO_CONTENTS
+ };
+ 
++struct wave_sta_role_request {
++  bool active;
++  struct mtlk_chan_def chandef;
++};
++
+ struct mtlk_ap_settings
+ {
++  struct mtlk_chan_def chandef; /* Requested native AP channel, checked at activation. */
+   int beacon_interval;
+   int dtim_period;
+   int hidden_ssid;
+@@ -1685,6 +1699,7 @@
+ {
+   int vap_id;
+   int use_cts_prot;
++  int protection_mode; /* -1 derives firmware protection from native CTS/HT. */
+   int use_short_preamble;
+   int use_short_slot_time;
+   int ap_isolate;
+@@ -1693,16 +1708,26 @@
+   u8 basic_rates_len;
+   s8 p2p_ctwindow, p2p_opp_ps;
+   u8 he_bss_color;
++  u16 beacon_interval;
++  u8 dtim_period;
++};
++
++/* Local VAP capabilities, distinct from the remote peer in STA_ADD. */
++struct wave_sta_bss_parameters
++{
++  struct mtlk_bss_parameters params;
++  u8 flags;
++  u8 ht_mcs[10];
++  u8 vht_mcs[8];
++  u8 he_mcs[8];
+ };
+ 
+ struct mtlk_sta_bss_change_parameters
+ {
+-  const char *vif_name;
+-  struct ieee80211_supported_band **bands;
+   mtlk_core_t *core;
+-  struct ieee80211_bss_conf *info;
+-  u32 changed;
+-  u8 vap_index;
++  struct mtlk_bss_parameters params;
++  u64 changed;
++  u16 beacon_interval;
+ };
+ 
+ /* mimic cfg80211_match_set with ours */
+@@ -1740,6 +1765,8 @@
+   void *wiphy;
+   mtlk_scan_type_e type;
+   u8 requester_vap_index;
++  /* mac80211 operating channel, captured under its wiphy mutex for STA scans. */
++  struct mtlk_chan_def sta_return_chandef;
+   struct mtlk_channel channels[NUM_TOTAL_CHANS];
+   u32 n_channels;
+   u32 flags;
+@@ -1924,9 +1951,8 @@
+ void wave_radio_abilities_enable_11b_abilities(mtlk_vap_handle_t vap_handle);
+ int  mtlk_core_dp_get_subif_cb (mtlk_vap_handle_t vap_handle,  char *mac_addr, uint32_t *subif);
+ BOOL mtlk_core_mcast_module_is_available(mtlk_core_t* nic);
+-void mtlk_core_mcast_group_id_action_serialized(mtlk_core_t* nic, mc_action_t action, int grp_id, uint8 *mac_addr, mtlk_mc_addr_t *mc_addr);
+ uint32 mtlk_core_mcast_handle_grid(mtlk_core_t* nic, mtlk_mc_addr_t *mc_addr, mc_grid_action_t action, int grp_id);
+-int mtlk_core_mcast_notify_fw(mtlk_vap_handle_t vap_handle, int action, int sta_id, int grp_id);
++int mtlk_core_mcast_notify_fw(mtlk_vap_handle_t vap_handle, int action, int sta_id, int grp_id, BOOL *attempted);
+ 
+ void mtlk_core_on_bss_drop_tx_que_full(mtlk_core_t *core);
+ 
+--- a/wireless/driver/shared/rts_threshold_fw.h
++++ b/wireless/driver/shared/rts_threshold_fw.h
+@@ -0,0 +1,306 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Generated from both exact linked lower RTS implementations. The unchanged
++ * upper route is independently required through FIXED_DATA admission. */
++#ifndef WAVE_RTS_THRESHOLD_FW_H
++#define WAVE_RTS_THRESHOLD_FW_H
++
++/* lm0 .extension_init_hook at 0x10cde4. */
++static const u8 wave_rts_span_0[] = {
++  0x1d, 0x02, 0x80, 0x0c,
++};
++
++/* lm0 .extension_unused_marker at 0xe04cc. */
++static const u8 wave_rts_span_1[] = {
++  0x0a, 0x20, 0x80, 0x0f, 0x12, 0x00, 0x00, 0xe0,
++};
++
++/* lm0 .extension_code at 0x126000. */
++static const u8 wave_rts_span_2[] = {
++  0x0a, 0x20, 0x80, 0x0f, 0x12, 0x00, 0x00, 0xc0, 0x0a, 0x21, 0x80, 0x0f,
++  0x12, 0x00, 0x18, 0xc1, 0x4c, 0x70, 0x04, 0xf0, 0x04, 0x18, 0x90, 0x00,
++  0xfd, 0x08, 0x44, 0x80, 0xe0, 0x7e, 0xe0, 0x78, 0x25, 0x88, 0x13, 0x09,
++  0x10, 0x00, 0x12, 0x10, 0x81, 0x00, 0x11, 0x09, 0x80, 0x0f, 0x00, 0x00,
++  0xa6, 0x00, 0x59, 0x06, 0x8f, 0xed, 0xe0, 0x78, 0xe6, 0xc2, 0x08, 0x45,
++  0xcb, 0x46, 0x12, 0x00, 0x00, 0xc0, 0x0c, 0x71, 0x14, 0xad, 0xad, 0x44,
++  0x67, 0x08, 0x81, 0x0f, 0x00, 0x00, 0x01, 0x01, 0xf3, 0x8d, 0x43, 0x0f,
++  0x80, 0x1f, 0x00, 0x00, 0x92, 0x00, 0x1f, 0x0f, 0x80, 0x1f, 0x00, 0x00,
++  0x91, 0x00, 0x4f, 0x0f, 0x81, 0x1f, 0x00, 0x00, 0x90, 0x00, 0x08, 0x95,
++  0x43, 0x0e, 0x04, 0x70, 0x00, 0x00, 0x31, 0x09, 0x04, 0xf0, 0x08, 0x95,
++  0x37, 0x08, 0x11, 0x00, 0x21, 0x8e, 0x11, 0x09, 0x11, 0x00, 0x02, 0xb6,
++  0xe1, 0xae, 0x0c, 0x70, 0x14, 0xad, 0x13, 0xf0, 0x0c, 0x72, 0x14, 0xad,
++  0x0f, 0xf0, 0x08, 0x95, 0x1b, 0x08, 0x11, 0x00, 0x01, 0x96, 0x08, 0xb5,
++  0x00, 0x8e, 0x16, 0xad, 0x01, 0x8e, 0x17, 0xad, 0x2c, 0x70, 0x09, 0x08,
++  0x10, 0x00, 0x2c, 0x74, 0x34, 0xad, 0xa1, 0x42, 0x0c, 0x15, 0x84, 0x10,
++  0xf7, 0xd8, 0x07, 0xd9, 0x6c, 0x70, 0xc2, 0x0a, 0x8f, 0xe5, 0xc6, 0xc6,
++  0x00, 0x16, 0x81, 0x70, 0x12, 0x00, 0x00, 0xc0, 0x0f, 0x09, 0x10, 0x00,
++  0x00, 0x16, 0x01, 0x71, 0x12, 0x00, 0x02, 0xc0, 0xe0, 0x7e, 0x0a, 0x21,
++  0x80, 0x0f, 0x00, 0x00, 0xbe, 0x2c, 0xe0, 0x7e, 0xe6, 0xc2, 0x53, 0x21,
++  0x41, 0x00, 0x40, 0x29, 0x82, 0x00, 0x05, 0x22, 0x42, 0x00, 0x0a, 0x25,
++  0x80, 0x1f, 0x12, 0x00, 0x08, 0xc0, 0x00, 0x25, 0x0d, 0x10, 0x2f, 0x27,
++  0xff, 0x03, 0x00, 0x1d, 0x82, 0x10, 0x00, 0x16, 0x8e, 0x70, 0x12, 0x00,
++  0x00, 0xc0, 0x0d, 0x0e, 0x10, 0x10, 0x09, 0x09, 0x11, 0x00, 0x4c, 0x75,
++  0x40, 0x2a, 0x02, 0x05, 0x9f, 0x20, 0x03, 0x07, 0x00, 0x20, 0x81, 0x0f,
++  0x32, 0xa0, 0x7c, 0xdd, 0x24, 0x40, 0x04, 0x20, 0x80, 0x0f, 0x0f, 0xff,
++  0xff, 0xff, 0x45, 0x78, 0x00, 0xa1, 0x2f, 0x26, 0xff, 0x03, 0xc6, 0xc6,
++  0xe6, 0xc2, 0x53, 0x21, 0x41, 0x00, 0x40, 0x29, 0x82, 0x00, 0x05, 0x22,
++  0x42, 0x00, 0x0a, 0x25, 0x80, 0x1f, 0x12, 0x00, 0x08, 0xc1, 0x00, 0x25,
++  0x0d, 0x10, 0x2f, 0x27, 0xff, 0x03, 0x00, 0x1d, 0x82, 0x10, 0x00, 0x16,
++  0x8e, 0x70, 0x12, 0x00, 0x00, 0xc0, 0x0d, 0x0e, 0x10, 0x10, 0x09, 0x09,
++  0x11, 0x00, 0x4c, 0x75, 0x40, 0x2a, 0x02, 0x02, 0x9f, 0x20, 0x01, 0x09,
++  0x00, 0x20, 0x81, 0x0f, 0x31, 0xa0, 0x64, 0x0f, 0x24, 0x40, 0x04, 0x20,
++  0x80, 0x0f, 0xff, 0xff, 0xff, 0xf0, 0x45, 0x78, 0x00, 0xa1, 0x2f, 0x26,
++  0xff, 0x03, 0xc6, 0xc6, 0xe4, 0xc2, 0xe5, 0x40, 0x04, 0x20, 0x80, 0x0f,
++  0xff, 0xff, 0xff, 0xfc, 0x41, 0x28, 0x0d, 0x02, 0x53, 0x25, 0xcd, 0x10,
++  0x0a, 0x26, 0x80, 0x1f, 0x12, 0x00, 0x08, 0xc1, 0x00, 0x26, 0xce, 0x14,
++  0x00, 0x1e, 0x42, 0x13, 0x00, 0x16, 0x8e, 0x70, 0x12, 0x00, 0x00, 0xc0,
++  0x15, 0x0e, 0x10, 0x10, 0x85, 0x20, 0x04, 0x00, 0x44, 0x25, 0x0d, 0x13,
++  0x09, 0x0d, 0x11, 0x10, 0x85, 0x20, 0x10, 0x00, 0x00, 0xa7, 0xc4, 0xc6,
++  0xf8, 0xc2, 0x0a, 0x25, 0x80, 0x1f, 0x12, 0x00, 0x00, 0xc0, 0x00, 0x15,
++  0x8e, 0x10, 0x01, 0x15, 0x8f, 0x10, 0x05, 0x26, 0xc0, 0x13, 0x4c, 0x20,
++  0x00, 0x80, 0xde, 0x01, 0x01, 0x00, 0xca, 0x0a, 0x0f, 0xdf, 0x0a, 0x20,
++  0x00, 0x20, 0xde, 0x0a, 0x0f, 0xdf, 0x00, 0x20, 0x11, 0x20, 0x2f, 0x27,
++  0xbf, 0x04, 0x4a, 0x23, 0x00, 0x20, 0x5b, 0x0f, 0x80, 0x1f, 0x00, 0x00,
++  0x91, 0x00, 0x2f, 0x0f, 0x10, 0x10, 0x04, 0x15, 0x14, 0x11, 0x02, 0x1d,
++  0x04, 0x15, 0x1b, 0x0e, 0x11, 0x10, 0x00, 0x16, 0x00, 0x70, 0x93, 0xa0,
++  0x18, 0x20, 0x53, 0x20, 0xc0, 0x00, 0x06, 0x1d, 0x02, 0x10, 0x4a, 0x23,
++  0x40, 0x20, 0x4a, 0x26, 0x40, 0x10, 0x00, 0x1d, 0x82, 0x13, 0x02, 0x15,
++  0x14, 0x11, 0x00, 0x16, 0x00, 0x70, 0x93, 0xa0, 0x18, 0x20, 0x04, 0x20,
++  0x80, 0x0f, 0xff, 0xff, 0xf0, 0xff, 0x45, 0x20, 0x80, 0x02, 0x00, 0x1e,
++  0x00, 0x70, 0x93, 0xa0, 0x18, 0x20, 0x43, 0x00, 0x00, 0x00, 0x4c, 0x26,
++  0x00, 0x90, 0x56, 0x01, 0x01, 0x00, 0x4a, 0x26, 0x00, 0x10, 0x00, 0x1d,
++  0x82, 0x13, 0x02, 0x1d, 0x84, 0x13, 0x00, 0x16, 0x00, 0x70, 0x93, 0xa0,
++  0x18, 0x20, 0x04, 0x20, 0x80, 0x0f, 0xff, 0xff, 0xf0, 0xff, 0x06, 0x15,
++  0x81, 0x10, 0x05, 0x20, 0x40, 0x00, 0x00, 0x1e, 0x00, 0x70, 0x93, 0xa0,
++  0x18, 0x20, 0x0a, 0x24, 0x80, 0x2f, 0x00, 0x00, 0xbe, 0x2c, 0x0a, 0x25,
++  0x00, 0x24, 0x43, 0x00, 0x00, 0x00, 0x32, 0x26, 0x40, 0x75, 0x11, 0x00,
++  0xf8, 0x3e, 0x33, 0x08, 0x15, 0x01, 0x5a, 0x25, 0x16, 0x23, 0x00, 0x26,
++  0x96, 0x2f, 0x34, 0xa0, 0xe0, 0xb3, 0x00, 0x16, 0x00, 0x20, 0x6c, 0x20,
++  0xc0, 0x04, 0x05, 0x20, 0x00, 0x05, 0x00, 0x1e, 0x00, 0x20, 0x04, 0x16,
++  0x00, 0x20, 0x6c, 0x20, 0xc0, 0x04, 0x05, 0x20, 0x00, 0x05, 0x04, 0x1e,
++  0x00, 0x20, 0x40, 0x25, 0x55, 0x20, 0xc7, 0x0d, 0x44, 0xa4, 0x4a, 0x25,
++  0x00, 0x20, 0x32, 0x26, 0x40, 0x75, 0x11, 0x00, 0x18, 0x3f, 0x53, 0x08,
++  0xd5, 0x00, 0x1f, 0x25, 0x96, 0x2f, 0x00, 0x00, 0xdc, 0x00, 0x00, 0x26,
++  0x96, 0x2f, 0x32, 0xa0, 0x7c, 0xdd, 0x00, 0x16, 0x17, 0x20, 0x1b, 0x0b,
++  0x10, 0x20, 0x41, 0x2f, 0x18, 0x25, 0x53, 0x20, 0xd8, 0x30, 0x00, 0x25,
++  0x81, 0x2f, 0x12, 0x00, 0x08, 0xc0, 0x00, 0x19, 0x02, 0x06, 0x32, 0x26,
++  0x40, 0x75, 0x12, 0x00, 0x08, 0xc0, 0xae, 0x08, 0x00, 0x00, 0x40, 0x28,
++  0x00, 0x05, 0x04, 0x27, 0x97, 0x2f, 0x0f, 0xff, 0xff, 0xff, 0x05, 0x27,
++  0x17, 0x20, 0x00, 0x1e, 0xc0, 0x25, 0x40, 0x25, 0x55, 0x20, 0xa7, 0x0d,
++  0x84, 0xaf, 0x00, 0x00, 0x00, 0x01, 0x4a, 0x25, 0x00, 0x20, 0x1a, 0x25,
++  0x80, 0x2f, 0x00, 0x00, 0xf0, 0x02, 0x32, 0x20, 0x80, 0x0f, 0x00, 0x00,
++  0x51, 0x07, 0x53, 0x08, 0x10, 0x00, 0x1f, 0x25, 0x96, 0x2f, 0x00, 0x00,
++  0x64, 0x00, 0x00, 0x26, 0x96, 0x2f, 0x31, 0xa0, 0x64, 0x0f, 0x00, 0x16,
++  0x17, 0x20, 0x1b, 0x0b, 0x10, 0x20, 0x41, 0x2f, 0x18, 0x22, 0x53, 0x20,
++  0xd8, 0x30, 0x00, 0x25, 0x81, 0x2f, 0x12, 0x00, 0x08, 0xc1, 0x00, 0x19,
++  0x02, 0x06, 0x32, 0x26, 0x40, 0x75, 0x12, 0x00, 0x08, 0xc1, 0x3e, 0x08,
++  0x00, 0x00, 0x40, 0x28, 0x00, 0x02, 0x04, 0x27, 0x97, 0x2f, 0xff, 0xff,
++  0xff, 0xf0, 0x05, 0x27, 0x17, 0x20, 0x00, 0x1e, 0xc0, 0x25, 0x40, 0x25,
++  0x55, 0x20, 0x9f, 0x0d, 0x14, 0xa4, 0x6f, 0x23, 0x3f, 0x00, 0x4a, 0x20,
++  0x00, 0x00, 0x01, 0x1d, 0x02, 0x10, 0x2f, 0x26, 0xbf, 0x04, 0x45, 0xd8,
++  0x11, 0xd9, 0x4c, 0x70, 0xd8, 0xc6, 0xe0, 0x78, 0x1d, 0x0e, 0x10, 0x10,
++  0x44, 0x20, 0xc1, 0x00, 0x09, 0x09, 0x11, 0x00, 0x45, 0x20, 0x40, 0x00,
++  0x44, 0x20, 0x01, 0x03, 0x09, 0x09, 0x11, 0x00, 0x45, 0x20, 0x00, 0x01,
++  0xe0, 0x7e, 0xe0, 0x78,
++};
++
++/* lm0 .rts_dispatch_hook at 0x10eab8. */
++static const u8 wave_rts_span_3[] = {
++  0x20, 0x60, 0x12, 0x00,
++};
++
++/* lm0 .rts_completion_hook at 0x101572. */
++static const u8 wave_rts_span_4[] = {
++  0x66, 0x0c, 0x40, 0x12, 0xe0, 0x78,
++};
++
++/* lm0 .rts_vap_hook at 0xec57e. */
++static const u8 wave_rts_span_5[] = {
++  0x46, 0x0b, 0xc0, 0x1c, 0xe0, 0x78,
++};
++
++/* lm0 .rts_sta_hook at 0x103614. */
++static const u8 wave_rts_span_6[] = {
++  0xcd, 0x02, 0x40, 0x11, 0xe0, 0x78,
++};
++
++/* lm0 .rts_group_hook at 0x1035ec. */
++static const u8 wave_rts_span_7[] = {
++  0x4d, 0x03, 0x40, 0x11, 0xe0, 0x78,
++};
++
++/* lm0 .rts_group_constructor_hook at 0xffe00. */
++static const u8 wave_rts_span_8[] = {
++  0x92, 0x0b, 0x00, 0x13, 0xe0, 0x78, 0xe0, 0x78,
++};
++
++/* lm1 .extension_init_hook at 0x15ca58. */
++static const u8 wave_rts_span_9[] = {
++  0xa9, 0x05, 0x80, 0x0c,
++};
++
++/* lm1 .extension_unused_marker at 0x1304cc. */
++static const u8 wave_rts_span_10[] = {
++  0x0a, 0x20, 0x80, 0x0f, 0x17, 0x00, 0x00, 0xe0,
++};
++
++/* lm1 .extension_code at 0x176000. */
++static const u8 wave_rts_span_11[] = {
++  0x0a, 0x20, 0x80, 0x0f, 0x17, 0x00, 0x00, 0xc0, 0x0a, 0x21, 0x80, 0x0f,
++  0x17, 0x00, 0x18, 0xc1, 0x4c, 0x70, 0x04, 0xf0, 0x04, 0x18, 0x90, 0x00,
++  0xfd, 0x08, 0x44, 0x80, 0xe0, 0x7e, 0xe0, 0x78, 0x25, 0x88, 0x13, 0x09,
++  0x10, 0x00, 0x12, 0x10, 0x81, 0x00, 0x11, 0x09, 0x80, 0x0f, 0x00, 0x00,
++  0xa6, 0x00, 0x05, 0x04, 0x8f, 0xed, 0xe0, 0x78, 0xe6, 0xc2, 0x08, 0x45,
++  0xcb, 0x46, 0x17, 0x00, 0x00, 0xc0, 0x0c, 0x71, 0x14, 0xad, 0xad, 0x44,
++  0x67, 0x08, 0x81, 0x0f, 0x00, 0x00, 0x01, 0x01, 0xf3, 0x8d, 0x43, 0x0f,
++  0x80, 0x1f, 0x00, 0x00, 0x92, 0x00, 0x1f, 0x0f, 0x80, 0x1f, 0x00, 0x00,
++  0x91, 0x00, 0x4f, 0x0f, 0x81, 0x1f, 0x00, 0x00, 0x90, 0x00, 0x08, 0x95,
++  0x43, 0x0e, 0x04, 0x70, 0x00, 0x00, 0x31, 0x09, 0x04, 0xf0, 0x08, 0x95,
++  0x37, 0x08, 0x11, 0x00, 0x21, 0x8e, 0x11, 0x09, 0x11, 0x00, 0x02, 0xb6,
++  0xe1, 0xae, 0x0c, 0x70, 0x14, 0xad, 0x13, 0xf0, 0x0c, 0x72, 0x14, 0xad,
++  0x0f, 0xf0, 0x08, 0x95, 0x1b, 0x08, 0x11, 0x00, 0x01, 0x96, 0x08, 0xb5,
++  0x00, 0x8e, 0x16, 0xad, 0x01, 0x8e, 0x17, 0xad, 0x2c, 0x70, 0x09, 0x08,
++  0x10, 0x00, 0x2c, 0x74, 0x34, 0xad, 0xa1, 0x42, 0x0c, 0x15, 0x84, 0x10,
++  0xf7, 0xd8, 0x07, 0xd9, 0x6c, 0x70, 0x2e, 0x08, 0x8f, 0xe5, 0xc6, 0xc6,
++  0x00, 0x16, 0x81, 0x70, 0x17, 0x00, 0x00, 0xc0, 0x0f, 0x09, 0x10, 0x00,
++  0x00, 0x16, 0x01, 0x71, 0x17, 0x00, 0x02, 0xc0, 0xe0, 0x7e, 0x0a, 0x21,
++  0x80, 0x0f, 0x00, 0x00, 0xbe, 0x2c, 0xe0, 0x7e, 0xe6, 0xc2, 0x53, 0x21,
++  0x41, 0x00, 0x40, 0x29, 0x82, 0x00, 0x05, 0x22, 0x42, 0x00, 0x0a, 0x25,
++  0x80, 0x1f, 0x17, 0x00, 0x08, 0xc0, 0x00, 0x25, 0x0d, 0x10, 0x2f, 0x27,
++  0xff, 0x03, 0x00, 0x1d, 0x82, 0x10, 0x00, 0x16, 0x8e, 0x70, 0x17, 0x00,
++  0x00, 0xc0, 0x0d, 0x0e, 0x10, 0x10, 0x09, 0x09, 0x11, 0x00, 0x4c, 0x75,
++  0x40, 0x2a, 0x02, 0x05, 0x9f, 0x20, 0x03, 0x07, 0x00, 0x20, 0x81, 0x0f,
++  0x32, 0xa0, 0x7c, 0xdd, 0x24, 0x40, 0x04, 0x20, 0x80, 0x0f, 0x0f, 0xff,
++  0xff, 0xff, 0x45, 0x78, 0x00, 0xa1, 0x2f, 0x26, 0xff, 0x03, 0xc6, 0xc6,
++  0xe6, 0xc2, 0x53, 0x21, 0x41, 0x00, 0x40, 0x29, 0x82, 0x00, 0x05, 0x22,
++  0x42, 0x00, 0x0a, 0x25, 0x80, 0x1f, 0x17, 0x00, 0x08, 0xc1, 0x00, 0x25,
++  0x0d, 0x10, 0x2f, 0x27, 0xff, 0x03, 0x00, 0x1d, 0x82, 0x10, 0x00, 0x16,
++  0x8e, 0x70, 0x17, 0x00, 0x00, 0xc0, 0x0d, 0x0e, 0x10, 0x10, 0x09, 0x09,
++  0x11, 0x00, 0x4c, 0x75, 0x40, 0x2a, 0x02, 0x02, 0x9f, 0x20, 0x01, 0x09,
++  0x00, 0x20, 0x81, 0x0f, 0x31, 0xa0, 0x64, 0x0f, 0x24, 0x40, 0x04, 0x20,
++  0x80, 0x0f, 0xff, 0xff, 0xff, 0xf0, 0x45, 0x78, 0x00, 0xa1, 0x2f, 0x26,
++  0xff, 0x03, 0xc6, 0xc6, 0xe4, 0xc2, 0xe5, 0x40, 0x04, 0x20, 0x80, 0x0f,
++  0xff, 0xff, 0xff, 0xfc, 0x41, 0x28, 0x0d, 0x02, 0x53, 0x25, 0xcd, 0x10,
++  0x0a, 0x26, 0x80, 0x1f, 0x17, 0x00, 0x08, 0xc1, 0x00, 0x26, 0xce, 0x14,
++  0x00, 0x1e, 0x42, 0x13, 0x00, 0x16, 0x8e, 0x70, 0x17, 0x00, 0x00, 0xc0,
++  0x15, 0x0e, 0x10, 0x10, 0x85, 0x20, 0x04, 0x00, 0x44, 0x25, 0x0d, 0x13,
++  0x09, 0x0d, 0x11, 0x10, 0x85, 0x20, 0x10, 0x00, 0x00, 0xa7, 0xc4, 0xc6,
++  0xf8, 0xc2, 0x0a, 0x25, 0x80, 0x1f, 0x17, 0x00, 0x00, 0xc0, 0x00, 0x15,
++  0x8e, 0x10, 0x01, 0x15, 0x8f, 0x10, 0x05, 0x26, 0xc0, 0x13, 0x4c, 0x20,
++  0x00, 0x80, 0xde, 0x01, 0x01, 0x00, 0xb6, 0x0a, 0x0f, 0xdf, 0x0a, 0x20,
++  0x00, 0x20, 0xe2, 0x0a, 0x0f, 0xdf, 0x00, 0x20, 0x11, 0x20, 0x2f, 0x27,
++  0xbf, 0x04, 0x4a, 0x23, 0x00, 0x20, 0x5b, 0x0f, 0x80, 0x1f, 0x00, 0x00,
++  0x91, 0x00, 0x2f, 0x0f, 0x10, 0x10, 0x04, 0x15, 0x14, 0x11, 0x02, 0x1d,
++  0x04, 0x15, 0x1b, 0x0e, 0x11, 0x10, 0x00, 0x16, 0x00, 0x70, 0x93, 0xa0,
++  0x18, 0x20, 0x53, 0x20, 0xc0, 0x00, 0x06, 0x1d, 0x02, 0x10, 0x4a, 0x23,
++  0x40, 0x20, 0x4a, 0x26, 0x40, 0x10, 0x00, 0x1d, 0x82, 0x13, 0x02, 0x15,
++  0x14, 0x11, 0x00, 0x16, 0x00, 0x70, 0x93, 0xa0, 0x18, 0x20, 0x04, 0x20,
++  0x80, 0x0f, 0xff, 0xff, 0xf0, 0xff, 0x45, 0x20, 0x80, 0x02, 0x00, 0x1e,
++  0x00, 0x70, 0x93, 0xa0, 0x18, 0x20, 0x43, 0x00, 0x00, 0x00, 0x4c, 0x26,
++  0x00, 0x90, 0x56, 0x01, 0x01, 0x00, 0x4a, 0x26, 0x00, 0x10, 0x00, 0x1d,
++  0x82, 0x13, 0x02, 0x1d, 0x84, 0x13, 0x00, 0x16, 0x00, 0x70, 0x93, 0xa0,
++  0x18, 0x20, 0x04, 0x20, 0x80, 0x0f, 0xff, 0xff, 0xf0, 0xff, 0x06, 0x15,
++  0x81, 0x10, 0x05, 0x20, 0x40, 0x00, 0x00, 0x1e, 0x00, 0x70, 0x93, 0xa0,
++  0x18, 0x20, 0x0a, 0x24, 0x80, 0x2f, 0x00, 0x00, 0xbe, 0x2c, 0x0a, 0x25,
++  0x00, 0x24, 0x43, 0x00, 0x00, 0x00, 0x32, 0x26, 0x40, 0x75, 0x16, 0x00,
++  0x68, 0x3b, 0x33, 0x08, 0x15, 0x01, 0x5a, 0x25, 0x16, 0x23, 0x00, 0x26,
++  0x96, 0x2f, 0x34, 0xa0, 0xe0, 0xb3, 0x00, 0x16, 0x00, 0x20, 0x6c, 0x20,
++  0xc0, 0x04, 0x05, 0x20, 0x00, 0x05, 0x00, 0x1e, 0x00, 0x20, 0x04, 0x16,
++  0x00, 0x20, 0x6c, 0x20, 0xc0, 0x04, 0x05, 0x20, 0x00, 0x05, 0x04, 0x1e,
++  0x00, 0x20, 0x40, 0x25, 0x55, 0x20, 0xc7, 0x0d, 0x44, 0xa4, 0x4a, 0x25,
++  0x00, 0x20, 0x32, 0x26, 0x40, 0x75, 0x16, 0x00, 0x88, 0x3b, 0x53, 0x08,
++  0xd5, 0x00, 0x1f, 0x25, 0x96, 0x2f, 0x00, 0x00, 0xdc, 0x00, 0x00, 0x26,
++  0x96, 0x2f, 0x32, 0xa0, 0x7c, 0xdd, 0x00, 0x16, 0x17, 0x20, 0x1b, 0x0b,
++  0x10, 0x20, 0x41, 0x2f, 0x18, 0x25, 0x53, 0x20, 0xd8, 0x30, 0x00, 0x25,
++  0x81, 0x2f, 0x17, 0x00, 0x08, 0xc0, 0x00, 0x19, 0x02, 0x06, 0x32, 0x26,
++  0x40, 0x75, 0x17, 0x00, 0x08, 0xc0, 0xae, 0x08, 0x00, 0x00, 0x40, 0x28,
++  0x00, 0x05, 0x04, 0x27, 0x97, 0x2f, 0x0f, 0xff, 0xff, 0xff, 0x05, 0x27,
++  0x17, 0x20, 0x00, 0x1e, 0xc0, 0x25, 0x40, 0x25, 0x55, 0x20, 0xa7, 0x0d,
++  0x84, 0xaf, 0x00, 0x00, 0x00, 0x01, 0x4a, 0x25, 0x00, 0x20, 0x1a, 0x25,
++  0x80, 0x2f, 0x00, 0x00, 0xf0, 0x02, 0x32, 0x20, 0x80, 0x0f, 0x00, 0x00,
++  0x51, 0x07, 0x53, 0x08, 0x10, 0x00, 0x1f, 0x25, 0x96, 0x2f, 0x00, 0x00,
++  0x64, 0x00, 0x00, 0x26, 0x96, 0x2f, 0x31, 0xa0, 0x64, 0x0f, 0x00, 0x16,
++  0x17, 0x20, 0x1b, 0x0b, 0x10, 0x20, 0x41, 0x2f, 0x18, 0x22, 0x53, 0x20,
++  0xd8, 0x30, 0x00, 0x25, 0x81, 0x2f, 0x17, 0x00, 0x08, 0xc1, 0x00, 0x19,
++  0x02, 0x06, 0x32, 0x26, 0x40, 0x75, 0x17, 0x00, 0x08, 0xc1, 0x3e, 0x08,
++  0x00, 0x00, 0x40, 0x28, 0x00, 0x02, 0x04, 0x27, 0x97, 0x2f, 0xff, 0xff,
++  0xff, 0xf0, 0x05, 0x27, 0x17, 0x20, 0x00, 0x1e, 0xc0, 0x25, 0x40, 0x25,
++  0x55, 0x20, 0x9f, 0x0d, 0x14, 0xa4, 0x6f, 0x23, 0x3f, 0x00, 0x4a, 0x20,
++  0x00, 0x00, 0x01, 0x1d, 0x02, 0x10, 0x2f, 0x26, 0xbf, 0x04, 0x45, 0xd8,
++  0x11, 0xd9, 0x4c, 0x70, 0xd8, 0xc6, 0xe0, 0x78, 0x1d, 0x0e, 0x10, 0x10,
++  0x44, 0x20, 0xc1, 0x00, 0x09, 0x09, 0x11, 0x00, 0x45, 0x20, 0x40, 0x00,
++  0x44, 0x20, 0x01, 0x03, 0x09, 0x09, 0x11, 0x00, 0x45, 0x20, 0x00, 0x01,
++  0xe0, 0x7e, 0xe0, 0x78,
++};
++
++/* lm1 .rts_dispatch_hook at 0x15e72c. */
++static const u8 wave_rts_span_12[] = {
++  0x20, 0x60, 0x17, 0x00,
++};
++
++/* lm1 .rts_completion_hook at 0x15131e. */
++static const u8 wave_rts_span_13[] = {
++  0xba, 0x0e, 0x40, 0x12, 0xe0, 0x78,
++};
++
++/* lm1 .rts_vap_hook at 0x13c41e. */
++static const u8 wave_rts_span_14[] = {
++  0xa6, 0x0c, 0xc0, 0x1c, 0xe0, 0x78,
++};
++
++/* lm1 .rts_sta_hook at 0x1533a4. */
++static const u8 wave_rts_span_15[] = {
++  0x3d, 0x05, 0x40, 0x11, 0xe0, 0x78,
++};
++
++/* lm1 .rts_group_hook at 0x15337c. */
++static const u8 wave_rts_span_16[] = {
++  0xbd, 0x05, 0x40, 0x11, 0xe0, 0x78,
++};
++
++/* lm1 .rts_group_constructor_hook at 0x14fbac. */
++static const u8 wave_rts_span_17[] = {
++  0xe6, 0x0d, 0x00, 0x13, 0xe0, 0x78, 0xe0, 0x78,
++};
++
++static bool wave_rts_threshold_fw_matches(const void *data, size_t size)
++{
++  const u8 *p = data;
++
++  return size >= 0x10cde4 + sizeof(wave_rts_span_0) &&
++         !memcmp(p + 0x10cde4, wave_rts_span_0, sizeof(wave_rts_span_0)) &&
++         size >= 0xe04cc + sizeof(wave_rts_span_1) &&
++         !memcmp(p + 0xe04cc, wave_rts_span_1, sizeof(wave_rts_span_1)) &&
++         size >= 0x126000 + sizeof(wave_rts_span_2) &&
++         !memcmp(p + 0x126000, wave_rts_span_2, sizeof(wave_rts_span_2)) &&
++         size >= 0x10eab8 + sizeof(wave_rts_span_3) &&
++         !memcmp(p + 0x10eab8, wave_rts_span_3, sizeof(wave_rts_span_3)) &&
++         size >= 0x101572 + sizeof(wave_rts_span_4) &&
++         !memcmp(p + 0x101572, wave_rts_span_4, sizeof(wave_rts_span_4)) &&
++         size >= 0xec57e + sizeof(wave_rts_span_5) &&
++         !memcmp(p + 0xec57e, wave_rts_span_5, sizeof(wave_rts_span_5)) &&
++         size >= 0x103614 + sizeof(wave_rts_span_6) &&
++         !memcmp(p + 0x103614, wave_rts_span_6, sizeof(wave_rts_span_6)) &&
++         size >= 0x1035ec + sizeof(wave_rts_span_7) &&
++         !memcmp(p + 0x1035ec, wave_rts_span_7, sizeof(wave_rts_span_7)) &&
++         size >= 0xffe00 + sizeof(wave_rts_span_8) &&
++         !memcmp(p + 0xffe00, wave_rts_span_8, sizeof(wave_rts_span_8)) &&
++         size >= 0x15ca58 + sizeof(wave_rts_span_9) &&
++         !memcmp(p + 0x15ca58, wave_rts_span_9, sizeof(wave_rts_span_9)) &&
++         size >= 0x1304cc + sizeof(wave_rts_span_10) &&
++         !memcmp(p + 0x1304cc, wave_rts_span_10, sizeof(wave_rts_span_10)) &&
++         size >= 0x176000 + sizeof(wave_rts_span_11) &&
++         !memcmp(p + 0x176000, wave_rts_span_11, sizeof(wave_rts_span_11)) &&
++         size >= 0x15e72c + sizeof(wave_rts_span_12) &&
++         !memcmp(p + 0x15e72c, wave_rts_span_12, sizeof(wave_rts_span_12)) &&
++         size >= 0x15131e + sizeof(wave_rts_span_13) &&
++         !memcmp(p + 0x15131e, wave_rts_span_13, sizeof(wave_rts_span_13)) &&
++         size >= 0x13c41e + sizeof(wave_rts_span_14) &&
++         !memcmp(p + 0x13c41e, wave_rts_span_14, sizeof(wave_rts_span_14)) &&
++         size >= 0x1533a4 + sizeof(wave_rts_span_15) &&
++         !memcmp(p + 0x1533a4, wave_rts_span_15, sizeof(wave_rts_span_15)) &&
++         size >= 0x15337c + sizeof(wave_rts_span_16) &&
++         !memcmp(p + 0x15337c, wave_rts_span_16, sizeof(wave_rts_span_16)) &&
++         size >= 0x14fbac + sizeof(wave_rts_span_17) &&
++         !memcmp(p + 0x14fbac, wave_rts_span_17, sizeof(wave_rts_span_17));
++}
++#endif
+--- a/wireless/driver/shared/txop_read_fw.h
++++ b/wireless/driver/shared/txop_read_fw.h
+@@ -0,0 +1,31 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/* Actual linked A0 TXOP GET handlers and both lower policy readers. */
++#ifndef __WAVE_TXOP_READ_FW_H__
++#define __WAVE_TXOP_READ_FW_H__
++
++static const u8 wave_txop_read_span_0[] = { 0xe2, 0xc2, 0x08, 0x45, 0x34, 0x88, 0x36, 0x08, 0x20, 0x01, 0x08, 0x90, 0xc3, 0x41, 0x0b, 0x00, 0x86, 0x49, 0x00, 0x91, 0x04, 0x71, 0x00, 0xb1, 0x0c, 0x15, 0x84, 0x10, 0x8a, 0x20, 0x88, 0x0c, 0x2c, 0x73, 0xa1, 0x42, 0xda, 0x08, 0xef, 0xf4, 0x6c, 0x70, 0xc2, 0xc6 };
++static const u8 wave_txop_read_span_1[] = { 0x55, 0x8d, 0x0b, 0x0a, 0x50, 0x00, 0x85, 0x05, 0x4f, 0xf2, 0xe0, 0x7e };
++static const u8 wave_txop_read_span_2[] = { 0xe2, 0xc2, 0x08, 0x45, 0x08, 0x90, 0x35, 0x8d, 0x0f, 0x09, 0x51, 0x00, 0x8f, 0xb8, 0x76, 0x0f, 0xcf, 0xf1, 0x14, 0xad, 0x04, 0xf0, 0x26, 0x09, 0x2f, 0xf2, 0x34, 0x8d, 0x46, 0x0f, 0x0f, 0xf1, 0x00, 0x44, 0x8a, 0x20, 0x04, 0x07, 0x07, 0xd9, 0xa1, 0x42, 0xfa, 0x0d, 0xaf, 0xf7, 0x6c, 0x70, 0xc2, 0xc6, 0xe0, 0x78 };
++static const u8 wave_txop_read_span_3[] = { 0xc3, 0x41, 0x00, 0x00, 0x9f, 0x34, 0x0f, 0x7b, 0x0b, 0x08, 0x17, 0x02, 0x9f, 0x23, 0x05, 0x05, 0x79, 0x61, 0x28, 0xb8, 0x05, 0xe8, 0x02, 0x89, 0x03, 0xe8, 0xe0, 0x7f, 0x01, 0x89, 0x00, 0x89, 0xe0, 0x7f, 0x26, 0xb8 };
++static const u8 wave_txop_read_span_4[] = { 0xe2, 0xc2, 0x08, 0x45, 0x08, 0x90, 0x35, 0x8d, 0x0f, 0x09, 0x51, 0x00, 0x8f, 0xb8, 0x82, 0x09, 0x0f, 0xf2, 0x14, 0xad, 0x04, 0xf0, 0x32, 0x0b, 0x2f, 0xf2, 0x34, 0x8d, 0x86, 0x09, 0x4f, 0xf1, 0x00, 0x44, 0x8a, 0x20, 0x04, 0x07, 0x07, 0xd9, 0xa1, 0x42, 0xba, 0x0d, 0xaf, 0xf7, 0x6c, 0x70, 0xc2, 0xc6, 0xe0, 0x78 };
++static const u8 wave_txop_read_span_5[] = { 0xc3, 0x41, 0x00, 0x00, 0x9f, 0x34, 0x0f, 0x7b, 0x0b, 0x08, 0x17, 0x02, 0x9f, 0x23, 0x05, 0x05, 0x79, 0x61, 0x28, 0xb8, 0x05, 0xe8, 0x02, 0x89, 0x03, 0xe8, 0xe0, 0x7f, 0x01, 0x89, 0x00, 0x89, 0xe0, 0x7f, 0x26, 0xb8 };
++
++static bool wave_txop_read_fw_matches(const void *data, size_t size)
++{
++  const u8 *p = data;
++
++  return size >= 0x64da0 + sizeof(wave_txop_read_span_0) &&
++         !memcmp(p + 0x64da0, wave_txop_read_span_0, sizeof(wave_txop_read_span_0)) &&
++         size >= 0x66dd8 + sizeof(wave_txop_read_span_1) &&
++         !memcmp(p + 0x66dd8, wave_txop_read_span_1, sizeof(wave_txop_read_span_1)) &&
++         size >= 0x101d58 + sizeof(wave_txop_read_span_2) &&
++         !memcmp(p + 0x101d58, wave_txop_read_span_2, sizeof(wave_txop_read_span_2)) &&
++         size >= 0xe5cd8 + sizeof(wave_txop_read_span_3) &&
++         !memcmp(p + 0xe5cd8, wave_txop_read_span_3, sizeof(wave_txop_read_span_3)) &&
++         size >= 0x151b04 + sizeof(wave_txop_read_span_4) &&
++         !memcmp(p + 0x151b04, wave_txop_read_span_4, sizeof(wave_txop_read_span_4)) &&
++         size >= 0x135c90 + sizeof(wave_txop_read_span_5) &&
++         !memcmp(p + 0x135c90, wave_txop_read_span_5, sizeof(wave_txop_read_span_5));
++}
++
++#endif
+--- a/wireless/shared_mbss_mac/mhi_umi.h
++++ b/wireless/shared_mbss_mac/mhi_umi.h
+@@ -2349,7 +2349,7 @@
+ 	CO_EX_QOS_WIFI_QOS_MID,				/* All radios are activated. WIFI TX is suspended at ratio of 500/1000 milisecond. */
+ 	CO_EX_QOS_WIFI_QOS_LOW,				/* All radios are activated. WIFI TX is suspended at ratio of 600/3000 milisecond. */
+ 	CO_EX_QOS_NUM_OF_TYPES,
+-} __MTLK_PACKED CO_EX_QOS;
++} CO_EX_QOS; /* Constants only; the firmware field below remains uint8. */
+ 
+ typedef struct _UMI_SET_2_4_G_COEX
+ {
