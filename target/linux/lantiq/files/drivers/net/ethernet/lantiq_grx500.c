@@ -53,8 +53,8 @@
 #define PHY_ADDR(i)	(GSW_TOP + 0x110 + (i) * 0x10)
 #define PHY_ADDR_FCON_TX	GENMASK(8, 7)
 #define PHY_ADDR_FCON_RX	GENMASK(6, 5)
-#define PHY_ADDR_FCON_TX_EN BIT(8)
-#define PHY_ADDR_FCON_RX_EN BIT(6)
+#define PHY_ADDR_FCON_TX_EN BIT(7)
+#define PHY_ADDR_FCON_RX_EN BIT(5)
 #define MAC_CTRL0	(0x903 * 4)
 #define MAC_CTRL0_FCON	GENMASK(6, 4)
 #define MAC_CTRL0_FCON_RX	BIT(4)
@@ -62,7 +62,7 @@
 #define MAC_CTRL0_FCON_OFF BIT(6)
 #define SDMA_PCTRL(p)	((0xbc0 + 6 * (p)) * 4)
 #define SDMA_PCTRL_FCEN	BIT(1)
-#define GRX500_PAUSE_REGS_COUNT 43
+#define GRX500_PAUSE_REGS_COUNT 46
 #define PHY_FW_ADDR(i)	(GSW_TOP + 0x228 + (i) * 0x10)
 #define PCE_TABLE_CTRL	(0x44f * 4)
 #define PCE_TABLE_ADDR	(0x44e * 4)
@@ -746,7 +746,7 @@ static void grx500_wan_set_pause(struct grx500_eth *eth, bool tx, bool rx)
 	if (!mac)
 		mac = MAC_CTRL0_FCON_OFF;
 	/* WAN logical port 15 is physical MAC/PHY bank 0. GSWIP3 uses force
-	 * value 2 for enable and 3 for disable; polling still owns speed/duplex.
+	 * value 1 for enable and 3 for disable; polling still owns speed/duplex.
 	 */
 	value = __raw_readl(eth->gsw + MAC_CTRL0);
 	grx500_writel(eth->gsw, MAC_CTRL0, (value & ~MAC_CTRL0_FCON) | mac);
@@ -833,14 +833,17 @@ static void grx500_wan_get_regs(struct net_device *netdev,
 	unsigned int bank, port, mac, reg;
 	void __iomem *base;
 
-	/* Version 1: native-endian u32 words, GSW-L then GSW-R. Each bank
+	/* Version 2: native-endian u32 words, GSW-L then GSW-R. Each bank
 	 * starts with SDMA_FCTHR1..4, followed by physical ports 2..5 (L) or
 	 * 15 (R). Each port contributes MAC_CTRL0, MAC_PSTAT, PHY_ADDR,
 	 * MDIO_STAT, SDMA_PCTRL, SDMA_PFCTHR8, SDMA_PFCTHR9, in that order.
-	 * These are ordinary read-only snapshots, without read-clear fields;
-	 * link/configuration changes can occur between individual reads.
+	 * The original 43 words are followed by the attached WAN PHY's BMCR,
+	 * ADVERTISE and LPA. Each PHY word contains a 16-bit register value or
+	 * a negative signed 32-bit errno. No latch-low BMSR read is performed.
+	 * These are non-atomic snapshots; link/configuration changes can occur
+	 * between reads. PHY reads use the existing phylib and MDIO bus locks.
 	 */
-	regs->version = 1;
+	regs->version = 2;
 	for (bank = 0; bank < ARRAY_SIZE(eth->board->gsw); bank++) {
 		base = eth->board->gsw[bank];
 		for (reg = 0xb41; reg <= 0xb44; reg++)
@@ -856,6 +859,11 @@ static void grx500_wan_get_regs(struct net_device *netdev,
 			*values++ = __raw_readl(base + (0xb81 + port * 2) * 4);
 		}
 	}
+	mutex_lock(&eth->phydev->lock);
+	*values++ = phy_read(eth->phydev, MII_BMCR);
+	*values++ = phy_read(eth->phydev, MII_ADVERTISE);
+	*values++ = phy_read(eth->phydev, MII_LPA);
+	mutex_unlock(&eth->phydev->lock);
 }
 
 static int grx500_rmon_read32(struct grx500_eth *eth, u8 table, u8 offset,

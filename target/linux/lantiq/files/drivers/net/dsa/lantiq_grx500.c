@@ -72,8 +72,8 @@
 #define PHY_ADDR(p)	(0xf44 + 4 * ((p) - 1))
 #define PHY_ADDR_FCON_TX	GENMASK(8, 7)
 #define PHY_ADDR_FCON_RX	GENMASK(6, 5)
-#define PHY_ADDR_FCON_TX_EN BIT(8)
-#define PHY_ADDR_FCON_RX_EN BIT(6)
+#define PHY_ADDR_FCON_TX_EN BIT(7)
+#define PHY_ADDR_FCON_RX_EN BIT(5)
 #define TABLE_BUSY	BIT(15)
 #define TABLE_VALID	BIT(12)
 #define TABLE_WRITE	BIT(5)
@@ -1490,7 +1490,7 @@ static void grx500_port_set_pause(struct grx500_switch *sw, int port,
 		return;
 	if (!mac)
 		mac = MAC_CTRL0_FCON_OFF;
-	/* GSW-L PHY ports use bank port - 1, with GSWIP3 force values 2/3
+	/* GSW-L PHY ports use bank port - 1, with GSWIP3 force values 1/3
 	 * for enable/disable. CPU/P2P and speed/duplex polling stay unchanged.
 	 */
 	grx500_update(sw, MAC_CTRL0(port), MAC_CTRL0_FCON, mac);
