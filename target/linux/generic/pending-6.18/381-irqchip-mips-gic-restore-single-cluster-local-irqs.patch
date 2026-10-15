@@ -1,0 +1,52 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] irqchip/mips-gic: Configure local interrupts on single-cluster systems
+
+Local interrupt mapping and mask updates are required for every cluster
+topology. Skipping them when no other cluster is present leaves the CP0
+timer interrupt unrouted and masked, so delay calibration waits forever
+for the first tick.
+
+Use the existing online-CPU iterator for single-cluster systems as well.
+It selects each VP under gic_lock and only releases a cluster lock when
+the multicluster path requires one. This also preserves the cached mask
+state used when another CPU comes online.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/drivers/irqchip/irq-mips-gic.c
++++ b/drivers/irqchip/irq-mips-gic.c
+@@ -512,9 +512,6 @@ static void gic_mask_local_irq_all_vpes(st
+ 	struct gic_all_vpes_chip_data *cd;
+ 	int intr, cpu;
+ 
+-	if (!mips_cps_multicluster_cpus())
+-		return;
+-
+ 	intr = GIC_HWIRQ_TO_LOCAL(d->hwirq);
+ 	cd = irq_data_get_irq_chip_data(d);
+ 	cd->mask = false;
+@@ -529,9 +526,6 @@ static void gic_unmask_local_irq_all_vpes(
+ 	struct gic_all_vpes_chip_data *cd;
+ 	int intr, cpu;
+ 
+-	if (!mips_cps_multicluster_cpus())
+-		return;
+-
+ 	intr = GIC_HWIRQ_TO_LOCAL(d->hwirq);
+ 	cd = irq_data_get_irq_chip_data(d);
+ 	cd->mask = true;
+@@ -698,10 +692,8 @@ static int gic_irq_domain_map(struct irq_
+ 	if (!gic_local_irq_is_routable(intr))
+ 		return -EPERM;
+ 
+-	if (mips_cps_multicluster_cpus()) {
+-		for_each_online_cpu_gic(cpu, &gic_lock)
+-			write_gic_vo_map(mips_gic_vx_map_reg(intr), map);
+-	}
++	for_each_online_cpu_gic(cpu, &gic_lock)
++		write_gic_vo_map(mips_gic_vx_map_reg(intr), map);
+ 
+ 	return 0;
+ }
