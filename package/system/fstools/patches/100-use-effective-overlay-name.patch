@@ -1,0 +1,241 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] libfstools: use the selected overlay throughout its lifecycle
+
+mount_root start already honors fstools_overlay_name, but completion, reset,
+snapshots and block's extroot discovery still look up rootfs_data. Operations
+on a selected writable overlay can therefore miss it or act on another volume.
+
+Keep the choice in one libfstools accessor and use it throughout those paths.
+Leave rootfs_data as the default when no nonempty selector is supplied. Link
+block with the owning library in both extroot build variants; no board-specific
+mount or reset path is needed.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/libfstools/libfstools.h
++++ b/libfstools/libfstools.h
+@@ -39,6 +39,8 @@
+ 	__FS_STATE_LAST = FS_STATE_READY,
+ };
+ 
++#include "overlay.h"
++
+ extern int mount_extroot(char const *extroot_prefix);
+ extern int mount_snapshot(struct volume *v);
+ extern int mount_overlay(struct volume *v);
+--- a/libfstools/common.c
++++ b/libfstools/common.c
+@@ -85,6 +85,18 @@
+ 	}
+ 
+ 	return NULL;
++}
++
++char *overlay_name(void)
++{
++	static char name[128];
++
++	if (!name[0] &&
++	    (!get_var_from_file("/proc/cmdline", "fstools_overlay_name", name, sizeof(name)) ||
++	     !name[0]))
++		strcpy(name, "rootfs_data");
++
++	return name;
+ }
+ 
+ int block_file_identify(FILE *f, uint64_t offset)
+--- a/mount_root.c
++++ b/mount_root.c
+@@ -24,8 +24,6 @@
+ #include "libfstools/volume.h"
+ #include "libfstools/common.h"
+ 
+-#define BUFLEN 64
+-
+ /*
+  * Called in the early (PREINIT) stage, when we immediately need some writable
+  * filesystem.
+@@ -33,16 +31,11 @@
+ static int
+ start(int argc, char *argv[3])
+ {
+-	char dataparam[BUFLEN];
+-	char *dataname = "rootfs_data";
+ 	struct volume *root;
+ 	struct volume *data;
+ 	struct stat s;
+ 
+-	if (get_var_from_file("/proc/cmdline", "fstools_overlay_name", dataparam, sizeof(dataparam)))
+-		dataname = dataparam;
+-
+-	data = volume_find(dataname);
++	data = volume_find(overlay_name());
+ 
+ 	if (!getenv("PREINIT") && stat("/tmp/.preinit", &s))
+ 		return -1;
+@@ -115,7 +108,7 @@
+ static int
+ done(int argc, char *argv[1])
+ {
+-	struct volume *v = volume_find("rootfs_data");
++	struct volume *v = volume_find(overlay_name());
+ 
+ 	if (!v)
+ 		return -1;
+--- a/factoryreset.c
++++ b/factoryreset.c
+@@ -136,9 +136,9 @@
+ 		return -1;
+ 	}
+ 
+-	v = volume_find("rootfs_data");
++	v = volume_find(overlay_name());
+ 	if (!v) {
+-		ULOG_ERR("MTD partition 'rootfs_data' not found\n");
++		ULOG_ERR("Overlay volume '%s' not found\n", overlay_name());
+ 		return -1;
+ 	}
+ 
+--- a/snapshot.c
++++ b/snapshot.c
+@@ -39,7 +39,7 @@
+ static int
+ config_write(int argc, char **argv)
+ {
+-	struct volume *v = volume_find("rootfs_data");
++	struct volume *v = volume_find(overlay_name());
+ 	int ret;
+ 
+ 	if (!v)
+@@ -56,7 +56,7 @@
+ static int
+ config_read(int argc, char **argv)
+ {
+-	struct volume *v = volume_find("rootfs_data");
++	struct volume *v = volume_find(overlay_name());
+ 	struct file_header conf, sentinel;
+ 	int next, block, ret = 0;
+ 	uint32_t seq;
+@@ -84,7 +84,7 @@
+ static int
+ snapshot_write(int argc, char **argv)
+ {
+-	struct volume *v = volume_find("rootfs_data");
++	struct volume *v = volume_find(overlay_name());
+ 	int block, ret;
+ 	uint32_t seq;
+ 
+@@ -117,9 +117,9 @@
+ 	if (getchar() != 'y')
+ 		return -1;
+ 
+-	v = volume_find("rootfs_data");
++	v = volume_find(overlay_name());
+ 	if (!v) {
+-		ULOG_ERR("MTD partition 'rootfs_data' not found\n");
++		ULOG_ERR("Overlay volume '%s' not found\n", overlay_name());
+ 		return -1;
+ 	}
+ 
+@@ -146,7 +146,7 @@
+ static int
+ snapshot_read(int argc, char **argv)
+ {
+-	struct volume *v = volume_find("rootfs_data");;
++	struct volume *v = volume_find(overlay_name());;
+ 	int block = 0, ret = 0;
+ 	char file[64];
+ 
+@@ -179,7 +179,7 @@
+ static int
+ snapshot_info(void)
+ {
+-	struct volume *v = volume_find("rootfs_data");
++	struct volume *v = volume_find(overlay_name());
+ 	struct file_header hdr = { 0 }, conf;
+ 	int block = 0;
+ 
+--- a/block.c
++++ b/block.c
+@@ -45,6 +45,7 @@
+ #include <libubus.h>
+ 
+ #include "probe.h"
++#include "libfstools/overlay.h"
+ 
+ #define AUTOFS_MOUNT_PATH       "/tmp/run/blockd/"
+ 
+@@ -489,7 +490,7 @@
+ static bool mtdblock_is_nand(char *mtdnum)
+ {
+ 	char tmppath[64];
+-	char buf[16];
++	char buf[128];
+ 	FILE *fp;
+ 
+ 	snprintf(tmppath, sizeof(tmppath) - 1, "/sys/class/mtd/mtd%s/type", mtdnum);
+@@ -529,7 +530,7 @@
+ 	buf[strlen(buf) - 1] = '\0'; /* strip final char (newline) */
+ 
+-	/* only return true if name differs from 'rootfs' and 'rootfs_data' */
++	/* Only return true if name differs from rootfs and the selected overlay. */
+-	if (strcmp(buf, "rootfs") && strcmp(buf, "rootfs_data"))
++	if (strcmp(buf, "rootfs") && strcmp(buf, overlay_name()))
+ 		return true;
+ 
+ 	/* --- CUT HERE --- */
+@@ -1670,6 +1671,7 @@
+ {
+ 	struct probe_info *pr;
+ 	char blkdev_path[32] = { 0 };
++	char mtd_name[132];
+ 	int err = -1;
+ #ifdef UBIFS_EXTROOT
+ 	libubi_t libubi;
+@@ -1700,7 +1702,8 @@
+ 	 */
+ 
+ 	/* Start with looking for MTD partition */
+-	find_block_mtd("\"rootfs_data\"", blkdev_path, sizeof(blkdev_path));
++	snprintf(mtd_name, sizeof(mtd_name), "\"%s\"", overlay_name());
++	find_block_mtd(mtd_name, blkdev_path, sizeof(blkdev_path));
+ 	if (blkdev_path[0]) {
+ 		pr = find_block_info(NULL, NULL, blkdev_path);
+ 		if (pr && !strcmp(pr->type, "jffs2")) {
+@@ -1726,7 +1729,7 @@
+ 	/* ... but it also could be an UBI volume */
+ 	memset(blkdev_path, 0, sizeof(blkdev_path));
+ 	libubi = libubi_open();
+-	find_block_ubi(libubi, "rootfs_data", blkdev_path, sizeof(blkdev_path));
++	find_block_ubi(libubi, overlay_name(), blkdev_path, sizeof(blkdev_path));
+ 	libubi_close(libubi);
+ 	if (blkdev_path[0]) {
+ 		char cfg[] = "/tmp/ubifs_cfg";
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -80,9 +80,9 @@
+ ADD_EXECUTABLE(block block.c probe.c probe-libblkid.c)
+ IF(DEFINED CMAKE_UBIFS_EXTROOT)
+ 	ADD_DEFINITIONS(-DUBIFS_EXTROOT)
+-	TARGET_LINK_LIBRARIES(block blkid-tiny dl uci ubox ubus blobmsg_json ubi-utils ${json})
++	TARGET_LINK_LIBRARIES(block fstools blkid-tiny dl uci ubox ubus blobmsg_json ubi-utils ${json})
+ ELSE(DEFINED CMAKE_UBIFS_EXTROOT)
+-	TARGET_LINK_LIBRARIES(block blkid-tiny dl uci ubox ubus blobmsg_json ${json})
++	TARGET_LINK_LIBRARIES(block fstools blkid-tiny dl uci ubox ubus blobmsg_json ${json})
+ ENDIF(DEFINED CMAKE_UBIFS_EXTROOT)
+ INSTALL(TARGETS block RUNTIME DESTINATION sbin)
+ 
+--- /dev/null
++++ b/libfstools/overlay.h
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef __FSTOOLS_OVERLAY_H
++#define __FSTOOLS_OVERLAY_H
++
++/* Effective writable overlay, including the kernel-selected UBI bank.
++ * Separate from libfstools.h so block can use this without mount APIs. */
++char *overlay_name(void);
++
++#endif
