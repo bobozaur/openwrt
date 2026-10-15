@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=fstools
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=$(PROJECT_GIT)/project/fstools.git
@@ -72,6 +72,7 @@ define Package/snapshot-tool
   CATEGORY:=Base system
   TITLE:=rootfs snapshoting tool
   DEPENDS:=+libubox +fstools
+  EXTRA_DEPENDS:=fstools (>=2026.07.25~2aa16407-r2)
 endef
 
 define Package/block-mount/conffiles
@@ -82,7 +83,8 @@ define Package/block-mount
   SECTION:=base
   CATEGORY:=Base system
   TITLE:=Block device mounting and checking
-  DEPENDS:=+ubox +libubox +libuci +libblobmsg-json +libjson-c
+  DEPENDS:=+ubox +libubox +libuci +libblobmsg-json +libjson-c +fstools
+  EXTRA_DEPENDS:=fstools (>=2026.07.25~2aa16407-r2)
 endef
 
 define Package/blockd
