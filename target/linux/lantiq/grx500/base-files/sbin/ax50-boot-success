@@ -1,0 +1,69 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# procd runs this once, after rcS and the transition to STATE_RUNNING.
+
+. /lib/functions/system.sh
+. /lib/functions/ax50.sh
+
+# A native RAM installer has neither a booted bank nor a persistent overlay.
+ax50_is_initial_install && exit 0
+
+ax50_board_label() {
+	local label
+	[ -s "$1" ] || return 1
+	label=$(jsonfilter -i "$1" -e '@.system.label_macaddr' 2>/dev/null) || return 1
+	case "$label" in
+	[[:xdigit:]][[:xdigit:]]:[[:xdigit:]][[:xdigit:]]:[[:xdigit:]][[:xdigit:]]:[[:xdigit:]][[:xdigit:]]:[[:xdigit:]][[:xdigit:]]:[[:xdigit:]][[:xdigit:]])
+		printf '%s\n' "$label" ;;
+	*) return 1 ;;
+	esac
+}
+
+ax50_check_board_identity() (
+	local mac="$1" label stage result=1
+	# A valid conflicting identity must fail, never be regenerated away.
+	if label=$(ax50_board_label /etc/board.json); then
+		[ "$label" = "$mac" ]
+		return
+	fi
+	[ ! -L /etc/board.json ] &&
+		{ [ ! -e /etc/board.json ] || [ -f /etc/board.json ]; } || return 1
+
+	# board.json is generated metadata. Regenerate through the native owner
+	# at a private path, then publish only after the factory comparison.
+	# Staging on /etc keeps the final rename on the same filesystem.
+	stage=$(mktemp -d /etc/.ax50-board.XXXXXX) || return 1
+	trap 'rm -f "$stage/board.json" "$stage/.board.json.tmp"; rmdir "$stage"' EXIT
+	trap 'exit 1' HUP INT TERM
+	if /bin/board_detect "$stage/board.json" &&
+		label=$(ax50_board_label "$stage/board.json") &&
+		[ "$label" = "$mac" ] &&
+		mv -f "$stage/board.json" /etc/board.json; then
+		result=0
+	fi
+	rm -f "$stage/board.json" "$stage/.board.json.tmp" || result=1
+	rmdir "$stage" || result=1
+	trap - EXIT HUP INT TERM
+	return "$result"
+)
+
+ax50_confirm_boot() {
+	local bank expected mac
+	bank=$(ax50_running_bank) || return 1
+	ax50_check_bootenv || return 1
+	case "$bank" in A) expected=0 ;; B) expected=2 ;; esac
+	# A confirmed bank retains ordinary extroot and RAM-overlay recovery.
+	# Strict trial acceptance applies only while the other bank is fallback.
+	[ "$(fw_printenv -n update_chk)" = "$expected" ] &&
+		[ "$(fw_printenv -n loadaddr)" = 0x82000000 ] && return 0
+	ax50_check_layout && ax50_check_running_root &&
+		mac=$(ax50_factory_mac) &&
+		ax50_check_board_identity "$mac" &&
+		ax50_select_bank "$bank" stable
+}
+
+ax50_confirm_boot && exit 0
+
+logger -t ax50 'Cannot confirm the running bank'
+reboot -f
+exit 1

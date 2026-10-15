@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+[ "$ACTION" = "released" ] || exit 0
+
+. /lib/functions.sh
+
+[ "$(board_name)" = "tplink,archer-ax50-v1" ] || exit 0
+
+if [ "$(uci -q get system.@system[-1].leds_off)" = "1" ]; then
+	uci set system.@system[-1].leds_off=0 || exit 1
+	uci commit system || exit 1
+	/etc/init.d/led turnon
+else
+	uci set system.@system[-1].leds_off=1 || exit 1
+	uci commit system || exit 1
+	/etc/init.d/led turnoff
+fi
