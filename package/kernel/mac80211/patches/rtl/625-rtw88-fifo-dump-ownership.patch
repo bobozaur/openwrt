@@ -1,0 +1,192 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wifi: rtw88: preserve FIFO dump bytes and access state
+
+FIFO dumps are byte streams consumed by firmware crash-header decoding and
+reserved-page inspection. Store little-endian bytes on all host
+architectures and use byte capacities for bounds.
+Restore the original packet-buffer selector and RX clock-gate state.
+Serialize reserved-page debugfs access with firmware recovery and other
+register users,
+and reject invalid page ranges before allocation.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/drivers/net/wireless/realtek/rtw88/fw.c
++++ b/drivers/net/wireless/realtek/rtw88/fw.c
+@@ -3,6 +3,7 @@
+  */
+ 
+ #include <linux/iopoll.h>
++#include <linux/unaligned.h>
+ 
+ #include "main.h"
+ #include "coex.h"
+@@ -1805,23 +1806,26 @@
+ 	mutex_unlock(&rtwdev->mutex);
+ }
+ 
+-static void rtw_fw_read_fifo_page(struct rtw_dev *rtwdev, u32 offset, u32 size,
++static void rtw_fw_read_fifo_page(struct rtw_dev *rtwdev, u32 size,
+ 				  u32 *buf, u32 residue, u16 start_pg)
+ {
+ 	u32 i;
+ 	u16 idx = 0;
+ 	u16 ctl;
+-
+-	ctl = rtw_read16(rtwdev, REG_PKTBUF_DBG_CTRL) & 0xf000;
+-	/* disable rx clock gate */
+-	rtw_write32_set(rtwdev, REG_RCR, BIT_DISGCLK);
++	bool clock_gate_disabled;
++
++	ctl = rtw_read16(rtwdev, REG_PKTBUF_DBG_CTRL);
++	clock_gate_disabled = rtw_read32(rtwdev, REG_RCR) & BIT_DISGCLK;
++	if (!clock_gate_disabled)
++		rtw_write32_set(rtwdev, REG_RCR, BIT_DISGCLK);
+ 
+ 	do {
+-		rtw_write16(rtwdev, REG_PKTBUF_DBG_CTRL, start_pg | ctl);
++		rtw_write16(rtwdev, REG_PKTBUF_DBG_CTRL, start_pg | (ctl & 0xf000));
+ 
+ 		for (i = FIFO_DUMP_ADDR + residue;
+ 		     i < FIFO_DUMP_ADDR + FIFO_PAGE_SIZE; i += 4) {
+-			buf[idx++] = rtw_read32(rtwdev, i);
++			/* Consumers decode the original firmware byte stream. */
++			put_unaligned_le32(rtw_read32(rtwdev, i), &buf[idx++]);
+ 			size -= 4;
+ 			if (size == 0)
+ 				goto out;
+@@ -1833,8 +1837,8 @@
+ 
+ out:
+ 	rtw_write16(rtwdev, REG_PKTBUF_DBG_CTRL, ctl);
+-	/* restore rx clock gate */
+-	rtw_write32_clr(rtwdev, REG_RCR, BIT_DISGCLK);
++	if (!clock_gate_disabled)
++		rtw_write32_clr(rtwdev, REG_RCR, BIT_DISGCLK);
+ }
+ 
+ static void rtw_fw_read_fifo(struct rtw_dev *rtwdev, enum rtw_fw_fifo_sel sel,
+@@ -1843,36 +1847,52 @@
+ 	const struct rtw_chip_info *chip = rtwdev->chip;
+ 	u32 start_pg, residue;
+ 
+-	if (sel >= RTW_FW_FIFO_MAX) {
+-		rtw_dbg(rtwdev, RTW_DBG_FW, "wrong fw fifo sel\n");
+-		return;
+-	}
+ 	if (sel == RTW_FW_FIFO_SEL_RSVD_PAGE)
+ 		offset += rtwdev->fifo.rsvd_boundary << TX_PAGE_SIZE_SHIFT;
+ 	residue = offset & (FIFO_PAGE_SIZE - 1);
+ 	start_pg = (offset >> FIFO_PAGE_SIZE_SHIFT) + chip->fw_fifo_addr[sel];
+ 
+-	rtw_fw_read_fifo_page(rtwdev, offset, size, buf, residue, start_pg);
++	rtw_fw_read_fifo_page(rtwdev, size, buf, residue, start_pg);
+ }
+ 
+ static bool rtw_fw_dump_check_size(struct rtw_dev *rtwdev,
+ 				   enum rtw_fw_fifo_sel sel,
+ 				   u32 start_addr, u32 size)
+ {
++	const struct rtw_chip_info *chip = rtwdev->chip;
++	u32 fifo_size, boundary;
++
+ 	switch (sel) {
+ 	case RTW_FW_FIFO_SEL_TX:
++		fifo_size = chip->txff_size;
++		break;
+ 	case RTW_FW_FIFO_SEL_RX:
+-		if ((start_addr + size) > rtwdev->chip->fw_fifo_addr[sel])
++		fifo_size = chip->rxff_size;
++		break;
++	case RTW_FW_FIFO_SEL_RSVD_PAGE:
++		boundary = rtwdev->fifo.rsvd_boundary << TX_PAGE_SIZE_SHIFT;
++		if (boundary > chip->txff_size)
+ 			return false;
+-		fallthrough;
++		fifo_size = chip->txff_size - boundary;
++		break;
++	case RTW_FW_FIFO_SEL_RXBUF_FW:
++		fifo_size = chip->fw_rxff_size;
++		break;
+ 	default:
+ 		return true;
+ 	}
++
++	return start_addr <= fifo_size && size <= fifo_size - start_addr;
+ }
+ 
+ int rtw_fw_dump_fifo(struct rtw_dev *rtwdev, u8 fifo_sel, u32 addr, u32 size,
+ 		     u32 *buffer)
+ {
++	lockdep_assert_held(&rtwdev->mutex);
++
++	if (fifo_sel >= RTW_FW_FIFO_MAX)
++		return -EINVAL;
++
+ 	if (!rtwdev->chip->fw_fifo_addr[0]) {
+ 		rtw_dbg(rtwdev, RTW_DBG_FW, "chip not support dump fw fifo\n");
+ 		return -ENOTSUPP;
+@@ -1881,7 +1901,7 @@
+ 	if (size == 0 || !buffer)
+ 		return -EINVAL;
+ 
+-	if (size & 0x3) {
++	if ((addr | size) & 0x3) {
+ 		rtw_dbg(rtwdev, RTW_DBG_FW, "not 4byte alignment\n");
+ 		return -EINVAL;
+ 	}
+--- a/drivers/net/wireless/realtek/rtw88/debug.c
++++ b/drivers/net/wireless/realtek/rtw88/debug.c
+@@ -309,18 +309,23 @@
+ 	struct rtw_debugfs_priv *debugfs_priv = m->private;
+ 	struct rtw_dev *rtwdev = debugfs_priv->rtwdev;
+ 	u16 page_size = rtwdev->chip->page_size;
+-	u32 buf_size = debugfs_priv->rsvd_page.page_num * page_size;
+-	u32 offset = debugfs_priv->rsvd_page.page_offset * page_size;
++	u32 buf_size, offset;
+ 	u8 *buf;
+ 	int i;
+ 	int ret;
+ 
++	mutex_lock(&rtwdev->mutex);
++	buf_size = debugfs_priv->rsvd_page.page_num * page_size;
++	offset = debugfs_priv->rsvd_page.page_offset * page_size;
+ 	buf = vzalloc(buf_size);
+-	if (!buf)
++	if (!buf) {
++		mutex_unlock(&rtwdev->mutex);
+ 		return -ENOMEM;
++	}
+ 
+ 	ret = rtw_fw_dump_fifo(rtwdev, RTW_FW_FIFO_SEL_RSVD_PAGE, offset,
+ 			       buf_size, (u32 *)buf);
++	mutex_unlock(&rtwdev->mutex);
+ 	if (ret) {
+ 		rtw_err(rtwdev, "failed to dump rsvd page\n");
+ 		vfree(buf);
+@@ -353,15 +358,22 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	num = sscanf(tmp, "%d %d", &offset, &page_num);
++	num = sscanf(tmp, "%u %u", &offset, &page_num);
+ 
+ 	if (num != 2) {
+ 		rtw_warn(rtwdev, "invalid arguments\n");
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&rtwdev->mutex);
++	if (!page_num || offset >= rtwdev->fifo.rsvd_pg_num ||
++	    page_num > rtwdev->fifo.rsvd_pg_num - offset) {
++		mutex_unlock(&rtwdev->mutex);
++		return -EINVAL;
++	}
+ 	debugfs_priv->rsvd_page.page_offset = offset;
+ 	debugfs_priv->rsvd_page.page_num = page_num;
++	mutex_unlock(&rtwdev->mutex);
+ 
+ 	return count;
+ }

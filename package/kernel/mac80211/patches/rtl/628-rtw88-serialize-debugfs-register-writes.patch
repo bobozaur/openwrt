@@ -1,0 +1,33 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wifi: rtw88: serialize raw debugfs register writes
+
+Raw register writes must share the driver's register and firmware mutex.
+Otherwise a debugfs writer can race ordinary power, calibration and reserved
+page operations that already hold the mutex. Keep this native writer fix
+independent of the removed TX gate snapshot and its eligibility state.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/drivers/net/wireless/realtek/rtw88/debug.c
++++ b/drivers/net/wireless/realtek/rtw88/debug.c
+@@ -405,6 +405,10 @@
+ 	if (num !=  3)
+ 		return -EINVAL;
+ 
++	ret = mutex_lock_interruptible(&rtwdev->mutex);
++	if (ret)
++		return ret;
++
+ 	switch (len) {
+ 	case 1:
+ 		rtw_dbg(rtwdev, RTW_DBG_DEBUGFS,
+@@ -427,6 +431,7 @@
+ 		break;
+ 	}
+ 
++	mutex_unlock(&rtwdev->mutex);
+ 	return count;
+ }
+ 
