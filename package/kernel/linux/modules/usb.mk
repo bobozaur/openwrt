@@ -560,6 +560,18 @@ endef
 $(eval $(call KernelPackage,usb-dwc3))
 
 
+define KernelPackage/usb-dwc3-grx500
+  TITLE:=DWC3 Lantiq GRX500 USB controller glue
+  DEPENDS:=@TARGET_lantiq_grx500 +kmod-usb-dwc3 +kmod-usb3
+  KCONFIG:=CONFIG_USB_DWC3_GRX500
+  FILES:=$(LINUX_DIR)/drivers/usb/dwc3/dwc3-grx500.ko
+  AUTOLOAD:=$(call AutoProbe,dwc3-grx500,1)
+  $(call AddDepends/usb)
+endef
+
+$(eval $(call KernelPackage,usb-dwc3-grx500))
+
+
 define KernelPackage/usb-dwc3-octeon
   TITLE:=DWC3 Cavium Octeon USB driver
   DEPENDS:=@TARGET_octeon +kmod-usb-dwc3
