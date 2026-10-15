@@ -2052,6 +2052,12 @@ function dpp_rx_via_channel(ifname, method, data)
 }
 
 let main_obj = {
+	wps_state: {
+		args: {},
+		call: function(req) {
+			return hostapd.wps_state();
+		},
+	},
 	reload: {
 		args: {
 			phy: "",
@@ -2239,6 +2245,7 @@ let main_obj = {
 			radio: 0,
 			config: "",
 			prev_config: "",
+			uci: {},
 		},
 		call: function(req) {
 			let phy = req.args.phy;
@@ -2258,6 +2265,8 @@ let main_obj = {
 			}
 
 			let config = iface_load_config(phy, radio, file);
+			for (let bss in config.bss)
+				bss.uci = req.args.uci ? req.args.uci[bss.ifname] : null;
 
 			hostapd.printf(`Set new config for phy ${name}: ${file}`);
 			iface_set_config(name, config);
@@ -2469,7 +2478,77 @@ function bss_event(type, name, data) {
 	ubus.call("service", "event", { type: `hostapd.${name}.${type}`, data: {} });
 }
 
+function wps_ap_values(cred)
+{
+	if (type(cred.ssid) != 'string' || length(cred.ssid) < 1 ||
+	    length(cred.ssid) > 32 || index(cred.ssid, '\x00') >= 0 ||
+	    type(cred.key) != 'string' || index(cred.key, '\x00') >= 0 ||
+	    cred.ieee80211w < 0 || cred.ieee80211w > 2)
+		return null;
+
+	// These are native WPS Authentication/Encryption Type attributes.
+	// WEP and enterprise credentials have no complete personal UCI profile.
+	let mode = { '2': 'psk', '32': 'psk2', '34': 'psk-mixed' }[sprintf('%d', cred.auth_type)];
+	let cipher = { '4': 'tkip', '8': 'ccmp', '12': 'tkip+ccmp' }[sprintf('%d', cred.encr_type)];
+	let pmf = cred.ieee80211w;
+	if (cred.auth_type == 1 && cred.encr_type == 1 &&
+	    !length(cred.key) && !pmf)
+		return { ssid: cred.ssid, encryption: 'none', key: null,
+			 ieee80211w: '0', sae_password: null, wps_state: '2' };
+	if (!mode || !cipher || length(cred.key) < 8 || length(cred.key) > 64 ||
+	    (length(cred.key) == 64 && !match(cred.key, /^[0-9a-fA-F]{64}$/)) ||
+	    (pmf && (mode == 'psk' || cipher != 'ccmp')))
+		return null;
+	if (cred.add_sae && (cred.auth_type & 32) && length(cred.key) < 64) {
+		if (cipher != 'ccmp')
+			return null;
+		mode = 'sae-mixed';
+		if (!pmf)
+			pmf = 1;
+	}
+	return { ssid: cred.ssid, encryption: mode + '+' + cipher, key: cred.key,
+		 ieee80211w: sprintf('%d', pmf), sae_password: null, wps_state: '2' };
+}
+
 return {
+	wps_credential: function(phy, ifname, iface, cred) {
+		let config = hostapd.data.config[phy];
+		let bss = filter(config?.bss ?? [], (v) => v.ifname == ifname);
+		if (length(bss) != 1 || !hostapd.bss[phy] ||
+		    hostapd.bss[phy][ifname] != iface)
+			return false;
+		let owner = bss[0].uci;
+		let devices = owner?.expected?.device;
+		if (type(owner?.section) != 'string' || !length(owner.section) ||
+		    type(owner.device) != 'string' || !length(owner.device) ||
+		    type(owner.expected) != 'object' ||
+		    owner.expected['.type'] != 'wifi-iface' ||
+		    owner.expected.mode != 'ap' ||
+		    type(owner.expected_device) != 'object' ||
+		    owner.expected_device['.type'] != 'wifi-device' ||
+		    !((type(devices) == 'string' && devices == owner.device) ||
+		      (type(devices) == 'array' && length(devices) == 1 &&
+		       devices[0] == owner.device)))
+			return false;
+		let values = wps_ap_values(cred);
+		if (!values)
+			return false;
+
+		// This is the same registered ubus context that owns config_set.
+		// A synchronous call queues nested INVOKE messages until the current
+		// native WPS/SOAP callback unwinds. Commit precedes protocol success;
+		// normal netifd reload applies it afterwards.
+		let result = ubus.call('uci', 'wireless_enroll', { ...owner, mode: 'ap', values });
+		if (result?.status != 'saved') {
+			hostapd.printf('WPS AP settings on ' + ifname + ': ' +
+				       (result?.status ?? 'transaction failed'));
+			return false;
+		}
+		return true;
+	},
+	wps_state_changed: function() {
+		hostapd.data.obj.notify("wps.state", {}, null, null, null, -1);
+	},
 	iface_state: function(phy, iface, state, channel_changed) {
 		let tx = hostapd.data.apsta_pending[phy];
 		if (channel_changed && hostapd.data.config[phy]?.station_phy &&

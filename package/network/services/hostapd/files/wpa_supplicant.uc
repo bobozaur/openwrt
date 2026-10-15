@@ -20,6 +20,226 @@ wpas.data.iface_phy = {};
 wpas.data.iface_ubus = {};
 wpas.data.dpp_hooks = {};
 wpas.data.config_generation = 0;
+wpas.data.enrollment = {};
+wpas.data.enrollment_results = {};
+
+function enrollment_result(owner, phase)
+{
+	let binding = owner.config.uci;
+	if (!binding)
+		return;
+	let key = binding.section;
+	let previous = wpas.data.enrollment_results[key];
+	previous?.expiry?.cancel();
+	// This is a bounded result of an enrollment operation, not a connection
+	// state cache. Keep it through the config reload caused by persistence;
+	// current connection state is always queried from the native interface.
+	let result = { phase, device: binding.device };
+	wpas.data.enrollment_results[key] = result;
+	result.expiry = uloop.timer(120000, () => {
+		if (wpas.data.enrollment_results[key] == result)
+			delete wpas.data.enrollment_results[key];
+	});
+}
+
+function enrollment_forget(ifname, status)
+{
+	let entry = wpas.data.enrollment[ifname];
+	if (!entry)
+		return;
+	entry.expiry?.cancel();
+	entry.retry?.cancel();
+	delete wpas.data.enrollment[ifname];
+	if (status) {
+		enrollment_result(entry.owner, status);
+		wpas.printf(`WPS persistence on ${ifname}: ${status}`);
+		ubus.event('wps_persistence', { ifname, status });
+	}
+}
+
+function enrollment_owner(ifname, iface)
+{
+	let phy = wpas.data.config[wpas.data.iface_phy[ifname]];
+	let owner = phy?.data[ifname];
+	if (!owner || owner.config.mode != 'sta' || !owner.config.uci ||
+	    wpas.interfaces[ifname] != iface)
+		return null;
+	let uci = owner.config.uci;
+	if (type(uci.section) != 'string' || !length(uci.section) ||
+	    type(uci.device) != 'string' || !length(uci.device))
+		return null;
+	// The transaction owns one complete persistent radio/iface snapshot.
+	// Preserve section identity for status even when a multi-radio or partial
+	// configuration cannot safely enroll into that transaction.
+	let devices = uci.expected?.device;
+	let persistent = type(uci.expected) == 'object' &&
+		type(uci.expected_device) == 'object' &&
+		uci.expected['.type'] == 'wifi-iface' &&
+		uci.expected_device['.type'] == 'wifi-device' && uci.expected.mode == 'sta' &&
+		((type(devices) == 'string' && devices == uci.device) ||
+		 (type(devices) == 'array' && length(devices) == 1 &&
+		  type(devices[0]) == 'string' && devices[0] == uci.device));
+	return { phy, owner, persistent };
+}
+
+function enrollment_values(cred, status)
+{
+	if (!cred.ssid || index(cred.ssid, '\x00') >= 0 ||
+	    index(cred.key, '\x00') >= 0 || cred.ieee80211w < 0 || cred.ieee80211w > 2)
+		return null;
+	let key_mgmt = split(cred.key_mgmt ?? '', ' ');
+	let proto = split(cred.proto ?? '', ' ');
+	let pairwise = split(cred.pairwise ?? '', ' ');
+	// WPS AES profiles may be expanded by the native driver to several optional
+	// ciphers. UCI can represent the cipher actually negotiated, even when it
+	// cannot express that entire optional set in one encryption value.
+	let cipher = {
+		'TKIP': 'tkip', 'CCMP': 'ccmp', 'GCMP': 'gcmp',
+		'CCMP-256': 'ccmp256', 'GCMP-256': 'gcmp256',
+	}[status.pairwise_cipher];
+	let encryption;
+	if (length(key_mgmt) == 1 && key_mgmt[0] == 'NONE') {
+		encryption = 'none';
+	} else {
+		if (!length(key_mgmt) || length(filter(key_mgmt, (v) => v != 'WPA-PSK' && v != 'SAE')) ||
+		    !cipher || index(pairwise, status.pairwise_cipher) < 0)
+			return null;
+		if (index(key_mgmt, 'SAE') >= 0) {
+			if (cipher == 'tkip')
+				return null;
+			encryption = index(key_mgmt, 'WPA-PSK') >= 0 ? 'sae-mixed' : 'sae';
+		} else if (index(proto, 'RSN') >= 0) {
+			encryption = index(proto, 'WPA') >= 0 ? 'psk-mixed' : 'psk2';
+		} else if (index(proto, 'WPA') >= 0) {
+			encryption = 'psk';
+		} else {
+			return null;
+		}
+		encryption += '+' + cipher;
+	}
+	return { ssid: cred.ssid, encryption, key: encryption == 'none' ? null : cred.key,
+		ieee80211w: sprintf('%d', cred.ieee80211w), sae_password: null };
+}
+
+function enrollment_persist(ifname, iface)
+{
+	let entry = wpas.data.enrollment[ifname];
+	if (!entry)
+		return;
+	if (entry.expiry.remaining() <= 0) {
+		enrollment_forget(ifname, entry.publication_unconfirmed ? 'unconfirmed' : 'expired');
+		return;
+	}
+	let binding = enrollment_owner(ifname, iface);
+	let status = iface.status();
+	if (!binding?.persistent || entry.iface != iface || entry.owner != binding.owner ||
+	    entry.generation != binding.phy.generation || status.wps_run != entry.run) {
+		enrollment_forget(ifname, entry.publication_unconfirmed ? 'unconfirmed' : 'cancelled');
+		return;
+	}
+	if (status.state != 'COMPLETED' || !status.wps_success || !status.wps_selected ||
+	    status.network_wps_run != entry.run)
+		return;
+	let cred = entry.candidates[sprintf('%d', status.network_id)];
+	if (!cred)
+		return;
+	let values = enrollment_values(cred, status);
+	if (!values) {
+		enrollment_forget(ifname, 'unrepresentable credential');
+		return;
+	}
+	let request = { ...entry.owner.config.uci, values };
+	delete entry.confirmation;
+	let result = ubus.call('uci', 'wireless_enroll', request);
+	let error = ubus.error(true);
+	if (wpas.data.enrollment[ifname] != entry)
+		return;
+	if (result?.status == 'saved' || result?.status == 'conflict') {
+		enrollment_forget(ifname, result.status);
+		return;
+	}
+	if (!result?.status && (error == null || index([
+	    libubus.STATUS_TIMEOUT, libubus.STATUS_CONNECTION_FAILED,
+	    libubus.STATUS_UNKNOWN_ERROR ], error) >= 0)) {
+		// A committed publication can lose its reply before config.change
+		// replaces this owner. Retain only an already-desired confirmation:
+		// its two transaction alternatives must both equal the desired state.
+		let expected = { ...request.expected };
+		for (let name, value in values)
+			if (value === null)
+				delete expected[name];
+			else
+				expected[name] = value;
+		entry.publication_unconfirmed = true;
+		entry.confirmation = { ...request, expected };
+	}
+	// Pending edits/Apply retain their owner. Retry only while this exact
+	// selected connection and configuration incarnation remain eligible.
+	enrollment_result(entry.owner, 'waiting');
+	entry.retry?.cancel();
+	entry.retry = uloop.timer(2000, () => enrollment_persist(ifname, iface));
+}
+
+function enrollment_reconcile(old_if, new_if, generation)
+{
+	if (!old_if)
+		return;
+	let ifname = old_if.config.iface;
+	let entry = wpas.data.enrollment[ifname];
+	let request = entry?.confirmation;
+	if (!request || entry.owner != old_if || entry.generation != generation ||
+	    wpas.interfaces[ifname] != entry.iface ||
+	    old_if.cancelled_wps_run == entry.run || entry.iface.status()?.wps_run != entry.run)
+		return;
+	if (entry.expiry.remaining() <= 0) {
+		enrollment_forget(ifname, 'unconfirmed');
+		return;
+	}
+	if (new_if) {
+		let binding = new_if.config.uci;
+		if (new_if.config.mode != 'sta' || binding?.section != request.section ||
+		    binding?.device != request.device ||
+		    !is_equal(binding.expected, request.expected) ||
+		    !is_equal(binding.expected_device, request.expected_device))
+			return;
+	}
+	// Reconcile the old operation before retiring its resource, including a
+	// stop-first reload. No candidate, writer or new expiry crosses generations.
+	// This request can only re-sync already-published values; runtime equality
+	// is never a durable saved acknowledgment and unsaved disk cannot be changed.
+	entry.retry?.cancel();
+	delete entry.confirmation;
+	let result = ubus.call('uci', 'wireless_enroll', request);
+	if (wpas.data.enrollment[ifname] != entry)
+		return;
+	enrollment_forget(ifname, result?.status == 'saved' ? 'saved' :
+		result?.status == 'conflict' ? 'conflict' : 'unconfirmed');
+}
+
+function enrollment_candidate(ifname, iface, cred)
+{
+	if (!cred.processed || !cred.wps_run || cred.network_id == null)
+		return;
+	let binding = enrollment_owner(ifname, iface);
+	if (!binding?.persistent || binding.owner.cancelled_wps_run == cred.wps_run)
+		return;
+	let entry = wpas.data.enrollment[ifname];
+	if (entry && (entry.iface != iface || entry.owner != binding.owner ||
+	             entry.generation != binding.phy.generation || entry.run != cred.wps_run)) {
+		enrollment_forget(ifname);
+		entry = null;
+	}
+	if (!entry) {
+		entry = wpas.data.enrollment[ifname] = {
+			iface, owner: binding.owner, generation: binding.phy.generation,
+			run: cred.wps_run, candidates: {},
+		};
+		entry.expiry = uloop.timer(120000, () => enrollment_forget(ifname,
+			entry.publication_unconfirmed ? 'unconfirmed' : 'expired'));
+	}
+	enrollment_result(entry.owner, 'connecting');
+	entry.candidates[sprintf('%d', cred.network_id)] = cred;
+}
 
 function iface_stop(iface)
 {
@@ -28,6 +248,8 @@ function iface_stop(iface)
 	if (!iface.running)
 		return;
 
+	enrollment_forget(ifname, wpas.data.enrollment[ifname]?.publication_unconfirmed ?
+		'unconfirmed' : 'cancelled');
 	delete wpas.data.iface_phy[ifname];
 	wpas.remove_iface(ifname);
 	wdev_remove(ifname);
@@ -161,6 +383,7 @@ function iface_network_apply(ifname, old_data, new_data, freq_list)
 
 function iface_cb(new_if, old_if, generation)
 {
+	enrollment_reconcile(old_if, new_if, generation);
 	if (old_if && new_if)
 		new_if.macaddr = old_if.macaddr;
 
@@ -1330,26 +1553,78 @@ function iface_ubus_add(ifname)
 		},
 		wps_start: {
 			args: {
-				multi_ap: true
+				multi_ap: true,
+				section: '',
+				// uHTTPd supplies the authenticated transport session. Its ACL
+				// check owns authorization; this method owns section identity.
+				ubus_rpc_session: '',
 			},
 			call: (req) => {
 				let iface = wpas.interfaces[ifname];
 				if (!iface)
 					return libubus.STATUS_NOT_FOUND;
 
-				iface.ctrl(`WPS_PBC multi_ap=${+req.args.multi_ap}`);
-				return 0;
+				let binding = enrollment_owner(ifname, iface);
+				if (req.args.section != null && req.args.section != binding?.owner.config.uci.section)
+					return libubus.STATUS_NOT_FOUND;
+				if (req.args.section != null && !binding?.persistent)
+					return libubus.STATUS_NOT_SUPPORTED;
+				enrollment_forget(ifname);
+				let multi_ap = req.args.multi_ap ?? binding?.owner.config.wps_multi_ap ?? false;
+				let result = iface.ctrl(`WPS_PBC multi_ap=${+multi_ap}`);
+				if (binding && result && match(result, /^OK\n?$/))
+					enrollment_result(binding.owner, 'active');
+				return result && match(result, /^OK\n?$/) ? 0 : libubus.STATUS_INVALID_ARGUMENT;
+			},
+		},
+		wps_status: {
+			args: { section: '', ubus_rpc_session: '' },
+			call: (req) => {
+				let iface = wpas.interfaces[ifname];
+				if (!iface)
+					return libubus.STATUS_NOT_FOUND;
+				let binding = enrollment_owner(ifname, iface);
+				if (req.args.section != null && req.args.section != binding?.owner.config.uci.section)
+					return libubus.STATUS_NOT_FOUND;
+				let result = wpas.data.enrollment_results[binding?.owner.config.uci.section];
+				if (result?.device != binding?.owner.config.uci.device)
+					result = null;
+				return { state: iface.status().state,
+					phase: result?.phase ?? 'idle',
+					persistent: !!binding?.persistent };
 			},
 		},
 		wps_cancel: {
-			args: {},
+			args: { section: '', ubus_rpc_session: '' },
 			call: (req) => {
 				let iface = wpas.interfaces[ifname];
 				if (!iface)
 					return libubus.STATUS_NOT_FOUND;
 
-				iface.ctrl("WPS_CANCEL");
-				return 0;
+				let binding = enrollment_owner(ifname, iface);
+				if (req.args.section != null && req.args.section != binding?.owner.config.uci.section)
+					return libubus.STATUS_NOT_FOUND;
+				let state = iface.status();
+				// Persistence reloads the saved profile into a new native network,
+				// so its WPS run tags no longer identify the established connection.
+				// Cancel may withdraw a selected candidate waiting to be saved, but
+				// must not disconnect any completed non-WPS profile or replace a
+				// terminal saved result on a late/repeated request.
+				if (state.state == 'COMPLETED' && state.wps_selected) {
+					if (wpas.data.enrollment[ifname]) {
+						if (binding)
+							binding.owner.cancelled_wps_run = state.wps_run;
+						enrollment_forget(ifname, 'cancelled');
+					}
+					return 0;
+				}
+				enrollment_forget(ifname);
+				if (binding) {
+					binding.owner.cancelled_wps_run = state.wps_run;
+					enrollment_result(binding.owner, 'cancelled');
+				}
+				let result = iface.ctrl("WPS_CANCEL");
+				return result && match(result, /^OK\n?$/) ? 0 : libubus.STATUS_INVALID_ARGUMENT;
 			},
 		},
 		control: {
@@ -1393,12 +1668,24 @@ return {
 		iface_event("add", name);
 	},
 	iface_remove: function(name, obj) {
+		enrollment_forget(name, wpas.data.enrollment[name]?.publication_unconfirmed ?
+			'unconfirmed' : 'cancelled');
 		iface_event("remove", name);
 		iface_ubus_remove(name);
 		delete wpas.data.dpp_hooks[name];
 	},
 	ctrl_event: function(name, iface, ev) {
 		iface_ubus_notify(name, ev);
+		if (match(ev, /^WPS-(CANCEL|FAIL|TIMEOUT|OVERLAP-DETECTED)/)) {
+			let binding = enrollment_owner(name, iface);
+			if (binding) {
+				binding.owner.cancelled_wps_run = iface.status().wps_run;
+				let result = wpas.data.enrollment_results[binding.owner.config.uci.section];
+				if (wpas.data.enrollment[name] || result?.phase in [ 'active', 'connecting', 'waiting' ])
+					enrollment_result(binding.owner, 'cancelled');
+			}
+			enrollment_forget(name, 'cancelled');
+		}
 
 		// The set of links of an associated MLD can change without a state
 		// transition, which would leave the AP side following a link that no
@@ -1417,6 +1704,7 @@ return {
 		event_data.name = ifname;
 		iface_event("state", ifname, event_data);
 		try {
+			enrollment_persist(ifname, iface);
 			iface_hostapd_notify(ifname, iface, state);
 
 			if (state != "COMPLETED")
@@ -1448,6 +1736,7 @@ return {
 			iface_channel_switch(ifname, iface, info);
 	},
 	wps_credentials: function(ifname, iface, cred) {
+		enrollment_candidate(ifname, iface, cred);
 		cred.ifname = ifname;
 		ubus.event("wps_credentials", cred);
 	},
