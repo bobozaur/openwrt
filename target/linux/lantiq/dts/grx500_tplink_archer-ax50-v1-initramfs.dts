@@ -1,0 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/dts-v1/;
+#include "grx500_tplink_archer-ax50-v1.dtsi"
+
+/ {
+	chosen {
+		bootargs = "console=ttyLTQ0,115200 earlycon panic=5 ubi.mtd=system_sw,2048 ubifs.default_version=4 boot_timeout=120 thread_backlog_napi ax50_initial_install=1";
+	};
+};
