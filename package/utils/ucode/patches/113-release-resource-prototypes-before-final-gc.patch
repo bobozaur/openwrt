@@ -1,0 +1,64 @@
+From 19ffa8aa3218f57f8bc52ce6b49db66dbcbebf4e Mon Sep 17 00:00:00 2001
+From: Jo-Philipp Wich <jo@mein.io>
+Date: Wed, 26 Aug 2026 11:02:16 +0200
+Subject: [PATCH] vm: release resource type prototypes before the final GC
+
+Since "include: register resource type prototypes with VM" (343ebc2),
+type prototypes are part of the VM value pool and are released by
+ucv_freeall() during VM teardown. Releasing them again afterwards
+results in a heap-use-after-free / double free:
+
+==ERROR: AddressSanitizer: heap-use-after-free ...
+    #0 ucv_put_value types.c
+    #1 uc_vm_free vm.c
+freed by thread T0 here:
+    #1 ucv_gc_common types.c
+    #2 uc_vm_free vm.c
+
+Drop 5a79aa56c15ec45dbd3eaff73d7a500ff3873936, which predates the value
+pool registration and relies on type prototypes living outside of the
+GC value list.
+
+[Bogdan Mircea: adapt unchanged hunk context for the source revision before
+source-table teardown; inserted and removed code remains the upstream change.]
+
+Upstream-Status: Backport [https://github.com/ucode-lang/ucode/commit/19ffa8aa3218f57f8bc52ce6b49db66dbcbebf4e]
+
+Signed-off-by: Jo-Philipp Wich <jo@mein.io>
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+---
+ vm.c | 14 +++++++-------
+ 1 file changed, 7 insertions(+), 7 deletions(-)
+
+--- a/vm.c
++++ b/vm.c
+@@ -274,6 +274,12 @@ void uc_vm_free(uc_vm_t *vm)
+ 		vm->open_upvals = ref;
+ 	}
+ 
++	/* Resource type prototypes are part of the VM value pool, so release the
++	 * restype refs before the final GC; any references still held by
++	 * GC-managed values are dropped by ucv_freeall() itself. */
++	for (i = 0; i < vm->restypes.count; i++)
++		ucv_put(vm->restypes.entries[i]->proto);
++
+ 	uc_vm_reset_callframes(vm);
+ 	uc_vm_reset_stack(vm);
+ 	uc_vector_clear(&vm->stack);
+@@ -283,14 +289,8 @@ void uc_vm_free(uc_vm_t *vm)
+ 
+ 	ucv_freeall(vm);
+ 
+-	/* Type prototypes are not on the GC value list, so a ucv_put() during
+-	 * ucv_freeall()'s retain phase would only mark them UC_NULL and leak
+-	 * them. Release them here, after the final GC, so the last reference a
+-	 * GC value may hold (e.g. via proto()) is already gone. */
+-	for (i = 0; i < vm->restypes.count; i++) {
+-		ucv_put(vm->restypes.entries[i]->proto);
++	for (i = 0; i < vm->restypes.count; i++)
+ 		free(vm->restypes.entries[i]);
+-	}
+ 
+ 	uc_vector_clear(&vm->restypes);
+ 

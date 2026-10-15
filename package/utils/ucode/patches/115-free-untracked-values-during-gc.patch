@@ -1,0 +1,29 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] types: free untracked values during garbage collection
+
+The retain phase defers freeing GC-linked values until the second pass so
+its list traversal stays valid. A value with an unused ref field has no
+second-pass entry; retaining it after its last reference is dropped leaks
+its allocation.
+
+Free those untracked values immediately. In particular, older binary modules
+can still register off-pool resource prototypes through the public API even
+when rebuilt inline helpers put prototypes in the VM pool. Preserve that
+compatibility without moving values between VM owners or changing the ABI.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/types.c
++++ b/types.c
+@@ -375,7 +375,8 @@ ucv_free(uc_value_t *uv, bool retain)
+ 		break;
+ 	}
+ 
+-	if (!ref || !retain) {
++	/* Only linked values have a second GC pass to reclaim their storage. */
++	if (!ref || !ref->next || !retain) {
+ 		if (ref && ref->prev && ref->next)
+ 			ucv_unref(ref);
+ 
