@@ -1,0 +1,47 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] net: defer backlog NAPI static key activation until network init
+
+Some architectures, including MIPS, call parse_early_param() from
+setup_arch(), before start_kernel() initializes jump labels. Enabling the
+backlog static key from the early option callback therefore warns and has
+no linked branch sites to update. Later jump-label initialization does not
+repair the already-enabled false-key branch, so the requested backlog
+threads are not registered.
+
+Keep the early command-line option but only record its request there.
+Enable the key in net_dev_init(), after jump-label initialization and before
+backlog-thread selection. PREEMPT_RT retains its unconditional threaded
+backlog path.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -206,10 +206,11 @@
+ #ifndef CONFIG_PREEMPT_RT
+ 
+ static DEFINE_STATIC_KEY_FALSE(use_backlog_threads_key);
++static bool backlog_napi_requested __initdata;
+ 
+ static int __init setup_backlog_napi_threads(char *arg)
+ {
+-	static_branch_enable(&use_backlog_threads_key);
++	backlog_napi_requested = true;
+ 	return 0;
+ }
+ early_param("thread_backlog_napi", setup_backlog_napi_threads);
+@@ -13162,6 +13163,12 @@
+ 
+ 	BUG_ON(!dev_boot_phase);
+ 
++#ifndef CONFIG_PREEMPT_RT
++	/* An architecture may parse early options before jump_label_init(). */
++	if (backlog_napi_requested)
++		static_branch_enable(&use_backlog_threads_key);
++#endif
++
+ 	net_dev_struct_check();
+ 
+ 	if (dev_proc_init())
