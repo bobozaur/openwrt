@@ -1,0 +1,133 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: reclaim removed explicit VLAN configuration
+
+Reconcile removed explicit VLAN sections before interface configuration
+claims their implicit devices. Clear obsolete settings on implicit VLANs
+and transfer canonical 8021q names and device users to the implicit owner.
+
+Keep explicitly configured intermediate VLAN owners and differently named
+aliases intact. Limit the handover to removed VLAN configuration; other
+virtual device types still follow their existing interface lifecycle.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/config.c
++++ b/config.c
+@@ -835,6 +835,7 @@ config_init_all(void)
+ 	config_init_vlans();
+ 	config_init_devices(false);
+ 	netifd_ucode_config_load(false);
++	device_reset_old_vlans();
+ 	config_init_interfaces();
+ 	config_free_vlans();
+ 	config_init_ip();
+--- a/device.c
++++ b/device.c
+@@ -1439,6 +1439,61 @@ device_reset_config(void)
+ }
+ 
+ void
++device_reset_old_vlans(void)
++{
++	struct device *dev, *tmp, *ndev;
++	const char *suffix;
++	struct blob_buf empty = {};
++
++	blob_buf_init(&empty, 0);
++	if (!empty.head)
++		return;
++
++	/* Reclaim removed explicit VLAN settings before interfaces claim their
++	 * devices, so legacy interface attributes apply to the implicit owner.
++	 * Other virtual types may still be declared by legacy interface sections.
++	 */
++	avl_for_each_element_safe(&devices, dev, avl, tmp) {
++		if (dev->current_config || dev->default_config || dev->external)
++			continue;
++
++		if (!strcmp(dev->type->name, "VLAN")) {
++			/* An implicit VLAN configured by a device section without a
++			 * type already has the correct parent and VLAN identity.
++			 */
++			if (device_apply_config(dev, dev->type, empty.head) == DEV_CONFIG_RECREATE)
++				continue;
++			dev->iface_config = false;
++			dev->config_iface = NULL;
++			dev->default_config = true;
++			continue;
++		}
++
++		if (strcmp(dev->type->name, "8021q"))
++			continue;
++		suffix = strrchr(dev->ifname, '.');
++		if (!suffix || !suffix[1] || strspn(suffix + 1, "0123456789") != strlen(suffix + 1))
++			continue;
++
++		device_delete(dev);
++		ndev = get_vlan_device_chain(dev->ifname, 1);
++		if (ndev && ndev != dev && ndev->default_config &&
++		    !strcmp(ndev->type->name, "VLAN") &&
++		    !strcmp(ndev->ifname, dev->ifname)) {
++			device_replace(ndev, dev);
++			continue;
++		}
++
++		/* An alias may resolve to an existing, differently named owner.
++		 * Never replace or free it on failure to create this exact device.
++		 */
++		dev->avl.key = dev->ifname;
++		avl_insert(&devices, &dev->avl);
++	}
++	blob_buf_free(&empty);
++}
++
++void
+ device_reset_old(void)
+ {
+ 	struct device *dev, *tmp, *ndev;
+--- a/device.h
++++ b/device.h
+@@ -420,6 +420,7 @@ device_apply_config(struct device *dev,
+ 		    struct blob_attr *config);
+ 
+ void device_reset_config(void);
++void device_reset_old_vlans(void);
+ void device_reset_old(void);
+ 
+ int device_init_virtual(struct device *dev, struct device_type *type, const char *name);
+--- a/vlan.c
++++ b/vlan.c
+@@ -205,6 +205,7 @@ static struct device *get_vlan_device(st
+ 	};
+ 	struct vlan_device *vldev;
+ 	struct device_user *dep;
++	struct device *existing;
+ 	char name[IFNAMSIZ];
+ 	char *err = NULL;
+ 	int id, *alias_id;
+@@ -218,6 +219,14 @@ static struct device *get_vlan_device(st
+ 		id = *alias_id;
+ 	}
+ 
++	if (snprintf(name, sizeof(name), "%s.%d", dev->ifname, id) >= (int)sizeof(name))
++		return NULL;
++
++	/* Explicitly configured intermediate VLANs own their canonical name. */
++	existing = device_find(name);
++	if (existing)
++		return existing;
++
+ 	/* look for an existing interface before creating a new one */
+ 	list_for_each_entry(dep, &dev->users.list, list.list) {
+ 		if (dep->cb != vlan_dev_cb)
+@@ -233,9 +242,6 @@ static struct device *get_vlan_device(st
+ 	if (!create)
+ 		return NULL;
+ 
+-	if (snprintf(name, sizeof(name), "%s.%d", dev->ifname, id) >= (int)sizeof(name))
+-		return NULL;
+-
+ 	D(DEVICE, "Create vlan device '%s'", name);
+ 
+ 	vldev = calloc(1, sizeof(*vldev));
