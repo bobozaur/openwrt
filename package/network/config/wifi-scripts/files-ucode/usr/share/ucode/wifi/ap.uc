@@ -164,15 +164,18 @@ function iface_setup(config) {
 	else
 		append('bss', config.ifname);
 
-	if (config.multicast_to_unicast || config.proxy_arp)
-		config.ap_isolate = 1;
+	/* A bridge must apply snooping/proxy policy before intra-BSS delivery.
+	 * Without that owner, preserve native forwarding unless isolation was
+	 * explicitly requested. Emit both states for configuration replacements. */
+	config.ap_isolate = +(!!config.ap_isolate ||
+		(!!config.network_bridge && (config.multicast_to_unicast || config.proxy_arp)));
 
 	if (config.proxy_arp)
 		set_default(config, 'na_mcast_to_ucast', true);
 
 	append('bssid', config.macaddr);
 	config.ssid2 = config.ssid;
-	config.wmm_enabled = 1;
+	config.wmm_enabled = +(config.wmm ?? true);
 	append_string_vars(config, [ 'ssid2' ]);
 
 	/* vendor_elements is a single concatenated hex blob, not one per line */

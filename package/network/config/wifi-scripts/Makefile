@@ -21,6 +21,7 @@ define Package/wifi-scripts
   SECTION:=utils
   CATEGORY:=Base system
   DEPENDS:=+netifd +ucode +ucode-mod-nl80211 +ucode-mod-rtnl +ucode-mod-ubus +ucode-mod-uci +ucode-mod-digest
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r5)
   TITLE:=Wi-Fi configuration scripts
   PKGARCH:=all
 endef
