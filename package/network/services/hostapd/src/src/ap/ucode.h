@@ -4,6 +4,7 @@
 #include "utils/ucode.h"
 
 struct hostapd_data;
+struct hostapd_iface;
 
 struct hostapd_ucode_bss {
 #ifdef UCODE_SUPPORT
@@ -14,6 +15,7 @@ struct hostapd_ucode_bss {
 struct hostapd_ucode_iface {
 #ifdef UCODE_SUPPORT
 	int idx;
+	bool channel_changed;
 #endif
 };
 
@@ -23,6 +25,8 @@ int hostapd_ucode_init(struct hapd_interfaces *ifaces);
 
 void hostapd_ucode_free(void);
 void hostapd_ucode_free_iface(struct hostapd_iface *iface);
+void hostapd_ucode_iface_state_changed(struct hostapd_iface *iface);
+void hostapd_ucode_iface_channel_changed(struct hostapd_iface *iface);
 void hostapd_ucode_free_bss(struct hostapd_data *hapd);
 void hostapd_ucode_bss_cb(struct hostapd_data *hapd, const char *type);
 int hostapd_ucode_sta_auth(struct hostapd_data *hapd, struct sta_info *sta);
@@ -56,6 +60,12 @@ static inline void hostapd_ucode_free(void)
 {
 }
 static inline void hostapd_ucode_free_iface(struct hostapd_iface *iface)
+{
+}
+static inline void hostapd_ucode_iface_state_changed(struct hostapd_iface *iface)
+{
+}
+static inline void hostapd_ucode_iface_channel_changed(struct hostapd_iface *iface)
 {
 }
 static inline void hostapd_ucode_bss_cb(struct hostapd_data *hapd, const char *type)
