@@ -1,0 +1,5 @@
+# Replace the generic MIPS32r2 24K tuning; two -mtune options also make gas warn.
+cflags-y := $(filter-out -mtune=%,$(cflags-y))
+cflags-$(CONFIG_MACH_GRX500) += -I$(srctree)/arch/mips/include/asm/mach-grx500 \
+	-mtune=interaptiv -mno-mips16 -mno-micromips
+load-$(CONFIG_MACH_GRX500) = 0xffffffff60020000
