@@ -604,6 +604,7 @@ export function setup(data) {
 		append('\n#station_phy', data.station_phy);
 
 	let has_ap;
+	let owners = {};
 	for (let k, interface in data.interfaces) {
 		if (interface.config.mode != 'ap')
 			continue;
@@ -615,6 +616,8 @@ export function setup(data) {
 
 		if (!setup_interface(k, data, interface.config, interface.vlans, interface.stas, phy_features, owe ? 'owe' : null))
 			continue;
+		if (interface.uci)
+			owners[interface.config.ifname] = interface.uci;
 		if (owe)
 			setup_interface(k, data, interface.config, interface.vlans, interface.stas, phy_features, 'owe-transition');
 		has_ap = true;
@@ -626,7 +629,8 @@ export function setup(data) {
 		phy: data.phy,
 		radio: data.config.radio,
 		config: has_ap ? file_name : "",
-		prev_config: file_name + '.prev'
+		prev_config: file_name + '.prev',
+		uci: owners,
 	};
 	if (!global.ubus.list('hostapd'))
 		system('ubus wait_for hostapd');
