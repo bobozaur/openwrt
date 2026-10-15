@@ -1,0 +1,5193 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wave: own device, DMA, IRQ and control lifetimes
+
+Keep terminal quiesce, native confirmations, serialized VAP destruction and
+TXMM payload completion under their real owners. Retain data-pool totals and
+early-failure register guards; omit temporary IRQ/MMIO sampling. Preserve the
+native fatal dump before terminal reset, serialize card-index-only replies,
+and consume statistics replies before returning their TXMM payloads.
+Join netlink callback removal with native generic-netlink dispatch, publishing
+recovery and logger callbacks only while their state remains initialized.
+
+This is the final native integration against the pinned vendor source.
+Firmware-dependent policy remains downstream with exact image admission.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+---
+--- a/tools/mtlkroot/linux/nlmsgs.c
++++ b/tools/mtlkroot/linux/nlmsgs.c
+@@ -262,15 +262,27 @@
+ {
+   wave_nl_socket_t *nl_socket = &wave_nl_socket;
+ 
+-  if (!nl_socket->is_active)
+-    return MTLK_ERR_UNKNOWN;
+-
+-  if (rx_clb_fn && nl_socket->receive_callback[cmd])
+-    return MTLK_ERR_ALREADY_EXISTS;
++  int result = MTLK_ERR_OK;
++
++  /* This family's parallel_ops is false: genl_lock joins receive callbacks.
++   * Updates run only from owner init/cleanup, never from a callback.
++   */
++  genl_lock();
++  if (!nl_socket->is_active) {
++    result = MTLK_ERR_UNKNOWN;
++    goto out;
++  }
++
++  if (rx_clb_fn && nl_socket->receive_callback[cmd]) {
++    result = MTLK_ERR_ALREADY_EXISTS;
++    goto out;
++  }
+ 
+   nl_socket->receive_callback_ctx[cmd] = rx_clb_fn_params;
+   nl_socket->receive_callback[cmd] = rx_clb_fn;
+-  return MTLK_ERR_OK;
++out:
++  genl_unlock();
++  return result;
+ }
+ 
+ static void _wave_nl_parse_msg (struct mtlk_nl_msghdr *hdr)
+@@ -291,6 +303,10 @@
+     return;
+   }
+ 
++  /* No callback (including the logger) may run outside its owner's lifetime. */
++  if (!nl_socket->receive_callback[hdr->cmd_id])
++    return;
++
+   /* Check version of protocol */
+   if (hdr->proto_ver != MTLK_NL_PROTOCOL_VERSION) {
+     ELOG_DD("Wrong MTLK Protocol version for Netlink socket: got %d, expected %d.",
+@@ -298,13 +314,8 @@
+     return;
+   }
+ 
+-  /* Call RX-callback function if any */
+-  if (nl_socket->receive_callback[hdr->cmd_id]) {
+-    nl_socket->receive_callback[hdr->cmd_id](nl_socket->receive_callback_ctx[hdr->cmd_id], (void *)(hdr+1));
+-  }
+-  else {
+-    ELOG_V("Fail to parse Notification message from application: RX-callback function not found.");
+-  }
++  /* Generic netlink holds genl_lock across this non-parallel family's doit. */
++  nl_socket->receive_callback[hdr->cmd_id](nl_socket->receive_callback_ctx[hdr->cmd_id], (void *)(hdr+1));
+ }
+ 
+ /* Validate the complete original userspace wire contract before callbacks
+--- a/tools/mtlkroot/linux/mtlkroot.c
++++ b/tools/mtlkroot/linux/mtlkroot.c
+@@ -100,7 +100,7 @@
+     MTLK_INIT_STEP(root_drv, ROOT_CDEV_INIT, MTLK_OBJ_PTR(&gRootDrv),
+                    mtlk_cdev_drv_init, ());
+     MTLK_INIT_STEP(root_drv, ROOT_NL_INIT, MTLK_OBJ_PTR(&gRootDrv),
+-                   mtlk_nl_init, (mtlk_log_parse_notification_msg, NULL, NL_DRV_CMD_RTLOG_NOTIFY));
++                   mtlk_nl_init, (NULL, NULL, NL_DRV_CMD_RTLOG_NOTIFY));
+     MTLK_INIT_STEP(root_drv, ROOT_LOG, MTLK_OBJ_PTR(&gRootDrv),
+                    mtlk_log_init, ());
+     MTLK_INIT_STEP(root_drv, ROOT_IRBD, MTLK_OBJ_PTR(&gRootDrv),
+--- a/tools/mtlkroot/log_drv.c
++++ b/tools/mtlkroot/log_drv.c
+@@ -172,6 +172,7 @@
+   MTLK_INIT_STEPS_LIST_ENTRY(log_drv, DETACH_ACTIVE_BUFF)
+   MTLK_INIT_STEPS_LIST_ENTRY(log_drv, LOG_TIMER)
+   MTLK_INIT_STEPS_LIST_ENTRY(log_drv, TIMER_SET)
++  MTLK_INIT_STEPS_LIST_ENTRY(log_drv, NL_CALLBACK)
+ MTLK_INIT_INNER_STEPS_BEGIN(log_drv)
+ MTLK_INIT_STEPS_LIST_END(log_drv);
+ 
+@@ -179,6 +180,8 @@
+ mtlk_log_cleanup(void)
+ {
+   MTLK_CLEANUP_BEGIN(log_drv, MTLK_OBJ_PTR(&log_data))
++    MTLK_CLEANUP_STEP(log_drv, NL_CALLBACK, MTLK_OBJ_PTR(&log_data),
++                      wave_nl_update_receive_callback, (NULL, NULL, NL_DRV_CMD_RTLOG_NOTIFY));
+     MTLK_CLEANUP_STEP(log_drv, TIMER_SET, MTLK_OBJ_PTR(&log_data),
+                       mtlk_osal_timer_cancel_sync, (&log_data.timer));
+     MTLK_CLEANUP_STEP(log_drv, LOG_TIMER, MTLK_OBJ_PTR(&log_data),
+@@ -249,6 +252,9 @@
+     // TODO: This step should become a part of start sequence
+     MTLK_INIT_STEP(log_drv, TIMER_SET, MTLK_OBJ_PTR(&log_data),
+                    mtlk_osal_timer_set, (&log_data.timer, buf_swap_tmout));
++    /* Publish only after every logger state and lock is initialized. */
++    MTLK_INIT_STEP(log_drv, NL_CALLBACK, MTLK_OBJ_PTR(&log_data),
++                   wave_nl_update_receive_callback, (mtlk_log_parse_notification_msg, NULL, NL_DRV_CMD_RTLOG_NOTIFY));
+   MTLK_INIT_FINALLY(log_drv, MTLK_OBJ_PTR(&log_data))
+   MTLK_INIT_RETURN(log_drv, MTLK_OBJ_PTR(&log_data), mtlk_log_cleanup, ());
+ }
+--- a/wireless/driver/linux/mtlk_mmb_drv.c
++++ b/wireless/driver/linux/mtlk_mmb_drv.c
+@@ -21,6 +21,7 @@
+ #include "mtlk_df.h"
+ #include "fw_recovery.h"
+ #include "wave_fapi_if.h"
++#include "wave_mc_native.h"
+ 
+ #include <linux/module.h>
+ #include <linux/init.h>
+@@ -70,8 +71,8 @@
+                                                          WAVE_HW_RADIO_BAND_CFG_UNSUPPORTED,
+                                                          WAVE_HW_RADIO_BAND_CFG_UNSUPPORTED};
+ /* Recovery Enable flag (per card, default value = enabled) */
+-int rcvry_on[MTLK_MAX_HW_ADAPTERS_SUPPORTED] = {WAVE_RCVRY_ENABLE_VAL_DEFAULT, WAVE_RCVRY_ENABLE_VAL_DEFAULT,
+-                                                WAVE_RCVRY_ENABLE_VAL_DEFAULT, WAVE_RCVRY_ENABLE_VAL_DEFAULT};
++/* Terminal fencing is qualified first; automatic firmware restart is not. */
++int rcvry_on[MTLK_MAX_HW_ADAPTERS_SUPPORTED] = {0};
+ #ifdef MTLK_DEBUG
+ extern int step_to_fail;
+ #endif
+@@ -148,6 +149,11 @@
+   mtlk_irq_handler_data *ihd_pending;
+   BOOL                  g6_pci_aux;  /* Gen6 specific: auxilary PCIe  */
+   BOOL                  g6_dual_pci; /* Gen6 specific: dual PCIe mode */
++  bool                  pci_enabled;
++  bool                  pci_region_claimed;
++  bool                  irq_vectors_allocated;
++  unsigned long         irqs_requested;
++  unsigned long         tasklets_initialized;
+ 
+   MTLK_DECLARE_INIT_STATUS;
+ };
+@@ -391,7 +397,7 @@
+   return _mtlk_bcl_ui_iw_mac_data_proc(ndev, info, wrqu, extra, 0);
+ }
+ 
+-static const iw_handler  mtlk_bcl_private_handlers[] = {
++static const iw_handler __maybe_unused mtlk_bcl_private_handlers[] = {
+   [20] = _mtlk_bcl_ui_iw_mac_data_get,
+   [21] = _mtlk_bcl_ui_iw_mac_data_set,
+   [31] = NULL,
+@@ -399,8 +405,10 @@
+ 
+ const struct iw_handler_def  mtlk_bcl_handler_def = {
+   .num_standard     = ARRAY_SIZE(mtlk_bcl_standard_handlers),
++#ifdef CONFIG_WEXT_PRIV
+   .num_private      = ARRAY_SIZE(mtlk_bcl_private_handlers),
+   .private          = (iw_handler *) mtlk_bcl_private_handlers,
++#endif
+   .standard         = (iw_handler *) mtlk_bcl_standard_handlers,
+ };
+ 
+@@ -457,10 +465,12 @@
+   _mtlk_bcl_user_fill_callbacks(bcl_user);
+ 
+   /* setup destructor */
+-  bcl_user->ndev->destructor = free_netdev;
++  bcl_user->ndev->needs_free_netdev = true;
+ 
+   /* configure handlers */
++#ifdef CONFIG_WEXT_CORE
+   bcl_user->ndev->wireless_handlers = (struct iw_handler_def *)&mtlk_bcl_handler_def;
++#endif
+ }
+ 
+ static void
+@@ -473,15 +483,9 @@
+ 
+   ndev = bcl_user->ndev;
+   if(NULL != ndev) {
+-    _LOG_("ndev (%p), destructor (%p)", ndev, ndev->destructor);
+-#if 1
+-      unregister_netdev(ndev);
+-      _LOG_("unregister_netdev Ok");
+-
+-      if (ndev && !ndev->destructor) {
+-        free_netdev(ndev);
+-    }
+-#endif
++    /* needs_free_netdev transfers ownership to the network core. */
++    bcl_user->ndev = NULL;
++    unregister_netdev(ndev);
+   }
+ }
+ 
+@@ -631,18 +635,24 @@
+ static __INLINE void
+ _pci_stop (struct pci_dev *pdev, mtlk_mmb_drv_t *obj)
+ {
+-  if (FALSE == obj->g6_pci_aux) {
+-    pci_disable_msi(pdev);
+-  }
++  if (obj->pci_enabled) {
++    pci_intx(pdev, 0);
++    pci_clear_master(pdev);
++  }
++  if (obj->irq_vectors_allocated)
++    pci_free_irq_vectors(pdev);
+ 
+   /* remove link for resources */
+   pci_set_drvdata(pdev, NULL);
+ 
+   /* release device memory */
+   _pci_mem_put(obj->bar1);
++  if (obj->pci_region_claimed)
++    pci_release_region(pdev, MTLK_MEM_BAR0_INDEX);
+ 
+   /* disable device */
+-  pci_disable_device(pdev);
++  if (obj->pci_enabled)
++    pci_disable_device(pdev);
+ 
+ }
+ 
+@@ -667,18 +677,32 @@
+   int       res = 0;
+ 
+   dual_pci_cfg = !!dual_pci[card_idx];
++  /* This first AX50 profile has one DMA owner. The auxiliary link stays
++   * unbound and host-fenced even though the chip straps select dual PCI. */
++  if (dual_pci_over_all || dual_pci_cfg)
++    return -EOPNOTSUPP;
++  obj->pdev = pdev;
++  obj->dev = &pdev->dev;
+ 
+   ILOG1_DDD("CID-%02x: dual_pci insmod param %d, over all %d",
+            card_idx, (int)dual_pci_cfg, (int)dual_pci_over_all);
+ 
+   /* enable PCI device */
+-  res = pci_enable_device(pdev);
++  res = pci_enable_device_mem(pdev);
+   if (0 != res) {
+     return res;
+   }
+ 
+-  /* set master mode for PCI device */
+-  pci_set_master(pdev);
++  obj->pci_enabled = true;
++  pci_clear_master(pdev);
++  pci_intx(pdev, 0);
++  res = dma_set_mask_and_coherent(&pdev->dev, PCI_SUPPORTED_DMA_MASK);
++  if (res)
++    return res;
++  res = pci_request_region(pdev, MTLK_MEM_BAR0_INDEX, DRV_NAME);
++  if (res)
++    return res;
++  obj->pci_region_claimed = true;
+ 
+   /* request device memory for BAR1 */
+   _pci_mem_get(pdev, MTLK_MEM_BAR0_INDEX, &obj->bar1, &obj->bar1_physical);
+@@ -715,15 +739,6 @@
+     WLOG_DDD("CID-%02x: Skip detection of DUAL PCI for device_id 0x%04X, dual_pci %d",
+            card_idx, device_id, dual_pci_cfg);
+   }
+-
+-  if (FALSE == obj->g6_pci_aux) {
+-    /* configure DMA */
+-    res = pci_set_dma_mask(pdev, PCI_SUPPORTED_DMA_MASK);
+-    if (0 != res) {
+-      return res;
+-    }
+-  }
+-
+ 
+   /* Link PCI device with MMB Drv */
+   pci_set_drvdata(pdev, obj);
+@@ -803,10 +818,11 @@
+     res = pci_enable_msi_block(pdev, msi_nvect);
+     if (res == 0) {
+ #else
+-    res = pci_enable_msi_range(pdev, msi_nvect, msi_nvect);
++    res = pci_alloc_irq_vectors(pdev, msi_nvect, msi_nvect, PCI_IRQ_MSI);
+     if (res == msi_nvect) {
+ #endif
+       obj->irq_mode = (msi_nvect > 4) ? MTLK_IRQ_MODE_MSI_8 : MTLK_IRQ_MODE_MSI_4;
++      obj->irq_vectors_allocated = true;
+       obj->nof_irqs = msi_nvect;
+       ILOG0_DD("CID-%02x: Interrupt configuration: using MSI vector of %d interrupts", card_idx, msi_nvect);
+     } else {
+@@ -817,8 +833,9 @@
+   /* The second priority is to try a single MSI interrupt */
+   if (MTLK_IRQ_MODE_INVALID == obj->irq_mode && can_use_single_msi)
+   {
+-    res = pci_enable_msi(pdev);
+-    if (res == 0) {
++    res = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
++    if (res == 1) {
++      obj->irq_vectors_allocated = true;
+       obj->irq_mode = MTLK_IRQ_MODE_MSI_1;
+       obj->nof_irqs = 1;
+       ILOG0_D("CID-%02x: Interrupt configuration: using a single MSI interrupt", card_idx);
+@@ -842,7 +859,10 @@
+   }
+ 
+   for (i = 0; i < obj->nof_irqs; i++) {
+-    obj->irq_out[i] = pdev->irq + i;
++    obj->irq_out[i] = obj->irq_mode == MTLK_IRQ_MODE_LEGACY ?
++                      pdev->irq : pci_irq_vector(pdev, i);
++    if (obj->irq_out[i] <= 0)
++      return MTLK_ERR_NOT_READY;
+     ILOG1_D("MSI got IRQ: %d", obj->irq_out[i]);
+   }
+ #endif /* MTCFG_USE_INTERRUPT_POLLING */
+@@ -1134,8 +1154,6 @@
+              return MTLK_ERR_UNKNOWN;
+   }
+ 
+-  mtlk_hw_mmb_set_msi_intr_mode(obj->hw_api->hw, obj->irq_mode);
+-
+   for (i = 0; i < obj->nof_irqs; i++) {
+     MTLK_ASSERT(obj->irq_out[i]);
+ 
+@@ -1152,8 +1170,13 @@
+                 request_irq(obj->irq_out[i], _on_interrupt_legacy, IRQF_SHARED, DRV_NAME, &obj->irq_handler_data[i]);
+         if (err < 0) {
+           ELOG_DD("Failed to allocate interrupt %d, error code: %d", obj->irq_out[i], err);
++          while (i-- > 0) {
++            if (test_and_clear_bit(i, &obj->irqs_requested))
++              free_irq(obj->irq_out[i], &obj->irq_handler_data[i]);
++          }
+           return MTLK_ERR_UNKNOWN;
+         }
++        set_bit(i, &obj->irqs_requested);
+       }
+     }
+   }
+@@ -1174,7 +1197,7 @@
+   MTLK_ASSERT(obj->hw_api->hw);
+ 
+   for (i = 0; i < obj->nof_irqs; i++) {
+-   if (_mmb_drv_is_irqno_required(obj->hw_api->hw, obj->irq_handler_data[i].irq_no)) {
++   if (test_and_clear_bit(i, &obj->irqs_requested)) {
+      free_irq(obj->irq_out[i], &obj->irq_handler_data[i]);
+    }
+   }
+@@ -1205,6 +1228,7 @@
+ #ifndef MTCFG_USE_INTERRUPT_POLLING
+   MTLK_INIT_STEPS_LIST_ENTRY(mmb_drv, MMB_IRQ_START)
+ #endif /* not MTCFG_USE_INTERRUPT_POLLING */
++  MTLK_INIT_STEPS_LIST_ENTRY(mmb_drv, MMB_DMA_START)
+   MTLK_INIT_STEPS_LIST_ENTRY(mmb_drv, MMB_CARD_START)
+   MTLK_INIT_STEPS_LIST_ENTRY(mmb_drv, WAVE_RADIO_INIT)
+   MTLK_INIT_STEPS_LIST_ENTRY(mmb_drv, MMB_TXMM_INIT)
+@@ -1257,7 +1281,7 @@
+   MTLK_ASSERT(obj->hw_api->hw);
+ 
+   for (i = 0; i < obj->nof_irqs; i++) {
+-    if (_mmb_drv_is_irqno_required(obj->hw_api->hw, obj->irq_handler_data[i].irq_no)) {
++    if (test_and_clear_bit(i, &obj->tasklets_initialized)) {
+       tasklet_kill(&obj->irq_tasklet[i]);
+     }
+   }
+@@ -1265,26 +1289,74 @@
+   if (obj->ihd_pending) tasklet_kill(&obj->irq_tasklets_global[0]);
+ }
+ 
+-static void
+-_mmb_drv_mac_assert (mtlk_hw_t *hw)
+-{
+-  mtlk_hw_state_e hw_state;
+-
+-  wave_hw_mmb_get_prop(hw, MTLK_HW_PROP_STATE, &hw_state, sizeof(&hw_state));
+-
+-  /* FW Assert can be done if FW is in Steady State */
+-  if (hw_state < MTLK_HW_STATE_WAITING_READY)
+-    return;
+-
+-  /* Check FW is not halted */
+-  if (!mtlk_hw_is_halted(hw_state)) {
+-    /* Execute FW Assert */
+-    wave_hw_mmb_cause_umac_assert(hw);
+-    /* TODO: remove LMAC assert (required by design) as soon as FW is implemented */
+-    wave_hw_mmb_cause_lmac_assert(hw);
+-    /* Wait for FW Assert Indication from UMAC */
+-    wave_hw_mmb_wait_umac_assert_evt(hw);
+-  }
++/* Called after the hardware owner has blocked all new submissions. */
++void wave_mmb_drv_drain_dma(struct device *dev)
++{
++  mtlk_mmb_drv_t *obj = dev_get_drvdata(dev);
++  u16 command;
++  unsigned int i;
++
++  pci_intx(obj->pdev, 0);
++  pci_clear_master(obj->pdev);
++  if (pci_read_config_word(obj->pdev, PCI_COMMAND, &command) ||
++      (command & PCI_COMMAND_MASTER))
++    panic("AX50 WAVE: cannot fence DMA; refusing to free live buffers");
++  for (i = 0; i < obj->nof_irqs; i++) {
++    if (test_bit(i, &obj->irqs_requested))
++      synchronize_irq(obj->irq_out[i]);
++  }
++  kill_all_tasklets(obj);
++  /* This drains outstanding reads; the hardware owner also resets the
++   * WLAN DMA engines before releasing any buffer or mapping. */
++  pci_wait_for_pending_transaction(obj->pdev);
++  synchronize_net();
++}
++
++static int wave_pci_start_dma(mtlk_mmb_drv_t *obj)
++{
++  u16 command;
++
++  /* IRQ handlers and tasklets are ready, and the WAVE core is reset. */
++  pci_set_master(obj->pdev);
++  pci_intx(obj->pdev, 1);
++  if (pci_read_config_word(obj->pdev, PCI_COMMAND, &command) ||
++      !(command & PCI_COMMAND_MASTER) || (command & PCI_COMMAND_INTX_DISABLE)) {
++    pci_intx(obj->pdev, 0);
++    pci_clear_master(obj->pdev);
++    return MTLK_ERR_NOT_READY;
++  }
++  /* Program the device output after PCI INTx is enabled, with its source
++   * still masked and firmware CPUs held in reset. IRQ handlers already own
++   * the line. This preserves the retained driver's PCI/device ordering. */
++  mtlk_hw_mmb_set_msi_intr_mode(obj->hw_api->hw, obj->irq_mode);
++  return MTLK_ERR_OK;
++}
++
++/* Reuse the requested IRQ identities after the hardware owner has masked
++ * sources, fenced PCI DMA, joined IRQs/tasklets, and reset the device. */
++int wave_mmb_drv_restart_dma(struct device *dev)
++{
++  mtlk_mmb_drv_t *obj = dev_get_drvdata(dev);
++  tasklet_func **tasklets;
++  unsigned int i;
++
++  if (obj->ihd_pending || obj->tasklets_initialized)
++    return MTLK_ERR_NOT_READY;
++  switch (obj->nof_irqs) {
++    case 6: tasklets = tasklets_8; break;
++    case 4: tasklets = tasklets_4; break;
++    case 1: tasklets = tasklets_1; break;
++    default: return MTLK_ERR_NOT_SUPPORTED;
++  }
++  for (i = 0; i < obj->nof_irqs; i++) {
++    if (!test_bit(i, &obj->irqs_requested))
++      continue;
++    /* Do not overwrite irq_handler_data: shared IRQs still reference it. */
++    obj->irq_handler_data[i].status = MTLK_IRQ_NONE;
++    tasklet_init(&obj->irq_tasklet[i], tasklets[i], (mtlk_handle_t)&obj->irq_handler_data[i]);
++    set_bit(i, &obj->tasklets_initialized);
++  }
++  return wave_pci_start_dma(obj);
+ }
+ 
+ /**
+@@ -1301,13 +1373,11 @@
+   }
+ 
+   if (is_rollback) {
+-    wave_rcvry_pci_probe_error_set(obj->bar1, TRUE);
+-    _mmb_drv_mac_assert(obj->hw_api->hw);
+-    if (!wave_rcvry_enabled_get(obj->bar1))
+-      return;
+-  }
+-
+-  radio_descr = wave_card_radio_descr_get(obj->hw_api->hw);
++    /* A failed probe must unwind, never leave a partially running device. */
++    ILOG0_V("Unwinding failed card initialization");
++  }
++
++  radio_descr = obj->hw_api ? wave_card_radio_descr_get(obj->hw_api->hw) : NULL;
+ 
+   MTLK_CLEANUP_BEGIN(mmb_drv, MTLK_OBJ_PTR(obj))
+     MTLK_CLEANUP_STEP(mmb_drv, MMB_RCVRY_INIT_FINALIZE, MTLK_OBJ_PTR(obj),
+@@ -1334,6 +1404,8 @@
+                       wave_radio_deinit, (radio_descr));
+     MTLK_CLEANUP_STEP(mmb_drv, MMB_CARD_START, MTLK_OBJ_PTR(obj),
+                       mtlk_hw_mmb_stop_card, (obj->hw_api->hw));
++    MTLK_CLEANUP_STEP(mmb_drv, MMB_DMA_START, MTLK_OBJ_PTR(obj),
++                      wave_hw_mmb_quiesce, (obj->hw_api->hw));
+ #ifndef MTCFG_USE_INTERRUPT_POLLING
+     MTLK_CLEANUP_STEP(mmb_drv, MMB_IRQ_START, MTLK_OBJ_PTR(obj),
+                       _mmb_drv_irq_stop, (obj));
+@@ -1356,7 +1428,7 @@
+     MTLK_CLEANUP_STEP(mmb_drv, MMB_RADIO_NUMBER_GET, MTLK_OBJ_PTR(obj),
+                       MTLK_NOACTION, ());
+     MTLK_CLEANUP_STEP(mmb_drv, MMB_RCVRY_INIT, MTLK_OBJ_PTR(obj),
+-                      MTLK_NOACTION, ());
++                      wave_rcvry_card_remove, (obj->hw_api->hw));
+     MTLK_CLEANUP_STEP(mmb_drv, MMB_HW_RADIO_BAND_INIT, MTLK_OBJ_PTR(obj),
+                       MTLK_NOACTION, ());
+     MTLK_CLEANUP_STEP(mmb_drv, MMB_EEPROM_PSDB_INIT, MTLK_OBJ_PTR(obj),
+@@ -1396,6 +1468,7 @@
+     obj->irq_handler_data[i] = ihd_defaults[i];
+     if (_mmb_drv_is_irqno_required(obj->hw_api->hw, obj->irq_handler_data[i].irq_no)) {
+       tasklet_init(&obj->irq_tasklet[i], tasklets[i], (mtlk_handle_t) &obj->irq_handler_data[i]);
++      set_bit(i, &obj->tasklets_initialized);
+     }
+   }
+ 
+@@ -1520,6 +1593,8 @@
+     ILOG2_S("%s IRQ polling mode", DRV_NAME);
+ #endif /* not MTCFG_USE_INTERRUPT_POLLING */
+ 
++    MTLK_INIT_STEP(mmb_drv, MMB_DMA_START, MTLK_OBJ_PTR(obj),
++                   wave_pci_start_dma, (obj));
+     MTLK_INIT_STEP(mmb_drv, MMB_CARD_START, MTLK_OBJ_PTR(obj),
+                    mtlk_hw_mmb_start_card, (hw));
+ #if defined(MTCFG_G6_FPGA_IRAM_TEST)
+@@ -1598,6 +1673,9 @@
+     return -ENODEV;
+   }
+ 
++  if (rcvry_on[card_idx] || fastpath[card_idx] != FASTPATH_DISABLED || bcl)
++    return -EOPNOTSUPP;
++
+   obj = mtlk_fast_mem_alloc(MTLK_FM_USER_MMBDRV, sizeof(*obj));
+   if (NULL == obj) {
+     return -ENOMEM;
+@@ -1615,8 +1693,9 @@
+     return res;
+   }
+ 
+-  if (MTLK_ERR_OK != _mmb_drv_init(obj, (mtlk_card_type_t)ent->driver_data)) {
+-    res = 0; /* at this point PCI-card is started even if _mmb_drv_init is failed */
++  res = _mmb_drv_init(obj, (mtlk_card_type_t)ent->driver_data);
++  if (res != MTLK_ERR_OK) {
++    res = _mtlk_df_mtlk_to_linux_error_code(res);
+     goto _pci_probe_error;
+   }
+ 
+@@ -1631,20 +1710,8 @@
+ _pci_probe_error:
+   ELOG_SD("PCI %s Initialization failure (%d)", pci_name(pdev), res);
+ 
+-  /* Recovery is not related to PCI AUX device */
+-  if (!obj->g6_pci_aux && wave_rcvry_pci_probe_error_get(obj->bar1)) {
+-    /* Signal to FAPI about Recovery */
+-    if (wave_rcvry_enabled_get(obj->bar1))
+-      wave_rcvry_process_msg_complete_rcvry(obj->bar1);
+-    else {
+-      wave_rcvry_process_msg_mac_error(obj->bar1);
+-      wave_rcvry_process_msg_dump_evac(obj->bar1);
+-    }
+-  } else {
+-    _pci_stop(pdev, obj);
+-    mtlk_fast_mem_free(obj);
+-    ILOG2_S("PCI %s Stop done", pci_name(pdev));
+-  }
++  _pci_stop(pdev, obj);
++  mtlk_fast_mem_free(obj);
+   return res;
+ }
+ 
+@@ -1654,7 +1721,6 @@
+ static void
+ _pci_remove (struct pci_dev *pdev)
+ {
+-  BOOL is_pci_probe_error;
+   mtlk_mmb_drv_t *obj = pci_get_drvdata(pdev);
+ 
+   if (NULL == obj)
+@@ -1662,11 +1728,7 @@
+ 
+   ILOG2_S("PCI %s CleanUp", pci_name(pdev));
+ 
+-  is_pci_probe_error = wave_rcvry_pci_probe_error_get(obj->bar1);
+-
+-  if ((FALSE == obj->g6_pci_aux) &&
+-      (!is_pci_probe_error ||
+-       (is_pci_probe_error && !wave_rcvry_enabled_get(obj->bar1)))) {
++  if (!obj->g6_pci_aux) {
+     _mmb_drv_cleanup(obj, FALSE);
+   }
+ 
+@@ -1675,6 +1737,30 @@
+   ILOG2_S("PCI %s Stop done", pci_name(pdev));
+ 
+   ILOG2_S("PCI %s CleanUp finished", pci_name(pdev));
++}
++
++/* device_shutdown() must fence the card without releasing shared BARs or
++ * host allocations. The auxiliary endpoint may be visited before the main
++ * endpoint, whose terminal reset still needs those mappings. */
++static void
++_pci_shutdown (struct pci_dev *pdev)
++{
++  mtlk_mmb_drv_t *obj = pci_get_drvdata(pdev);
++  u16 command;
++
++  if (!obj)
++    return;
++
++  if (!obj->g6_pci_aux) {
++    wave_hw_mmb_quiesce(obj->hw_api->hw);
++  } else {
++    pci_intx(pdev, 0);
++    pci_clear_master(pdev);
++    if (pci_read_config_word(pdev, PCI_COMMAND, &command) ||
++        (command & PCI_COMMAND_MASTER))
++      panic("WAVE: cannot fence auxiliary PCI DMA at shutdown");
++  }
++  dev_info(&pdev->dev, "WAVE DMA fenced for shutdown\n");
+ }
+ 
+ #endif /* MTCFG_BUS_PCI_PCIE */
+@@ -1703,6 +1789,7 @@
+   .id_table = mmb_pci_tbl,
+   .probe    = _pci_probe,
+   .remove   = _pci_remove,
++  .shutdown = _pci_shutdown,
+ };
+ #endif /* MTCFG_BUS_PCI_PCIE */
+ 
+@@ -1718,6 +1805,7 @@
+ 
+ MTLK_INIT_STEPS_LIST_BEGIN(bus_drv_mod)
+   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_DFG_INIT)
++  MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_MC_NOTIFY)
+   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_RCVRY_INIT)
+ #ifdef MTCFG_PMCU_SUPPORT
+   MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_PMCU_INIT)
+@@ -1742,6 +1830,8 @@
+ #endif /* MTCFG_PMCU_SUPPORT */
+     MTLK_CLEANUP_STEP(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
+                       wave_rcvry_cleanup, ());
++    MTLK_CLEANUP_STEP(bus_drv_mod, DRV_MC_NOTIFY, MTLK_OBJ_PTR(&drv_state),
++                      wave_mc_native_module_exit, ());
+     MTLK_CLEANUP_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
+                       mtlk_dfg_cleanup, ());
+   MTLK_CLEANUP_END(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
+@@ -1761,6 +1851,9 @@
+   MTLK_INIT_TRY(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
+     MTLK_INIT_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
+                    mtlk_dfg_init, ());
++    MTLK_INIT_STEP_EX(bus_drv_mod, DRV_MC_NOTIFY, MTLK_OBJ_PTR(&drv_state),
++                      wave_mc_native_module_init, (),
++                      drv_state.os_res, 0 == drv_state.os_res, MTLK_ERR_NO_RESOURCES);
+     MTLK_INIT_STEP_VOID(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
+                         wave_rcvry_init, ());
+ #ifdef MTCFG_PMCU_SUPPORT
+@@ -1828,4 +1921,3 @@
+ /* Register entry and termination pints for MMB driver */
+ module_init(_init_module);
+ module_exit(_exit_module);
+-
+--- a/wireless/driver/linux/mtlk_mmb_drv.h
++++ b/wireless/driver/linux/mtlk_mmb_drv.h
+@@ -80,4 +80,7 @@
+ mtlk_mmb_drv_get_pci_dev(struct _mtlk_mmb_drv_t *mmb_drv);
+ 
+ 
++void wave_mmb_drv_drain_dma(struct device *dev);
++int wave_mmb_drv_restart_dma(struct device *dev);
++
+ #endif /* __MTLK_MMB_DRV_H_INCLUDED__ */
+--- a/wireless/driver/linux/mtlk_vap_manager.c
++++ b/wireless/driver/linux/mtlk_vap_manager.c
+@@ -419,6 +419,15 @@
+   int max_vaps_count = 0;
+   MTLK_ASSERT(NULL != obj);
+ 
++  /* This whole-card/startup-unwind boundary must also cover a partial start
++   * which never registered the later MAC-events cleanup step. Control
++   * confirmations stay enabled while pending membership owners retire. */
++  if (mtlk_vap_manager_get_master_core(obj)) {
++    mtlk_core_t *master = mtlk_vap_manager_get_master_core(obj);
++    mtlk_hw_mmb_stop_mac_events(mtlk_vap_get_hw(master->vap_handle));
++    synchronize_net();
++    mtlk_mc_close_external(master, TRUE);
++  }
+   max_vaps_count = mtlk_vap_manager_get_max_vaps_count(obj);
+   for (vap_index = max_vaps_count - 1; vap_index >= 0; vap_index--) {
+     mtlk_vap_handle_t vap_handle = __mtlk_vap_manager_vap_handle_by_id(obj, vap_index);
+@@ -488,7 +497,7 @@
+     return FALSE;
+   }
+ 
+-  return (obj->e_vap_status[vap_id] != VAP_STATUS_READY);
++  return (READ_ONCE(obj->e_vap_status[vap_id]) != VAP_STATUS_READY);
+ }
+ 
+ 
+@@ -856,7 +865,7 @@
+ 
+   if (obj->e_vap_status) {
+     ILOG1_D("VAP is stopped:%d", vap_index);
+-    obj->e_vap_status[vap_index] = VAP_STATUS_STOPPED;
++    WRITE_ONCE(obj->e_vap_status[vap_index], VAP_STATUS_STOPPED);
+   }
+ }
+ 
+@@ -876,7 +885,7 @@
+ 
+   if (obj->e_vap_status) {
+     ILOG1_D("VAP is ready:%d", vap_index);
+-    obj->e_vap_status[vap_index] = VAP_STATUS_READY;
++    WRITE_ONCE(obj->e_vap_status[vap_index], VAP_STATUS_READY);
+   }
+ }
+ 
+--- a/wireless/driver/shared/fw_recovery.c
++++ b/wireless/driver/shared/fw_recovery.c
+@@ -30,6 +30,8 @@
+ #include "cfg80211.h"
+ #include "mtlk_dfg.h"
+ #include "mtlk_df_priv.h"
++#include <linux/mutex.h>
++#include <linux/spinlock.h>
+ 
+ #define LOG_LOCAL_GID   GID_RECOVERY
+ #define LOG_LOCAL_FID   0
+@@ -125,6 +127,12 @@
+   mtlk_osal_event_t   mac_hang_evt[MAX_NUM_OF_FW_CORES];            /* object for MAC-hang event waiting */
+   MTLK_DECLARE_INIT_STATUS;                                         /* container for initialization steps */
+ } wave_rcvry_task_ctx_t;
++
++enum wave_fatal_dump_state {
++  WAVE_FATAL_DUMP_NONE,
++  WAVE_FATAL_DUMP_PENDING,
++  WAVE_FATAL_DUMP_ATTEMPTED
++};
+ 
+ /* per card instance */
+ typedef struct {
+@@ -138,6 +146,8 @@
+   int                     nof_files_done;
+   uint8                   card_idx;                      /* internal index of PCI-card */
+   wave_rcvry_task_ctx_t   rcvry_ctx;                     /* context for Recovery task */
++  atomic_t                fatal_dump_state;            /* current firmware lifetime */
++  int                     fatal_dump_result;           /* protected by dump mutex */
+ } wave_rcvry_card_cfg_t;
+ 
+ 
+@@ -191,7 +201,9 @@
+ /* Netlink messaging context (per driver instance) */
+ typedef struct {
+   BOOL              nl_inited;          /* if TRUE, then Netlink module is initialized */
+-  uint8             card_idx;           /* PCI-card index of last Dump Evacuation request */
++  uint8             card_idx;           /* PCI-card index of active Dump Evacuation request */
++  BOOL              dump_active;        /* protected by RX spinlock */
++  BOOL              dump_poisoned[MTLK_MAX_HW_ADAPTERS_SUPPORTED]; /* no cookie in native replies */
+   mtlk_osal_event_t rxmsg_evt;          /* object for Dump Evacuation response waiting */
+   MTLK_DECLARE_INIT_STATUS;             /* container for initialization steps */
+ } wave_rcvry_nl_ctx_t;
+@@ -206,6 +218,11 @@
+ 
+ static wave_rcvry_t wave_rcvry;
+ 
++/* The native FAPI reply carries only a card index. Serialize transactions
++ * across cards, and card publication/removal against a sleeping evacuation. */
++static DEFINE_MUTEX(wave_rcvry_dump_mutex);
++static DEFINE_SPINLOCK(wave_rcvry_dump_rx_lock);
++
+ static inline void __rcvry_type_global_set (rcvry_type_e type)
+ {
+   atomic_set(&wave_rcvry.rcvry_type_global, (uint32)type);
+@@ -241,15 +258,18 @@
+ 
+ static wave_rcvry_card_cfg_t *_rcvry_card_hw_ctx_get (const mtlk_hw_t *hw_ctx)
+ {
+-  int i;
+-  wave_rcvry_proc_descr_t *proc_descr = &wave_rcvry.proc_descr;
+-
+-  for (i = 0; i < proc_descr->nof_cards; i++) {
+-    wave_rcvry_card_cfg_t *pcard = proc_descr->p_card[i];
+-    if (pcard && (hw_ctx == pcard->hw_ctx))
+-      return pcard;
+-  }
+-  return NULL;
++  unsigned int idx;
++  wave_rcvry_card_cfg_t *pcard;
++
++  if (!hw_ctx)
++    return NULL;
++  idx = mtlk_hw_mmb_get_card_idx((mtlk_hw_t *)hw_ctx);
++  if (idx >= MTLK_MAX_HW_ADAPTERS_SUPPORTED)
++    return NULL;
++  /* The caller owns this hardware lifetime; do not dereference unrelated
++   * card slots while another device is being removed. */
++  pcard = READ_ONCE(wave_rcvry.proc_descr.p_card[idx]);
++  return pcard && pcard->hw_ctx == hw_ctx ? pcard : NULL;
+ }
+ 
+ static wave_rcvry_task_ctx_t *_rcvry_task_ctx_get (const mtlk_hw_t *hw_ctx)
+@@ -348,7 +368,7 @@
+ }
+ 
+ /* TODO: rework this function using MTLK_STEPS */
+-int wave_rcvry_card_add (void *mmb_base, void *hw_ctx)
++static int _rcvry_card_add (void *mmb_base, void *hw_ctx)
+ {
+   wave_rcvry_task_ctx_t *rcvry_ctx;
+   int i, res = MTLK_ERR_OK;
+@@ -359,8 +379,9 @@
+   MTLK_ASSERT(NULL != mmb_base);
+   MTLK_ASSERT(NULL != hw_ctx);
+ 
+-  if (proc_descr->nof_cards >= MTLK_MAX_HW_ADAPTERS_SUPPORTED) {
+-    ELOG_D("Max num of cards is reached %d", proc_descr->nof_cards);
++  i = mtlk_hw_mmb_get_card_idx(hw_ctx);
++  if (i >= MTLK_MAX_HW_ADAPTERS_SUPPORTED || proc_descr->p_card[i]) {
++    ELOG_D("Recovery card slot is unavailable: %d", i);
+     return MTLK_ERR_NO_MEM;
+   }
+ 
+@@ -376,7 +397,7 @@
+ 
+   pcard->mmb_base = mmb_base;
+   pcard->hw_ctx = hw_ctx;
+-  pcard->card_idx = (uint8)proc_descr->nof_cards;
++  pcard->card_idx = (uint8)i;
+   snprintf(pcard->card_dir_name, sizeof(pcard->card_dir_name), "%s%d", WAVE_RCVRY_CARD_DIR_NAME, pcard->card_idx);
+ 
+   rcvry_ctx = &pcard->rcvry_ctx;
+@@ -388,7 +409,7 @@
+ 
+   /* take the card slot and promote card index */
+   proc_descr->p_card[pcard->card_idx] = pcard;
+-  proc_descr->nof_cards++;
++  proc_descr->nof_cards = MAX(proc_descr->nof_cards, i + 1);
+ 
+   for (i = 0; i < MAX_NUM_OF_FW_CORES; i++)
+     mtlk_osal_event_init(&rcvry_ctx->mac_hang_evt[i]);
+@@ -425,9 +446,41 @@
+ 
+ WAVE_RCVRY_CARD_ADD_ERR:
+   proc_descr->p_card[pcard->card_idx] = NULL;
+-  proc_descr->nof_cards--;
++  while (proc_descr->nof_cards && !proc_descr->p_card[proc_descr->nof_cards - 1])
++    proc_descr->nof_cards--;
+   _rcvry_card_delete(pcard);
+   return res;
++}
++
++int wave_rcvry_card_add (void *mmb_base, void *hw_ctx)
++{
++  int res;
++
++  mutex_lock(&wave_rcvry_dump_mutex);
++  res = _rcvry_card_add(mmb_base, hw_ctx);
++  mutex_unlock(&wave_rcvry_dump_mutex);
++  return res;
++}
++
++/* Remove proc callbacks before the card's MMIO and private state disappear.
++ * Per-card task cleanup has already completed in the driver's reverse order. */
++void wave_rcvry_card_remove(void *hw_ctx)
++{
++  wave_rcvry_proc_descr_t *descr = &wave_rcvry.proc_descr;
++  unsigned int i;
++
++  mutex_lock(&wave_rcvry_dump_mutex);
++  for (i = 0; i < descr->nof_cards; i++) {
++    wave_rcvry_card_cfg_t *card = descr->p_card[i];
++    if (!card || card->hw_ctx != hw_ctx)
++      continue;
++    descr->p_card[i] = NULL;
++    _rcvry_card_delete(card);
++    while (descr->nof_cards && !descr->p_card[descr->nof_cards - 1])
++      descr->nof_cards--;
++    break;
++  }
++  mutex_unlock(&wave_rcvry_dump_mutex);
+ }
+ 
+ static void _rcvry_proc_file_init (wave_rcvry_proc_descr_t *proc_descr)
+@@ -443,6 +496,8 @@
+   ILOG0_D("num of cards to cleanup %d", proc_descr->nof_cards);
+   for (i = 0; i < proc_descr->nof_cards; i++) {
+     wave_rcvry_card_cfg_t *pcard = proc_descr->p_card[i];
++    if (!pcard)
++      continue;
+     ILOG0_S("Deleting proc for card %s", pcard->card_dir_name);
+     _rcvry_card_delete(pcard);
+   }
+@@ -470,9 +525,9 @@
+ /* steps for Netlink context initialization and cleanup */
+ MTLK_INIT_STEPS_LIST_BEGIN(wave_rcvry_nl_ctx)
+   MTLK_INIT_STEPS_LIST_ENTRY(wave_rcvry_nl_ctx, RCVRY_NL_CTX_INTERFACE_CHECK)
++  MTLK_INIT_STEPS_LIST_ENTRY(wave_rcvry_nl_ctx, RCVRY_NL_CTX_EVENT_INIT)
+   MTLK_INIT_STEPS_LIST_ENTRY(wave_rcvry_nl_ctx, RCVRY_NL_CTX_RXMSG_CB_SET)
+   MTLK_INIT_STEPS_LIST_ENTRY(wave_rcvry_nl_ctx, RCVRY_NL_CTX_SOCKET_CHECK)
+-  MTLK_INIT_STEPS_LIST_ENTRY(wave_rcvry_nl_ctx, RCVRY_NL_CTX_EVENT_INIT)
+ MTLK_INIT_INNER_STEPS_BEGIN(wave_rcvry_nl_ctx)
+ MTLK_INIT_STEPS_LIST_END(wave_rcvry_nl_ctx)
+ 
+@@ -541,12 +596,12 @@
+     return; /* already done */
+ 
+   MTLK_CLEANUP_BEGIN(wave_rcvry_nl_ctx, MTLK_OBJ_PTR(pnl_ctx))
+-    MTLK_CLEANUP_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_EVENT_INIT, MTLK_OBJ_PTR(pnl_ctx),
+-                      mtlk_osal_event_cleanup, (&pnl_ctx->rxmsg_evt));
+     MTLK_CLEANUP_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_SOCKET_CHECK, MTLK_OBJ_PTR(pnl_ctx),
+                       MTLK_NOACTION, ());
+     MTLK_CLEANUP_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_RXMSG_CB_SET, MTLK_OBJ_PTR(pnl_ctx),
+                       __rcvry_nl_rxmsg_cb_clear, ());
++    MTLK_CLEANUP_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_EVENT_INIT, MTLK_OBJ_PTR(pnl_ctx),
++                      mtlk_osal_event_cleanup, (&pnl_ctx->rxmsg_evt));
+     MTLK_CLEANUP_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_INTERFACE_CHECK, MTLK_OBJ_PTR(pnl_ctx),
+                       MTLK_NOACTION, ());
+   MTLK_CLEANUP_END(wave_rcvry_nl_ctx, MTLK_OBJ_PTR(pnl_ctx))
+@@ -564,12 +619,12 @@
+   MTLK_INIT_TRY(wave_rcvry_nl_ctx, MTLK_OBJ_PTR(pnl_ctx))
+     MTLK_INIT_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_INTERFACE_CHECK, MTLK_OBJ_PTR(pnl_ctx),
+                    __rcvry_nl_interface_check, (pnl_ctx));
++    MTLK_INIT_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_EVENT_INIT, MTLK_OBJ_PTR(pnl_ctx),
++                   mtlk_osal_event_init, (&pnl_ctx->rxmsg_evt));
+     MTLK_INIT_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_RXMSG_CB_SET, MTLK_OBJ_PTR(pnl_ctx),
+                    __rcvry_nl_rxmsg_cb_set, ());
+     MTLK_INIT_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_SOCKET_CHECK, MTLK_OBJ_PTR(pnl_ctx),
+                    __rcvry_nl_socket_check, ());
+-    MTLK_INIT_STEP(wave_rcvry_nl_ctx, RCVRY_NL_CTX_EVENT_INIT, MTLK_OBJ_PTR(pnl_ctx),
+-                   mtlk_osal_event_init, (&pnl_ctx->rxmsg_evt));
+   MTLK_INIT_FINALLY(wave_rcvry_nl_ctx, MTLK_OBJ_PTR(pnl_ctx))
+   MTLK_INIT_RETURN(wave_rcvry_nl_ctx, MTLK_OBJ_PTR(pnl_ctx), _rcvry_nl_cleanup, (pnl_ctx))
+ }
+@@ -693,7 +748,8 @@
+ {
+   vap_info->vap_handle = vap_handle;
+   vap_info->vap_number = mtlk_vap_get_id(vap_handle);
+-  vap_info->was_connected = mtlk_core_get_net_state(mtlk_vap_get_core(vap_handle));
++  vap_info->was_connected = wave_hw_monitor_recovery_state(mtlk_vap_get_hw(vap_handle),
++      vap_handle, mtlk_core_get_net_state(mtlk_vap_get_core(vap_handle)));
+   vap_info->slave_sync_mutex = NULL;
+   vap_info->slave_release_mutex = NULL;
+ 
+@@ -1184,7 +1240,7 @@
+ 
+   ILOG1_D("CID-%04x: Master Recovery FW Dump Evacuation Step started", oid);
+ 
+-  res = wave_rcvry_nl_process_msg_dump_evac(pcard->card_idx, TRUE);
++  res = wave_rcvry_nl_process_msg_dump_evac(pcard->card_idx);
+ 
+   if (MTLK_ERR_OK == res)
+     ILOG1_D("CID-%04x: Master Recovery FW Dump Evacuation Step finished successfully", oid);
+@@ -1333,6 +1389,12 @@
+ 
+   ILOG1_D("CID-%04x: Master Recovery FW Isolation Step started", oid);
+ 
++  if (wave_hw_monitor_held(pcard->hw_ctx) && wave_hw_monitor_dirty(pcard->hw_ctx)) {
++    wave_hw_monitor_suspend_rx(pcard->hw_ctx);
++    res = wave_hw_monitor_fence(pcard->hw_ctx);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
+   mtlk_hw_mmb_isolate(pcard->hw_ctx);
+ 
+   for (i = 0; i < rcvry_ctx->max_radios_number; i++) {
+@@ -1349,14 +1411,14 @@
+   return res;
+ }
+ 
+-static inline int __rcvry_step_fw_restoration (wave_rcvry_radio_ctx_t *radio_ctx, rcvry_type_e rcvry_type)
++static inline int __rcvry_step_fw_restoration (wave_rcvry_radio_ctx_t *radio_ctx, rcvry_type_e rcvry_type, BOOL start_df_stats)
+ {
+   wave_rcvry_vap_info_t **vap_info_ptr_temp = radio_ctx->vap_info;
+   wave_rcvry_vap_info_t *vap_info_temp = *vap_info_ptr_temp++;
+   int res = MTLK_ERR_OK;
+ 
+   while (vap_info_temp) {
+-    mtlk_df_on_rcvry_restore(mtlk_vap_get_df(vap_info_temp->vap_handle));
++    mtlk_df_on_rcvry_restore(mtlk_vap_get_df(vap_info_temp->vap_handle), start_df_stats);
+     res = core_on_rcvry_restore(mtlk_vap_get_core(vap_info_temp->vap_handle), rcvry_type);
+     if (MTLK_ERR_OK != res)
+       return res;
+@@ -1365,7 +1427,7 @@
+   return res;
+ }
+ 
+-static int _rcvry_step_fw_restoration (wave_rcvry_card_cfg_t *pcard, uint16 oid)
++static int _rcvry_step_fw_restoration (wave_rcvry_card_cfg_t *pcard, uint16 oid, BOOL start_df_stats)
+ {
+   int res;
+   wave_rcvry_task_ctx_t *rcvry_ctx = &pcard->rcvry_ctx;
+@@ -1382,7 +1444,7 @@
+     uint32 i;
+ 
+     for (i = 0; i < rcvry_ctx->max_radios_number; i++) {
+-      res = __rcvry_step_fw_restoration(&rcvry_ctx->radio_ctx[i], rcvry_type);
++      res = __rcvry_step_fw_restoration(&rcvry_ctx->radio_ctx[i], rcvry_type, start_df_stats);
+       if (MTLK_ERR_OK != res)
+         break;
+     }
+@@ -1452,6 +1514,8 @@
+   else
+     ELOG_DD("CID-%04x: Master Recovery FW Reconfiguration Step finished with error: res=%d", oid, res);
+ 
++  if (res == MTLK_ERR_OK && wave_hw_monitor_held(pcard->hw_ctx))
++    wave_hw_monitor_restarted(pcard->hw_ctx);
+   return res;
+ }
+ 
+@@ -1614,6 +1678,14 @@
+ {
+   int res;
+ 
++  /* A monitor stream has no per-stream drain. Fence before the ordinary
++   * host-only HALTED VAP cleanup, including genuine fault recovery. */
++  if (wave_hw_monitor_held(pcard->hw_ctx) && wave_hw_monitor_dirty(pcard->hw_ctx)) {
++    wave_hw_monitor_suspend_rx(pcard->hw_ctx);
++    res = wave_hw_monitor_fence(pcard->hw_ctx);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
+   /* Execute VAP Deactivation step */
+   res = _rcvry_step_vap_deactivation(&pcard->rcvry_ctx, oid);
+   if (MTLK_ERR_OK != res)
+@@ -1679,7 +1751,7 @@
+       if (MTLK_ERR_OK != res)
+         break;
+       /* Execute FW Restoration step */
+-      res = _rcvry_step_fw_restoration(pcard, oid);
++      res = _rcvry_step_fw_restoration(pcard, oid, TRUE);
+       if (MTLK_ERR_OK != res)
+         break;
+       /* Execute FW Reconfiguration step */
+@@ -1978,6 +2050,111 @@
+   return res;
+ }
+ 
++/* Monitor mode changes card-global firmware classification. Its normal stop
++ * therefore uses the existing complete recovery stages, not REMOVE_STREAM or
++ * module unload. No fault budget/assertion/dump is manufactured. The caller is
++ * the cfg80211/RTNL netdevice owner, outside every core serializer. */
++int wave_rcvry_monitor_restart(mtlk_hw_t *hw)
++{
++  wave_rcvry_card_cfg_t *pcard = _rcvry_card_hw_ctx_get(hw);
++  wave_rcvry_task_ctx_t *ctx;
++  unsigned int r, v;
++  uint16 oid;
++  int res = MTLK_ERR_NOT_READY, start_res;
++
++  if (!pcard || !wave_hw_monitor_held(hw) || !wave_hw_monitor_dirty(hw))
++    return res;
++  ctx = &pcard->rcvry_ctx;
++  if (!_rcvry_is_initialized(ctx))
++    return res;
++  /* The same type lock excludes ordinary fault recovery throughout this
++   * synchronous lifetime; normal user commands remain admission-blocked. */
++  mtlk_osal_lock_acquire(&ctx->lock);
++  if (ctx->rcvry_type_current != RCVRY_TYPE_UNDEF) {
++    mtlk_osal_lock_release(&ctx->lock);
++    return MTLK_ERR_BUSY;
++  }
++  ctx->rcvry_type_current = RCVRY_TYPE_FULL;
++  mtlk_osal_lock_release(&ctx->lock);
++  _rcvry_task_vap_info_prepare(ctx);
++  res = _rcvry_task_scan_info_prepare(ctx);
++  if (res != MTLK_ERR_OK)
++    goto done;
++  for (r = 0; r < ctx->max_radios_number; r++) {
++    wave_rcvry_radio_ctx_t *radio = &ctx->radio_ctx[r];
++
++    if (radio->scan_info->scan_type_current != RCVRY_NO_SCAN) {
++      res = MTLK_ERR_BUSY;
++      goto done;
++    }
++    for (v = 0; radio->vap_info[v]; v++) {
++      if (radio->vap_info[v]->was_connected &
++          (NET_STATE_ACTIVATING | NET_STATE_CONNECTED | NET_STATE_DEACTIVATING)) {
++        res = MTLK_ERR_BUSY;
++        goto done;
++      }
++    }
++  }
++  /* Stop the statistics producer before closing its serializer. Completion
++   * only releases the pending request; it cannot rearm a stopped timer. */
++  for (r = 0; r < ctx->max_radios_number; r++)
++    for (v = 0; ctx->radio_ctx[r].vap_info[v]; v++)
++      mtlk_df_on_rcvry_isol(mtlk_vap_get_df(ctx->radio_ctx[r].vap_info[v]->vap_handle));
++
++  /* Accepted control commands may be blocked waiting for firmware. Native
++   * recovery cancellation must release them before joining their workers.
++   * Queues/storage stay owned until the existing DMA fence and restore. */
++  mtlk_txmm_pause(mtlk_hw_mmb_get_txmm_base(hw));
++  mtlk_txmm_pause(mtlk_hw_mmb_get_txdm_base(hw));
++
++  /* Native serializer stop drains accepted commands and joins each worker.
++   * Unlike the fault queue this requires no new asynchronous allocation and
++   * cannot leave a partial set of blocked slave recovery commands. */
++  for (r = 0; r < ctx->max_radios_number; r++)
++    for (v = 0; ctx->radio_ctx[r].vap_info[v]; v++)
++      mtlk_serializer_stop(&mtlk_vap_get_core(ctx->radio_ctx[r].vap_info[v]->vap_handle)->slow_ctx->serializer);
++
++  oid = mtlk_vap_get_oid(ctx->radio_ctx[0].master_vap_handle);
++  res = wave_hw_monitor_fence(hw);
++  /* Ordinary fault recovery deliberately ignores this step's errors. A
++   * synchronous monitor transition must not restart over a failed VAP stop. */
++  for (r = 0; r < ctx->max_radios_number && res == MTLK_ERR_OK; r++) {
++    wave_rcvry_radio_ctx_t *radio = &ctx->radio_ctx[r];
++    mtlk_core_t *master = mtlk_vap_get_core(radio->master_vap_handle);
++
++    for (v = 0; radio->vap_info[v] && res == MTLK_ERR_OK; v++)
++      res = core_recovery_deactivate(master, mtlk_vap_get_core(radio->vap_info[v]->vap_handle));
++  }
++  if (res == MTLK_ERR_OK)
++    res = _rcvry_step_fw_isolation(pcard, oid);
++  if (res == MTLK_ERR_OK)
++    res = _rcvry_step_fw_restoration(pcard, oid, FALSE);
++  if (res == MTLK_ERR_OK)
++    res = _rcvry_step_fw_reconfiguration(pcard, oid);
++  if (res != MTLK_ERR_OK)
++    wave_hw_mmb_quiesce(hw);
++
++  /* Recreate the same native workers even on failure so ordinary object
++   * destruction retains its owner. A failed card remains terminal-fenced. */
++  for (r = 0; r < ctx->max_radios_number; r++) {
++    for (v = 0; ctx->radio_ctx[r].vap_info[v]; v++) {
++      start_res = mtlk_serializer_start(&mtlk_vap_get_core(ctx->radio_ctx[r].vap_info[v]->vap_handle)->slow_ctx->serializer);
++      if (start_res != MTLK_ERR_OK && res == MTLK_ERR_OK)
++        res = start_res;
++    }
++  }
++  if (res == MTLK_ERR_OK) {
++    wave_hw_monitor_restarted(hw);
++    for (r = 0; r < ctx->max_radios_number; r++)
++      for (v = 0; ctx->radio_ctx[r].vap_info[v]; v++)
++        mtlk_df_on_rcvry_restore(mtlk_vap_get_df(ctx->radio_ctx[r].vap_info[v]->vap_handle), TRUE);
++  } else
++    wave_hw_mmb_quiesce(hw);
++done:
++  __rcvry_type_current_set(ctx, RCVRY_TYPE_UNDEF);
++  return res;
++}
++
+ BOOL wave_rcvry_is_configured (const mtlk_hw_t *hw_ctx)
+ {
+   wave_rcvry_card_cfg_t *pcard = _rcvry_card_hw_ctx_get(hw_ctx);
+@@ -2012,27 +2189,17 @@
+ void wave_rcvry_nl_process_rxmsg (uint8 subcmd_id, uint8 card_idx)
+ {
+   wave_rcvry_nl_ctx_t *pnl_ctx = &wave_rcvry.nl_ctx;
+-  uint8 card_idx_ref = pnl_ctx->card_idx;
+-
+-  MTLK_ASSERT(WAVE_FAPI_SUBCMDID_RCVRY_DUMP_EVAC_RESP == subcmd_id);
+-
+-  switch (subcmd_id)
+-  {
+-    case WAVE_FAPI_SUBCMDID_RCVRY_DUMP_EVAC_RESP:
+-    {
+-      /* Validate incoming PCI-card index */
+-      if (card_idx == card_idx_ref) {
+-        /* Set event to proceed in serializer */
+-        mtlk_osal_event_set(&pnl_ctx->rxmsg_evt);
+-      }
+-      else {
+-        WLOG_DD("Unexpected PCI-card index (%d) received from FAPI "
+-                "instead of correct one (%d)", card_idx, card_idx_ref);
+-      }
+-      break;
+-    }
+-    default: break;
+-  }
++  unsigned long flags;
++
++  if (subcmd_id != WAVE_FAPI_SUBCMDID_RCVRY_DUMP_EVAC_RESP)
++    return;
++
++  spin_lock_irqsave(&wave_rcvry_dump_rx_lock, flags);
++  if (pnl_ctx->dump_active && card_idx == pnl_ctx->card_idx) {
++    pnl_ctx->dump_active = FALSE;
++    mtlk_osal_event_set(&pnl_ctx->rxmsg_evt);
++  }
++  spin_unlock_irqrestore(&wave_rcvry_dump_rx_lock, flags);
+ }
+ 
+ static int _rcvry_nl_send_msg_dump_evac_req (const uint8 card_idx)
+@@ -2040,57 +2207,104 @@
+   return _rcvry_nl_send_msg(WAVE_FAPI_SUBCMDID_RCVRY_DUMP_EVAC_REQ, card_idx, NULL, 0, "Dump Evacuation request");
+ }
+ 
+-/* This function MUST be executed via SERIALIZER (if wait_resp==TRUE) because it sleeps while waiting for response */
+-int wave_rcvry_nl_process_msg_dump_evac (const uint8 card_idx, BOOL wait_resp)
++/* Called with the dump mutex held. Proc RAM reads and the response callback
++ * do not use a core serializer or the hardware quiesce mutex. */
++static int _rcvry_dump_locked (wave_rcvry_card_cfg_t *pcard)
+ {
+   wave_rcvry_nl_ctx_t *pnl_ctx = &wave_rcvry.nl_ctx;
+-  int res = MTLK_ERR_OK;
+-
+-  /* Don't proceed if Netlink module not initialized */
+-  if (!pnl_ctx->nl_inited) {
+-    WLOG_V("Netlink module (for Recovery support) not initialized");
+-    return res;
+-  }
+-
+-  /* Store outgoing PCI-card index for validation with incoming message */
++  uint8 card_idx = pcard->card_idx;
++  BOOL fatal = atomic_read(&pcard->fatal_dump_state) != WAVE_FATAL_DUMP_NONE;
++  unsigned long flags;
++  int res = MTLK_ERR_NOT_READY;
++
++  lockdep_assert_held(&wave_rcvry_dump_mutex);
++  if (atomic_read(&pcard->fatal_dump_state) == WAVE_FATAL_DUMP_ATTEMPTED)
++    return pcard->fatal_dump_result;
++  if (fatal)
++    atomic_set(&pcard->fatal_dump_state, WAVE_FATAL_DUMP_ATTEMPTED);
++
++  if (!pnl_ctx->nl_inited || pnl_ctx->dump_poisoned[card_idx])
++    goto out;
++
++  mtlk_osal_event_reset(&pnl_ctx->rxmsg_evt);
++  spin_lock_irqsave(&wave_rcvry_dump_rx_lock, flags);
+   pnl_ctx->card_idx = card_idx;
+-
+-  /* Reset event to sleep in serializer */
+-  mtlk_osal_event_reset(&pnl_ctx->rxmsg_evt);
+-
+-  /* Send message to FAPI and set FW dump in progress flag */
++  pnl_ctx->dump_active = TRUE;
++  spin_unlock_irqrestore(&wave_rcvry_dump_rx_lock, flags);
++  _rcvry_fw_dump_in_progress_set(card_idx, TRUE);
++
+   res = _rcvry_nl_send_msg_dump_evac_req(card_idx);
+-
+-  if (MTLK_ERR_OK == res)
+-    _rcvry_fw_dump_in_progress_set(card_idx, TRUE);
+-  else
+-    return res;
+-
+-  /* Wait for event (i.e. response message) */
+-  if (wait_resp) {
+-    res = mtlk_osal_event_wait(&pnl_ctx->rxmsg_evt, WAVE_RCVRY_TIMEOUT_DUMP_EVAC_RESP);
+-
+-    if (MTLK_ERR_OK == res) {
+-      ILOG1_V("Dump Evacuation response received from FAPI");
+-    }
+-    else {
+-      WLOG_D("Dump Evacuation response not received from FAPI during time-interval %dms.",
+-              WAVE_RCVRY_TIMEOUT_DUMP_EVAC_RESP);
+-    }
+-  }
++  if (res == MTLK_ERR_OK)
++    res = mtlk_osal_event_wait(&pnl_ctx->rxmsg_evt,
++                             WAVE_RCVRY_TIMEOUT_DUMP_EVAC_RESP);
++
++  spin_lock_irqsave(&wave_rcvry_dump_rx_lock, flags);
++  pnl_ctx->dump_active = FALSE;
++  spin_unlock_irqrestore(&wave_rcvry_dump_rx_lock, flags);
+   _rcvry_fw_dump_in_progress_set(card_idx, FALSE);
+-  return res;
+-}
+-
+-int wave_rcvry_process_msg_dump_evac (const void *mmb_base)
+-{
++
++  /* A late same-card reply has no generation cookie. Never reuse that
++   * response channel after an ambiguous send or timeout, even after a
++   * firmware restart or card reprobe in this netlink lifetime. */
++  if (res != MTLK_ERR_OK)
++    pnl_ctx->dump_poisoned[card_idx] = TRUE;
++out:
++  if (fatal)
++    pcard->fatal_dump_result = res;
++  ILOG0_DD("CID-%02x: FW dump evacuation finished: res=%d", card_idx, res);
++  return res;
++}
++
++/* Sleepable: native recovery and explicit userspace requests are synchronous.
++ * No asynchronous entry may leave a reply for a later transaction. */
++int wave_rcvry_nl_process_msg_dump_evac (const uint8 card_idx)
++{
++  wave_rcvry_card_cfg_t *pcard;
+   int res = MTLK_ERR_NOT_READY;
+-  wave_rcvry_card_cfg_t *pcard = _rcvry_card_ctx_get(mmb_base);
+-
++
++  if (card_idx >= MTLK_MAX_HW_ADAPTERS_SUPPORTED)
++    return MTLK_ERR_PARAMS;
++  mutex_lock(&wave_rcvry_dump_mutex);
++  pcard = wave_rcvry.proc_descr.p_card[card_idx];
+   if (pcard)
+-    res = wave_rcvry_nl_process_msg_dump_evac(pcard->card_idx, FALSE);
+-
+-  return res;
++    res = _rcvry_dump_locked(pcard);
++  mutex_unlock(&wave_rcvry_dump_mutex);
++  return res;
++}
++
++/* The terminal owner has closed admission and joined IRQ/tasklet/DMA work,
++ * but has not reset firmware or released its mappings. Preserve the native
++ * fatal dump contract before that irreversible boundary. */
++void wave_rcvry_dump_before_reset (mtlk_hw_t *hw_ctx)
++{
++  wave_rcvry_card_cfg_t *pcard = _rcvry_card_hw_ctx_get(hw_ctx);
++
++  /* The caller owns this card's lifetime. Ordinary stop and nonfatal lost
++   * acknowledgements must not wait behind another card's dump. */
++  if (!pcard || atomic_read(&pcard->fatal_dump_state) == WAVE_FATAL_DUMP_NONE)
++    return;
++  if (atomic_read(&pcard->fatal_dump_state) == WAVE_FATAL_DUMP_PENDING &&
++      !READ_ONCE(pcard->rcvry_ctx.cfg.fw_dump))
++    return;
++  mutex_lock(&wave_rcvry_dump_mutex);
++  _rcvry_dump_locked(pcard);
++  mutex_unlock(&wave_rcvry_dump_mutex);
++}
++
++/* All actual firmware starts pass here while the CPUs are still in reset.
++ * The old evacuation has finished before a new fatal generation is admitted.
++ * Do not clear the transport poison: a late native reply can outlive reset. */
++void wave_rcvry_firmware_start (mtlk_hw_t *hw_ctx)
++{
++  wave_rcvry_card_cfg_t *pcard;
++
++  mutex_lock(&wave_rcvry_dump_mutex);
++  pcard = _rcvry_card_hw_ctx_get(hw_ctx);
++  if (pcard) {
++    atomic_set(&pcard->fatal_dump_state, WAVE_FATAL_DUMP_NONE);
++    pcard->fatal_dump_result = MTLK_ERR_NOT_READY;
++  }
++  mutex_unlock(&wave_rcvry_dump_mutex);
+ }
+ 
+ int wave_rcvry_nl_send_msg_complete_rcvry_req (const uint8 card_idx)
+@@ -2388,6 +2602,9 @@
+   if (!pcard)
+     return;
+ 
++  /* Latch before terminating waiters can enter terminal quiesce. */
++  atomic_cmpxchg(&pcard->fatal_dump_state, WAVE_FATAL_DUMP_NONE,
++                 WAVE_FATAL_DUMP_PENDING);
+   _rcvry_mac_fatal_pending_set(pcard, TRUE);
+   _rcvry_process_mac_fatal(pcard, data);
+ }
+--- a/wireless/driver/shared/fw_recovery.h
++++ b/wireless/driver/shared/fw_recovery.h
+@@ -47,7 +47,10 @@
+   uint8 fw_dump;                /* enable FW dumps evacuation after crash */
+ } wave_rcvry_cfg_t;
+ 
++int wave_rcvry_monitor_restart(mtlk_hw_t *hw);
++
+ int wave_rcvry_card_add(void *mmb_base, void *hw_ctx);
++void wave_rcvry_card_remove(void *hw_ctx);
+ int wave_rcvry_init(void);
+ void wave_rcvry_cleanup(void);
+ int wave_rcvry_init_finalize(mtlk_hw_t *hw_ctx);
+@@ -81,8 +84,9 @@
+ int wave_rcvry_task_initiate(mtlk_hw_t *hw_ctx);
+ 
+ void wave_rcvry_nl_process_rxmsg(uint8 subcmd_id, uint8 card_idx);
+-int wave_rcvry_nl_process_msg_dump_evac(const uint8 card_idx, BOOL wait_resp);
+-int wave_rcvry_process_msg_dump_evac(const void *mmb_base);
++int wave_rcvry_nl_process_msg_dump_evac(const uint8 card_idx);
++void wave_rcvry_dump_before_reset(mtlk_hw_t *hw_ctx);
++void wave_rcvry_firmware_start(mtlk_hw_t *hw_ctx);
+ int wave_rcvry_nl_send_msg_complete_rcvry_req(const uint8 card_idx);
+ int wave_rcvry_process_msg_complete_rcvry(const void *mmb_base);
+ int wave_rcvry_nl_send_msg_mac_error_evt(const uint8 card_idx, const uint8 error_type);
+--- a/wireless/driver/shared/hw_hal.h
++++ b/wireless/driver/shared/hw_hal.h
+@@ -19,7 +19,6 @@
+ /**********************************************************************
+  * Common definitions. Used by HW and Core (logic module)
+ ***********************************************************************/
+-typedef struct _mtlk_hw_msg_t                 mtlk_hw_msg_t;
+ typedef struct _mtlk_persistent_device_data_t mtlk_persistent_device_data_t;
+ /**********************************************************************/
+ 
+@@ -130,6 +129,7 @@
+   uint8                wds;             /* WDS packet flag                                  */
+   uint8                frame_type;      /* Frame type, 0b00 - Ethernet II, !EAPOL ### 0b11 - EAPOL ### 0b10 - IPX, LLC/SNAP */
+   uint8                mc_index;        /* multicast group, or 0 if not multicast */
++  bool                 mc_pinned;       /* Native TX owns one hardware group pin. */
+   uint8                mcf;
+   /* release TX data */
+   UMI_STATUS           status;          /* Is Tx failed?                            */
+@@ -150,7 +150,7 @@
+   MTLK_HW_STATE_LAST
+ } mtlk_hw_state_e;
+ 
+-typedef mtlk_hw_msg_t* (__MTLK_IFUNC *mtlk_hw_get_msg_to_send_f)(mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle, uint32 *nof_free_tx_msgs);
++typedef mtlk_hw_msg_t* (__MTLK_IFUNC *mtlk_hw_get_msg_to_send_f)(mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle, int *error);
+ typedef int            (__MTLK_IFUNC *mtlk_hw_send_data_f)(mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle, mtlk_hw_data_req_mirror_t *data);
+ typedef int            (__MTLK_IFUNC *mtlk_hw_release_msg_to_send_f)(mtlk_hw_t *hw, mtlk_hw_msg_t *msg);
+ typedef int            (__MTLK_IFUNC *mtlk_hw_set_prop_f)(mtlk_hw_t *hw, mtlk_hw_prop_e prop_id, void *buffer, uint32 size);
+@@ -184,8 +184,11 @@
+ void    __MTLK_IFUNC mtlk_hw_get_log_fw_timestamps(mtlk_vap_handle_t vap_handle, uint32 *t_log, uint32 *t_tsf);
+ #endif /* MTCFG_TSF_TIMER_ACCESS_ENABLED */
+ 
++/* Reserves a descriptor without taking skb ownership. The optional error
++ * distinguishes temporary pool exhaustion from terminal hardware shutdown.
++ * Release an unused reservation with mtlk_hw_release_msg_to_send(). */
+ static __INLINE mtlk_hw_msg_t *
+-mtlk_hw_get_msg_to_send (mtlk_hw_api_t *hw_api, mtlk_vap_handle_t vap_handle, uint32 *nof_free_tx_msgs)
++mtlk_hw_get_msg_to_send (mtlk_hw_api_t *hw_api, mtlk_vap_handle_t vap_handle, int *error)
+ {
+   MTLK_ASSERT(NULL != hw_api);
+   MTLK_ASSERT(NULL != hw_api->hw);
+@@ -193,7 +196,7 @@
+   MTLK_ASSERT(NULL != hw_api->vft->get_msg_to_send);
+   MTLK_ASSERT(NULL != vap_handle);
+ 
+-  return hw_api->vft->get_msg_to_send(hw_api->hw, vap_handle, nof_free_tx_msgs);
++  return hw_api->vft->get_msg_to_send(hw_api->hw, vap_handle, error);
+ }
+ 
+ static __INLINE int
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -42,6 +42,8 @@
+ #include "drvver.h"
+ 
+ #include "linux/netdevice.h"
++#include <linux/unaligned.h>
++#include <net/ieee80211_radiotap.h>
+ #ifdef MTCFG_SET_PM_QOS
+ #include "linux/pm_qos.h"
+ #endif
+@@ -232,6 +234,11 @@
+   StatsEntryDecoded_t  *table;      /* table */
+   uint16                db_size;    /* data size */
+   uint16                tab_size;   /* table size in bytes or entries */
++  uint64                sta_generation; /* Last confirmed snapshot incarnation. */
++  uint64                sample_serial; /* Successful MAC snapshots only. */
++  mtlk_osal_timestamp_t  sample_time; /* Request time, not cache-consumption time. */
++  mhi_stats_offs_t       tx_success_offs;
++  uint16                tx_success_sids; /* Zero if this optional A0 table is absent. */
+ 
+   mtlk_hw_tx_power_t    tx_power[WAVE_CARD_RADIO_NUM_MAX];   /* min/max Tx power per BW and pw_size */
+ 
+@@ -253,6 +260,8 @@
+   wholePhyRxStatusDb_t *db_data;
+   uint16                db_size;
+   uint16                all_sta_sid;
++  uint64                sta_generation;
++  BOOL                  valid; /* DMA buffer is published only after confirmation. */
+   uint16                max_sid;
+   uint8                 noise_offs;
+   uint8                 rssi_offs;
+@@ -324,6 +333,8 @@
+   BOOL   is_broadcast;
+   IEEE_ADDR dst_addr;
+   mtlk_nbuf_t *skb;
++  struct wave_pmf *pmf;
++  u8 pmf_slot;
+   BOOL   power_mgmt_on;
+   uint32 tid;
+ };
+@@ -383,11 +394,13 @@
+ MTLK_INIT_INNER_STEPS_BEGIN(mmb_basic_bdr)
+ MTLK_INIT_STEPS_LIST_END(mmb_basic_bdr);
+ 
+-static mtlk_hw_msg_t* _mtlk_hw_get_msg_to_send(mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle, uint32 *nof_free_tx_msgs)       __MTLK_INT_HANDLER_SECTION;
++static mtlk_hw_msg_t* _mtlk_hw_get_msg_to_send(mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle, int *error)       __MTLK_INT_HANDLER_SECTION;
+ static int            _mtlk_hw_send_data(mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle, mtlk_hw_data_req_mirror_t *data)      __MTLK_INT_HANDLER_SECTION;
+ static int            _mtlk_hw_release_msg_to_send(mtlk_hw_t *hw, mtlk_hw_msg_t *msg)                                       __MTLK_INT_HANDLER_SECTION;
+ static int            _mtlk_hw_set_prop(mtlk_hw_t *hw, mtlk_hw_prop_e prop_id, void *buffer, uint32 size);
+ static int            _mtlk_hw_get_prop(mtlk_hw_t *hw, mtlk_hw_prop_e prop_id, void *buffer, uint32 size)                   __MTLK_INT_HANDLER_SECTION;
++static void wave_hw_mmb_quiesce_locked(mtlk_hw_t *hw);
++static void wave_hw_monitor_flush_tx(mtlk_hw_t *hw);
+ static int            _mtlk_hw_load_file(mtlk_hw_t *hw, const char *name, mtlk_df_fw_file_buf_t *fb);
+ static void           _mtlk_hw_unload_file(mtlk_hw_t *hw, mtlk_df_fw_file_buf_t *fb);
+ static int            _mtlk_hw_get_info(mtlk_hw_t *card, char *hw_info, uint32 size);
+@@ -404,7 +417,7 @@
+ static uint32   __MTLK_IFUNC _mtlk_hw_mmb_interrupt_recover_mon(mtlk_osal_timer_t *timer, mtlk_handle_t usr_data);
+ #endif
+ 
+-static void   _mtlk_mmb_put_hd_to_ring(mtlk_hw_t *hw, HOST_DSC *pHD, mtlk_ring_buffer *ring);
++static int    _mtlk_mmb_put_hd_to_ring(mtlk_hw_t *hw, HOST_DSC *pHD, mtlk_ring_buffer *ring);
+ 
+ static __INLINE mtlk_hw_mirror_hdr_t *
+ _mtlk_basic_bdr_get_mirror_bd_hdr (mtlk_mmb_basic_bdr_t *bbdr, uint32 index)
+@@ -661,12 +674,11 @@
+ {
+   mtlk_mmb_advanced_bdr_t bdr_data;      /* Tx Data BDs */
+   uint32                  nof_free_bds;  /* Number of free REQ BD descriptors */
++  struct list_head        queues;       /* Native data netdevs, under bdr_data.lock */
+   uint32                  max_used_bds;  /* Maximal number of used REQ BD descriptors */
+   mtlk_ring_buffer        ring;          /* TX ring data */
+ #ifdef MTLK_DEBUG
+   uint32                  max_received_cfm;      /* max received cfm for packets within one tasklet */
+-  uint64                  max_int_tasklet_time;  /* time between interrupt to tasklet */
+-  uint64                  max_int_processed_cfm; /* time between interrupt and cfm processed */
+ #endif
+ #ifdef BD_DBG
+   volatile unsigned long *used_bd_map;   /* bitmap of BD buffers, currently being processed within FW, one per BD */
+@@ -682,8 +694,6 @@
+   mtlk_nbuf_t            *last_fragment; /* fragments received and not yet sent up */
+ #ifdef MTLK_DEBUG
+   uint32                  max_received_pckts;       /* max received packets within one tasklet */
+-  uint64                  max_int_tasklet_time;     /* time between interrupt to tasklet */
+-  uint64                  max_int_processed_packet; /* time between interrupt to packet processed */
+ #endif
+ };
+ 
+@@ -720,6 +730,9 @@
+ {
+   mtlk_mc_addr_t mc_addr;
+   uint32         ref_cnt;
++  uint32         pins;
++  bool           quarantined;
++  bool           native; /* Exclusive immutable native recipient-set owner. */
+ } mtlk_hw_mc_t;
+ 
+ 
+@@ -847,6 +860,20 @@
+ 
+ struct _mtlk_hw_t
+ {
++  struct mutex          quiesce_lock;
++  struct mutex          airtime_lock; /* Global native MU/ATF policy exclusion. */
++  unsigned long         airtime_radios;
++  bool                  quiescing;
++  spinlock_t            monitor_lock;
++  struct wave_monitor __rcu *monitor;
++  mtlk_vap_handle_t     monitor_vap;
++  unsigned int          monitor_users;
++  u32                   monitor_saved_net_state;
++  u32                   fw_features;
++  bool                  monitor_dirty;
++  bool                  monitor_fenced;
++  bool                  monitor_irqs_blocked; /* protected by reg_lock */
++  bool                  monitor_tx_enabled; /* protected by BSS tx_bdr.lock */
+   mtlk_ccr_t            *ccr;
+   mtlk_hw_mmb_t         *mmb;
+   unsigned char         *mmb_base;
+@@ -883,6 +910,7 @@
+ 
+   void                   *calibr_buffer;  /* Calibration Extension related */
+   uint32                 calibr_dma_addr;
++  uint32                 calibr_buffer_size;
+ 
+   uint8                  fw_log_is_supported;    /* FW Logger Extension related */
+   uint8                  fw_log_is_supported_ex;
+@@ -897,14 +925,8 @@
+   mtlk_hw_ind_req_bd_t   bds;     /* IND/REQ BD */
+ 
+   struct mtlk_tx         tx;      /* DAT TX-related variables */
+-#ifdef MTLK_DEBUG
+-  mtlk_dbg_hres_ts_t     tx_interrupt_time;
+-#endif
+ 
+   struct mtlk_rx         rx;      /* DAT RX-related variables */
+-#ifdef MTLK_DEBUG
+-  mtlk_dbg_hres_ts_t     rx_interrupt_time;
+-#endif
+ 
+   mtlk_mmb_advanced_bdr_t tx_man;  /* Tx MM related */
+   mtlk_mmb_basic_bdr_t    rx_man;  /* Rx MM related */
+@@ -937,6 +959,9 @@
+ 
+   /* todo: will be moved to radio module */
+   hw_phy_rx_status_t    phy_rx_status;
++  /* Protected by phy_rx_status.mutex; serial survives firmware recovery. */
++  uint64                stats_generation;
++  uint64                sta_stats_generation[GEN6_MAX_SID];
+   hw_psdb_t             psdb;
+ 
+   uint8                 tx_ant_num;    /* Number of TX antennas */
+@@ -1545,6 +1570,22 @@
+ #endif
+ #define _mtlk_mmb_nbuf_free(nbuf)   mtlk_df_nbuf_free(nbuf)
+ 
++/* CPU delivery/reassembly storage is never published as a firmware buffer.
++ * Keep the normal private-data/object-pool allocation owner, with Linux's
++ * Ethernet-to-IP alignment reserved before any bytes are copied. */
++static __INLINE mtlk_nbuf_t *
++_mtlk_mmb_nbuf_alloc_rx_cpu (uint32 size)
++{
++  mtlk_nbuf_t *nbuf;
++
++  if (unlikely(size > UINT_MAX - NET_IP_ALIGN))
++    return NULL;
++  nbuf = mtlk_df_nbuf_alloc(size + NET_IP_ALIGN);
++  if (nbuf)
++    mtlk_df_nbuf_reserve(nbuf, NET_IP_ALIGN);
++  return nbuf;
++}
++
+ /* Convert card index to wlan interface index of the master AP VAP
+  * for hw idx 0/1/2 interface names are wlan0/wlan2/wlan4 respectively
+  * AP interfaces use the even numbers while sta interfaces use the odd indexes */
+@@ -1678,36 +1719,88 @@
+   return MTLK_ERR_OK;
+ }
+ 
++/* Both radios consume this pool. Queue transitions and descriptor ownership
++ * use the same lock so completion cannot race ahead of the final stop. */
++static void wave_hw_tx_stop_locked(mtlk_hw_t *hw)
++{
++  struct wave_tx_queue *queue;
++
++  list_for_each_entry(queue, &hw->tx.queues, node)
++    netif_tx_stop_all_queues(queue->ndev);
++}
++
++static void wave_hw_tx_wake_locked(mtlk_hw_t *hw)
++{
++  struct wave_tx_queue *queue;
++
++  if (READ_ONCE(hw->quiescing))
++    return;
++  list_for_each_entry(queue, &hw->tx.queues, node) {
++    if (netif_running(queue->ndev))
++      netif_tx_wake_all_queues(queue->ndev);
++  }
++}
++
++void wave_hw_tx_queue_start(mtlk_hw_t *hw, struct wave_tx_queue *queue)
++{
++  mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
++  list_add_tail(&queue->node, &hw->tx.queues);
++  if (READ_ONCE(hw->quiescing) || !hw->tx.nof_free_bds)
++    netif_tx_stop_all_queues(queue->ndev);
++  else
++    netif_tx_start_all_queues(queue->ndev);
++  mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
++}
++
++void wave_hw_tx_queue_stop(mtlk_hw_t *hw, struct wave_tx_queue *queue)
++{
++  mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
++  list_del_init(&queue->node);
++  netif_tx_stop_all_queues(queue->ndev);
++  mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
++}
++
+ static mtlk_hw_data_req_mirror_t *
+-_mtlk_mmb_get_msg_from_data_pool(mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle)
++_mtlk_mmb_get_msg_from_data_pool(mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle,
++                               int *error)
+ {
+   mtlk_hw_data_req_mirror_t *data_req = NULL;
++  mtlk_dlist_entry_t *node;
+   uint32 nof_used_bds;
++  int res = MTLK_ERR_NO_RESOURCES;
+ 
+   mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
+-  if (mtlk_dlist_size(&hw->tx.bdr_data.free_list)) {
+-    mtlk_dlist_entry_t *node = mtlk_dlist_pop_front(&hw->tx.bdr_data.free_list);
+-
+-    if (__LIKELY(NULL != node)) {
+-      data_req = MTLK_LIST_GET_CONTAINING_RECORD(node,
+-                                                 mtlk_hw_data_req_mirror_t,
+-                                                 hdr.list_entry);
+-      hw->tx.nof_free_bds--;
+-
+-      nof_used_bds = hw->tx.bdr_data.basic.nof_bds - hw->tx.nof_free_bds;
+-      if (nof_used_bds > hw->tx.max_used_bds)
+-        hw->tx.max_used_bds = nof_used_bds;
+-
+-      data_req->vap_id = mtlk_vap_get_id(vap_handle);
+-
+-      /* add to the "used" list */
+-      mtlk_dlist_push_back(&hw->tx.bdr_data.used_list, &data_req->hdr.list_entry);
+-    }
+-  }
++  if (READ_ONCE(hw->quiescing)) {
++    res = MTLK_ERR_NOT_READY;
++    goto out;
++  }
++  node = mtlk_dlist_pop_front(&hw->tx.bdr_data.free_list);
++  if (!node)
++    goto out;
++
++  data_req = MTLK_LIST_GET_CONTAINING_RECORD(node,
++                                            mtlk_hw_data_req_mirror_t,
++                                            hdr.list_entry);
++  hw->tx.nof_free_bds--;
++  nof_used_bds = hw->tx.bdr_data.basic.nof_bds - hw->tx.nof_free_bds;
++  if (nof_used_bds > hw->tx.max_used_bds)
++    hw->tx.max_used_bds = nof_used_bds;
++
++  /* A reservation is on the used list before it owns a packet or DMA map. */
++  data_req->nbuf = NULL;
++  data_req->dma_addr = 0;
++  data_req->size = 0;
++  data_req->mc_pinned = false;
++  data_req->vap_id = mtlk_vap_get_id(vap_handle);
++  data_req->radio_id = wave_vap_radio_id_get(vap_handle);
++  mtlk_dlist_push_back(&hw->tx.bdr_data.used_list, &data_req->hdr.list_entry);
++  if (!hw->tx.nof_free_bds)
++    wave_hw_tx_stop_locked(hw);
++  res = MTLK_ERR_OK;
++out:
++  if (error)
++    *error = res;
+   mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
+-
+-  ILOG4_PD("got msg %p, %d free msgs", data_req, hw->tx.nof_free_bds);
+-
+   return data_req;
+ }
+ 
+@@ -1715,6 +1808,12 @@
+ _mtlk_mmb_free_sent_msg_to_data_pool(mtlk_hw_t                 *hw,
+                                      mtlk_hw_data_req_mirror_t *data_req)
+ {
++  /* Descriptor ownership has returned, including failed submission and
++   * completions whose VAP was already withdrawn. No VAP pointer is needed. */
++  if (data_req->mc_pinned) {
++    data_req->mc_pinned = false;
++    wave_hw_mc_put(hw, data_req->mc_index);
++  }
+   mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
+   /* remove from the "used" list */
+   mtlk_dlist_remove(&hw->tx.bdr_data.used_list,
+@@ -1722,7 +1821,8 @@
+   /* add to the "free" list */
+   mtlk_dlist_push_back(&hw->tx.bdr_data.free_list,
+                        &data_req->hdr.list_entry);
+-  hw->tx.nof_free_bds++;
++  if (++hw->tx.nof_free_bds == 1)
++    wave_hw_tx_wake_locked(hw);
+   mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
+ 
+   ILOG4_DD("%u msg freed, %u free msgs", data_req->hdr.index, hw->tx.nof_free_bds);
+@@ -1805,6 +1905,7 @@
+ _mtlk_mmb_handle_dat_cfm (mtlk_hw_t *hw,
+                           HOST_DSC  *hd)
+ {
++  dma_rmb();
+   mtlk_hw_data_req_mirror_t  *data_req;
+   uint32 u32BdIndex    = HD_BD_INDEX_GET(hd);
+   uint32 u32frameInfo0 = LE32_TO_CPU(hd->u32frameInfo0);
+@@ -1833,30 +1934,9 @@
+ #endif
+ 
+   /* TODO: use shift instead of multiplication */
++  if (u32BdIndex >= hw->tx.bdr_data.basic.nof_bds)
++    return;
+   data_req = _mtlk_basic_bdr_get_mirror_bd(&hw->tx.bdr_data.basic, u32BdIndex, mtlk_hw_data_req_mirror_t);
+-
+-  if (__UNLIKELY(_mtlk_mmb_get_vap_is_not_ready(hw, radio_id, vap_id))) {
+-    _mtlk_mmb_log_error_vap_not_ready(__FUNCTION__, radio_id, vap_id);
+-    goto skip_process;
+-  }
+-
+-  vap_handle = _mtlk_mmb_get_vap_handle_from_vap_id(hw, radio_id, vap_id);
+-  if (__UNLIKELY(!vap_handle)) {
+-    _mtlk_mmb_log_error_vap_not_exist(__FUNCTION__, radio_id, vap_id);
+-    goto skip_process;
+-  }
+-
+-#ifdef BD_DBG
+-  if (radio_id != data_req->radio_id) {
+-    ELOG_DD("Received data frame cfm from wrong RADIO:%d bss_req_RADIO:%d", radio_id, data_req->radio_id);
+-    goto the_trap;
+-  }
+-  if (__UNLIKELY(vap_id != data_req->vap_id)) {
+-    ELOG_DD("Received data frame cfm from wrong VAP:%d bss_req_VAP:%d", vap_id, data_req->vap_id);
+-    goto the_trap;
+-  }
+-#endif
+-
+ 
+   if (data_req->dma_addr) { /* NULL keep-alive packets are not mapped */
+     ILOG5_DDD("handling CFM: index %d, payload %08X, HD payload %08X", u32BdIndex, data_req->dma_addr, LE32_TO_CPU(hd->u32HostPayloadAddr));
+@@ -1865,7 +1945,31 @@
+                                    data_req->dma_addr,
+                                    data_req->size,
+                                    MTLK_DATA_TO_DEVICE);
+-  }
++    data_req->dma_addr = 0;
++  }
++
++  if (__UNLIKELY(_mtlk_mmb_get_vap_is_not_ready(hw, radio_id, vap_id))) {
++    _mtlk_mmb_log_error_vap_not_ready(__FUNCTION__, radio_id, vap_id);
++    goto skip_process;
++  }
++
++  vap_handle = _mtlk_mmb_get_vap_handle_from_vap_id(hw, radio_id, vap_id);
++  if (__UNLIKELY(!vap_handle)) {
++    _mtlk_mmb_log_error_vap_not_exist(__FUNCTION__, radio_id, vap_id);
++    goto skip_process;
++  }
++
++#ifdef BD_DBG
++  if (radio_id != data_req->radio_id) {
++    ELOG_DD("Received data frame cfm from wrong RADIO:%d bss_req_RADIO:%d", radio_id, data_req->radio_id);
++    goto the_trap;
++  }
++  if (__UNLIKELY(vap_id != data_req->vap_id)) {
++    ELOG_DD("Received data frame cfm from wrong VAP:%d bss_req_VAP:%d", vap_id, data_req->vap_id);
++    goto the_trap;
++  }
++#endif
++
+ 
+   /* at this time status is not returned by FW */
+   data_req->status          = (UMI_STATUS)UMI_OK; //MTLK_BFIELD_GET(info, IND_REQ_TX_STATUS);
+@@ -1874,8 +1978,15 @@
+   data_req->nof_retries     = 0;
+ 
+   mtlk_vap_get_core_vft(vap_handle)->release_tx_data(vap_handle, data_req);
++  data_req->nbuf = NULL;
+ 
+ skip_process:
++  /* A stopped/deleted VAP cannot own this completion. Release the packet
++   * here before its descriptor leaves the used list. */
++  if (data_req->nbuf)
++    mtlk_df_nbuf_free(data_req->nbuf);
++  data_req->nbuf = NULL;
++  data_req->size = 0;
+   /* TODO: get rid of used list */
+   _mtlk_mmb_free_sent_msg_to_data_pool(hw, data_req);
+   return;
+@@ -1990,6 +2101,262 @@
+ #define DBG_DUMP_HD     0   /* FIXME: HDs debug */
+ #define DBG_HW_LOGGER   0   /* FIXME: HW Logger */
+ #define OWN_ITER_CNTR   100
++
++/* The same card owns both native radios. Normal user commands enter/leave
++ * this admission gate at execution, not at asynchronous submission. */
++bool wave_hw_monitor_user_get(mtlk_hw_t *hw)
++{
++  unsigned long flags;
++  bool allowed;
++
++  spin_lock_irqsave(&hw->monitor_lock, flags);
++  allowed = !hw->monitor && !hw->quiescing;
++  if (allowed)
++    hw->monitor_users++;
++  spin_unlock_irqrestore(&hw->monitor_lock, flags);
++  return allowed;
++}
++
++void wave_hw_monitor_user_put(mtlk_hw_t *hw)
++{
++  unsigned long flags;
++
++  spin_lock_irqsave(&hw->monitor_lock, flags);
++  if (WARN_ON_ONCE(!hw->monitor_users)) {
++    spin_unlock_irqrestore(&hw->monitor_lock, flags);
++    return;
++  }
++  hw->monitor_users--;
++  spin_unlock_irqrestore(&hw->monitor_lock, flags);
++}
++
++bool wave_hw_fw_feature_supported(mtlk_hw_t *hw, u32 feature)
++{
++  return (READ_ONCE(hw->fw_features) & feature) == feature;
++}
++
++bool wave_hw_monitor_supported(mtlk_hw_t *hw)
++{
++  return mtlk_hw_type_is_gen6(hw) && !mtlk_hw_type_is_gen6_b0(hw) &&
++         wave_hw_mmb_card_is_asic(hw) &&
++         !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA &&
++         wave_hw_fw_feature_supported(hw, WAVE_FW_FEATURE_RX_STREAM);
++}
++
++bool wave_hw_monitor_held(mtlk_hw_t *hw)
++{
++  return READ_ONCE(hw->monitor) != NULL;
++}
++
++bool wave_hw_monitor_is_owner(mtlk_hw_t *hw, const struct wave_monitor *mon)
++{
++  return READ_ONCE(hw->monitor) == mon && !READ_ONCE(hw->quiescing);
++}
++
++/* Callers hold their radio master serializer before this card-wide lock.
++ * Neither native confirmations nor DMA/IRQ retirement acquire this lock. */
++void wave_hw_airtime_lock(mtlk_hw_t *hw) { mutex_lock(&hw->airtime_lock); }
++void wave_hw_airtime_unlock(mtlk_hw_t *hw) { mutex_unlock(&hw->airtime_lock); }
++bool wave_hw_airtime_owned(mtlk_hw_t *hw)
++{
++  lockdep_assert_held(&hw->airtime_lock);
++  return hw->airtime_radios != 0;
++}
++void wave_hw_airtime_mark(mtlk_hw_t *hw, unsigned radio, bool owned)
++{
++  lockdep_assert_held(&hw->airtime_lock);
++  if (WARN_ON(radio >= BITS_PER_LONG))
++    return;
++  if (owned)
++    hw->airtime_radios |= BIT(radio);
++  else
++    hw->airtime_radios &= ~BIT(radio);
++}
++
++bool wave_hw_monitor_fenced(mtlk_hw_t *hw)
++{
++  return smp_load_acquire(&hw->monitor_fenced);
++}
++
++bool wave_hw_monitor_set_tx(mtlk_hw_t *hw, const struct wave_monitor *mon, bool enable)
++{
++  bool valid = false;
++
++  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR))
++    return false;
++  mtlk_osal_lock_acquire(&hw->bss_mgmt.tx_bdr.lock);
++  if (READ_ONCE(hw->monitor) == mon) {
++    /* Sniffer TX has no qualified over-air contract. Keep the existing
++     * queue-lock publication boundary, but never grant transmit ownership. */
++    valid = !enable;
++    WRITE_ONCE(hw->monitor_tx_enabled, false);
++  }
++  mtlk_osal_lock_release(&hw->bss_mgmt.tx_bdr.lock);
++  return valid;
++}
++
++static void wave_hw_monitor_disable_tx(mtlk_hw_t *hw)
++{
++  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR)) {
++    WRITE_ONCE(hw->monitor_tx_enabled, false);
++    return;
++  }
++  mtlk_osal_lock_acquire(&hw->bss_mgmt.tx_bdr.lock);
++  WRITE_ONCE(hw->monitor_tx_enabled, false);
++  mtlk_osal_lock_release(&hw->bss_mgmt.tx_bdr.lock);
++}
++
++
++bool wave_hw_monitor_dirty(mtlk_hw_t *hw)
++{
++  return READ_ONCE(hw->monitor_dirty);
++}
++
++int wave_hw_monitor_claim(mtlk_hw_t *hw, mtlk_vap_handle_t vap,
++                          struct wave_monitor *mon)
++{
++  unsigned long flags;
++  unsigned int r, v;
++  int res = MTLK_ERR_BUSY;
++
++  if (!wave_hw_monitor_supported(hw) || wave_vap_radio_id_get(vap) != 0 ||
++      !mtlk_vap_is_master_ap(vap) || mtlk_vap_get_id(vap) != 0)
++    return MTLK_ERR_NOT_SUPPORTED;
++  spin_lock_irqsave(&hw->monitor_lock, flags);
++  if (hw->monitor || hw->monitor_users || !wave_hw_mmb_ready(hw) ||
++      wave_rcvry_type_current_get(hw) != RCVRY_TYPE_UNDEF)
++    goto out;
++  for (r = 0; r < hw->radio_descr->num_radios; r++) {
++    wave_radio_t *radio = wave_radio_descr_wave_radio_get(hw->radio_descr, r);
++    mtlk_vap_manager_t *manager = wave_radio_descr_vap_manager_get(hw->radio_descr, r);
++    mtlk_core_t *master = wave_radio_master_core_get(radio);
++
++    if (!master || wave_radio_get_sta_vifs_exist(radio) ||
++        mtlk_vap_manager_get_active_vaps_number(manager) ||
++        mtlk_core_scan_is_running(master) || wave_radio_cac_active(radio))
++      goto out;
++    for (v = 0; v < wave_radio_max_vaps_get(radio); v++) {
++      mtlk_vap_handle_t existing;
++      mtlk_core_t *core;
++
++      if (mtlk_vap_manager_get_vap_handle(manager, v, &existing) != MTLK_ERR_OK)
++        continue;
++      core = mtlk_vap_get_core(existing);
++      if (mtlk_core_get_net_state(core) &
++          (NET_STATE_ACTIVATING | NET_STATE_CONNECTED | NET_STATE_DEACTIVATING))
++        goto out;
++      if (core->is_stopping || core->is_iface_stopping)
++        goto out;
++    }
++  }
++  hw->monitor_vap = vap;
++  hw->monitor_saved_net_state = mtlk_core_get_net_state(mtlk_vap_get_core(vap));
++  hw->monitor_dirty = false;
++  WRITE_ONCE(hw->monitor_tx_enabled, false);
++  rcu_assign_pointer(hw->monitor, mon);
++  res = MTLK_ERR_OK;
++out:
++  spin_unlock_irqrestore(&hw->monitor_lock, flags);
++  return res;
++}
++
++void wave_hw_monitor_release(mtlk_hw_t *hw, struct wave_monitor *mon)
++{
++  unsigned long flags;
++
++  wave_hw_monitor_set_tx(hw, mon, false);
++
++  spin_lock_irqsave(&hw->monitor_lock, flags);
++  if (hw->monitor == mon) {
++    /* A failed restart retains the terminal fence, never an unfenced stream. */
++    WARN_ON_ONCE(hw->monitor_dirty && !hw->quiescing);
++    RCU_INIT_POINTER(hw->monitor, NULL);
++    hw->monitor_vap = NULL;
++  }
++  spin_unlock_irqrestore(&hw->monitor_lock, flags);
++  synchronize_net();
++}
++
++int wave_hw_monitor_activation_begin(mtlk_vap_handle_t vap, BOOL monitor)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(vap);
++
++  if (monitor)
++    return wave_hw_monitor_held(hw) && READ_ONCE(hw->monitor_vap) == vap &&
++           !READ_ONCE(hw->quiescing) ? MTLK_ERR_OK : MTLK_ERR_NOT_READY;
++  if (wave_hw_monitor_held(hw) && wave_rcvry_type_current_get(hw) != RCVRY_TYPE_UNDEF)
++    return MTLK_ERR_OK; /* Only the joined/blocked recovery owner can reach this. */
++  return wave_hw_monitor_user_get(hw) ? MTLK_ERR_OK : MTLK_ERR_BUSY;
++}
++
++void wave_hw_monitor_activation_end(mtlk_vap_handle_t vap, BOOL monitor)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(vap);
++
++  if (!monitor && !(wave_hw_monitor_held(hw) && wave_rcvry_type_current_get(hw) != RCVRY_TYPE_UNDEF))
++    wave_hw_monitor_user_put(hw);
++}
++
++u32 wave_hw_monitor_recovery_state(mtlk_hw_t *hw, mtlk_vap_handle_t vap, u32 state)
++{
++  return READ_ONCE(hw->monitor_vap) == vap ? hw->monitor_saved_net_state : state;
++}
++
++const u8 wave_monitor_header[44] = {
++  0x02,0x52,0x58,0x31,0x15,0x01, 0x02,0x52,0x58,0x31,0x15,0x02,
++  0x08,0x00, 0x45,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x11,0x00,0x00,
++  0xc6,0x12,0x5d,0x01,0xc6,0x12,0x5d,0x02,
++  0xbf,0x77,0xbf,0x78,0x00,0x00,0x00,0x00,0xca,0xfe
++};
++
++int wave_hw_monitor_template(mtlk_vap_handle_t vap)
++{
++  mtlk_hw_t *hw = mtlk_vap_get_hw(vap);
++  mtlk_txmm_msg_t msg;
++  mtlk_txmm_data_t *entry;
++  UMI_ADD_STREAM_REQ_t *req;
++  unsigned int i;
++  u32 sum = 0;
++  int res = MTLK_ERR_NOT_READY;
++
++  if (wave_hw_monitor_activation_begin(vap, TRUE) != MTLK_ERR_OK)
++    return res;
++  /* Intent precedes submission. Only complete card restart retires this mode,
++   * including a missing confirmation or an ADD_VAP failure. */
++  WRITE_ONCE(hw->monitor_dirty, true);
++  entry = mtlk_txmm_msg_init_with_empty_data(&msg, mtlk_vap_get_txmm(vap), &res);
++  if (!entry)
++    return res;
++  entry->id = UM_MAN_HW_LOGGER_ADD_STREAM_REQ;
++  entry->payload_size = sizeof(*req);
++  req = (UMI_ADD_STREAM_REQ_t *)entry->payload;
++  memset(req, 0, sizeof(*req));
++  req->be1 = 1;
++  for (i = 14; i < 34; i += 2)
++    sum += ((u32)wave_monitor_header[i] << 8) | wave_monitor_header[i + 1];
++  while (sum >> 16)
++    sum = (sum & 0xffff) + (sum >> 16);
++  req->swPreCalcChecksum = HOST_TO_MAC32(sum);
++  MTLK_STATIC_ASSERT(sizeof(req->udpHeader) == sizeof(wave_monitor_header));
++  memcpy(req->udpHeader, wave_monitor_header, sizeof(wave_monitor_header));
++  res = mtlk_txmm_msg_send_blocked(&msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
++  if (res == MTLK_ERR_OK && MAC_TO_HOST16(req->u16Status) != UMI_OK)
++    res = MTLK_ERR_MAC;
++  mtlk_txmm_msg_cleanup(&msg);
++  return res;
++}
++
++static bool wave_hw_monitor_rx(mtlk_hw_t *hw, const struct sk_buff *skb)
++{
++  struct wave_monitor *mon;
++
++  rcu_read_lock();
++  mon = rcu_dereference(hw->monitor);
++  if (mon)
++    wv_cfg80211_monitor_rx(mon, skb);
++  rcu_read_unlock();
++  return mon != NULL;
++}
+ 
+ static __INLINE int _mtlk_mmb_handle_dat_ind (mtlk_hw_t *hw, volatile HOST_DSC *pHD)
+ {
+@@ -2009,6 +2376,7 @@
+   uint8                      radio_id;
+   uint8                      frame_type;
+   uint8                      frag_type;
++  BOOL                       reuse_rx_buffer = FALSE;
+ 
+   u32frameInfo3 = LE32_TO_CPU(pHD->u32frameInfo3);
+   if (__UNLIKELY(MTLK_OWNER_FW == MTLK_BFIELD_GET(u32frameInfo3, TX_DATA_INFO_OWN_BIT))) {
+@@ -2027,6 +2395,7 @@
+     }
+   }
+ 
++  dma_rmb();
+   u32BdIndex    = HD_BD_INDEX_GET(pHD);
+   u32frameInfo0 = LE32_TO_CPU(pHD->u32frameInfo0);
+   u32frameInfo1 = LE32_TO_CPU(pHD->u32frameInfo1);
+@@ -2053,6 +2422,8 @@
+                          &radio_id,
+                          &vap_id);
+ 
++  if (u32BdIndex >= hw->rx.bdr_data.nof_bds)
++    return MTLK_ERR_UNKNOWN;
+   data_ind = _mtlk_basic_bdr_get_mirror_bd(&hw->rx.bdr_data, u32BdIndex, mtlk_hw_data_ind_mirror_t);
+ 
+   MTLK_ASSERT(data_size < data_ind->size);
+@@ -2076,6 +2447,12 @@
+   }
+ 
+   total_size    = offset + data_size;
++  if (offset > data_ind->size || data_size > data_ind->size - offset ||
++      total_size > mtlk_df_nbuf_get_tail_room_size(data_ind->nbuf)) {
++    mtlk_df_nbuf_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), data_ind->nbuf,
++                                 data_ind->dma_addr, data_ind->size, MTLK_DATA_FROM_DEVICE);
++    goto buf_return;
++  }
+ 
+ #if DBG_DUMP_HD
+   {
+@@ -2090,7 +2467,7 @@
+   mtlk_df_nbuf_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+                                data_ind->nbuf,
+                                data_ind->dma_addr,
+-                               total_size,
++                               data_ind->size,
+                                MTLK_DATA_FROM_DEVICE);
+ 
+   if (__UNLIKELY(total_size > mtlk_df_nbuf_get_tail_room_size(data_ind->nbuf))) {
+@@ -2101,6 +2478,12 @@
+ 
+   mtlk_df_nbuf_put(data.nbuf, total_size);  /* offset + data_size */
+   mtlk_df_nbuf_pull(data.nbuf, offset);
++  if (wave_hw_monitor_rx(hw, data.nbuf)) {
++    mtlk_df_nbuf_push(data.nbuf, offset);
++    mtlk_df_nbuf_trim(data.nbuf, 0);
++    res = MTLK_ERR_OK;
++    goto buf_return;
++  }
+ 
+   vap_handle = _mtlk_mmb_get_vap_handle_from_vap_id(hw, radio_id, vap_id);
+ 
+@@ -2155,7 +2538,9 @@
+                            total_size += nbuf->len;
+                          }
+ 
+-                         comb_nbuf = _mtlk_mmb_nbuf_alloc(total_size);
++                         /* This buffer goes only to the CPU consumer. Align
++                          * it before assembly, avoiding a second frame copy. */
++                         comb_nbuf = _mtlk_mmb_nbuf_alloc_rx_cpu(total_size);
+                          if (__UNLIKELY(comb_nbuf == NULL)) {
+                            _mtlk_mmb_rx_free_all_fragments(hw);
+                            res = MTLK_ERR_OK;
+@@ -2200,6 +2585,28 @@
+                        }
+ 
+                        if (FRAME_TYPE_EAPOL != frame_type) {
++                         /* A native DMA skb has no consumer metadata yet. Use
++                          * its required replacement allocation for an aligned
++                          * CPU copy, then return this unchanged DMA allocation.
++                          * DP allocator ownership and unknown fragment types
++                          * retain their existing path. */
++                         if (!MTLK_USE_DIRECTCONNECT_DP_API &&
++                             frag_type == NO_FRAG &&
++                             data.nbuf->len >= ETH_HLEN &&
++                             !skb_is_nonlinear(data.nbuf) &&
++                             !skb_shared(data.nbuf) && !skb_cloned(data.nbuf) &&
++                             (((unsigned long)data.nbuf->data + ETH_HLEN) & 3)) {
++                           mtlk_nbuf_t *cpu_nbuf;
++
++                           cpu_nbuf = _mtlk_mmb_nbuf_alloc_rx_cpu(data_size);
++                           if (cpu_nbuf) {
++                             skb_put_data(cpu_nbuf, data.nbuf->data, data_size);
++                             data.nbuf = cpu_nbuf;
++                             reuse_rx_buffer = TRUE;
++                           }
++                           /* Failure preserves the in-place alignment and
++                            * ordinary post-delivery replacement path. */
++                         }
+                          res = mtlk_vap_get_core_vft(vap_handle)->handle_rx_data(vap_handle, &data);
+                          break;
+                        } else {
+@@ -2227,6 +2634,15 @@
+     _mtlk_mmb_nbuf_free(data.nbuf);
+   }
+ 
++  if (reuse_rx_buffer) {
++    /* The callback consumed or rejected only the CPU copy. Restore the
++     * original allocation's DMA base/empty length before the same checked
++     * map, descriptor publication and failure-recovery owner below. */
++    mtlk_df_nbuf_push(data_ind->nbuf, offset);
++    mtlk_df_nbuf_trim(data_ind->nbuf, 0);
++    goto buf_return;
++  }
++
+ #if MTLK_USE_DIRECTCONNECT_DP_API
+     data_ind->nbuf = mtlk_df_dcdp_nbuf_alloc(mtlk_vap_get_df(vap_handle), data_ind->size);
+   if (NULL == data_ind->nbuf)
+@@ -2250,6 +2666,14 @@
+                                                      data_ind->nbuf,
+                                                      data_ind->size,
+                                                      MTLK_DATA_FROM_DEVICE);
++  if (dma_mapping_error(mtlk_ccr_get_device(hw->ccr), data_ind->dma_addr)) {
++    data_ind->dma_addr = 0;
++    _mtlk_mmb_nbuf_free(data_ind->nbuf);
++    data_ind->nbuf = NULL;
++    mtlk_lslist_push(&hw->rx.pending.lbufs, &data_ind->pend_l);
++    res = MTLK_ERR_NO_MEM;
++    goto FINISH;
++  }
+ #ifdef MTCFG_WAVE_FPGA
+   data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
+ #endif
+@@ -2294,7 +2718,7 @@
+ 
+   mtlk_nbuf_start_tracking(skb);
+ 
+-  if (__UNLIKELY(hw->mac_events_stopped)) {
++  if (__UNLIKELY(READ_ONCE(hw->mac_events_stopped))) {
+     res = DC_DP_SUCCESS;
+     goto finish;
+   }
+@@ -2344,8 +2768,9 @@
+       mtlk_handle_eapol(vap_handle, skb->data, skb->len);
+       mtlk_df_nbuf_free(skb);
+     } else {
+-      mtlk_core_handle_tx_data_t tx_data;
++      mtlk_core_handle_tx_data_t tx_data = {0};
+       tx_data.nbuf = skb;
++      tx_data.msg = NULL;
+       tx_data.dst_sta = NULL;
+       tx_data.rx_if = rxif;
+       tx_data.rx_subif = rx_subif;
+@@ -2537,7 +2962,7 @@
+   switch (type) {
+   case ARRAY_MAN_IND:
+     CPU_STAT_SPECIFY_TRACK(CPU_STAT_ID_RX_MM);
+-    if (__LIKELY(!hw->mac_events_stopped))
++    if (__LIKELY(!READ_ONCE(hw->mac_events_stopped)))
+       _mtlk_mmb_handle_cm_ind(hw, TRUE, &msg);
+     break;
+   case ARRAY_MAN_REQ:
+@@ -2547,7 +2972,7 @@
+     break;
+   case ARRAY_DBG_IND:
+     CPU_STAT_SPECIFY_TRACK(CPU_STAT_ID_RX_MM);
+-    if (__LIKELY(!hw->mac_events_stopped))
++    if (__LIKELY(!READ_ONCE(hw->mac_events_stopped)))
+       _mtlk_mmb_handle_cm_ind(hw, FALSE, &msg);
+     break;
+   case ARRAY_DBG_REQ:
+@@ -2601,7 +3026,7 @@
+ static int  _mtlk_hw_send_data(mtlk_hw_t *hw,
+     mtlk_vap_handle_t vap_handle, mtlk_hw_data_req_mirror_t *data_req)          __MTLK_INT_HANDLER_SECTION;
+ 
+-static void _mtlk_mmb_put_hd_to_ring(mtlk_hw_t *hw,
++static int _mtlk_mmb_put_hd_to_ring(mtlk_hw_t *hw,
+     HOST_DSC *pHD, mtlk_ring_buffer *ring)                                      __MTLK_INT_HANDLER_SECTION;
+ 
+ static int _mtlk_mmb_data_txout_process (mtlk_irq_handler_data *ihd)            __MTLK_INT_HANDLER_SECTION;
+@@ -2628,7 +3053,7 @@
+   int res;
+   mtlk_hw_t *hw = ihd->hw;
+ 
+-  if (__UNLIKELY(hw->mac_events_stopped)) {
++  if (__UNLIKELY(READ_ONCE(hw->mac_events_stopped))) {
+     return MTLK_ERR_OK;
+   }
+ 
+@@ -2688,25 +3113,12 @@
+ _mtlk_mmb_data_txout_process (mtlk_irq_handler_data *ihd)
+ {
+   int res = MTLK_ERR_OK;
+-#ifdef MTLK_DEBUG
+-  mtlk_dbg_hres_ts_t       time_current;
+-  uint64  time_diff;
+-#endif
+   mtlk_hw_t *hw = ihd->hw;
+ 
+   MTLK_ASSERT(NULL != hw->ccr);
+ 
+-  if (__LIKELY(!hw->mac_events_stopped)) {
++  if (__LIKELY(!READ_ONCE(hw->mac_events_stopped))) {
+     uint32 cur_hd, hds_to_process;
+-
+-#ifdef MTLK_DEBUG
+-    /* update max interrupt to tasklet statistic */
+-    mtlk_dbg_hres_ts(&time_current);
+-    time_diff = mtlk_dbg_hres_diff_uint64(&time_current, &hw->tx_interrupt_time);
+-    if(hw->tx.max_int_tasklet_time < time_diff) {
+-      hw->tx.max_int_tasklet_time = time_diff;
+-    }
+-#endif
+ 
+     hds_to_process = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->tx.ring.regs);
+     MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_TXOUT_START, hds_to_process);
+@@ -2714,6 +3126,7 @@
+       MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_TXOUT_END, 0);
+       return MTLK_ERR_OK;
+     }
++
+ 
+     if (hds_to_process > hw->data_txout_lim) {
+       hds_to_process = hw->data_txout_lim;
+@@ -2739,12 +3152,6 @@
+       hw->tx.max_received_cfm = hds_to_process;
+     }
+ 
+-    /* update max interrupt to processed cfm statistic */
+-    mtlk_dbg_hres_ts(&time_current);
+-    time_diff = mtlk_dbg_hres_diff_uint64(&time_current, &hw->tx_interrupt_time);
+-    if(hw->tx.max_int_processed_cfm < time_diff) {
+-      hw->tx.max_int_processed_cfm = time_diff;
+-    }
+ #endif
+ 
+     mtlk_ccr_ring_clear_interrupt(hw->ccr, &hw->tx.ring.regs, hds_to_process);
+@@ -2762,23 +3169,10 @@
+ _mtlk_mmb_data_rx_process (mtlk_irq_handler_data *ihd)
+ {
+   int res = MTLK_ERR_OK;
+-#ifdef MTLK_DEBUG
+-  mtlk_dbg_hres_ts_t       time_current;
+-  uint64  time_diff;
+-#endif
+   mtlk_hw_t *hw = ihd->hw;
+   uint32 cur_hd, hds_to_process;
+ 
+   MTLK_ASSERT(NULL != hw->ccr);
+-
+-#ifdef MTLK_DEBUG
+-  /* update max interrupt to tasklet statistic */
+-  mtlk_dbg_hres_ts(&time_current);
+-  time_diff = mtlk_dbg_hres_diff_uint64(&time_current, &hw->rx_interrupt_time);
+-  if(hw->rx.max_int_tasklet_time < time_diff) {
+-    hw->rx.max_int_tasklet_time = time_diff;
+-  }
+-#endif
+ 
+   hds_to_process = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->rx.ring.regs);
+   MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_RX_START, hds_to_process);
+@@ -2787,6 +3181,7 @@
+     return MTLK_ERR_OK;
+   }
+ 
++
+   if (hds_to_process > hw->data_rx_lim) {
+     hds_to_process = hw->data_rx_lim;
+     res = MTLK_ERR_PENDING;
+@@ -2798,7 +3193,7 @@
+   for (cur_hd = 0; cur_hd < hds_to_process; cur_hd++) {
+     CPU_STAT_BEGIN_TRACK(CPU_STAT_ID_RX_DAT);
+     CPU_STAT_BEGIN_TRACK(CPU_STAT_ID_RX_HW);
+-    if (__LIKELY(!hw->mac_events_stopped)) {
++    if (__LIKELY(!READ_ONCE(hw->mac_events_stopped))) {
+       _mtlk_mmb_handle_dat_ind(hw, hw->rx.ring.base_addr + hw->rx.ring.read_ptr);
+     } else {
+       /* must confirm w/o processing */
+@@ -2816,12 +3211,6 @@
+     hw->rx.max_received_pckts = hds_to_process;
+   }
+ 
+-  /* update max interrupt to time statistic */
+-  mtlk_dbg_hres_ts(&time_current);
+-  time_diff = mtlk_dbg_hres_diff_uint64(&time_current, &hw->rx_interrupt_time);
+-  if(hw->rx.max_int_processed_packet < time_diff) {
+-    hw->rx.max_int_processed_packet = time_diff;
+-  }
+ #endif
+ 
+   mtlk_ccr_ring_clear_interrupt(hw->ccr, &hw->rx.ring.regs, hds_to_process);
+@@ -2916,7 +3305,7 @@
+ 
+   hw->bss_ind_num++;
+ 
+-  if (__LIKELY(!hw->mac_events_stopped)) {
++  if (__LIKELY(!READ_ONCE(hw->mac_events_stopped))) {
+     uint32 cur_hd, hds_to_process = 0;
+ 
+     hds_to_process = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->bss_mgmt.rx_ring.regs);
+@@ -3045,6 +3434,9 @@
+ {
+   uint32 pas_offset;
+   uint32 val = 0;
++
++  if (READ_ONCE(hw->quiescing))
++    return MTLK_ERR_NOT_READY;
+ 
+   MTLK_ASSERT(mips_no < _hw_num_cores(hw));
+ 
+@@ -3289,6 +3681,12 @@
+                                                      data_ind->nbuf,
+                                                      data_ind->size,
+                                                      MTLK_DATA_FROM_DEVICE);
++  if (dma_mapping_error(mtlk_ccr_get_device(hw->ccr), data_ind->dma_addr)) {
++    data_ind->dma_addr = 0;
++    _mtlk_mmb_nbuf_free(data_ind->nbuf);
++    data_ind->nbuf = NULL;
++    goto FINISH;
++  }
+ #ifdef MTCFG_WAVE_FPGA
+   data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
+ #endif
+@@ -3319,6 +3717,12 @@
+                                                      data_ind->size,
+                                                      MTLK_DATA_FROM_DEVICE);
+ 
++  if (dma_mapping_error(mtlk_ccr_get_device(hw->ccr), data_ind->dma_addr)) {
++    data_ind->dma_addr = 0;
++    _mtlk_mmb_nbuf_free(data_ind->nbuf);
++    data_ind->nbuf = NULL;
++    goto FINISH;
++  }
+ #ifdef MTCFG_WAVE_FPGA
+   data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
+ #endif
+@@ -3842,6 +4246,12 @@
+   return res;
+ }
+ 
++static const u8 wave_monitor_fw_span[] = { 0x00, 0x42, 0x0c, 0x12, 0x84, 0x00, 0x8a, 0x20, 0xc9, 0x06, 0x2c, 0x74, 0x85, 0x01, 0x6f, 0xf5, 0x6c, 0x70, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78 };
++#include "fixed_data_fw.h"
++#include "rts_threshold_fw.h"
++#include "txop_read_fw.h"
++
++
+ static int
+ _mtlk_mmb_load_firmware(mtlk_hw_t* hw)
+ {
+@@ -3851,6 +4261,7 @@
+   int cpu = 0;
+   int res = MTLK_ERR_FW;
+ 
++  WRITE_ONCE(hw->fw_features, 0);
+   /* WAVE600: TODO: do it for the first radio now, but rework later! */
+   mode = mtlk_vap_manager_get_mode(wave_radio_descr_vap_manager_get(hw->radio_descr, 0));
+ 
+@@ -3892,6 +4303,30 @@
+ 
+     if (MTLK_ERR_OK == res) {
+       _mtlk_mmb_notify_firmware(hw, cpu, fw_info.fname, &fb);
++      /* Bind capability to the actual successfully loaded A0 producer, not
++       * an installed package name or an ACK-only unpatched UMI handler. */
++      if (cpu == CHI_CPU_NUM_UM && mtlk_hw_type_is_gen6(hw) &&
++          !mtlk_hw_type_is_gen6_b0(hw) && fb.size >= 0x63d0c + sizeof(wave_monitor_fw_span) &&
++          !memcmp((const u8 *)fb.buffer + 0x63d0c, wave_monitor_fw_span, sizeof(wave_monitor_fw_span)))
++        hw->fw_features |= WAVE_FW_FEATURE_RX_STREAM;
++      /* New eight-byte FixedPower policy is paired with both lower copies.
++       * A package/version string or an ACK-only OEM handler is insufficient. */
++      if (cpu == CHI_CPU_NUM_UM && mtlk_hw_type_is_gen6(hw) &&
++          !mtlk_hw_type_is_gen6_b0(hw) &&
++          wave_fixed_data_fw_matches(fb.buffer, fb.size))
++        hw->fw_features |= WAVE_FW_FEATURE_FIXED_DATA;
++      /* The new wrapper forwards the unchanged admitted FIXED route. Also
++       * require every RTS hook, startup reservation and lower code span. */
++      if (cpu == CHI_CPU_NUM_UM &&
++          (hw->fw_features & WAVE_FW_FEATURE_FIXED_DATA) &&
++          wave_rts_threshold_fw_matches(fb.buffer, fb.size))
++        hw->fw_features |= WAVE_FW_FEATURE_RTS_THRESHOLD;
++      /* This admits only the complete non-mutating UMI GET and both
++       * lower saved-policy readers, never a version-string assertion. */
++      if (cpu == CHI_CPU_NUM_UM && mtlk_hw_type_is_gen6(hw) &&
++          !mtlk_hw_type_is_gen6_b0(hw) &&
++          wave_txop_read_fw_matches(fb.buffer, fb.size))
++        hw->fw_features |= WAVE_FW_FEATURE_TXOP_READ;
+     }
+ 
+     /* WAVE600: TODO: do it for the first radio now, but rework later! */
+@@ -3904,6 +4339,8 @@
+     }
+   }
+ 
++  if (res != MTLK_ERR_OK)
++    WRITE_ONCE(hw->fw_features, 0);
+   return res;
+ }
+ 
+@@ -4027,10 +4464,6 @@
+     res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_PRGMDL_LOAD_CHUNK_TIMEOUT);
+     if (res != MTLK_ERR_OK) {
+       ELOG_D("Can't download programming model, timed-out. Err#%d", res);
+-#if 1
+-      /* a2k - do not exit - allow to connect to driver through BCL for debugging */
+-      res = MTLK_ERR_OK;
+-#endif
+       goto FINISH;
+     }
+ 
+@@ -4060,9 +4493,13 @@
+ {
+   MTLK_ASSERT(NULL != hw->ccr);
+ 
++  if (READ_ONCE(hw->quiescing))
++    return;
++
++  wave_rcvry_firmware_start(hw);
+   mtlk_ccr_disable_interrupts(hw->ccr, MTLK_IRQ_ALL);
+   mtlk_ccr_clear_interrupts_if_pending(hw->ccr, (uint32) -1);
+   mtlk_ccr_switch_to_iram_boot(hw->ccr);
+   hw->perform_isr_action = isr_action_init;
+   MTLK_HW_INIT_EVT_RESET(hw);
+   mtlk_ccr_enable_interrupts(hw->ccr, MTLK_IRQ_ALL);
+@@ -4438,13 +4875,13 @@
+ static void _mtlk_mmb_free_hd_ring(mtlk_hw_t *hw, mtlk_ring_buffer *ring)
+ {
+     uint32 total_ring_size = ring->size * sizeof(HOST_DSC);
+-    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), ring->dma_addr,
+-                              total_ring_size, MTLK_DATA_FROM_DEVICE);
+-#ifdef MTCFG_X86_PUMA7_WAV600_NOSNOOP
+-    if (_hw_type_is_gen6(hw))
+-      mtlk_osal_mem_ddr_dma_pages_set_uncacheable(ring->v_base_addr, total_ring_size, FALSE);
+-#endif
+-    mtlk_osal_mem_ddr_dma_pages_free(ring->v_base_addr, total_ring_size);
++    if (ring->v_base_addr) {
++      dma_free_coherent(mtlk_ccr_get_dev_ctx(hw->ccr), total_ring_size,
++                        ring->v_base_addr, ring->dma_addr);
++      ring->v_base_addr = NULL;
++      ring->base_addr = NULL;
++      ring->dma_addr = 0;
++    }
+ }
+ 
+ static void
+@@ -4684,36 +5121,17 @@
+ 
+   ILOG0_DD("ring_size:%d total_ring_size:%d", ring_size, total_ring_size);
+ 
+-  /* Allocate and initialize a ring buffer.
+-   * On MIPS we access that memory via KSEG1, so memory access is uncached
+-   * On X86/Gen5 we relay on cache coherence provided by hardware (cache snooping)
+-   * On X86/Gen6 we use no-snooping PCIe transactions, so memory needs to be remapped
+-     in TLB as uncacheable. This requiers memory to be aligned on page boundary.
+-   */
+-  ring->v_base_addr = mtlk_osal_mem_ddr_dma_pages_alloc(total_ring_size);
+-  if (NULL == ring->v_base_addr) {
++  /* Descriptors are shared continuously with the device. Use the DMA API's
++   * coherent allocation, including the board's EVA uncached CPU mapping.
++   * Streaming mappings and manual KSEG aliases do not provide this lifetime. */
++  ring->v_base_addr = dma_alloc_coherent(mtlk_ccr_get_dev_ctx(hw->ccr),
++                                        total_ring_size, &ring->dma_addr,
++                                        GFP_KERNEL);
++  if (!ring->v_base_addr)
+     return MTLK_ERR_NO_MEM;
+-  }
+-
+-#ifdef MTCFG_X86_PUMA7_WAV600_NOSNOOP
+-  if (_hw_type_is_gen6(hw)) {
+-    if (mtlk_osal_mem_ddr_dma_pages_set_uncacheable(ring->v_base_addr, total_ring_size, TRUE)) {
+-      mtlk_osal_mem_ddr_dma_pages_free(ring->v_base_addr, total_ring_size);
+-      return MTLK_ERR_NO_MEM;
+-    }
+-  }
+-#endif
+-
+-  memset(ring->v_base_addr, 0, total_ring_size);
+-
+-  ring->dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+-                                              ring->v_base_addr, total_ring_size,
+-                                              MTLK_DATA_BIDIRECTIONAL);
+-#if defined(__i386) || defined(__x86_64)
+-  ring->base_addr = (HOST_DSC *) (ring->v_base_addr);
+-#else
+-  ring->base_addr = (HOST_DSC *) KSEG1ADDR(ring->v_base_addr); /* use uncached access on mips */
+-#endif
++  ring->base_addr = ring->v_base_addr;
++  memset(ring->base_addr, 0, total_ring_size);
++
+   ILOG0_DDD("Ring virtual addr:%x dma_addr:%x base_addr:%x",(uintptr_t)ring->v_base_addr, (uintptr_t)ring->dma_addr,
+                                                             (uintptr_t)ring->base_addr);
+ 
+@@ -4879,6 +5297,7 @@
+ 
+   hw->tx.nof_free_bds = hw->tx.ring.size;
+   hw->tx.max_used_bds = 0;
++  INIT_LIST_HEAD(&hw->tx.queues);
+   hw->flags |= HW_FLAGS_PREPARED_DATA_REQ_BDR;
+   return res;
+ 
+@@ -5001,6 +5420,11 @@
+                                    MTLK_DATA_TO_DEVICE);
+     }
+ 
++    if (data_req->mc_pinned) {
++      data_req->mc_pinned = false;
++      wave_hw_mc_put(hw, data_req->mc_index);
++    }
++
+     /* Simply free the buffers without any statistic update due to with next steps
+        card will be completely deleted. */
+     mtlk_df_nbuf_free(data_req->nbuf);
+@@ -5080,18 +5504,20 @@
+       mtlk_hw_data_ind_mirror_t *data_ind =
+         _mtlk_basic_bdr_get_mirror_bd(&hw->rx.bdr_data, i, mtlk_hw_data_ind_mirror_t);
+ 
+-      MTLK_ASSERT(NULL != data_ind->nbuf || !"nbuf is NULL");
+       if (!data_ind->nbuf) {
+         continue;
+       }
+ 
+-      mtlk_df_nbuf_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
++      if (data_ind->dma_addr)
++        mtlk_df_nbuf_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+                                  data_ind->nbuf,
+                                  data_ind->dma_addr,
+                                  data_ind->size,
+                                  MTLK_DATA_FROM_DEVICE);
+ 
+       _mtlk_mmb_nbuf_free(data_ind->nbuf);
++      data_ind->nbuf = NULL;
++      data_ind->dma_addr = 0;
+     }
+   }
+ 
+@@ -5103,7 +5529,7 @@
+ }
+ 
+ static int
+-_mtlk_mmb_prealloc_rx_data_buffers (mtlk_hw_t *hw)
++_mtlk_mmb_prealloc_rx_data_buffers (mtlk_hw_t *hw, bool locked)
+ {
+   uint32 i;
+   mtlk_hw_data_ind_mirror_t *data_ind;
+@@ -5112,6 +5538,7 @@
+ 
+   data_ring_size = hw->chi_area.sBasic.sRdPOOL.u32NumRdsInPool;
+   ares  = MTLK_ERR_OK;
++  hw->flags |= HW_FLAGS_PREPARED_RX_DATA_BUFFERS;
+ 
+   if(!mtlk_mmb_dcdp_path_available(hw)) { /* DataPath driver allocates for FastPath */
+     for (i = 0; i < data_ring_size ; i++) {
+@@ -5126,6 +5553,8 @@
+         /* BRD pointer hole produced here (NULL-pointer) */
+          ILOG2_D("WARNING: Can't preallocate buffer of %d bytes.",
+              (int)RX_DATA_FRAME_SIZE);
++         if (locked) wave_hw_mmb_quiesce_locked(hw); else wave_hw_mmb_quiesce(hw);
++         _mtlk_mmb_free_preallocated_rx_data_buffers(hw);
+          return MTLK_ERR_NO_MEM;
+       }
+     }
+@@ -5147,21 +5576,34 @@
+   return MTLK_ERR_OK;
+ }
+ 
++static void _mtlk_mmb_free_preallocated_rx_mgmt_buffers(mtlk_hw_t *hw);
++
+ static int
+-_mtlk_mmb_prealloc_rx_mgmt_buffers (mtlk_hw_t *hw)
++_mtlk_mmb_prealloc_rx_mgmt_buffers (mtlk_hw_t *hw, bool locked)
+ {
+   uint32 i;
+   struct mtlk_hw_bss_ind_mirror *bss_ind;
+ 
+   MTLK_ASSERT(hw->bss_mgmt.rx_bdr.basic.nof_bds == hw->bss_mgmt.rx_ring.size);
+   ILOG2_D("About to allocate %d pointers", hw->bss_mgmt.rx_ring.size);
++  hw->flags |= HW_FLAGS_PREPARED_RX_MGMT_BUFFERS;
+ 
+   for (i = 0; i < hw->bss_mgmt.rx_ring.size; i++) {
+ 
+       bss_ind = _mtlk_basic_bdr_get_mirror_bd(&hw->bss_mgmt.rx_bdr.basic, i, struct mtlk_hw_bss_ind_mirror);
++
++      if ((uintptr_t)bss_ind->virt_addr & RX_MGMT_ALIGN_MASK)
++        goto map_failed;
+ 
+       bss_ind->dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), (void *)bss_ind->virt_addr,
+                                                      bss_ind->size, MTLK_DATA_FROM_DEVICE);
++
++      if (dma_mapping_error(mtlk_ccr_get_device(hw->ccr), bss_ind->dma_addr)) {
++        bss_ind->dma_addr = 0;
++        goto map_failed;
++      }
++      if (bss_ind->dma_addr & RX_MGMT_ALIGN_MASK)
++        goto map_failed;
+ 
+       #ifdef MTCFG_WAVE_FPGA
+         data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
+@@ -5176,6 +5618,10 @@
+   hw->flags |= HW_FLAGS_PREPARED_RX_MGMT_BUFFERS;
+ 
+   return MTLK_ERR_OK;
++map_failed:
++  if (locked) wave_hw_mmb_quiesce_locked(hw); else wave_hw_mmb_quiesce(hw);
++  _mtlk_mmb_free_preallocated_rx_mgmt_buffers(hw);
++  return MTLK_ERR_NO_MEM;
+ }
+ 
+ static void
+@@ -5202,6 +5648,7 @@
+                               bss_ind->dma_addr,
+                               bss_ind->size,
+                               MTLK_DATA_FROM_DEVICE);
++    bss_ind->dma_addr = 0;
+   }
+ 
+   hw->flags &= ~HW_FLAGS_PREPARED_RX_MGMT_BUFFERS;
+@@ -5218,6 +5665,10 @@
+   ILOG5_D("MSG WRITE: 0x%08x", descriptor);
+ 
+   lock_val = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++  if (hw->quiescing) {
++    mtlk_osal_lock_release_irq(&hw->reg_lock, lock_val);
++    return MTLK_ERR_NOT_READY;
++  }
+   _mtlk_mmb_pas_put(hw,
+                     "new BD descriptor",
+                     hw->bds.req.offset + (hw->bds.req.idx * sizeof(descriptor)), /* DB Array [BD Idx] */
+@@ -5282,43 +5733,62 @@
+ {
+   /* NOTE: mac_events_stopped must be also set here to avoid additional checks
+    * in _mtlk_mmb_handle_received_msg() (hw->mac_events_stopped || hw->mac_events_stopped_completely) */
+-  hw->mac_events_stopped            = 1;
++  WRITE_ONCE(hw->mac_events_stopped, 1);
+   hw->mac_events_stopped_completely = 1;
+ }
+ 
+ static void
+ _mtlk_mmb_reset_all_events(mtlk_hw_t *hw)
+ {
+-    hw->mac_events_stopped            = 0;
++    WRITE_ONCE(hw->mac_events_stopped, 0);
+     hw->mac_events_stopped_completely = 0;
+ }
+ 
+ static void
+ _mtlk_mmb_cleanup_calibration_cache(mtlk_hw_t *hw)
+ {
++  if (!hw->calibr_buffer)
++    return;
++
+   mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+                             hw->calibr_dma_addr,
+-                            hw->chi_area.sCalibr.sData.u32BufferRequestedSize,
+-                            MTLK_DATA_FROM_DEVICE);
++                            hw->calibr_buffer_size,
++                            MTLK_DATA_BIDIRECTIONAL);
+   mtlk_osal_mem_free(hw->calibr_buffer);
+   hw->calibr_dma_addr = 0;
+   hw->calibr_buffer = NULL;
+-}
+-
+-static void _mtlk_mmb_set_calibration_buffers (mtlk_hw_t *hw)
+-{
+-
+-  memset(hw->calibr_buffer, 0, hw->chi_area.sCalibr.sData.u32BufferRequestedSize);
+-
+-  hw->calibr_dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
++  hw->calibr_buffer_size = 0;
++}
++
++static int _mtlk_mmb_set_calibration_buffers (mtlk_hw_t *hw)
++{
++  struct device *dev = mtlk_ccr_get_dev_ctx(hw->ccr);
++
++  memset(hw->calibr_buffer, 0, hw->calibr_buffer_size);
++  hw->calibr_dma_addr = mtlk_osal_map_to_phys_addr(dev,
+                                                    hw->calibr_buffer,
+-                                                   hw->chi_area.sCalibr.sData.u32BufferRequestedSize,
++                                                   hw->calibr_buffer_size,
+                                                    MTLK_DATA_BIDIRECTIONAL);
+-  MTLK_ASSERT(0 != hw->calibr_dma_addr);
++  if (dma_mapping_error(dev, hw->calibr_dma_addr))
++    goto failed;
++  /* The native HDK request uses zero to mean no host calibration cache. */
++  if (!hw->calibr_dma_addr) {
++    mtlk_osal_unmap_phys_addr(dev, hw->calibr_dma_addr,
++                              hw->calibr_buffer_size,
++                              MTLK_DATA_BIDIRECTIONAL);
++    goto failed;
++  }
+ 
+   ILOG0_DPD("Calibration buffer: dma_addr 0x%08X, virt_addr 0x%p, size %d",
+-            hw->calibr_dma_addr, hw->calibr_buffer, hw->chi_area.sCalibr.sData.u32BufferRequestedSize);
+-
++            hw->calibr_dma_addr, hw->calibr_buffer, hw->calibr_buffer_size);
++  return MTLK_ERR_OK;
++
++failed:
++  mtlk_osal_mem_free(hw->calibr_buffer);
++  hw->calibr_buffer = NULL;
++  hw->calibr_dma_addr = 0;
++  hw->calibr_buffer_size = 0;
++  return MTLK_ERR_NO_RESOURCES;
+ }
+ 
+ #define __CCR_IO_MASK__         ((1u << 24) - 1) /* 16M - accessible from the host */
+@@ -5350,8 +5820,8 @@
+                                               MTLK_MEM_TAG_EXTENSION);
+ 
+   if (hw->calibr_buffer) {
+-    _mtlk_mmb_set_calibration_buffers(hw);
+-    return MTLK_ERR_OK;
++    hw->calibr_buffer_size = hw->chi_area.sCalibr.sData.u32BufferRequestedSize;
++    return _mtlk_mmb_set_calibration_buffers(hw);
+   }
+   else {
+     WLOG_D("Can't allocate Calibration buffer of %d bytes",
+@@ -5703,6 +6173,7 @@
+     UMI_GET_STATISTICS_DATA *req;
+     hw_mhi_stats_t          *mhi_stats;
+     uint32                   dma_addr;
++    mtlk_osal_timestamp_t     sample_time;
+     int                      res = MTLK_ERR_UNKNOWN;
+ 
+     /* prepare msg for the FW */
+@@ -5712,6 +6183,9 @@
+     }
+ 
+     mhi_stats = &hw->hw_mhi_stats;
++    /* Serialize the shared DMA buffer and peer incarnation publication. */
++    mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
++    sample_time = mtlk_osal_timestamp();
+ 
+     dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+                                           mhi_stats->db_data,
+@@ -5731,8 +6205,6 @@
+                               dma_addr, mhi_stats->db_size,
+                               MTLK_DATA_FROM_DEVICE);
+ 
+-    mtlk_txmm_msg_cleanup(&man_msg);
+-
+     if (res != MTLK_ERR_OK) {
+         ELOG_DD("card_idx %d: Sending failed, err=%i", hw->card_idx, res);
+     } else if (UMI_OK != req->u8status) {
+@@ -5740,18 +6212,26 @@
+         res = MTLK_ERR_MAC;
+     }
+ 
++    mtlk_txmm_msg_cleanup(&man_msg);
++
+     if (res == MTLK_ERR_OK) {
+         mtlk_osal_lock_acquire(&mhi_stats->lock);
+ 
+         wave_memcpy(mhi_stats->db_copy, mhi_stats->db_size,  mhi_stats->db_data, mhi_stats->db_size);
+         mtlk_dump(3, mhi_stats->db_copy, MIN(32, mhi_stats->db_size), "dump of MHI statistics");
+ 
++        mhi_stats->sta_generation = hw->stats_generation;
++        if (++mhi_stats->sample_serial == 0)
++            ++mhi_stats->sample_serial;
++        mhi_stats->sample_time = sample_time;
++
+         /* Update HW related statistics */
+         _mtlk_hw_mhi_update_hw_stats(hw, mhi_stats);
+ 
+         mtlk_osal_lock_release(&mhi_stats->lock);
+     }
+ 
++    mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
+     return res;
+ }
+ 
+@@ -5815,6 +6295,7 @@
+     int                  res = MTLK_ERR_NOT_SUPPORTED;
+ 
+     mhi_stats = &hw->hw_mhi_stats;
++    mhi_stats->tx_success_sids = 0;
+     total = mhi_stats->db_size; /* total data size */
+     num   = mhi_stats->tab_size / sizeof(StatsEntryDecoded_t);
+     if (mhi_stats->tab_size != (num * sizeof(StatsEntryDecoded_t))) {
+@@ -5854,12 +6335,27 @@
+             entry->nextIdxOffset,
+             size);
+ 
+-        subtype++;
+         next = entry->offset + size;
+         if (next > total) {
+             ELOG_DDDDD("[%4d: %3d] (offs %d + size %d) > (total %d)", entry_offs, i, entry->offset, size, total);
+             goto finish; /* error */
+         }
++
++        /* Use the native success counter only with the matched A0 layout.
++         * Do not make this optional activity source a requirement for other
++         * firmware statistics ABIs or derive it from ordinary DATA CFM. */
++        if (_chipid_is_gen6_a0(hw->ccr->chip_info->id) &&
++            entry->type == STATISTIC_TYPE_PER_CLIENT_TRANSMIT_COUNT &&
++            subtype == PCT_STATISTICS_SUCCESS_COUNT &&
++            entry->unitSize == sizeof(uint32) && entry->numOfDimensions == 1 &&
++            entry->dimension1 && entry->dimension2 == 1 &&
++            !(entry->offset & (sizeof(uint32) - 1)) &&
++            (!entry->nextIdxOffset || entry->nextIdxOffset == sizeof(uint32))) {
++            mhi_stats->tx_success_offs.start_offset = entry->offset;
++            mhi_stats->tx_success_offs.next_idx_offs = sizeof(uint32);
++            mhi_stats->tx_success_sids = entry->dimension1;
++        }
++        subtype++;
+     }
+ 
+     /* Check for HW power table sizes and fill offset's table */
+@@ -5965,8 +6461,7 @@
+                               dma_addr, mhi_stats->tab_size,
+                               MTLK_DATA_FROM_DEVICE);
+ 
+-    mtlk_txmm_msg_cleanup(&man_msg);
+-
++    /* Consume the reply before returning its payload to the TXMM pool. */
+     if (res != MTLK_ERR_OK) {
+         ELOG_DD("card_idx %d: Sending failed, err=%i", hw->card_idx, res);
+     } else if (UMI_OK != req->u8status) {
+@@ -5974,6 +6469,8 @@
+         res = MTLK_ERR_MAC;
+     }
+ 
++    mtlk_txmm_msg_cleanup(&man_msg);
++
+     /* without lock because it is called once during init */
+     if (res == MTLK_ERR_OK) {
+         ILOG0_DDPD("CID-%02x: MHI statistics table: size %d, buffer 0x%p, phys_addr 0x%08X",
+@@ -6128,11 +6625,12 @@
+   uint8             *db_data = hw->hw_mhi_stats.db_copy;
+   mhi_stats_offs_t  *offsets = hw->hw_mhi_stats.stats_sta_offs_table;
+   mhi_stats_offs_t  *tx_time_offs = &hw->hw_mhi_stats.tx_time_offs;
++  hw_mhi_stats_t    *mhi_stats = &hw->hw_mhi_stats;
+ 
+   sta_sid = mtlk_sta_get_sid(sta);
+ 
+   /* Get RX Time from PHY Statistics */
+-  new_rx_time = MAC_TO_HOST32(sta_status->perClientRxtimeUsage);
++  new_rx_time = sta_status ? MAC_TO_HOST32(sta_status->perClientRxtimeUsage) : as->rx_time;
+ 
+   /* Get TX Time from MAC Statistics */
+   new_tx_time_p = (void *)db_data + tx_time_offs->start_offset + (sta_sid * tx_time_offs->next_idx_offs);
+@@ -6153,8 +6651,19 @@
+   for (i = 0; i < STAT_STA_CNTR_TOTAL; i++) {
+     db_offs = offsets[i].start_offset + (sta_sid * offsets[i].next_idx_offs);
+     hw_cntr = (void *)hw->hw_mhi_stats.db_copy + db_offs;
+-    values[i] = MHI_STATS_STA_CNTR_TO_HOST(*hw_cntr);
++    WRITE_ONCE(values[i], MHI_STATS_STA_CNTR_TO_HOST(*hw_cntr));
+     ILOG3_DDD("[%2d] offs %4d, val %d", i, db_offs, values[i]);
++  }
++
++  /* Caller holds the statistics mutex and has admitted this exact SID
++   * incarnation against the successfully published MAC snapshot. */
++  if (sta_sid < mhi_stats->tx_success_sids) {
++    db_offs = mhi_stats->tx_success_offs.start_offset +
++              sta_sid * mhi_stats->tx_success_offs.next_idx_offs;
++    hw_cntr = (void *)db_data + db_offs;
++    mtlk_sta_record_tx_success(sta, sta->info.stats_generation,
++                              mhi_stats->sample_serial, MAC_TO_HOST32(*hw_cntr),
++                              mhi_stats->sample_time);
+   }
+ 
+   delta_bytes = (values[STAT_STA_CNTR_RX_BYTES] - rx_bytes) + (values[STAT_STA_CNTR_TX_BYTES] - tx_bytes);
+@@ -6207,6 +6716,8 @@
+ 
+     mhi_stats = &hw->hw_mhi_stats;
+     memset(mhi_stats, 0, sizeof(*mhi_stats));
++    /* Recovery has retired the previous firmware station owners. */
++    memset(hw->sta_stats_generation, 0, sizeof(hw->sta_stats_generation));
+ 
+     res = mtlk_osal_lock_init(&mhi_stats->lock);
+     if (MTLK_ERR_OK != res) {
+@@ -6278,6 +6789,9 @@
+ 
+     /* Get Statistics Table */
+     res = _mtlk_hw_mhi_get_table(hw);
++    if (MTLK_ERR_OK != res)
++        goto finish;
++
+     for (i = 0; i < hw->radio_descr->num_radios; i++) {
+         res = mtlk_df_ui_mhi_stats_create(mtlk_df_get_user(mtlk_vap_manager_get_master_df(wave_radio_descr_vap_manager_get(hw->radio_descr, i))), db_size);
+         if (MTLK_ERR_OK != res) {
+@@ -6462,6 +6976,10 @@
+ 
+     *size = phy_rx_status->db_size;
+     mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
++    if (!phy_rx_status->valid) {
++        mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
++        return MTLK_ERR_NOT_READY;
++    }
+     memcpy(buff, phy_rx_status->db_data, *size);
+     mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
+ 
+@@ -6497,6 +7015,49 @@
+ _mtlk_hw_is_sid_valid (mtlk_hw_t *hw, uint32 sid)
+ {
+     return (sid < __mtlk_hw_get_max_sid(hw));
++}
++
++uint64 __MTLK_IFUNC
++wave_hw_stats_sta_connected (mtlk_hw_t *hw, uint32 sid)
++{
++    uint64 generation = 0;
++
++    MTLK_STATIC_ASSERT(GEN5_MAX_SID <= GEN6_MAX_SID);
++    mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
++    if (_mtlk_hw_is_sid_valid(hw, sid)) {
++        if (++hw->stats_generation == 0)
++            ++hw->stats_generation;
++        generation = hw->stats_generation;
++        hw->sta_stats_generation[sid] = generation;
++    }
++    mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
++    return generation;
++}
++
++void __MTLK_IFUNC
++wave_hw_stats_sta_disconnected (mtlk_hw_t *hw, uint32 sid, uint64 generation)
++{
++    mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
++    if (_mtlk_hw_is_sid_valid(hw, sid) && generation &&
++        hw->sta_stats_generation[sid] == generation)
++        hw->sta_stats_generation[sid] = 0;
++    mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
++}
++
++static void
++_wave_hw_stats_reset_lifetime (mtlk_hw_t *hw)
++{
++    /* Native recovery has stopped the old firmware and its DMA producers. */
++    mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
++    mtlk_osal_lock_acquire(&hw->hw_mhi_stats.lock);
++    memset(hw->sta_stats_generation, 0, sizeof(hw->sta_stats_generation));
++    hw->hw_mhi_stats.sta_generation = 0;
++    hw->hw_mhi_stats.sample_time = 0; /* Keep serial monotonic across recovery. */
++    memset(hw->hw_mhi_stats.db_copy, 0, hw->hw_mhi_stats.db_size);
++    hw->phy_rx_status.sta_generation = 0;
++    hw->phy_rx_status.valid = FALSE;
++    mtlk_osal_lock_release(&hw->hw_mhi_stats.lock);
++    mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
+ }
+ 
+ static BOOL
+@@ -6660,15 +7221,19 @@
+     if (sta) {
+       do {
+         sta_sid = mtlk_sta_get_sid(sta);
+-        if (_mtlk_hw_is_sid_valid(hw, sta_sid)) {
+-            stationPhyRxStatusDb_t *sta_status = &phy_db->sta_status[sta_sid];
+-
+-            mtlk_sta_update_phy_info((sta_entry *)sta, hw, sta_status);
++        if (_mtlk_hw_is_sid_valid(hw, sta_sid) && sta->info.stats_generation &&
++            hw->sta_stats_generation[sta_sid] == sta->info.stats_generation &&
++            hw->hw_mhi_stats.sta_generation >= sta->info.stats_generation) {
++            stationPhyRxStatusDb_t *sta_status = NULL;
+ 
+             _mtlk_hw_mhi_sta_fill_tx_rate_statistic(hw, mtlk_sta_get_mhi_tx_stats((sta_entry *)sta), sta_sid);
+-
++            if (hw->phy_rx_status.valid &&
++                hw->phy_rx_status.sta_generation >= sta->info.stats_generation) {
++                sta_status = &phy_db->sta_status[sta_sid];
++                mtlk_sta_update_phy_info((sta_entry *)sta, hw, sta_status);
++            }
++            /* MAC-only measurements must not inherit an older SID's RX time. */
+             _mtlk_sta_update_statistics(hw, (sta_entry *)sta, sta_status);
+-
+             mtlk_sta_update_mhi_peers_stats((sta_entry *)sta);
+         }
+ 
+@@ -6707,6 +7272,8 @@
+       goto FINISH;
+     }
+ 
++    /* This buffer is overwritten by DMA; a failed request is not a snapshot. */
++    phy_rx_status->valid = FALSE;
+     dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+                                           phy_rx_status->db_data,
+                                           phy_rx_status->db_size,
+@@ -6730,7 +7297,14 @@
+         goto FINISH;
+     }
+ 
++    phy_rx_status->sta_generation = hw->stats_generation;
++    phy_rx_status->valid = TRUE;
++
+ READY: /* Parse received data */
++    if (!phy_rx_status->valid) {
++        res = MTLK_ERR_NOT_READY;
++        goto FINISH;
++    }
+     _wave_hw_phy_rx_status_update_dev_info(hw, core);
+ 
+ FINISH:
+@@ -6913,9 +7487,148 @@
+ static void _mtlk_mmb_data_path_unregister(mtlk_hw_t *hw);
+ static int _mtlk_mmb_data_path_uninit(mtlk_hw_t *hw, BOOL is_recovery);
+ 
++bool wave_hw_mmb_ready(mtlk_hw_t *hw)
++{
++  return !READ_ONCE(hw->quiescing) &&
++         READ_ONCE(hw->state) == MTLK_HW_STATE_READY;
++}
++
++/* The General proc owner keeps the data pool alive until its readers drain.
++ * These are ordinary pool totals, not a hardware/register snapshot. */
++bool wave_hw_get_tx_stats(mtlk_hw_t *hw, struct wave_tx_stats *stats)
++{
++  if (!wave_hw_mmb_ready(hw))
++    return false;
++
++  mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
++  stats->free_desc = hw->tx.nof_free_bds;
++  stats->used_peak = hw->tx.max_used_bds;
++  mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
++  /* Native software completion total; no device register access. */
++  stats->completed_cfm = READ_ONCE(hw->tx.ring.regs.int_OUT_cntr);
++  return true;
++}
++
++/* Called only after all native core serializers have been joined, or after
++ * the existing recovery owner has blocked all its slave VAP serializers.
++ * It has the same PCI/IRQ/tasklet/DMA/reset boundary as terminal quiesce but
++ * retains restartable TXMM and core objects. It never clears quiescing. */
++static int _wave_hw_monitor_fence_locked(mtlk_hw_t *hw)
++{
++  mtlk_handle_t flags;
++  int res = MTLK_ERR_NOT_READY;
++
++  lockdep_assert_held(&hw->quiesce_lock);
++  if (hw->quiescing || !wave_hw_monitor_held(hw))
++    goto out;
++  if (hw->monitor_fenced) {
++    res = MTLK_ERR_OK;
++    goto out;
++  }
++  wave_hw_monitor_disable_tx(hw);
++  flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++  /* Shared IRQs can still call our handler after PCI INTx is disabled.
++   * Close admission before the join; monitor_fenced means reset completed. */
++  hw->monitor_irqs_blocked = true;
++  WRITE_ONCE(hw->state, MTLK_HW_STATE_APPFATAL);
++  _mtlk_mmb_stop_events_completely(hw);
++  mtlk_ccr_disable_interrupts(hw->ccr, MTLK_IRQ_ALL);
++  mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
++  if (hw->flags & HW_FLAGS_PREPARED_DATA_REQ_BDR) {
++    mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
++    wave_hw_tx_stop_locked(hw);
++    mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
++  }
++  mtlk_osal_timer_cancel_sync(&hw->rx.pending.timer);
++#ifdef MTCFG_LEGACY_INT_RECOVERY_MON
++  mtlk_osal_timer_cancel_sync(&hw->recover_timer);
++#endif
++  wave_mmb_drv_drain_dma(mtlk_ccr_get_device(hw->ccr));
++  wave_rcvry_dump_before_reset(hw);
++  _mtlk_mmb_cleanup_reset_mac(hw);
++  mtlk_ccr_reset_mac(hw->ccr);
++  smp_store_release(&hw->monitor_fenced, true);
++  wave_hw_monitor_flush_tx(hw);
++  res = MTLK_ERR_OK;
++out:
++  return res;
++}
++
++int wave_hw_monitor_fence(mtlk_hw_t *hw)
++{
++  int res;
++
++  mutex_lock(&hw->quiesce_lock);
++  res = _wave_hw_monitor_fence_locked(hw);
++  mutex_unlock(&hw->quiesce_lock);
++  return res;
++}
++
++void wave_hw_monitor_restarted(mtlk_hw_t *hw)
++{
++  WRITE_ONCE(hw->monitor_dirty, false);
++}
++
++void wave_hw_monitor_suspend_rx(mtlk_hw_t *hw)
++{
++  struct wave_monitor *mon;
++
++  rcu_read_lock();
++  mon = rcu_dereference(hw->monitor);
++  if (mon)
++    wv_cfg80211_monitor_suspend(mon);
++  rcu_read_unlock();
++}
++
++/* Terminal for this probe. Only a fresh PCI probe may restart the card. */
++static void wave_hw_mmb_quiesce_locked(mtlk_hw_t *hw)
++{
++  mtlk_handle_t flags;
++
++  lockdep_assert_held(&hw->quiesce_lock);
++  if (hw->quiescing)
++    return;
++  wave_hw_monitor_disable_tx(hw);
++  flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++  WRITE_ONCE(hw->quiescing, true);
++  WRITE_ONCE(hw->state, MTLK_HW_STATE_UNLOADING);
++  _mtlk_mmb_stop_events_completely(hw);
++  mtlk_ccr_disable_interrupts(hw->ccr, MTLK_IRQ_ALL);
++  mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
++
++  if (hw->flags & HW_FLAGS_PREPARED_DATA_REQ_BDR) {
++    mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
++    wave_hw_tx_stop_locked(hw);
++    mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
++  }
++  wave_radio_leds_off(hw->radio_descr);
++
++  /* Firmware cannot answer once terminal shutdown starts. Reject new work,
++   * wake blocked control senders and stop timeouts before draining cores. */
++  mtlk_txmm_quiesce(&hw->txmm_base);
++  mtlk_txmm_quiesce(&hw->txdm_base);
++  mtlk_osal_timer_cancel_sync(&hw->rx.pending.timer);
++#ifdef MTCFG_LEGACY_INT_RECOVERY_MON
++  mtlk_osal_timer_cancel_sync(&hw->recover_timer);
++#endif
++  wave_mmb_drv_drain_dma(mtlk_ccr_get_device(hw->ccr));
++  wave_rcvry_dump_before_reset(hw);
++  _mtlk_mmb_cleanup_reset_mac(hw);
++  mtlk_ccr_reset_mac(hw->ccr);
++  wave_hw_monitor_flush_tx(hw);
++}
++
++void wave_hw_mmb_quiesce(mtlk_hw_t *hw)
++{
++  mutex_lock(&hw->quiesce_lock);
++  wave_hw_mmb_quiesce_locked(hw);
++  mutex_unlock(&hw->quiesce_lock);
++}
++
+ void __MTLK_IFUNC
+ mtlk_hw_mmb_stop_card(mtlk_hw_t *hw)
+ {
++  wave_hw_mmb_quiesce(hw);
+   MTLK_STOP_BEGIN(hw_mmb_card, MTLK_OBJ_PTR(hw))
+     MTLK_STOP_STEP(hw_mmb_card, HW_FW_LOGGER, MTLK_OBJ_PTR(hw),
+                    _mtlk_mmb_cleanup_fw_logger, (hw));
+@@ -6958,9 +7671,7 @@
+ #ifdef MTCFG_PMCU_SUPPORT
+     MTLK_STOP_STEP(hw_mmb_card, HW_PMCU_INIT_CLIENT, MTLK_OBJ_PTR(hw), _mtlk_mmb_pmcu_unregister, (hw));
+ #endif
+-#ifndef MTCFG_NO_FW_RESET_ON_STOP
+-    _mtlk_mmb_cleanup_reset_mac(hw);
+-#endif
++
+   MTLK_STOP_END(hw_mmb_card, MTLK_OBJ_PTR(hw))
+ }
+ 
+@@ -6974,13 +7685,24 @@
+ 
+   MTLK_ASSERT(NULL != hw->ccr);
+ 
+-  hw->state = MTLK_HW_STATE_UNLOADING;
++  WRITE_ONCE(hw->state, MTLK_HW_STATE_UNLOADING);
+ 
+   /* WAVE600: TODO: do it for the first radio now, but rework later! */
+   res = mtlk_hw_get_prop(wave_radio_descr_hw_api_get(hw->radio_descr, 0), MTLK_CORE_PROP_MAC_SW_RESET_ENABLED, &mac_soft_reset_enable, sizeof(mac_soft_reset_enable));
+   if (res != MTLK_ERR_OK) {
+     mac_soft_reset_enable = 0;
+   }
++
++    if (!hw->quiescing && hw->mac_reset_logic_initialized && !exception) {
++      ILOG3_V("Calling _mtlk_pci_send_sw_reset_mac_req");
++      if (_mtlk_mmb_send_sw_reset_mac_req(hw) != MTLK_ERR_OK) {
++        hw->mac_reset_logic_initialized = FALSE;
++      }
++    } else if (exception && (mac_soft_reset_enable == 0)) {
++      hw->mac_reset_logic_initialized = FALSE;
++    }
++
++  wave_hw_mmb_quiesce(hw);
+ 
+   MTLK_STOP_BEGIN(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin))
+     MTLK_STOP_STEP(hw_mmb_card_fin, HW_PHY_RX_STATUS, MTLK_OBJ_PTR(&hw->hw_start_fin),
+@@ -6997,15 +7719,6 @@
+ #if !MTLK_DCDP_SEPARATE_REG
+     MTLK_STOP_STEP(hw_mmb_card_fin, HW_DATA_PATH_REGISTER, MTLK_OBJ_PTR(&hw->hw_start_fin), _mtlk_mmb_data_path_unregister, (hw));
+ #endif
+-
+-    if (hw->mac_reset_logic_initialized && !exception) {
+-      ILOG3_V("Calling _mtlk_pci_send_sw_reset_mac_req");
+-      if (_mtlk_mmb_send_sw_reset_mac_req(hw) != MTLK_ERR_OK) {
+-        hw->mac_reset_logic_initialized = FALSE;
+-      }
+-    } else if (exception && (mac_soft_reset_enable == 0)) {
+-      hw->mac_reset_logic_initialized = FALSE;
+-    }
+ 
+     /* Disable Interrupts and recovery timer */
+ #ifdef MTCFG_LEGACY_INT_RECOVERY_MON
+@@ -7110,6 +7823,13 @@
+   MTLK_ASSERT(NULL != radio_descr);
+   MTLK_ASSERT(ARRAY_SIZE(hw->wss_hcntrs) == MTLK_HW_SOURCE_CNT_LAST);
+ 
++  mutex_init(&hw->quiesce_lock);
++  mutex_init(&hw->airtime_lock);
++  hw->airtime_radios = 0;
++  spin_lock_init(&hw->monitor_lock);
++  hw->quiescing = false;
++  hw->monitor_irqs_blocked = false;
++
+   hw->mmb_base = mmb_pas;
+ 
+   /* Shared RAM offset depending on platform */
+@@ -7120,7 +7840,7 @@
+ 
+   hw->radio_descr = radio_descr;
+   hw->is_sync_hostapd_done = TRUE;
+-  hw->state = MTLK_HW_STATE_INITIATING;
++  WRITE_ONCE(hw->state, MTLK_HW_STATE_INITIATING);
+   hw->irq_mode = MTLK_IRQ_MODE_INVALID;
+ #ifdef MTCFG_LEGACY_INT_RECOVERY_MON
+   hw->need_legacy_int_recovery = FALSE;
+@@ -7889,6 +8609,9 @@
+ {
+   MTLK_ASSERT(hw != NULL);
+ 
++  if (READ_ONCE(hw->quiescing))
++    return MTLK_ERR_NOT_READY;
++
+   /* Don't control on FPGA */
+   if (!__hw_mmb_card_is_fpga(hw)) {
+     mtlk_ccr_reset_mac(hw->ccr);
+@@ -7966,9 +8689,9 @@
+     MTLK_START_STEP(hw_mmb_card, HW_BSS_MGMT, MTLK_OBJ_PTR(hw),
+                     _mtlk_mmb_bss_mgmt_init, (hw));
+     MTLK_START_STEP(hw_mmb_card, HW_RX_DATA_BUFFERS, MTLK_OBJ_PTR(hw),
+-                    _mtlk_mmb_prealloc_rx_data_buffers, (hw));
++                    _mtlk_mmb_prealloc_rx_data_buffers, (hw, false));
+     MTLK_START_STEP(hw_mmb_card, HW_RX_MGMT_BUFFERS, MTLK_OBJ_PTR(hw),
+-                    _mtlk_mmb_prealloc_rx_mgmt_buffers, (hw));
++                    _mtlk_mmb_prealloc_rx_mgmt_buffers, (hw, false));
+ 
+ #if 1 /* We need to read CHI area. BufSize will be checked inside */
+     MTLK_START_STEP(
+@@ -8016,7 +8739,7 @@
+     MTLK_START_STEP(hw_mmb_card_fin, HW_TXDM, MTLK_OBJ_PTR(&hw->hw_start_fin),
+                     mtlk_txmm_start, (&hw->txdm_base));
+ 
+-    hw->state    = MTLK_HW_STATE_WAITING_READY;
++    WRITE_ONCE(hw->state, MTLK_HW_STATE_WAITING_READY);
+     hw->perform_isr_action = isr_action_normal;
+ 
+ #if !MTLK_DCDP_SEPARATE_REG
+@@ -8048,7 +8771,7 @@
+     MTLK_START_STEP(hw_mmb_card_fin, HW_PHY_RX_STATUS, MTLK_OBJ_PTR(&hw->hw_start_fin),
+                    _hw_init_phy_rx_status, (hw));
+ 
+-    hw->state  = MTLK_HW_STATE_READY;
++    WRITE_ONCE(hw->state, MTLK_HW_STATE_READY);
+     ILOG2_V("HW layer activated");
+   MTLK_START_FINALLY(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin));
+   MTLK_START_RETURN(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin), mtlk_hw_mmb_stop_card_finalize, (hw));
+@@ -8136,6 +8859,9 @@
+   void                    *iom      = _mtlk_mmb_cm_bdr_get_iom_bd(bbdr, req_obj->hdr.index, iom_size);
+   uint32                  descr;
+ 
++  if (READ_ONCE(hw->quiescing))
++    return;
++
+   _mtlk_mmb_dbg_verify_msg_send(req_obj);
+ 
+   /* Must do this in order to deal with MsgID endianess */
+@@ -8164,6 +8890,8 @@
+   BOOL is_pending = FALSE;
+   mtlk_vap_handle_t master_vap;
+ 
++  if (READ_ONCE(hw->quiescing))
++    return;
+ 
+   WLOG_DD("CID-%02x: Resetting FW because of message timeout. Message ID is 0x%X",
+           hw->card_idx, msg_id);
+@@ -8283,15 +9011,11 @@
+  * HW interface implementation for VFT
+  **************************************************************/
+ static mtlk_hw_msg_t*
+-_mtlk_hw_get_msg_to_send (mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle, uint32 *nof_free_tx_msgs)
++_mtlk_hw_get_msg_to_send (mtlk_hw_t *hw, mtlk_vap_handle_t vap_handle, int *error)
+ {
+   mtlk_hw_data_req_mirror_t *data_req;
+ 
+-  data_req = _mtlk_mmb_get_msg_from_data_pool(hw, vap_handle);
+-
+-  if (nof_free_tx_msgs) {
+-    *nof_free_tx_msgs = (uint32)hw->tx.nof_free_bds;
+-  }
++  data_req = _mtlk_mmb_get_msg_from_data_pool(hw, vap_handle, error);
+ 
+   return HW_MSG_PTR(data_req);
+ }
+@@ -8333,7 +9057,7 @@
+   mtlk_dump(0, hw->bss_mgmt.tx_ring.v_base_addr, hw->bss_mgmt.tx_ring.size * sizeof(HOST_DSC), "TX BSS HD ring");
+ }
+ 
+-static void
++static int
+ _mtlk_mmb_put_hd_to_ring(mtlk_hw_t *hw, HOST_DSC *pHD, mtlk_ring_buffer *ring)
+ {
+   mtlk_handle_t lock_val;
+@@ -8348,21 +9072,22 @@
+   pHD->u32frameInfo3 = CPU_TO_LE32(u32frameInfo3);
+ 
+   lock_val = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++  if (hw->quiescing) {
++    mtlk_osal_lock_release_irq(&hw->reg_lock, lock_val);
++    return MTLK_ERR_NOT_READY;
++  }
+ 
+   /* copy descriptor into ring */
+   *(ring->base_addr + ring->write_ptr) = *pHD;
+ 
+-  mmiowb();
+-
+-  while(__UNLIKELY(memcmp(pHD, ring->base_addr + ring->write_ptr, sizeof(HOST_DSC)))){
+-    mtlk_dump(0,ring->base_addr + ring->write_ptr, sizeof(HOST_DSC), "PHD");
+-    mtlk_dump(0,pHD, sizeof(HOST_DSC), "stored");
+-  }
++  /* Coherent descriptor stores must reach the device before its doorbell. */
++  dma_wmb();
+ 
+   INC_WRAP_IDX(ring->write_ptr, ring->size);
+ 
+   mtlk_ccr_ring_initiate_doorbell_interrupt(hw->ccr, &ring->regs);
+   mtlk_osal_lock_release_irq(&hw->reg_lock, lock_val);
++  return MTLK_ERR_OK;
+ }
+ 
+ static int
+@@ -8371,6 +9096,10 @@
+ {
+   int       res = MTLK_ERR_OK;
+   HOST_DSC  tx_bd;
++
++  if (READ_ONCE(hw->quiescing) ||
++      wave_radio_dfs_tx_blocked(wave_vap_radio_get(vap_handle)))
++    return MTLK_ERR_NOT_READY;
+ 
+ #if (defined MTLK_DEBUG_IPERF_PAYLOAD_RX) || (defined MTLK_DEBUG_IPERF_PAYLOAD_TX)
+   data_req->ts           = mtlk_osal_timestamp();
+@@ -8384,6 +9113,10 @@
+                                     data_req->nbuf,
+                                     data_req->size,
+                                     MTLK_DATA_TO_DEVICE);
++    if (dma_mapping_error(mtlk_ccr_get_device(hw->ccr), data_req->dma_addr)) {
++      data_req->dma_addr = 0;
++      return MTLK_ERR_NO_MEM;
++    }
+   }
+   else {
+     data_req->dma_addr = 0;
+@@ -8466,7 +9199,17 @@
+   }
+ #endif
+ 
+-  _mtlk_mmb_put_hd_to_ring(hw, &tx_bd, &hw->tx.ring);
++  res = _mtlk_mmb_put_hd_to_ring(hw, &tx_bd, &hw->tx.ring);
++  if (res != MTLK_ERR_OK) {
++    if (data_req->dma_addr) {
++      mtlk_df_nbuf_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), data_req->nbuf, data_req->dma_addr,
++                                   data_req->size, MTLK_DATA_TO_DEVICE);
++      data_req->dma_addr = 0;
++    }
++#ifdef BD_DBG
++    clear_bit(data_req->hdr.index, hw->tx.used_bd_map);
++#endif
++  }
+   CPU_STAT_END_TRACK(CPU_STAT_ID_TX_HW);
+   return res;
+ }
+@@ -8490,6 +9233,191 @@
+                 DRV_VERSION, hw->if_version, hw->progmodel);
+ 
+   mtlk_osal_lock_release(&hw->version_lock);
++}
++
++/* Host groups, commands, applied memberships and TX descriptors each own
++ * their lifetime independently. A retiring ID is not available even to the
++ * same key until every prior owner has drained. Quarantine lasts this probe. */
++BOOL wave_hw_mc_get(mtlk_hw_t *hw, uint8 id, BOOL pin)
++{
++  mtlk_hw_mc_t *group;
++  BOOL valid = FALSE;
++
++  if (id < MC_MIN_GROUP || id >= MC_GROUPS)
++    return FALSE;
++  mtlk_osal_lock_acquire(&hw->mc_group_lock);
++  group = &hw->mc_groups[id];
++  if (!READ_ONCE(hw->quiescing) && group->ref_cnt && !group->quarantined &&
++      (!pin || group->pins != (uint32)~0U)) {
++    if (pin)
++      group->pins++;
++    valid = TRUE;
++  }
++  mtlk_osal_lock_release(&hw->mc_group_lock);
++  return valid;
++}
++
++void wave_hw_mc_put(mtlk_hw_t *hw, uint8 id)
++{
++  mtlk_hw_mc_t *group;
++
++  MTLK_ASSERT(id >= MC_MIN_GROUP && id < MC_GROUPS);
++  mtlk_osal_lock_acquire(&hw->mc_group_lock);
++  group = &hw->mc_groups[id];
++  MTLK_ASSERT(group->pins);
++  if (group->pins && !--group->pins && !group->ref_cnt && !group->quarantined)
++    memset(group, 0, sizeof(*group));
++  mtlk_osal_lock_release(&hw->mc_group_lock);
++}
++
++void wave_hw_mc_quarantine(mtlk_hw_t *hw, uint8 id)
++{
++  MTLK_ASSERT(id >= MC_MIN_GROUP && id < MC_GROUPS);
++  mtlk_osal_lock_acquire(&hw->mc_group_lock);
++  hw->mc_groups[id].quarantined = true;
++  mtlk_osal_lock_release(&hw->mc_group_lock);
++}
++
++/* Native source policy owns immutable recipient sets. These IDs share the
++ * same pin/quarantine pool, but never alias an address-keyed helper group or
++ * another VAP's recipient set. A host owner is released only after its command
++ * and applied-membership owners have withdrawn; DAT_CFM may retain TX pins.
++ */
++int wave_hw_mc_alloc_native(mtlk_hw_t *hw)
++{
++  int id, result = MCAST_GROUP_UNDEF;
++
++  mtlk_osal_lock_acquire(&hw->mc_group_lock);
++  if (!READ_ONCE(hw->quiescing)) {
++    for (id = MC_MIN_GROUP; id < MC_GROUPS; id++) {
++      mtlk_hw_mc_t *group = &hw->mc_groups[id];
++
++      if (group->ref_cnt || group->pins || group->quarantined)
++        continue;
++      memset(group, 0, sizeof(*group));
++      group->native = true;
++      group->ref_cnt = 1;
++      result = id;
++      break;
++    }
++  }
++  mtlk_osal_lock_release(&hw->mc_group_lock);
++  return result;
++}
++
++void wave_hw_mc_release_native(mtlk_hw_t *hw, uint8 id)
++{
++  mtlk_hw_mc_t *group;
++
++  MTLK_ASSERT(id >= MC_MIN_GROUP && id < MC_GROUPS);
++  mtlk_osal_lock_acquire(&hw->mc_group_lock);
++  group = &hw->mc_groups[id];
++  MTLK_ASSERT(group->native && group->ref_cnt == 1);
++  if (group->native && group->ref_cnt == 1) {
++    group->ref_cnt = 0;
++    if (!group->pins && !group->quarantined)
++      memset(group, 0, sizeof(*group));
++  }
++  mtlk_osal_lock_release(&hw->mc_group_lock);
++}
++
++/* Group IDs are shared by all VAPs of this hardware. Match semantic keys,
++ * and admit the requested ID under the same lock as reference changes. A
++ * failed request must leave every existing owner and reference unchanged. */
++static BOOL
++_mtlk_hw_mc_addr_equal (const mtlk_mc_addr_t *a, const mtlk_mc_addr_t *b)
++{
++  if (a->type != b->type)
++    return FALSE;
++  if (a->type == MTLK_IPv4)
++    return a->src_ip.ip4_addr.s_addr == b->src_ip.ip4_addr.s_addr &&
++           a->grp_ip.ip4_addr.s_addr == b->grp_ip.ip4_addr.s_addr;
++  return !memcmp(&a->src_ip.ip6_addr, &b->src_ip.ip6_addr, sizeof(struct in6_addr)) &&
++         !memcmp(&a->grp_ip.ip6_addr, &b->grp_ip.ip6_addr, sizeof(struct in6_addr));
++}
++
++static int
++_mtlk_hw_mc_group_action (mtlk_hw_t *hw, mtlk_core_ui_mc_grid_action_t *req)
++{
++  mtlk_hw_mc_t *group;
++  int i, first_free = 0, found = MC_GROUPS;
++  int res = MTLK_ERR_VALUE;
++  uint8 requested = req->grp_id;
++
++  req->grp_id = MCAST_GROUP_UNDEF;
++  if (req->action != MTLK_GRID_ADD && req->action != MTLK_GRID_DEL)
++    return res;
++  /* An undefined deletion owns no reference, even if the key exists. */
++  if (req->action == MTLK_GRID_DEL && requested == MCAST_GROUP_UNDEF)
++    return MTLK_ERR_OK;
++  if ((requested != MCAST_GROUP_UNDEF &&
++       (requested < MC_MIN_GROUP || requested >= MC_GROUPS)) ||
++      (req->mc_addr.type != MTLK_IPv4 && req->mc_addr.type != MTLK_IPv6))
++    return res;
++
++  mtlk_osal_lock_acquire(&hw->mc_group_lock);
++  for (i = MC_MIN_GROUP; i < MC_GROUPS; i++) {
++    if (hw->mc_groups[i].ref_cnt || hw->mc_groups[i].pins || hw->mc_groups[i].quarantined) {
++      if (!hw->mc_groups[i].native &&
++          _mtlk_hw_mc_addr_equal(&hw->mc_groups[i].mc_addr, &req->mc_addr))
++        found = i;
++    } else if (!first_free) {
++      first_free = i;
++    }
++  }
++
++  if (found != MC_GROUPS) {
++    if (requested != MCAST_GROUP_UNDEF && requested != found)
++      goto out;
++    group = &hw->mc_groups[found];
++    if (req->action == MTLK_GRID_ADD) {
++      if (!group->ref_cnt || group->quarantined || READ_ONCE(hw->quiescing))
++        goto out;
++      if (group->ref_cnt == (uint32)~0U) {
++        res = MTLK_ERR_NO_RESOURCES;
++        goto out;
++      }
++      group->ref_cnt++;
++    } else {
++      if (!group->ref_cnt)
++        goto out;
++      if (!--group->ref_cnt && !group->pins && !group->quarantined)
++        memset(group, 0, sizeof(*group));
++    }
++    req->grp_id = found;
++    res = MTLK_ERR_OK;
++    goto out;
++  }
++
++  if (req->action == MTLK_GRID_DEL || READ_ONCE(hw->quiescing))
++    goto out;
++  if (requested != MCAST_GROUP_UNDEF) {
++    if (hw->mc_groups[requested].ref_cnt || hw->mc_groups[requested].pins ||
++        hw->mc_groups[requested].quarantined)
++      goto out;
++    first_free = requested;
++  }
++  if (!first_free) {
++    res = MTLK_ERR_NO_RESOURCES;
++    goto out;
++  }
++
++  group = &hw->mc_groups[first_free];
++  memset(group, 0, sizeof(*group));
++  group->mc_addr.type = req->mc_addr.type;
++  if (req->mc_addr.type == MTLK_IPv4) {
++    group->mc_addr.src_ip.ip4_addr = req->mc_addr.src_ip.ip4_addr;
++    group->mc_addr.grp_ip.ip4_addr = req->mc_addr.grp_ip.ip4_addr;
++  } else {
++    group->mc_addr.src_ip.ip6_addr = req->mc_addr.src_ip.ip6_addr;
++    group->mc_addr.grp_ip.ip6_addr = req->mc_addr.grp_ip.ip6_addr;
++  }
++  group->ref_cnt = 1;
++  req->grp_id = first_free;
++  res = MTLK_ERR_OK;
++out:
++  mtlk_osal_lock_release(&hw->mc_group_lock);
++  return res;
+ }
+ 
+ static int
+@@ -8506,7 +9434,7 @@
+     if (size == sizeof(mtlk_hw_state_e))
+     {
+       mtlk_hw_state_e *val = (mtlk_hw_state_e *)buffer;
+-      hw->state = *val;
++      WRITE_ONCE(hw->state, *val);
+       res       = MTLK_ERR_OK;
+       if (mtlk_hw_is_halted(hw->state)) {
+         mtlk_txmm_halt(&hw->txmm_base);
+@@ -8585,105 +9513,8 @@
+     break;
+ #endif
+   case MTLK_HW_MC_GROUP_ID:
+-    if (buffer && (size == sizeof(mtlk_core_ui_mc_grid_action_t)))
+-    {
+-      mtlk_core_ui_mc_grid_action_t  *req = (mtlk_core_ui_mc_grid_action_t *)buffer;
+-      mtlk_mc_addr_t *mc_addr = &req->mc_addr;
+-      int i, first_free = 0;
+-
+-      if ((MTLK_GRID_DEL == req->action) && (MCAST_GROUP_UNDEF == req->grp_id)) {
+-        res = MTLK_ERR_OK;
+-      }
+-
+-      ILOG1_DS("MC GRID Action: %d (%s)", req->action, (req->action == MTLK_GRID_ADD) ? "add group" : "del group");
+-
+-      if (MTLK_IPv4 == req->mc_addr.type) {
+-        ILOG1_DD("IPv4:%B --> %B", htonl(req->mc_addr.src_ip.ip4_addr.s_addr), htonl(req->mc_addr.grp_ip.ip4_addr.s_addr));
+-      } else {
+-        ILOG1_KK("IPv6:%K --> %K", req->mc_addr.src_ip.ip6_addr.s6_addr, req->mc_addr.grp_ip.ip6_addr.s6_addr);
+-      }
+-
+-      /* Sanity check */
+-      if ((req->grp_id >= MC_GROUPS) && (req->grp_id != MCAST_GROUP_UNDEF)) {
+-        ELOG_DD("Group ID (%u) exceeds range 0..%d", req->grp_id, MC_GROUPS-1);
+-        req->grp_id = MCAST_GROUP_UNDEF;
+-        res = MTLK_ERR_VALUE;
+-        break;
+-      }
+-
+-      mtlk_osal_lock_acquire(&hw->mc_group_lock);
+-
+-      for (i = MC_MIN_GROUP; i < MC_GROUPS; i++) {
+-        if (hw->mc_groups[i].ref_cnt) {
+-          if (0==memcmp(&hw->mc_groups[i].mc_addr, mc_addr, sizeof (mtlk_mc_addr_t))) {
+-            /* entry found */
+-            break;
+-          }
+-        }
+-        else {
+-          if (!first_free) {
+-            first_free = i;
+-          }
+-        }
+-      }
+-
+-      if (req->grp_id != MCAST_GROUP_UNDEF) {
+-        if (i == MC_GROUPS) {
+-          first_free = req->grp_id;
+-        }
+-        else {
+-          if (i != req->grp_id) {
+-            ELOG_DD("Group ID %d not match with HW table GRID %d", req->grp_id, i);
+-          }
+-        }
+-      }
+-
+-      if (req->action == MTLK_GRID_ADD) {
+-        /* Add a new MC group into table */
+-        if (i == MC_GROUPS) {
+-          if (!first_free) {
+-            ELOG_V("No space available for new group");
+-          } else {
+-            ILOG1_V("Group is not found, adding new");
+-            hw->mc_groups[first_free].mc_addr = *mc_addr;
+-            if (hw->mc_groups[first_free].ref_cnt) {
+-              ELOG_V("ERROR ref counter is not zero");
+-            }
+-            hw->mc_groups[first_free].ref_cnt++;
+-            req->grp_id = first_free;
+-          }
+-        } else {
+-           hw->mc_groups[i].ref_cnt++;
+-           ILOG1_D("Group is already available, increase ref counter:%d", hw->mc_groups[i].ref_cnt);
+-           req->grp_id = i;
+-        }
+-      } else {
+-        /* Remove MC group from table */
+-        if (i == MC_GROUPS) {
+-          ILOG1_V("Group is not found");
+-        } else {
+-          ILOG1_D("group ref counter:%d", hw->mc_groups[i].ref_cnt);
+-          if (0 == hw->mc_groups[i].ref_cnt)
+-          {
+-            ELOG_V("Multicast group refecence counter already is equal zero before decrement");
+-          }
+-
+-          MTLK_ASSERT(hw->mc_groups[i].ref_cnt);
+-
+-          hw->mc_groups[i].ref_cnt--;
+-          if (0 == hw->mc_groups[i].ref_cnt)
+-          {
+-            ILOG1_D("Clearing group %d", i);
+-            memset(&hw->mc_groups[i].mc_addr, 0, sizeof(mtlk_mc_addr_t));
+-            hw->mc_groups[i].mc_addr.type = MTLK_IP_NONE;
+-          }
+-          req->grp_id = i;
+-        }
+-      }
+-
+-      mtlk_osal_lock_release(&hw->mc_group_lock);
+-      res = MTLK_ERR_OK;
+-    }
++    if (buffer && size == sizeof(mtlk_core_ui_mc_grid_action_t))
++      res = _mtlk_hw_mc_group_action(hw, buffer);
+     break;
+ 
+   case MTLK_HW_DATA_TXOUT_LIM:
+@@ -9008,22 +9839,6 @@
+       res  = MTLK_ERR_OK;
+     }
+     break;
+-  case MTLK_HW_FW_TX_TIME_INT_TO_TASKLET:
+-    if (size == sizeof(uint64))
+-    {
+-      uint64 *val = (uint64 *)buffer;
+-      *val = hw->tx.max_int_tasklet_time;
+-      res  = MTLK_ERR_OK;
+-    }
+-    break;
+-  case MTLK_HW_FW_TX_TIME_INT_TO_CFM:
+-    if (size == sizeof(uint64))
+-    {
+-      uint64 *val = (uint64 *)buffer;
+-      *val = hw->tx.max_int_processed_cfm;
+-      res  = MTLK_ERR_OK;
+-    }
+-    break;
+   case MTLK_HW_FW_DATA_IN_TASKLET:
+     if (size == sizeof(uint32))
+     {
+@@ -9032,22 +9847,6 @@
+       res  = MTLK_ERR_OK;
+     }
+     break;
+-  case MTLK_HW_FW_RX_TIME_INT_TO_TASKLET:
+-    if (size == sizeof(uint64))
+-    {
+-      uint64 *val = (uint64 *)buffer;
+-      *val = hw->rx.max_int_tasklet_time;
+-      res  = MTLK_ERR_OK;
+-    }
+-    break;
+-  case MTLK_HW_FW_RX_TIME_INT_TO_PCK:
+-    if (size == sizeof(uint64))
+-    {
+-      uint64 *val = (uint64 *)buffer;
+-      *val = hw->rx.max_int_processed_packet;
+-      res  = MTLK_ERR_OK;
+-    }
+-    break;
+ #endif /* MTLK_DEBUG */
+ 
+   case MTLK_HW_CALIB_BUF_DMA_ADDR:
+@@ -9060,20 +9859,21 @@
+     }
+     break;
+   case MTLK_HW_MC_GROUP_ID:
+-    if (buffer && (size == sizeof(mtlk_core_ui_mc_grid_action_t)))
+-    {
+-      mtlk_core_ui_mc_grid_action_t *req = (mtlk_core_ui_mc_grid_action_t *) buffer;
+-
+-      /* Sanity check */
+-      if (req->grp_id >= MC_GROUPS) {
+-        ELOG_DD("Group ID (%u) exceeds range 0..%d", req->grp_id, MC_GROUPS-1);
+-        req->grp_id = MCAST_GROUP_UNDEF;
+-        memset(&req->mc_addr, 0, sizeof(req->mc_addr));
+-        res = MTLK_ERR_VALUE;
+-      }
+-      else {
+-        req->mc_addr = hw->mc_groups[req->grp_id].mc_addr;
+-        res = MTLK_ERR_OK;
++    if (buffer && size == sizeof(mtlk_core_ui_mc_grid_action_t)) {
++      mtlk_core_ui_mc_grid_action_t *req = buffer;
++      uint8 id = req->grp_id;
++
++      req->grp_id = MCAST_GROUP_UNDEF;
++      memset(&req->mc_addr, 0, sizeof(req->mc_addr));
++      res = MTLK_ERR_VALUE;
++      if (id >= MC_MIN_GROUP && id < MC_GROUPS) {
++        mtlk_osal_lock_acquire(&hw->mc_group_lock);
++        if (hw->mc_groups[id].ref_cnt && !hw->mc_groups[id].quarantined) {
++          req->grp_id = id;
++          req->mc_addr = hw->mc_groups[id].mc_addr;
++          res = MTLK_ERR_OK;
++        }
++        mtlk_osal_lock_release(&hw->mc_group_lock);
+       }
+     }
+     break;
+@@ -9406,7 +10206,7 @@
+ void __MTLK_IFUNC
+ mtlk_hw_mmb_stop_mac_events (mtlk_hw_t *hw)
+ {
+-  hw->mac_events_stopped = 1;
++  WRITE_ONCE(hw->mac_events_stopped, 1);
+ }
+ 
+ mtlk_hw_api_t * __MTLK_IFUNC
+@@ -9558,6 +10358,10 @@
+ 
+   lock = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
+ 
++  if (hw->quiescing || hw->monitor_irqs_blocked) {
++    mtlk_osal_lock_release_irq(&hw->reg_lock, lock);
++    return 0;
++  }
+   irq_status = mtlk_ccr_is_interrupt_pending(hw->ccr);
+   if (irq_status == 0xFFFFFFFF ) {
+     /* PCIE bus stuck is detected. Do not reschedule timer */
+@@ -9620,6 +10424,7 @@
+ mtlk_hw_mmb_interrupt_handler_msi (mtlk_irq_handler_data *ihd)
+ {
+   mtlk_hw_t    *hw;
++  mtlk_handle_t lock;
+   MTLK_ASSERT(NULL != ihd);
+ 
+   hw = ihd->hw;
+@@ -9627,7 +10432,13 @@
+   MTLK_ASSERT(NULL != hw);
+   MTLK_ASSERT(NULL != hw->ccr);
+ 
++  lock = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++  if (hw->quiescing || hw->monitor_irqs_blocked) {
++    mtlk_osal_lock_release_irq(&hw->reg_lock, lock);
++    return MTLK_ERR_UNKNOWN;
++  }
+   hw->perform_isr_action(hw, ihd);
++  mtlk_osal_lock_release_irq(&hw->reg_lock, lock);
+   return MTLK_ERR_OK;
+ }
+ 
+@@ -9645,6 +10456,11 @@
+   MTLK_ASSERT(NULL != hw->ccr);
+ 
+   lock = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++
++  if (hw->quiescing || hw->monitor_irqs_blocked) {
++    mtlk_osal_lock_release_irq(&hw->reg_lock, lock);
++    return MTLK_ERR_UNKNOWN;
++  }
+ 
+   CPU_STAT_BEGIN_TRACK(CPU_STAT_ID_ISR);
+ 
+@@ -9669,17 +10485,6 @@
+       MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_INTR_ENABLE_INT, MTLK_IRQ_ALL);
+       break; /* do */
+     }
+-    else {
+-#ifdef MTLK_DEBUG
+-      if (ihd->status & MTLK_IRQ_TXOUT) {
+-        mtlk_dbg_hres_ts(&hw->tx_interrupt_time);
+-      }
+-
+-      if (ihd->status & MTLK_IRQ_RX) {
+-        mtlk_dbg_hres_ts(&hw->rx_interrupt_time);
+-      }
+-#endif
+-    }
+ 
+     hw->perform_isr_action(hw, ihd);
+ 
+@@ -9702,7 +10507,8 @@
+ /* TODO: make a CPU optimization in IRQ_ENABLE_OR_RESCHEDULE (return rescheduling of tasklet) */
+ #define IRQ_ENABLE_OR_RESCHEDULE(ihd){ \
+     mtlk_handle_t lock_val = mtlk_osal_lock_acquire_irq(&ihd->hw->reg_lock); \
+-    mtlk_ccr_enable_interrupts(ihd->hw->ccr, ihd->irq_no); \
++    if (!ihd->hw->quiescing && !ihd->hw->monitor_irqs_blocked) \
++      mtlk_ccr_enable_interrupts(ihd->hw->ccr, ihd->irq_no); \
+     MTLK_TRACER_ADD_ENTRY(ihd->hw, MTLK_TR_INTR_ENABLE_INT, ihd->irq_no); \
+     mtlk_osal_lock_release_irq(&ihd->hw->reg_lock, lock_val); }
+ 
+@@ -9937,20 +10743,37 @@
+   return res;
+ }
+ 
+-int __MTLK_IFUNC
+-mtlk_hw_mmb_restore (mtlk_hw_t *hw)
++static int
++_wave_hw_mmb_restore (mtlk_hw_t *hw)
+ {
+   int res = MTLK_ERR_OK;
++  bool fresh_monitor;
+ 
+   MTLK_ASSERT(hw != NULL);
+   /* MTLK_ASSERT(hw->vap_manager != NULL); */
+   MTLK_ASSERT(hw->radio_descr != NULL);
++
++  if (READ_ONCE(hw->quiescing))
++    return MTLK_ERR_NOT_READY;
++
++  /* A monitor transition uses a complete fresh firmware/RX lifetime.
++   * Its completed PCI/IRQ/DMA/CPU fence owns the old cache before unmap.
++   * Ordinary fault recovery retains its native calibration-cache policy. */
++  fresh_monitor = smp_load_acquire(&hw->monitor_fenced);
++  if (fresh_monitor)
++    _mtlk_mmb_cleanup_calibration_cache(hw);
+ 
+   /* Reset FW and chip */
+   _mtlk_mmb_reset_all_events(hw);
+   mtlk_hw_mmb_reset_mac(hw);
+   mtlk_hw_mmb_restore_irq_mode(hw);
+   _mtlk_mmb_cleanup_reset_mac(hw);
++  /* The old native policy/peers are now retired. New recovery configuration
++   * may re-enable MU before hostapd admits fresh station/weight owners. */
++  wave_hw_airtime_lock(hw);
++  hw->airtime_radios = 0;
++  wave_hw_airtime_unlock(hw);
++  _wave_hw_stats_reset_lifetime(hw);
+ 
+   /* STOP */
+   if (mtlk_mmb_dcdp_path_available(hw)) {
+@@ -9972,6 +10795,22 @@
+ #if MTLK_DCDP_SEPARATE_REG
+   _mtlk_mmb_data_path_unregister(hw);
+ #endif
++  if (fresh_monitor) {
++    mtlk_handle_t flags;
++
++    hw->perform_isr_action = isr_action_init;
++    /* Match cold startup: finish PCI/tasklet admission before power/PLL
++     * initialization. The old DMA/rings and CPUs are already fenced.
++     * Keep shared IRQ admission closed until the fresh firmware is loaded.
++     * Even a partial restart must be refenced on failure. */
++    flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++    WRITE_ONCE(hw->monitor_fenced, false);
++    mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
++    res = wave_mmb_drv_restart_dma(mtlk_ccr_get_device(hw->ccr));
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++
+   /* Power ON chip */
+   _mtlk_mmb_power_on(hw);
+ 
+@@ -9993,6 +10832,15 @@
+     return res;
+   }
+ 
++  if (fresh_monitor) {
++    mtlk_handle_t flags;
++
++    /* PCI/tasklets and PLL are ready; firmware CPUs are still reset.
++     * Bootstrap IRQs may now run the existing initialization action. */
++    flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
++    hw->monitor_irqs_blocked = false;
++    mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
++  }
+   _mtlk_mmb_run_firmware(hw);
+ 
+   res = _mtlk_mmb_wait_chi_magic(hw);
+@@ -10072,16 +10920,22 @@
+     return res;
+   }
+ 
+-  res = _mtlk_mmb_prealloc_rx_data_buffers(hw);
++  res = _mtlk_mmb_prealloc_rx_data_buffers(hw, true);
+   if (res != MTLK_ERR_OK) {
+     ELOG_D("MMB_Restore _mtlk_mmb_prealloc_rx_data_buffers failed(%d)", res);
+     return res;
+   }
+ 
+-  res = _mtlk_mmb_prealloc_rx_mgmt_buffers(hw);
++  res = _mtlk_mmb_prealloc_rx_mgmt_buffers(hw, true);
+   if (res != MTLK_ERR_OK) {
+     ELOG_D("MMB_Restore _mtlk_mmb_prealloc_rx_mgmt_buffers failed(%d)", res);
+     return res;
++  }
++
++  if (fresh_monitor) {
++    res = _mtlk_mmb_init_calibration_cache(hw);
++    if (res != MTLK_ERR_OK)
++      return res;
+   }
+ 
+   if (hw->chi_area.sMipsControl.sData.u32DescriptorLocation) {
+@@ -10110,7 +10964,7 @@
+ 
+   hw->mac_reset_logic_initialized = TRUE;
+ 
+-  hw->state    = MTLK_HW_STATE_WAITING_READY;
++  WRITE_ONCE(hw->state, MTLK_HW_STATE_WAITING_READY);
+   hw->perform_isr_action = isr_action_normal;
+ 
+ #if !MTLK_DCDP_SEPARATE_REG
+@@ -10153,10 +11007,34 @@
+     return res;
+   }
+ 
+-  hw->state = MTLK_HW_STATE_READY;
++  WRITE_ONCE(hw->state, MTLK_HW_STATE_READY);
+ 
+   ILOG2_V("HW layer restored!");
+   return MTLK_ERR_OK;
++}
++
++int __MTLK_IFUNC
++mtlk_hw_mmb_restore(mtlk_hw_t *hw)
++{
++  int res;
++  bool restore_monitor;
++
++  /* Terminal removal/failure may not interleave a new DMA enable with its
++   * fence. quiescing is never cleared by the restartable recovery path. */
++  mutex_lock(&hw->quiesce_lock);
++  restore_monitor = wave_hw_monitor_fenced(hw);
++  res = _wave_hw_mmb_restore(hw);
++  if (res != MTLK_ERR_OK && restore_monitor) {
++    /* PCI or tasklets may have restarted before any later init failure.
++     * Retire that attempt before returning to either recovery caller. Keep
++     * ordinary fault recovery restartable; the monitor netdev caller owns
++     * its existing terminal-on-error decision. Preserve the original error. */
++    if (_wave_hw_monitor_fence_locked(hw) != MTLK_ERR_OK &&
++        !READ_ONCE(hw->quiescing))
++      wave_hw_mmb_quiesce_locked(hw);
++  }
++  mutex_unlock(&hw->quiesce_lock);
++  return res;
+ }
+ 
+ static int
+@@ -10309,6 +11187,117 @@
+   }
+ }
+ 
++static void wave_bss_complete_pmf(struct mtlk_hw_bss_req_mirror *entry)
++{
++  struct wave_pmf *pmf = xchg(&entry->pmf, NULL);
++
++  if (pmf)
++    wave_pmf_complete(pmf, entry->pmf_slot);
++}
++
++/* Called after terminal quiesce or the complete restartable monitor fence.
++ * The VAP lifetime excludes process producers; both fences join IRQ/tasklet
++ * producers and reset firmware before any pending PMF reference is detached. */
++void wave_hw_mmb_detach_pmf(mtlk_hw_t *hw, struct wave_pmf *pmf)
++{
++  mtlk_mmb_basic_bdr_t *ring = &hw->bss_mgmt.tx_bdr.basic;
++  unsigned int i;
++
++  if (WARN_ON(!READ_ONCE(hw->quiescing) && !wave_hw_monitor_fenced(hw)))
++    return;
++  for (i = 0; i < ring->nof_bds; i++) {
++    struct mtlk_hw_bss_req_mirror *entry =
++      _mtlk_basic_bdr_get_mirror_bd(ring, i, struct mtlk_hw_bss_req_mirror);
++    if (READ_ONCE(entry->pmf) == pmf)
++      wave_bss_complete_pmf(entry);
++  }
++}
++
++/* A successful queue publication holds the exact monitor netdev until native
++ * CFM or post-DMA-fence retirement. This is not a mac80211 STA skb. */
++static void wave_bss_complete_raw(struct mtlk_hw_bss_req_mirror *entry,
++                                  bool completed)
++{
++  struct sk_buff *skb = xchg(&entry->skb, NULL);
++  struct net_device *ndev;
++
++  if (!skb)
++    return;
++  ndev = skb->dev;
++  if (completed) {
++    ndev->stats.tx_packets++;
++    ndev->stats.tx_bytes += skb->len;
++  } else {
++    ndev->stats.tx_dropped++;
++    ndev->stats.tx_errors++;
++  }
++  dev_kfree_skb_any(skb);
++  dev_put(ndev);
++}
++
++static void wave_hw_monitor_flush_tx(mtlk_hw_t *hw)
++{
++  mtlk_mmb_advanced_bdr_t *queues[] = { &hw->bss_mgmt.tx_bdr, &hw->bss_mgmt.tx_res_bdr };
++  unsigned int q, i;
++
++  if (WARN_ON(!READ_ONCE(hw->quiescing) && !wave_hw_monitor_fenced(hw)))
++    return;
++  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR))
++    return;
++  /* RAW producers have joined the queue gate; IRQ/tasklet/DMA are fenced.
++   * Keep native BD/list ownership for its existing reset/free operation. */
++  for (q = 0; q < ARRAY_SIZE(queues); q++) {
++    for (i = 0; i < queues[q]->basic.nof_bds; i++) {
++      struct mtlk_hw_bss_req_mirror *entry =
++        _mtlk_basic_bdr_get_mirror_bd(&queues[q]->basic, i, struct mtlk_hw_bss_req_mirror);
++      if (entry->extra_processing != PROCESS_RAW_DATA || !entry->skb)
++        continue;
++      if (entry->dma_addr) {
++        mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), entry->dma_addr,
++                                  entry->size, MTLK_DATA_TO_DEVICE);
++        entry->dma_addr = 0;
++      }
++      wave_bss_complete_raw(entry, false);
++    }
++  }
++}
++
++
++static void wave_bss_discard_skb(mtlk_hw_t *hw, struct mtlk_hw_bss_req_mirror *entry)
++{
++  wave_radio_t *radio;
++
++  if (!entry->skb)
++    return;
++  if (entry->extra_processing == PROCESS_RAW_DATA) {
++    wave_bss_complete_raw(entry, false);
++    return;
++  }
++  radio = __mtlk_hw_wave_radio_get(hw, entry->radio_id);
++  if (WARN_ON(!radio || !wave_radio_mac80211_get(radio)))
++    return;
++  ieee80211_free_txskb(wave_radio_ieee80211_hw_get(radio), entry->skb);
++  entry->skb = NULL;
++}
++
++/* The caller has fenced DMA/drained IRQs and still owns the mac80211 hw. */
++void wave_hw_mmb_flush_sta_tx(mtlk_hw_t *hw, unsigned int radio_id)
++{
++  mtlk_mmb_advanced_bdr_t *queues[] = { &hw->bss_mgmt.tx_bdr, &hw->bss_mgmt.tx_res_bdr };
++  unsigned int q, i;
++
++  if (WARN_ON(!READ_ONCE(hw->quiescing)))
++    return;
++  for (q = 0; q < ARRAY_SIZE(queues); q++) {
++    for (i = 0; i < queues[q]->basic.nof_bds; i++) {
++      struct mtlk_hw_bss_req_mirror *entry =
++        _mtlk_basic_bdr_get_mirror_bd(&queues[q]->basic, i, struct mtlk_hw_bss_req_mirror);
++      if (entry->radio_id == radio_id)
++        wave_bss_discard_skb(hw, entry);
++    }
++  }
++}
++
+ static void
+ mtlk_mmb_free_bss_tx_buffers(mtlk_hw_t *hw, mtlk_mmb_advanced_bdr_t *control)
+ {
+@@ -10321,6 +11310,16 @@
+     if (!bss_req->virt_addr)
+       continue;
+ 
++    if (bss_req->dma_addr) {
++      mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->dma_addr,
++                                bss_req->size, MTLK_DATA_TO_DEVICE);
++      bss_req->dma_addr = 0;
++    }
++    if (bss_req->extra_processing == PROCESS_RAW_DATA)
++      wave_bss_complete_raw(bss_req, false);
++    /* Native VIF owners detach their pending references before destruction. */
++    WARN_ON(bss_req->pmf);
++    WARN_ON(bss_req->skb);
+     mtlk_osal_mem_free(bss_req->virt_addr);
+     bss_req->virt_addr = NULL;
+   }
+@@ -10606,7 +11605,7 @@
+ mtlk_hw_mmb_fill_phy_info_by_default (mtlk_phy_info_t *phy_info)
+ {
+     MTLK_ASSERT(NULL != phy_info);
+-    mtlk_hw_mmb_fill_phy_info_by_default(phy_info);
++    _mtlk_hw_mmb_fill_phy_info_by_default(phy_info);
+ }
+ 
+ static void
+@@ -10744,6 +11743,76 @@
+     } else { /* dummy */
+       _mtlk_hw_mmb_fill_phy_info_by_default(phy_info);
+     }
++}
++
++static struct mtlk_hw_bss_ind_mirror *
++wave_mgmt_rx_owner(mtlk_hw_t *hw, u32 address, u32 index)
++{
++  mtlk_mmb_basic_bdr_t *bdr = &hw->bss_mgmt.rx_bdr.basic;
++  struct mtlk_hw_bss_ind_mirror *entry;
++  unsigned int i;
++
++  /* Firmware is given a local RD index. Verify it against the DMA owner;
++   * Ethernet decapsulation can move the payload within the allocation. */
++  if (index < bdr->nof_bds) {
++    entry = _mtlk_basic_bdr_get_mirror_bd(bdr, index, struct mtlk_hw_bss_ind_mirror);
++    if (entry->dma_addr && address >= entry->dma_addr &&
++        address - entry->dma_addr < entry->size)
++      return entry;
++  }
++  for (i = 0; i < bdr->nof_bds; i++) {
++    if (i == index)
++      continue;
++    entry = _mtlk_basic_bdr_get_mirror_bd(bdr, i, struct mtlk_hw_bss_ind_mirror);
++    if (entry->dma_addr && address >= entry->dma_addr &&
++        address - entry->dma_addr < entry->size)
++      return entry;
++  }
++  return NULL;
++}
++
++struct wave_bss_rx_mapping {
++  void *virt_addr;
++  u32 dma_addr;
++  u32 size;
++};
++
++static bool
++wave_bss_rx_mapping_get(mtlk_hw_t *hw, u32 address, u32 index, bool is_eapol,
++                        struct wave_bss_rx_mapping *mapping)
++{
++  struct mtlk_hw_bss_ind_mirror *mgmt = wave_mgmt_rx_owner(hw, address, index);
++  mtlk_mmb_basic_bdr_t *bdr = &hw->rx.bdr_data;
++  mtlk_hw_data_ind_mirror_t *data;
++  unsigned int i, candidate;
++
++  if (mgmt) {
++    mapping->virt_addr = mgmt->virt_addr;
++    mapping->dma_addr = mgmt->dma_addr;
++    mapping->size = mgmt->size;
++    return true;
++  }
++  if (!is_eapol)
++    return false;
++
++  /* Retained firmware can report Ethernet EAPOL from a data RD on the
++   * management ring. Borrow its live allocation for a copy only: the original
++   * descriptor must be returned on the management ring without freeing or
++   * replacing the data skb. This card's RX tasklet serializes both rings. */
++  for (i = 0; i <= bdr->nof_bds; i++) {
++    candidate = i ? i - 1 : index;
++    if (candidate >= bdr->nof_bds || (i && candidate == index))
++      continue;
++    data = _mtlk_basic_bdr_get_mirror_bd(bdr, candidate, mtlk_hw_data_ind_mirror_t);
++    if (!data->nbuf || !data->dma_addr || address < data->dma_addr ||
++        address - data->dma_addr >= data->size)
++      continue;
++    mapping->virt_addr = data->nbuf->data;
++    mapping->dma_addr = data->dma_addr;
++    mapping->size = data->size;
++    return true;
++  }
++  return false;
+ }
+ 
+ int _mtlk_mmb_handle_bss_ind (mtlk_hw_t *hw, volatile HOST_DSC *pHD)
+@@ -10761,7 +11830,10 @@
+   uint8                         type;
+   mtlk_vap_handle_t             vap_handle;
+   BOOL                          is_eapol;
+-  uint32                        total_size;
++  uint32                        total_size, lead, metrics_offset = 0;
++  struct wave_bss_rx_mapping mapping;
++  struct wave_bss_rx_mapping *owner = &mapping;
++  bool cpu_owned = false;
+   BOOL                          is_gen5 = _hw_type_is_gen5(hw);
+   void                         *buf;
+   mtlk_core_handle_rx_bss_t     data;
+@@ -10783,6 +11855,7 @@
+       goto critical_error;
+     }
+   }
++  dma_rmb();
+   u32frameInfo0 = LE32_TO_CPU(pHD->u32frameInfo0);
+   u32frameInfo1 = LE32_TO_CPU(pHD->u32frameInfo1);
+   hostpayload   = LE32_TO_CPU(pHD->u32HostPayloadAddr);
+@@ -10812,21 +11885,42 @@
+     goto send_resp;
+   }
+ 
+-  /* Calculate total size of received data depending on the frame type and platform */
+-  is_eapol = ((FRAME_TYPE_EAPOL == frame_type) && (type == (IEEE80211_FTYPE_DATA >> 2)));
+-  total_size = (is_eapol ? size : /* Both: reported size = size of EAPOL frame, RxPhyMetrics is unavailable */
+-                is_gen5  ? size : /* Gen5: reported size = size of frame + size of RxPhyMetrics */
+-                                  /* Gen6: reported size = size of frame; need to add RxPhyMetrics with alignment */
+-                (RX_MGMT_ALIGNMENT(size + offset) - offset + sizeof(G6_RX_PHY_METRICS)));
+-
+-  hostpayload += offset;
+-  mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+-                            hostpayload, total_size, MTLK_DATA_FROM_DEVICE);
+-
+-  buf = (uint8 *)(phys_to_virt(hostpayload));
+-
+-  ILOG3_DP("phyaddr:0x%x vaddr:0x%p", hostpayload, buf);
+-  mtlk_dump(3, buf + sizeof(RX_PHY_METRICS), MIN(32, size),"EAPOL/BSS Frame");
++  is_eapol = ((type == (IEEE80211_FTYPE_DATA >> 2)) &&
++              (frame_type == FRAME_TYPE_EAPOL ||
++               (frame_type == FRAME_TYPE_ETHERNET && hw->bss_mgmt.rx_eapol.data_size)));
++  if (!wave_bss_rx_mapping_get(hw, hostpayload, HD_BD_INDEX_GET(pHD), is_eapol, owner)) {
++    ELOG_DD("BSS RX has no owned mapping: index=%u address=0x%08x",
++             HD_BD_INDEX_GET(pHD), hostpayload);
++    goto critical_error;
++  }
++  lead = hostpayload - owner->dma_addr;
++  if (offset > owner->size - lead)
++    goto critical_error;
++  lead += offset;
++  if (size > BSS_MGMT_FRAME_SIZE || size > owner->size - lead) {
++    ELOG_DDD("BSS RX exceeds owned mapping: lead=%u length=%u allocation=%u",
++             lead, size, owner->size);
++    goto critical_error;
++  }
++  total_size = lead + size;
++  if (!is_eapol) {
++    if (is_gen5) {
++      if (size < sizeof(RX_PHY_METRICS) + 24)
++        goto send_resp;
++    } else {
++      if (size < (type == (IEEE80211_FTYPE_CTL >> 2) ? 16 : 24))
++        goto send_resp;
++      /* Retained ABI uses the next 16-byte boundary even when aligned. */
++      metrics_offset = RX_MGMT_ALIGNMENT(total_size);
++      total_size = metrics_offset + sizeof(G6_RX_PHY_METRICS);
++    }
++  }
++  if (total_size > owner->size)
++    goto critical_error;
++  dma_sync_single_for_cpu(mtlk_ccr_get_device(hw->ccr), owner->dma_addr,
++                           owner->size, DMA_FROM_DEVICE);
++  cpu_owned = true;
++  buf = (u8 *)owner->virt_addr + lead;
+ 
+   if ((is_eapol) ||
+        ((FRAME_TYPE_ETHERNET == frame_type) && type == (IEEE80211_FTYPE_DATA >> 2) && hw->bss_mgmt.rx_eapol.data_size))
+@@ -10852,7 +11946,7 @@
+       MTLK_ASSERT(size <= BSS_MGMT_FRAME_SIZE); /* size of frame */
+       data.buf      = buf;
+       data.size     = size;
+-      g6_rx_metrics = (G6_RX_PHY_METRICS*)(RX_MGMT_ALIGNMENT((wave_addr)buf + size));
++      g6_rx_metrics = (G6_RX_PHY_METRICS *)((u8 *)owner->virt_addr + metrics_offset);
+       _mtlk_mmb_fill_phy_info_by_g6_rx_metrics(hw, phy_info, g6_rx_metrics);
+     }
+ 
+@@ -10875,14 +11969,18 @@
+     }
+   }
+ 
+-  mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+-                             buf, total_size, MTLK_DATA_FROM_DEVICE);
++  dma_sync_single_for_device(mtlk_ccr_get_device(hw->ccr), owner->dma_addr,
++                              owner->size, DMA_FROM_DEVICE);
++  cpu_owned = false;
+ 
+ send_resp:
+   _mtlk_mmb_put_hd_to_ring(hw, (HOST_DSC *)pHD, &hw->bss_mgmt.rx_ring);
+   return res;
+ 
+ critical_error:
++    if (cpu_owned)
++      dma_sync_single_for_device(mtlk_ccr_get_device(hw->ccr), owner->dma_addr,
++                                  owner->size, DMA_FROM_DEVICE);
+     ELOG_D("CID-%02x: Critical error in bss ring", hw->card_idx);
+     ELOG_DDDD("internal variables: hd_read_index %d hd_write_index %d rx_IN_copy %d OUT_cntr %d", hw->bss_mgmt.rx_ring.read_ptr, hw->bss_mgmt.rx_ring.write_ptr, hw->bss_mgmt.rx_ring.regs.IN_copy, hw->bss_mgmt.rx_ring.regs.int_OUT_cntr);
+     mtlk_dump(0, (void *)pHD, sizeof(HOST_DSC), "HD in error");
+@@ -10899,6 +11997,7 @@
+ #define  MTLK_HOST_TO_MAC_PAYLOAD(dma) CPU_TO_LE32(dma & ~7);
+ #endif
+ 
++
+ static int
+ _mtlk_mmb_bss_mgmt_tx(mtlk_hw_t *hw,
+                       struct mtlk_hw_bss_req_mirror *bss_req, mtlk_vap_handle_t vap_handle)
+@@ -10910,6 +12009,14 @@
+   unsigned char *dst_addr;
+   uint32 packet_length = bss_req->size;
+   BOOL mcf;
++
++  /* Reject the private RAW representation before any descriptor publication.
++   * Ordinary AP management, EAPOL and NULL requests retain their native path. */
++  if (bss_req->extra_processing == PROCESS_RAW_DATA)
++    return MTLK_ERR_NOT_SUPPORTED;
++  if (READ_ONCE(hw->quiescing) ||
++      wave_radio_dfs_tx_blocked(wave_vap_radio_get(vap_handle)))
++    return MTLK_ERR_NOT_READY;
+ 
+ #ifdef BD_DBG
+   if (bss_req->hdr.index >= hw->bss_mgmt.tx_bdr.basic.nof_bds) {
+@@ -11022,9 +12129,29 @@
+         return MTLK_ERR_PKT_DROPPED;
+   }
+ 
++  if (bss_req->extra_processing == PROCESS_MANAGEMENT && mtlk_vap_is_ap(vap_handle)) {
++    size_t length = bss_req->size;
++    int slot = wave_pmf_protect(&nic->slow_ctx->pmf, bss_req->virt_addr,
++                                &length, BSS_MGMT_FRAME_SIZE);
++
++    if (slot < 0)
++      return MTLK_ERR_NOT_READY;
++    bss_req->size = length;
++    packet_length = length;
++    if (slot < 2) {
++      bss_req->pmf_slot = slot;
++      smp_store_release(&bss_req->pmf, &nic->slow_ctx->pmf);
++    }
++  }
++
+   /* do not touch the data payload after dma map */
+   bss_req->dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->virt_addr,
+                                                  bss_req->size, MTLK_DATA_TO_DEVICE);
++  if (dma_mapping_error(mtlk_ccr_get_device(hw->ccr), bss_req->dma_addr)) {
++    bss_req->dma_addr = 0;
++    wave_bss_complete_pmf(bss_req);
++    return MTLK_ERR_NO_MEM;
++  }
+   /* leave the u8Reserved, u8Status and retransmissions fields as 0 */
+ 
+   bss_hd.u32BdIndex         = CPU_TO_LE32(bss_req->hdr.index);
+@@ -11063,13 +12190,23 @@
+ 
+   mtlk_dump(3, &bss_hd, sizeof(bss_hd), "BSS Mgmt TX HD:");
+ 
+-  mtlk_core_on_bss_tx(mtlk_vap_get_core(vap_handle), bss_req->subtype);
++  if (bss_req->extra_processing != PROCESS_RAW_DATA)
++    mtlk_core_on_bss_tx(mtlk_vap_get_core(vap_handle), bss_req->subtype);
+ 
+ #ifdef BD_DBG
+    set_bit(bss_req->hdr.index, hw->bss_mgmt.used_bd_map);
+ #endif
+ 
+-  _mtlk_mmb_put_hd_to_ring(hw, &bss_hd, &hw->bss_mgmt.tx_ring);
++  if (_mtlk_mmb_put_hd_to_ring(hw, &bss_hd, &hw->bss_mgmt.tx_ring) != MTLK_ERR_OK) {
++    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->dma_addr,
++                              bss_req->size, MTLK_DATA_TO_DEVICE);
++    bss_req->dma_addr = 0;
++#ifdef BD_DBG
++    clear_bit(bss_req->hdr.index, hw->bss_mgmt.used_bd_map);
++#endif
++    wave_bss_complete_pmf(bss_req);
++    return MTLK_ERR_NOT_READY;
++  }
+   return MTLK_ERR_OK;
+ 
+ #ifdef BD_DBG
+@@ -11194,6 +12331,14 @@
+   mtlk_core_t *cur_core;
+   struct mtlk_chan_def *ccd;
+   uint32 net_state;
++  int res;
++
++  if (extra_processing == PROCESS_RAW_DATA)
++    return MTLK_ERR_NOT_SUPPORTED;
++  if (READ_ONCE(hw->quiescing))
++    return MTLK_ERR_NOT_READY;
++  if (!buf || (extra_processing == PROCESS_EAPOL ? len < ETH_HLEN : len < 24))
++    return MTLK_ERR_PARAMS;
+ 
+   cur_core = mtlk_vap_get_core(vap_handle);
+   net_state = mtlk_core_get_net_state(cur_core);
+@@ -11253,13 +12398,18 @@
+     }
+ 
+     if (MAN_TYPE_ACTION == subtype) {
++      if (len <= sizeof(frame_head_t))
++        return MTLK_ERR_PARAMS;
+       action_code = *(buf + sizeof(frame_head_t));
+     }
+     if (MAN_TYPE_PROBE_RES == subtype) {
+       /* find BSS load ie if exist and update it*/
+       const u8 *ies_data = buf + sizeof(frame_head_t) + sizeof(frame_probe_resp_head_t);
+       int       ies_len = len - sizeof(frame_head_t) - sizeof(frame_probe_resp_head_t);
+-      ie_bss_load_t *ie_bss = (ie_bss_load_t *)cfg80211_find_ie(IE_BSS_LOAD, ies_data, ies_len);
++      ie_bss_load_t *ie_bss;
++      if (ies_len < 0)
++        return MTLK_ERR_PARAMS;
++      ie_bss = (ie_bss_load_t *)cfg80211_find_ie(IE_BSS_LOAD, ies_data, ies_len);
+       uint8     ch_util;
+       if((ie_bss) && (ie_bss->length == 5)) {
+         /* update parameters */
+@@ -11281,6 +12431,10 @@
+   }
+ 
+   mtlk_osal_lock_acquire(&bss_mgmt->tx_bdr.lock);
++  if (READ_ONCE(hw->quiescing)) {
++    mtlk_osal_lock_release(&bss_mgmt->tx_bdr.lock);
++    return MTLK_ERR_NOT_READY;
++  }
+ 
+   if (!dont_wait_for_ack) {
+     local_cookie = ++bss_mgmt->cookie_counter; /* at 4 billion mgmt frames per second, wraps in over 136 years */
+@@ -11321,6 +12475,7 @@
+ 
+   bss_req = MTLK_LIST_GET_CONTAINING_RECORD(entry, struct mtlk_hw_bss_req_mirror, hdr.list_entry);
+ 
++  bss_req->pmf = NULL; /* Reserved plaintext entries have no key reference. */
+   bss_req->vap_id = mtlk_vap_get_id(vap_handle);
+   bss_req->radio_id = radio_id;
+   bss_req->cookie = local_cookie;
+@@ -11336,7 +12491,15 @@
+   bss_req->tid              = tid;
+   if (transmit_now)
+   {
+-    _mtlk_mmb_bss_mgmt_tx(hw, bss_req, vap_handle);
++    res = _mtlk_mmb_bss_mgmt_tx(hw, bss_req, vap_handle);
++    if (res != MTLK_ERR_OK) {
++      bss_req->skb = NULL; /* The caller still owns an unsuccessful TX. */
++      mtlk_osal_lock_acquire(&bss_mgmt->tx_bdr.lock);
++      mtlk_dlist_remove(&bss_mgmt->tx_bdr.used_list, entry);
++      mtlk_dlist_push_back(&bss_mgmt->tx_bdr.free_list, entry);
++      mtlk_osal_lock_release(&bss_mgmt->tx_bdr.lock);
++      return res;
++    }
+   }
+   else
+   {
+@@ -11366,7 +12529,7 @@
+       mtlk_df_user_t *df_user = mtlk_df_get_user(df);
+       struct wireless_dev *wdev = mtlk_df_user_get_wdev(df_user);
+       MTLK_ASSERT(NULL != wdev);
+-      cfg80211_mgmt_tx_status(wdev,local_cookie,buf,len,TRUE,GFP_ATOMIC);
++      cfg80211_mgmt_tx_status(wdev,local_cookie,buf,len,FALSE,GFP_ATOMIC);
+     }
+     else
+     {
+@@ -11375,14 +12538,25 @@
+       MTLK_ASSERT(NULL != skb);
+       wv_ieee80211_tx_status(mac80211_hw, skb, FALSE);
+     }
++  } else if (skb && !mtlk_vap_is_ap(vap_handle)) {
++    ieee80211_free_txskb(wave_radio_ieee80211_hw_get(radio), skb);
+   }
+   return MTLK_ERR_OK;
++}
++
++
++/* Rejection retains caller ownership of skb and leaves cookie untouched. */
++int wave_hw_monitor_tx(mtlk_vap_handle_t vap, struct wave_monitor *owner,
++                       struct sk_buff *skb, int frequency, uint64 *cookie)
++{
++  return MTLK_ERR_NOT_SUPPORTED;
+ }
+ 
+ /* This runs from the tasklet context, and possibly on a different CPU
+  * than _mgmt_tx(), therefore a lock is needed in it (a simple spin_lock() will do) */
+ int _mtlk_mmb_handle_bss_cfm(mtlk_hw_t *hw, HOST_DSC *pHD)
+ {
++  dma_rmb();
+   struct mtlk_bss_management *bss_mgmt = &hw->bss_mgmt;
+   struct mtlk_hw_bss_req_mirror *bss_req, *bss_req_res;
+   struct wireless_dev *wdev;
+@@ -11399,6 +12573,7 @@
+   uint8  status = MTLK_BFIELD_GET(u32frameInfo0, TX_BSS_EXTRA_STATUS);
+   mtlk_vap_handle_t    vap_handle, vap_handle_res;
+   wave_radio_t *radio;
++  bool raw;
+ 
+   MTLK_ASSERT(hw);
+ 
+@@ -11414,6 +12589,8 @@
+   ILOG3_D("BSS CFM: index=%hu", u32BdIndex);
+ 
+   mtlk_osal_atomic_set(&bss_mgmt->tx_ring_last_cfm_ts, mtlk_osal_timestamp());
++  if (u32BdIndex >= bss_mgmt->tx_bdr.basic.nof_bds)
++    goto the_trap;
+   bss_req = _mtlk_basic_bdr_get_mirror_bd(&bss_mgmt->tx_bdr.basic, u32BdIndex, struct mtlk_hw_bss_req_mirror);
+ 
+ #ifdef BD_DBG
+@@ -11434,6 +12611,11 @@
+     goto the_trap;
+   }
+ #endif
++
++  raw = bss_req->extra_processing == PROCESS_RAW_DATA;
++  if (raw && (!bss_req->skb || !bss_req->dma_addr ||
++              radio_id != bss_req->radio_id || vap_id != bss_req->vap_id))
++    goto the_trap;
+ 
+   /* Confirmations can be received after VAP was traffic stopped */
+   if (__UNLIKELY(_mtlk_mmb_get_vap_is_not_ready(hw, radio_id, vap_id))) {
+@@ -11458,6 +12640,10 @@
+   wifi_header = (frame_head_t *)bss_req->virt_addr;
+ 
+   mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->dma_addr, bss_req->size, MTLK_DATA_TO_DEVICE);
++  bss_req->dma_addr = 0;
++  wave_bss_complete_pmf(bss_req);
++  if (raw)
++    wave_bss_complete_raw(bss_req, status == 1);
+ 
+   if (PROCESS_MANAGEMENT == bss_req->extra_processing)
+   {
+@@ -11468,7 +12654,7 @@
+         wdev = mtlk_df_user_get_wdev(df_user); /* this checks df_user */
+         MTLK_ASSERT(NULL != wdev);
+         cfg80211_mgmt_tx_status(wdev, bss_req->cookie, bss_req->virt_addr, bss_req->size,
+-                                (BOOL)status, GFP_ATOMIC);
++                                status == 1, GFP_ATOMIC);
+       }
+       else
+       {
+@@ -11476,6 +12662,7 @@
+         ILOG2_D("handle bss mgmt cfm status = %u", status);
+         MTLK_ASSERT(NULL != mac80211_hw);
+         wv_ieee80211_tx_status(mac80211_hw, bss_req->skb, status);
++        bss_req->skb = NULL;
+       }
+     }
+   }
+@@ -11485,7 +12672,7 @@
+     if (mtlk_vap_is_ap(vap_handle))
+     {
+       cfg80211_probe_status(ndev, wifi_header->dst_addr.au8Addr, bss_req->cookie,
+-                            (BOOL)status, GFP_ATOMIC);
++                            status == 1, 0, false, GFP_ATOMIC);
+     }
+     else
+     {
+@@ -11495,6 +12682,7 @@
+         ILOG2_D("handle bss null data packet cfm status = %u", status);
+         MTLK_ASSERT(NULL != mac80211_hw);
+         wv_ieee80211_tx_status(mac80211_hw, bss_req->skb, status);
++        bss_req->skb = NULL;
+       }
+     }
+   }
+@@ -11522,6 +12710,8 @@
+     bss_req->virt_addr = bss_req_res->virt_addr;
+     bss_req_res->virt_addr = tmp_ptr;
+ 
++    /* Dispose through the old radio owner before replacing its identity. */
++    wave_bss_discard_skb(hw, bss_req);
+     /* copy the relevant stuff */
+     bss_req->size = bss_req_res->size;
+     bss_req->cookie = bss_req_res->cookie;
+@@ -11533,6 +12723,9 @@
+     bss_req->is_broadcast     = bss_req_res->is_broadcast;
+     bss_req->dst_addr         = bss_req_res->dst_addr;
+     bss_req->skb              = bss_req_res->skb;
++    bss_req_res->skb = NULL;
++    bss_req->power_mgmt_on = bss_req_res->power_mgmt_on;
++    bss_req->tid = bss_req_res->tid;
+ 
+     mtlk_dlist_push_back(&bss_mgmt->tx_res_bdr.free_list, entry); /* push onto reserve free list */
+     ILOG3_PD("Pushed entry onto reserve free list: 0x%p, %i remaining",
+@@ -11556,10 +12749,12 @@
+       continue;
+     }
+ 
+-    mtlk_core_on_bss_res_freed(mtlk_vap_get_core(vap_handle_res)); /* update counter */
++    if (bss_req->extra_processing != PROCESS_RAW_DATA)
++      mtlk_core_on_bss_res_freed(mtlk_vap_get_core(vap_handle_res)); /* update counter */
+ 
+     /* core net state is NET_STATE_DEACTIVATING in case of VAP traffic was stopped */
+-    if (0 == ((NET_STATE_CONNECTED | NET_STATE_DEACTIVATING) &
++    if (bss_req->extra_processing != PROCESS_RAW_DATA &&
++        0 == ((NET_STATE_CONNECTED | NET_STATE_DEACTIVATING) &
+         mtlk_core_get_net_state(mtlk_vap_get_core(vap_handle_res)))) {
+       WLOG_DD("Drop bss frame from reserved queue due to VAP is not active radio_id:%d, vap_id:%d",
+                bss_req->radio_id, bss_req->vap_id);
+@@ -11574,15 +12769,18 @@
+ 
+     /* vap_handle from cfm frame we need to decrease it only after new frame
+        is sent for not having rase condition with waiting of unconf_bss */
+-    mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
++    if (!raw)
++      mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
+     return MTLK_ERR_OK;
+   }
+ 
+   /* No frames to send from reserved queue */
++  wave_bss_discard_skb(hw, bss_req);
+   mtlk_dlist_remove(&bss_mgmt->tx_bdr.used_list, &bss_req->hdr.list_entry);
+   mtlk_dlist_push_back(&bss_mgmt->tx_bdr.free_list, &bss_req->hdr.list_entry);
+   mtlk_osal_lock_release(&bss_mgmt->tx_bdr.lock);
+-  mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
++  if (!raw)
++    mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
+   return MTLK_ERR_OK;
+ 
+ the_trap:
+@@ -11787,7 +12985,7 @@
+ }
+ 
+ void __MTLK_IFUNC
+-mtlk_hw_mmb_set_msi_intr_mode(mtlk_hw_t *hw, mtlk_irq_mode_e mode)
++mtlk_hw_mmb_set_msi_intr_mode(mtlk_hw_t *hw, uint32 mode)
+ {
+   /* Save irq_mode for recovery */
+   hw->irq_mode = mode;
+@@ -12237,6 +13435,9 @@
+ static void _mtlk_hw_debug_print_ring_regs(mtlk_ring_regs *ring_regs, const char *reg_name)
+ {
+     uint32 reg_OUT_status, reg_OUT_counter, reg_IN_counter;
++    /* Firmware readiness can fail before any ring registers are assigned. */
++    if (!ring_regs->p_OUT_status || !ring_regs->p_OUT_cntr || !ring_regs->p_IN_cntr)
++      return;
+     reg_OUT_status  = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_OUT_status));
+     reg_OUT_counter = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_OUT_cntr));
+     reg_IN_counter  = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_IN_cntr));
+@@ -12499,7 +13700,7 @@
+ 
+   wave_rcvry_mac_hang_evt_reset(hw, core_no);
+ 
+-  hw->state = MTLK_HW_STATE_MAC_ASSERTED;
++  WRITE_ONCE(hw->state, MTLK_HW_STATE_MAC_ASSERTED);
+ 
+   if (MTLK_ERR_OK != _mtlk_mmb_cause_mac_assert(hw, core_no))
+     WLOG_D("FW MAC#%d assert not done because not supported", core_no);
+--- a/wireless/driver/shared/hw_mmb.h
++++ b/wireless/driver/shared/hw_mmb.h
+@@ -232,6 +232,36 @@
+ int __MTLK_IFUNC
+ mtlk_hw_mmb_start_card_finalize(mtlk_hw_t   *hw);
+ 
++void wave_hw_mmb_quiesce(mtlk_hw_t *hw);
++/* A successful pinned lookup transfers one reference to its caller. */
++BOOL wave_hw_mc_get(mtlk_hw_t *hw, uint8 id, BOOL pin);
++void wave_hw_mc_put(mtlk_hw_t *hw, uint8 id);
++void wave_hw_mc_quarantine(mtlk_hw_t *hw, uint8 id);
++bool wave_hw_mmb_ready(mtlk_hw_t *hw);
++
++/* Lock-protected operational data-pool totals. */
++struct wave_tx_stats {
++  u32 free_desc;
++  u32 used_peak;
++  u32 completed_cfm;
++};
++bool wave_hw_get_tx_stats(mtlk_hw_t *hw, struct wave_tx_stats *stats);
++
++/* An active native data netdev participates in the shared descriptor pool.
++ * The pool lock protects membership and stop/wake against completion. Control
++ * owners attach before TX activation and detach before releasing the netdev. */
++struct wave_tx_queue {
++  struct list_head node;
++  struct net_device *ndev;
++};
++void wave_hw_tx_queue_start(mtlk_hw_t *hw, struct wave_tx_queue *queue);
++void wave_hw_tx_queue_stop(mtlk_hw_t *hw, struct wave_tx_queue *queue);
++int wave_hw_mc_alloc_native(mtlk_hw_t *hw);
++void wave_hw_mc_release_native(mtlk_hw_t *hw, uint8 id);
++struct wave_pmf;
++void wave_hw_mmb_detach_pmf(mtlk_hw_t *hw, struct wave_pmf *pmf);
++void wave_hw_mmb_flush_sta_tx(mtlk_hw_t *hw, unsigned int radio_id);
++
+ void __MTLK_IFUNC 
+ mtlk_hw_mmb_stop_card(mtlk_hw_t *card);
+ 
+@@ -363,6 +393,7 @@
+   PROCESS_MANAGEMENT = 0,
+   PROCESS_EAPOL,
+   PROCESS_NULL_DATA_PACKET,
++  PROCESS_RAW_DATA,
+ };
+ 
+ uint8 __MTLK_IFUNC
+@@ -375,6 +406,37 @@
+ 
+ void __MTLK_IFUNC
+ mtlk_hw_reset_radar_cntr (mtlk_hw_t *hw);
++
++struct wave_monitor;
++#define WAVE_FW_FEATURE_RX_STREAM BIT(0)
++#define WAVE_FW_FEATURE_FIXED_DATA BIT(1)
++#define WAVE_FW_FEATURE_TXOP_READ BIT(2)
++#define WAVE_FW_FEATURE_RTS_THRESHOLD BIT(3)
++bool wave_hw_fw_feature_supported(mtlk_hw_t *hw, u32 feature);
++void wave_hw_airtime_lock(mtlk_hw_t *hw);
++void wave_hw_airtime_unlock(mtlk_hw_t *hw);
++bool wave_hw_airtime_owned(mtlk_hw_t *hw);
++void wave_hw_airtime_mark(mtlk_hw_t *hw, unsigned radio, bool owned);
++bool wave_hw_monitor_supported(mtlk_hw_t *hw);
++bool wave_hw_monitor_held(mtlk_hw_t *hw);
++bool wave_hw_monitor_is_owner(mtlk_hw_t *hw, const struct wave_monitor *mon);
++bool wave_hw_monitor_dirty(mtlk_hw_t *hw);
++bool wave_hw_monitor_fenced(mtlk_hw_t *hw);
++bool wave_hw_monitor_set_tx(mtlk_hw_t *hw, const struct wave_monitor *mon, bool enable);
++int wave_hw_monitor_tx(mtlk_vap_handle_t vap, struct wave_monitor *owner,
++                       struct sk_buff *skb, int frequency, uint64 *cookie);
++bool wave_hw_monitor_user_get(mtlk_hw_t *hw);
++void wave_hw_monitor_user_put(mtlk_hw_t *hw);
++int wave_hw_monitor_claim(mtlk_hw_t *hw, mtlk_vap_handle_t vap, struct wave_monitor *mon);
++void wave_hw_monitor_release(mtlk_hw_t *hw, struct wave_monitor *mon);
++int wave_hw_monitor_activation_begin(mtlk_vap_handle_t vap, BOOL monitor);
++void wave_hw_monitor_activation_end(mtlk_vap_handle_t vap, BOOL monitor);
++int wave_hw_monitor_template(mtlk_vap_handle_t vap);
++u32 wave_hw_monitor_recovery_state(mtlk_hw_t *hw, mtlk_vap_handle_t vap, u32 state);
++int wave_hw_monitor_fence(mtlk_hw_t *hw);
++void wave_hw_monitor_restarted(mtlk_hw_t *hw);
++void wave_hw_monitor_suspend_rx(mtlk_hw_t *hw);
++extern const u8 wave_monitor_header[44];
+ 
+ BOOL __MTLK_IFUNC
+ mtlk_hw_type_is_gen5(mtlk_hw_t *hw);
+@@ -455,6 +517,11 @@
+ int __MTLK_IFUNC
+ mtlk_hw_mhi_get_stats (mtlk_hw_t *hw);
+ 
++uint64 __MTLK_IFUNC
++wave_hw_stats_sta_connected (mtlk_hw_t *hw, uint32 sid);
++void __MTLK_IFUNC
++wave_hw_stats_sta_disconnected (mtlk_hw_t *hw, uint32 sid, uint64 generation);
++
+ int __MTLK_IFUNC
+ mtlk_hw_mhi_copy_stats (mtlk_hw_t *hw, uint8 *buff, uint32 *size);
+ 
+--- a/wireless/driver/shared/mtlk_ccr_defs.h
++++ b/wireless/driver/shared/mtlk_ccr_defs.h
+@@ -208,8 +208,7 @@
+ {
+   MTLK_ASSERT(NULL != ccr);
+ 
+-  return &((struct pci_dev*)ccr->mem.dev_ctx)->dev;
+-  /*return ccr->mem.dev_ctx;*/
++  return ccr->mem.dev_ctx;
+ }
+ 
+ static __INLINE int
+--- a/wireless/driver/shared/mtlk_ccr_pcieg6.c
++++ b/wireless/driver/shared/mtlk_ccr_pcieg6.c
+@@ -1807,7 +1807,7 @@
+     /* Legacy IRQ mode */
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_MSI_ENABLE, PCIE_MSI_DISABLED);
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_LEGACY_INT_ENA, PCIE_LEGACY_INT_ENABLED);
+-    _CCR_RMW_REG_FIELD_(ccr_mem, 0, REG_PCIE_REGBLOCK_MSI_CAPABILITY,
++    _CCR_RMW_REG_FIELD_(ccr_mem, 0, PCIE_CFG_REGS_MSI_CAPABILITY,
+                                               MSI_CAPABILITY_REGISTER_CTRL_MSI_ENABLE,
+                                               MSI_CAPABILITY_REGISTER_CTRL_MSI_DISABLED);
+   } else {
+@@ -1815,7 +1815,7 @@
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_MSI_ENABLE, PCIE_MSI_ENABLED);
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_LEGACY_INT_ENA, PCIE_LEGACY_INT_DISABLED);
+     _CCR_WRITE_REG_VALUE_(ccr_mem, SOC_REGS_PCIE_MSI_INTR_MODE, irq_mode);
+-    _CCR_RMW_REG_FIELD_(ccr_mem, 0, REG_PCIE_REGBLOCK_MSI_CAPABILITY,
++    _CCR_RMW_REG_FIELD_(ccr_mem, 0, PCIE_CFG_REGS_MSI_CAPABILITY,
+                                               MSI_CAPABILITY_REGISTER_CTRL_MSI_ENABLE,
+                                               MSI_CAPABILITY_REGISTER_CTRL_MSI_ENABLED);
+   }
+--- a/wireless/driver/shared/mtlk_df.h
++++ b/wireless/driver/shared/mtlk_df.h
+@@ -173,7 +173,7 @@
+ mtlk_df_on_rcvry_isol(mtlk_df_t *df);
+ 
+ void __MTLK_IFUNC
+-mtlk_df_on_rcvry_restore(mtlk_df_t *df);
++mtlk_df_on_rcvry_restore(mtlk_df_t *df, BOOL start_stats);
+ 
+ /* Remove MAC addr from switch DC DP table */
+ void __MTLK_IFUNC
+--- a/wireless/driver/shared/mtlk_serializer.c
++++ b/wireless/driver/shared/mtlk_serializer.c
+@@ -154,6 +154,12 @@
+ {
+   MTLK_ASSERT(NULL != szr);
+ 
++  /* Terminal control teardown may join this worker before normal core stop.
++   * Reuse the consumed lifecycle state; partial starts must still unwind.
++   * Start/stop callers retain exclusive ownership, not concurrent stop access. */
++  if (!szr->__START_bit_field_MAIN && !szr->__START_bit_field_SKIPPED)
++    return;
++
+   MTLK_STOP_BEGIN(serializer, MTLK_OBJ_PTR(szr))
+     MTLK_STOP_STEP(serializer, START_PROCESSING, MTLK_OBJ_PTR(szr),
+                    _mtlk_serializer_stop_processing, (szr));
+@@ -456,4 +462,3 @@
+   }
+   mtlk_osal_lock_release(&szr->lock);
+ }
+-
+--- a/wireless/driver/shared/txmm.c
++++ b/wireless/driver/shared/txmm.c
+@@ -24,6 +24,10 @@
+ */
+ #define TXMM_FLAGS_ACTIVE              0x40000000
+ #define TXMM_FLAGS_STOPPED             0x20000000
++#define TXMM_FLAGS_INITIALIZED         0x10000000
++#define TXMM_FLAGS_QUIESCED            0x08000000
++#define TXMM_FLAGS_PAUSED              0x04000000
++#define TXMM_FLAGS_UNAVAILABLE         (TXMM_FLAGS_QUIESCED | TXMM_FLAGS_PAUSED)
+ 
+ struct _mtlk_txmm_block_t
+ {
+@@ -336,6 +340,17 @@
+   int      res  = MTLK_ERR_UNKNOWN;
+   PMSG_OBJ pmsg = *_pmsg;
+ 
++  /* Called with the base lock held. An in-flight CFM may return its slot,
++   * but cannot start queued work during recovery or terminal shutdown. */
++  if (obj->flags & TXMM_FLAGS_UNAVAILABLE) {
++    if (pmsg)
++      obj->api.msg_free_to_pool(obj->api.usr_data, pmsg);
++    *_pmsg = NULL;
++    if (status)
++      *status = MTLK_TXMM_OK_FREED;
++    return MTLK_ERR_NOT_READY;
++  }
++
+   ILOG4_PD("PUMP: MSG=%p nU=%d", 
+        pmsg, (int)obj->ques[MTLK_TXMMB_QUEUED].total);
+ 
+@@ -539,6 +554,9 @@
+   mtlk_txmm_base_t          *obj = HANDLE_T_PTR(mtlk_txmm_base_t, clb_usr_data);
+   mtlk_osal_msec_t now_time = mtlk_osal_timestamp_to_ms(mtlk_osal_timestamp());
+ 
++  if (READ_ONCE(obj->flags) & TXMM_FLAGS_UNAVAILABLE)
++    return 0;
++
+   _mtlk_txmm_on_timer_que(obj, now_time, MTLK_TXMMB_SENT, MTLK_TXMM_CLBR_TIMEOUT_SENT, 0);
+   _mtlk_txmm_on_timer_que(obj, now_time, MTLK_TXMMB_QUEUED, MTLK_TXMM_CLBR_TIMEOUT_UNSENT, 1);
+ 
+@@ -690,6 +708,7 @@
+     }
+ 
+     mtlk_rmlock_acquire(&obj->bsend.rmlock);
++    obj->flags |= TXMM_FLAGS_INITIALIZED;
+ 
+   MTLK_INIT_FINALLY(txmm, MTLK_OBJ_PTR(obj))
+   MTLK_INIT_RETURN(txmm, MTLK_OBJ_PTR(obj), mtlk_txmm_cleanup, (obj))
+@@ -697,16 +716,32 @@
+ 
+ int __MTLK_IFUNC mtlk_txmm_start(mtlk_txmm_base_t *obj)
+ {
++  BOOL unavailable;
++
++  mtlk_osal_lock_acquire(&obj->lock);
++  unavailable = !!(obj->flags & TXMM_FLAGS_UNAVAILABLE);
++  mtlk_osal_lock_release(&obj->lock);
++  if (unavailable)
++    return MTLK_ERR_NOT_READY;
++
+   MTLK_START_TRY(txmm, MTLK_OBJ_PTR(obj))
+   
+   MTLK_START_STEP(txmm, TXMM_TIMER, MTLK_OBJ_PTR(obj),
+                     mtlk_osal_timer_set, (&obj->timer,
+                                           obj->cfg.tmr_granularity));
+ 
+-  obj->flags |= TXMM_FLAGS_ACTIVE;  /* allow blocked send from this point */
+-  obj->flags &= ~TXMM_FLAGS_STOPPED;
+-
+   MTLK_START_FINALLY(txmm, MTLK_OBJ_PTR(obj))
++    if (__res == MTLK_ERR_OK) {
++      /* The timer step is complete. Recheck cancellation before admission;
++       * native failed-start rollback cancels the timer outside this lock. */
++      mtlk_osal_lock_acquire(&obj->lock);
++      if (obj->flags & TXMM_FLAGS_UNAVAILABLE)
++        __res = MTLK_ERR_NOT_READY;
++      else
++        WRITE_ONCE(obj->flags, obj->flags | TXMM_FLAGS_ACTIVE);
++      WRITE_ONCE(obj->flags, obj->flags & ~TXMM_FLAGS_STOPPED);
++      mtlk_osal_lock_release(&obj->lock);
++    }
+   MTLK_START_RETURN(txmm, MTLK_OBJ_PTR(obj), mtlk_txmm_stop, (obj))
+ }
+ 
+@@ -748,13 +783,20 @@
+       MTLK_ASSERT(obj->ques[i].total == obj->cfg.max_msgs);
+     }
+   }
++
++  /* The existing card-recovery owner has joined users and fenced/reset
++   * firmware before rebuilding these queues. Only start reopens admission;
++   * terminal QUIESCED is deliberately retained and still rejects start. */
++  mtlk_osal_lock_acquire(&obj->lock);
++  WRITE_ONCE(obj->flags, obj->flags & ~TXMM_FLAGS_PAUSED);
++  mtlk_osal_lock_release(&obj->lock);
+ }
+ 
+ static void _mtlk_txmm_attach_data(mtlk_txmm_t *obj, mtlk_txmm_msg_t *msg)
+ {
+   mtlk_txmm_block_t* block = NULL;
+ 
+-  if (!(obj->base->flags & TXMM_FLAGS_ACTIVE)) {
++  if ((obj->base->flags & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_UNAVAILABLE)) != TXMM_FLAGS_ACTIVE) {
+     goto FINISH;
+   }
+ 
+@@ -818,6 +860,10 @@
+     block->send_time = mtlk_osal_timestamp_to_ms(mtlk_osal_timestamp());
+ 
+   mtlk_osal_lock_acquire(&obj->base->lock);
++  if (obj->base->flags & TXMM_FLAGS_UNAVAILABLE) {
++    mtlk_osal_lock_release(&obj->base->lock);
++    return MTLK_ERR_NOT_READY;
++  }
+   pmsg  = obj->base->api.msg_get_from_pool(obj->base->api.usr_data); /* get message slot */
+ 
+   if (!obj->base->ques[MTLK_TXMMB_QUEUED].total && pmsg)
+@@ -853,7 +899,8 @@
+   mtlk_vap_handle_t master_vap;
+   BOOL is_pending = FALSE;
+ 
+-  ASSERT(obj->base->flags & TXMM_FLAGS_ACTIVE); /* Nobody should call this function after the cleanup */
++  if (!mtlk_txmm_is_running(obj->base))
++    return MTLK_ERR_NOT_READY;
+ 
+   res = mtlk_vap_manager_get_master_vap(mtlk_vap_get_manager(obj->vap_handle), &master_vap);
+   if (res != MTLK_ERR_OK) {
+@@ -875,13 +922,18 @@
+   mtlk_rmlock_acquire(&obj->base->bsend.rmlock);
+   mtlk_osal_mutex_acquire(&obj->base->bsend.mutex);
+ 
+-  if ((obj->base->flags & TXMM_FLAGS_ACTIVE) == 0)
++  mtlk_osal_lock_acquire(&obj->base->lock);
++  if ((obj->base->flags & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_UNAVAILABLE)) != TXMM_FLAGS_ACTIVE)
+   { /* Cleanup issued. We must release all queued by mtlk_osal_mutex_acquire() threads */
++    mtlk_osal_lock_release(&obj->base->lock);
++    res = MTLK_ERR_NOT_READY;
+     ILOG2_V("send (b): cleaning up - ignored");
+     goto FINISH;
+   }
+ 
++  /* Quiesce publishes its cancellation and wakes us under this same lock. */
+   mtlk_osal_event_reset(&obj->base->bsend.evt);
++  mtlk_osal_lock_release(&obj->base->lock);
+ 
+   res = _mtlk_txmm_send_ex(obj,
+                            data,
+@@ -899,6 +951,11 @@
+   res = mtlk_osal_event_wait(&obj->base->bsend.evt, timeout_ms);
+   
+   _mtlk_txmm_block_history_blocked_finalize_and_commit(_mtlk_txmm_block_by_data(data), obj->base, res);
++
++  if (!mtlk_txmm_is_running(obj->base)) {
++    res = MTLK_ERR_NOT_READY;
++    goto FINISH;
++  }
+ 
+   if (res != MTLK_ERR_OK)
+   {
+@@ -913,6 +970,7 @@
+   }
+   else if ((obj->base->flags & TXMM_FLAGS_ACTIVE) == 0) 
+   {
++    res = MTLK_ERR_NOT_READY;
+     ILOG4_V("send (b): cancelled by cleanup");
+     goto FINISH;
+   }
+@@ -982,24 +1040,61 @@
+ 
+ void __MTLK_IFUNC mtlk_txmm_stop(mtlk_txmm_base_t *obj)
+ {
++  mtlk_osal_lock_acquire(&obj->lock);
+   if (obj->flags & TXMM_FLAGS_STOPPED) {
++    mtlk_osal_lock_release(&obj->lock);
+     return;
+   }
++  mtlk_osal_lock_release(&obj->lock);
+ 
+   MTLK_STOP_BEGIN(txmm, MTLK_OBJ_PTR(obj))
+     MTLK_STOP_STEP(txmm, TXMM_TIMER, MTLK_OBJ_PTR(obj),
+                    mtlk_osal_timer_cancel_sync, (&obj->timer));
+-    obj->flags |= TXMM_FLAGS_STOPPED;
++    mtlk_osal_lock_acquire(&obj->lock);
++    WRITE_ONCE(obj->flags, obj->flags | TXMM_FLAGS_STOPPED);
++    mtlk_osal_lock_release(&obj->lock);
+   MTLK_STOP_END(txmm, MTLK_OBJ_PTR(obj))
+ }
+ 
++void __MTLK_IFUNC mtlk_txmm_quiesce(mtlk_txmm_base_t *obj)
++{
++  /* Early card-start failures precede TXMM initialization. Never touch an
++   * uninitialized lock, event or timer, and retain storage until core drain. */
++  if (!(READ_ONCE(obj->flags) & TXMM_FLAGS_INITIALIZED))
++    return;
++
++  mtlk_osal_lock_acquire(&obj->lock);
++  WRITE_ONCE(obj->flags, obj->flags | TXMM_FLAGS_QUIESCED);
++  mtlk_osal_event_set(&obj->bsend.evt);
++  mtlk_osal_lock_release(&obj->lock);
++  mtlk_txmm_stop(obj);
++}
++
++void __MTLK_IFUNC mtlk_txmm_pause(mtlk_txmm_base_t *obj)
++{
++  if (!(READ_ONCE(obj->flags) & TXMM_FLAGS_INITIALIZED))
++    return;
++
++  /* A serializer may be waiting for firmware. Close both blocked and
++   * asynchronous admission before joining it, and wake its real waiter.
++   * Use the same lock as blocked-send admission/event reset so this wake
++   * cannot be lost. Keep all slots/storage until the normal reset/restore. */
++  mtlk_osal_lock_acquire(&obj->lock);
++  WRITE_ONCE(obj->flags, (obj->flags | TXMM_FLAGS_PAUSED) & ~TXMM_FLAGS_ACTIVE);
++  mtlk_osal_event_set(&obj->bsend.evt);
++  mtlk_osal_lock_release(&obj->lock);
++  mtlk_txmm_stop(obj);
++}
++
+ void __MTLK_IFUNC mtlk_txmm_cleanup(mtlk_txmm_base_t* obj)
+ {
+   int i = 0;
+ 
+-  if (obj->flags & TXMM_FLAGS_ACTIVE) {
+-    obj->flags &= ~TXMM_FLAGS_ACTIVE;        /* Prevent further blocked send waits        */
+-    mtlk_osal_event_set(&obj->bsend.evt);    /* Cancel current blocked send wait if fired */
++  if (obj->flags & TXMM_FLAGS_INITIALIZED) {
++    mtlk_txmm_quiesce(obj);
++    mtlk_osal_lock_acquire(&obj->lock);
++    WRITE_ONCE(obj->flags, obj->flags & ~TXMM_FLAGS_ACTIVE);
++    mtlk_osal_lock_release(&obj->lock);
+     mtlk_rmlock_release(&obj->bsend.rmlock); /* Release last reference to remove lock     */
+   
+     ILOG2_V("Wait until all the blocked sends are done...");
+@@ -1038,12 +1133,16 @@
+ 
+ void __MTLK_IFUNC mtlk_txmm_halt(mtlk_txmm_base_t* obj)
+ {
+-  obj->flags &= ~TXMM_FLAGS_ACTIVE;
++  if (!(READ_ONCE(obj->flags) & TXMM_FLAGS_INITIALIZED))
++    return;
++  mtlk_osal_lock_acquire(&obj->lock);
++  WRITE_ONCE(obj->flags, obj->flags & ~TXMM_FLAGS_ACTIVE);
++  mtlk_osal_lock_release(&obj->lock);
+ }
+ 
+ BOOL __MTLK_IFUNC mtlk_txmm_is_running(mtlk_txmm_base_t* obj)
+ {
+-  return (BOOL) ((obj->flags & TXMM_FLAGS_ACTIVE) == TXMM_FLAGS_ACTIVE);
++  return (READ_ONCE(obj->flags) & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_UNAVAILABLE)) == TXMM_FLAGS_ACTIVE;
+ }
+ 
+ MTLK_INIT_STEPS_LIST_BEGIN(txmm_msg)
+--- a/wireless/driver/shared/txmm.h
++++ b/wireless/driver/shared/txmm.h
+@@ -354,6 +354,10 @@
+ void __MTLK_IFUNC
+ mtlk_txmm_stop(mtlk_txmm_base_t *obj);
+ 
++/* Terminal submission/cancellation gate; storage stays alive for core drain. */
++void __MTLK_IFUNC
++mtlk_txmm_quiesce(mtlk_txmm_base_t *obj);
++
+ /*! \fn       void mtlk_txmm_cleanup(mtlk_txmm_base_t *obj)
+     \brief    cleans up TXMM object.
+ 
+@@ -549,6 +553,10 @@
+ void __MTLK_IFUNC
+ mtlk_txmm_terminate_waiting_msg(mtlk_txmm_base_t *base);
+ 
++/* Restartable cancellation: join users and fence/reset firmware before
++ * mtlk_txmm_restore() and mtlk_txmm_start(). Never clears terminal quiesce. */
++void __MTLK_IFUNC mtlk_txmm_pause(mtlk_txmm_base_t *base);
++
+ /*! \fn       void mtlk_txmm_base_get_stats(mtlk_txmm_base_t  *base,
+                                             mtlk_txmm_stats_t *stats)
+     \brief    retrieves TXMM base object statistics
+@@ -568,4 +576,3 @@
+ #include "mtlkidefs.h"
+ 
+ #endif /* !_MTLK_TXMM_H_ */
+-
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -5666,7 +5666,7 @@
+     {
+       case WAVE_FAPI_SUBCMDID_RCVRY_DUMP_EVAC_REQ:
+       {
+-        res = wave_rcvry_nl_process_msg_dump_evac(msgpay->card_idx, TRUE);
++        res = wave_rcvry_nl_process_msg_dump_evac(msgpay->card_idx);
+         break;
+       }
+       case WAVE_FAPI_SUBCMDID_RCVRY_COMPLETE_FLOW_REQ:
