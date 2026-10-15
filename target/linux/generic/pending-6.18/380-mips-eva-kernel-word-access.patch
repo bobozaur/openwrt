@@ -1,0 +1,41 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] MIPS: EVA: keep 32-bit kernel doubleword aliases in kernel space
+
+A 32-bit kernel implements these aliases using word accesses. Mapping them
+to user_sw/user_lw selects EVA user instructions even for kernel addresses.
+Use the kernel word aliases in both C strings and assembly.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/arch/mips/include/asm/asm-eva.h
++++ b/arch/mips/include/asm/asm-eva.h
+@@ -33,10 +33,10 @@
+ #ifdef CONFIG_32BIT
+ /*
+  * No 'sd' or 'ld' instructions in 32-bit but the code will
+- * do the correct thing
++ * use pairs of word accesses in the kernel address space.
+  */
+-#define kernel_sd(reg, addr)		user_sw(reg, addr)
+-#define kernel_ld(reg, addr)		user_lw(reg, addr)
++#define kernel_sd(reg, addr)		kernel_sw(reg, addr)
++#define kernel_ld(reg, addr)		kernel_lw(reg, addr)
+ #else
+ #define kernel_sd(reg, addr)		"sd " reg", " addr "\n"
+ #define kernel_ld(reg, addr)		"ld " reg", " addr "\n"
+@@ -120,10 +120,10 @@
+ #ifdef CONFIG_32BIT
+ /*
+  * No 'sd' or 'ld' instructions in 32-bit but the code will
+- * do the correct thing
++ * use pairs of word accesses in the kernel address space.
+  */
+-#define kernel_sd(reg, addr)		user_sw(reg, addr)
+-#define kernel_ld(reg, addr)		user_lw(reg, addr)
++#define kernel_sd(reg, addr)		kernel_sw(reg, addr)
++#define kernel_ld(reg, addr)		kernel_lw(reg, addr)
+ #else
+ #define kernel_sd(reg, addr)		sd reg, addr
+ #define kernel_ld(reg, addr)		ld reg, addr
