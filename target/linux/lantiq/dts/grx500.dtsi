@@ -1,0 +1,256 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include <dt-bindings/clock/lantiq,grx500-cgu.h>
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/mips-gic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	#address-cells = <1>;
+	#size-cells = <1>;
+	compatible = "lantiq,grx500";
+
+	aliases {
+		serial0 = &asc0;
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "mips,interaptiv";
+			reg = <0>;
+			clocks = <&cgu GRX500_CLK_CPU>;
+		};
+		/* Physical VPEs 1 and 3 belong to the boot monitor/firmware. */
+		cpu@2 {
+			device_type = "cpu";
+			compatible = "mips,interaptiv";
+			reg = <2>;
+			clocks = <&cgu GRX500_CLK_CPU>;
+		};
+	};
+
+	cpu_intc: interrupt-controller {
+		compatible = "mti,cpu-interrupt-controller";
+		interrupt-controller;
+		#address-cells = <0>;
+		#interrupt-cells = <1>;
+	};
+
+	gic: interrupt-controller@12320000 {
+		compatible = "mti,gic";
+		reg = <0x12320000 0x20000>;
+		interrupt-controller;
+		#interrupt-cells = <3>;
+	};
+
+	rcu: reset-controller@16000000 {
+		compatible = "lantiq,grx500-rcu", "syscon";
+		reg = <0x16000000 0x80200>;
+		native-endian;
+		#reset-cells = <1>;
+	};
+
+	reboot {
+		compatible = "syscon-reboot";
+		regmap = <&rcu>;
+		offset = <0x10>;
+		mask = <0x40000000>;
+		value = <0x40000000>;
+	};
+
+	cgu: clock-controller@16200000 {
+		compatible = "lantiq,grx500-cgu", "syscon";
+		reg = <0x16200000 0x200>;
+		native-endian;
+		#clock-cells = <1>;
+	};
+
+	asc0: serial@16600000 {
+		compatible = "lantiq,asc";
+		reg = <0x16600000 0x100000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 103 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 105 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 106 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cgu GRX500_CLK_FPI>, <&cgu GRX500_CLK_FPI>;
+		clock-names = "freq", "asc";
+		status = "disabled";
+	};
+
+	gpio0: gpio@16c00000 {
+		compatible = "lantiq,grx500-gpio";
+		reg = <0x16c00000 0x80>, <0x16c80000 0x100>;
+		reg-names = "gpio", "pad";
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+
+	gpio1: gpio@16c00100 {
+		compatible = "lantiq,grx500-gpio";
+		reg = <0x16c00100 0x80>, <0x16c80100 0x100>;
+		reg-names = "gpio", "pad";
+		lantiq,rcu = <&rcu>;
+		gpio-controller;
+		#gpio-cells = <2>;
+	};
+
+	nand: nand@17c00000 {
+		compatible = "lantiq,grx500-nand";
+		reg = <0x17c00000 0x100000>, <0x16f00000 0x100>;
+		reg-names = "nand", "ebu";
+		nand-bus-width = <8>;
+		nand-use-soft-ecc-engine;
+		nand-ecc-algo = "bch";
+		nand-ecc-step-size = <512>;
+		nand-ecc-strength = <4>;
+		status = "disabled";
+	};
+
+	pcie: pcie-controller@18900000 {
+		compatible = "lantiq,grx500-pcie";
+		reg = <0x18900000 0x100000>, <0xbb000000 0x200000>,
+		      <0x18800000 0x100000>, <0x18500000 0x100000>,
+		      <0x18400000 0x100000>, <0xb7000000 0x200000>,
+		      <0x18300000 0x100000>, <0x18000000 0x100000>;
+		reg-names = "csr0", "config0", "app0", "phy0",
+			    "csr1", "config1", "app1", "phy1";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 136 IRQ_TYPE_LEVEL_HIGH>;
+		clocks = <&cgu GRX500_CLK_PCIE0>, <&cgu GRX500_CLK_PCIE1>,
+			 <&cgu GRX500_CLK_PCIE_PLL>;
+		clock-names = "pcie0", "pcie1", "pll";
+		resets = <&rcu 12>, <&rcu 13>;
+		lantiq,rcu = <&rcu>;
+		status = "disabled";
+	};
+
+	usb0: usb-controller@1a300000 {
+		compatible = "lantiq,grx500-dwc3";
+		reg = <0x1a300000 0x100000>;
+		reg-names = "core";
+		lantiq,port = <0>;
+		lantiq,rcu = <&rcu>;
+		clocks = <&cgu GRX500_CLK_USB0>;
+		resets = <&rcu 36>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		dma-ranges = <0 0 0x40000000>;
+		status = "disabled";
+
+		usb@1a300000 {
+			compatible = "snps,dwc3";
+			reg = <0x1a300000 0x100000>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SHARED 54 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			maximum-speed = "super-speed";
+			snps,dis_rxdet_inp3_quirk;
+		};
+	};
+
+	usb1: usb-controller@1a500000 {
+		compatible = "lantiq,grx500-dwc3";
+		reg = <0x1a500000 0x100000>;
+		reg-names = "core";
+		lantiq,port = <1>;
+		lantiq,rcu = <&rcu>;
+		clocks = <&cgu GRX500_CLK_USB1>;
+		resets = <&rcu 37>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+		dma-ranges = <0 0 0x40000000>;
+		status = "disabled";
+
+		usb@1a500000 {
+			compatible = "snps,dwc3";
+			reg = <0x1a500000 0x100000>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SHARED 83 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			maximum-speed = "super-speed";
+			snps,dis_rxdet_inp3_quirk;
+		};
+	};
+
+	ethernet: ethernet-controller@1c000000 {
+		compatible = "lantiq,grx500-ethernet";
+		reg = <0x1c000000 0x10000>, <0x1c200000 0x100>,
+		      <0x1c100000 0x100>, <0x1a000000 0x10000>,
+		      <0x1a200000 0x100>, <0x1a100000 0x100>;
+		reg-names = "switch", "rx-dma", "tx-dma",
+			    "wan-switch", "wan-rx-dma", "wan-tx-dma";
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 68 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 67 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 66 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SHARED 65 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "rx", "tx", "wan-rx", "wan-tx";
+		resets = <&rcu 29>, <&rcu 28>, <&rcu 26>, <&rcu 25>, <&rcu 31>;
+		status = "disabled";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		lan_dma: ethernet@0 {
+			reg = <0>;
+			mdio {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				phy2: ethernet-phy@2 { reg = <2>; };
+				phy3: ethernet-phy@3 { reg = <3>; };
+				phy4: ethernet-phy@4 { reg = <4>; };
+				phy5: ethernet-phy@5 { reg = <5>; };
+			};
+		};
+
+		wan_dma: ethernet@1 {
+			reg = <1>;
+			label = "wan";
+			phy-mode = "rgmii";
+			phy-handle = <&wan_phy>;
+			mdio {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				wan_phy: ethernet-phy@1 { reg = <1>; };
+			};
+		};
+
+		switch: switch {
+			compatible = "lantiq,grx500-switch";
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				port@0 {
+					reg = <0>;
+					ethernet = <&lan_dma>;
+					phy-mode = "internal";
+					fixed-link { speed = <1000>; full-duplex; };
+				};
+				lan2: port@2 {
+					reg = <2>;
+					phy-mode = "internal";
+					phy-handle = <&phy2>;
+				};
+				lan3: port@3 {
+					reg = <3>;
+					phy-mode = "internal";
+					phy-handle = <&phy3>;
+				};
+				lan4: port@4 {
+					reg = <4>;
+					phy-mode = "internal";
+					phy-handle = <&phy4>;
+				};
+				lan5: port@5 {
+					reg = <5>;
+					phy-mode = "internal";
+					phy-handle = <&phy5>;
+				};
+			};
+		};
+	};
+};
