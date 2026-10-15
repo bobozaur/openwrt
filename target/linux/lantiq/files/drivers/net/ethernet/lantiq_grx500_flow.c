@@ -297,6 +297,144 @@ static int gf_table(struct grx500_flow *f, bool route, unsigned int table,
 	return ret;
 }
 
+/* Probe calls these before board publication and before either R transmitter
+ * starts. A failed optional flow owner leaves no worker; the unpublished core
+ * then owns the same staging registers without allocating a replacement owner.
+ */
+static int gf_bp_idle(void __iomem *gsw, unsigned int reg)
+{
+	u32 value;
+
+	return read_poll_timeout(__raw_readl, value, !(value & GF_BUSY),
+				1, 10000, false, gsw + reg);
+}
+
+static void gf_bp_write(void __iomem *gsw, unsigned int reg, u32 value)
+{
+	__raw_writel(value, gsw + reg);
+	/* Complete each selector/command write before polling shared staging. */
+	wmb();
+}
+
+static int gf_bp_queues(void __iomem *gsw, bool returns, u32 queues[3])
+{
+	static const unsigned int ports[] = { 0, GF_RETURN_EP, 15 };
+	unsigned int p, bypass, tc, queue, count;
+	int ret;
+
+	count = (__raw_readl(gsw + 0x007 * 4) >> 8) & 0x7f;
+	memset(queues, 0, 3 * sizeof(*queues));
+	for (p = 0; p < ARRAY_SIZE(ports); p++) {
+		if (p == 1 && !returns)
+			continue;
+		for (bypass = 0; bypass < 2; bypass++) {
+			for (tc = 0; tc < 16; tc++) {
+				ret = gf_bp_idle(gsw, GF_PCE_CTRL);
+				if (!ret)
+					ret = gf_bp_idle(gsw, GF_PAE_CTRL);
+				if (ret)
+					return ret;
+				gf_bp_write(gsw, GF_ADDR, ports[p] << 4 | tc | bypass << 8);
+				gf_bp_write(gsw, GF_PCE_CTRL, GF_BUSY | 0x11);
+				ret = gf_bp_idle(gsw, GF_PCE_CTRL);
+				if (ret)
+					return ret;
+				queue = __raw_readl(gsw + GF_VAL(0)) & 0x3f;
+				gf_bp_write(gsw, GF_PCE_CTRL, 0);
+				if (queue >= count || queue >= 32)
+					return -ERANGE;
+				queues[p] |= BIT(queue);
+			}
+		}
+	}
+	return 0;
+}
+
+int grx500_flow_bp_queues(struct grx500_flow *f, void __iomem *gsw, u32 queues[3])
+{
+	int ret;
+
+	if (f)
+		mutex_lock(&f->lock);
+	ret = gf_bp_queues(gsw, !!f, queues);
+	if (f)
+		mutex_unlock(&f->lock);
+	return ret;
+}
+
+static int gf_bp_map(void __iomem *gsw, unsigned int channel, bool write, u32 values[3])
+{
+	unsigned int i;
+	int ret;
+
+	ret = gf_bp_idle(gsw, GF_PMAC_CTRL);
+	if (ret)
+		return ret;
+	gf_bp_write(gsw, GF_PMAC_ADDR, channel);
+	if (write)
+		for (i = 0; i < 3; i++)
+			gf_bp_write(gsw, GF_PMAC_VAL(i), values[i]);
+	gf_bp_write(gsw, GF_PMAC_CTRL, GF_BUSY | (write ? GF_WRITE : 0));
+	ret = gf_bp_idle(gsw, GF_PMAC_CTRL);
+	if (!ret && !write)
+		for (i = 0; i < 3; i++)
+			values[i] = __raw_readl(gsw + GF_PMAC_VAL(i)) & 0xffff;
+	return ret;
+}
+
+int grx500_flow_bp_publish(struct grx500_flow *f, void __iomem *gsw,
+			   const u32 queues[3])
+{
+	u32 current_queues[3], saved[2][3], wanted[2][3], readback[3], mask;
+	unsigned int channel;
+	int ret, undo;
+
+	if (f)
+		mutex_lock(&f->lock);
+	/* Reject a queue-map change since the separate BM ownership check. */
+	ret = gf_bp_queues(gsw, !!f, current_queues);
+	if (ret || memcmp(current_queues, queues, sizeof(current_queues))) {
+		ret = ret ?: -EAGAIN;
+		goto out;
+	}
+	for (channel = 0; channel < 2; channel++) {
+		ret = gf_bp_map(gsw, channel, false, saved[channel]);
+		if (ret)
+			goto out;
+	}
+	wanted[0][0] = BIT(0);
+	mask = queues[2];
+	wanted[0][1] = mask & 0xffff;
+	wanted[0][2] = mask >> 16;
+	wanted[1][0] = GENMASK(5, 2);
+	mask = queues[0] | queues[1] | queues[2];
+	wanted[1][1] = mask & 0xffff;
+	wanted[1][2] = mask >> 16;
+	for (channel = 0; channel < 2; channel++) {
+		ret = gf_bp_map(gsw, channel, true, wanted[channel]);
+		if (!ret)
+			ret = gf_bp_map(gsw, channel, false, readback);
+		if (!ret && memcmp(readback, wanted[channel], sizeof(readback)))
+			ret = -EIO;
+		if (ret)
+			goto restore;
+	}
+	goto out;
+restore:
+	/* No transmitter is published. Restore both saved maps on partial setup. */
+	for (channel = 0; channel < 2; channel++) {
+		undo = gf_bp_map(gsw, channel, true, saved[channel]);
+		if (!undo)
+			undo = gf_bp_map(gsw, channel, false, readback);
+		if (undo || memcmp(readback, saved[channel], sizeof(readback)))
+			pr_err("GRX500 backpressure map restore failed on channel %u\n", channel);
+	}
+out:
+	if (f)
+		mutex_unlock(&f->lock);
+	return ret;
+}
+
 static int gf_flags(struct grx500_flow *f, unsigned int index, u16 value,
 		    u16 care)
 {

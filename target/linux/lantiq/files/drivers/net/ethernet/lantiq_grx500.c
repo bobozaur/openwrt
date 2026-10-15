@@ -325,7 +325,7 @@ static void grx500_dma_start(struct grx500_dma *dma, unsigned int channel)
 	spin_unlock_irqrestore(&dma->lock, flags);
 }
 
-static int grx500_dma_init(struct grx500_dma *dma)
+static int grx500_dma_init(struct grx500_dma *dma, bool flow_control)
 {
 	void __iomem *base = dma->base;
 	unsigned int channel;
@@ -352,7 +352,10 @@ static int grx500_dma_init(struct grx500_dma *dma)
 		if (ret)
 			return ret;
 	} else {
-		grx500_writel(base, DMA_CTRL, 0x80040200);
+		/* R native/P2P injectors receive the explicit PMAC sideband maps.
+		 * L TX0 has a separate DSA queue owner and remains unchanged.
+		 */
+		grx500_writel(base, DMA_CTRL, 0x80040200 | (flow_control ? BIT(6) : 0));
 	}
 	grx500_writel(base, DMA_IRNEN, 0);
 	grx500_writel(base, DMA_IRNCR, U32_MAX);
@@ -1141,6 +1144,44 @@ static int grx500_dma_prepare(struct grx500_dma *dma, unsigned int channel,
 	grx500_writel(base, DMA_CCTRL, value);
 out:
 	spin_unlock_irqrestore(&dma->lock, flags);
+	return ret;
+}
+
+/* Source-defined PMAC congestion masks couple only the R CPU/P2P injectors.
+ * This runs before board->ready and before any channel can be opened. Flow,
+ * BM and publication domains are acquired separately, never nested.
+ */
+static int grx500_backpressure_init(struct grx500_eth_board *board)
+{
+	static const unsigned int ports[] = { 0, 7, 15 };
+	struct grx500_eth *wan = netdev_priv(board->netdev[1]);
+	u32 queues[3], value;
+	unsigned int p, queue, owner, redirect;
+	int ret;
+
+	ret = grx500_flow_bp_queues(board->flow, board->gsw[1], queues);
+	if (ret)
+		return ret;
+	mutex_lock(&wan->bm_lock);
+	for (p = 0; p < ARRAY_SIZE(ports); p++) {
+		for (queue = 0; queue < 32; queue++) {
+			if (!(queues[p] & BIT(queue)))
+				continue;
+			ret = grx500_rmon_read32(wan, 0xe, queue, &value);
+			if (ret)
+				goto out;
+			owner = (value >> 8) & 0xf;
+			redirect = (value & 7) | ((value >> 1) & 8);
+			if (owner != ports[p] || redirect != ports[p]) {
+				ret = -EINVAL;
+				goto out;
+			}
+		}
+	}
+out:
+	mutex_unlock(&wan->bm_lock);
+	if (!ret)
+		ret = grx500_flow_bp_publish(board->flow, board->gsw[1], queues);
 	return ret;
 }
 
@@ -1999,9 +2040,9 @@ static int grx500_eth_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	for (port = 0; port < 2; port++) {
-		ret = grx500_dma_init(&board->rx_dma[port]);
+		ret = grx500_dma_init(&board->rx_dma[port], false);
 		if (!ret)
-			ret = grx500_dma_init(&board->tx_dma[port]);
+			ret = grx500_dma_init(&board->tx_dma[port], port == 1);
 		if (ret)
 			goto release_board;
 		ret = grx500_switch_init(board, port);
@@ -2030,6 +2071,9 @@ static int grx500_eth_probe(struct platform_device *pdev)
 			 PTR_ERR(board->flow));
 		board->flow = NULL;
 	}
+	ret = grx500_backpressure_init(board);
+	if (ret)
+		goto release_board;
 	board->switch_data.base = board->gsw[0];
 	board->switch_data.cpu_rx_channel = P2P_CHANNEL;
 	board->switch_data.flow_owner = board->flow;

@@ -12,6 +12,10 @@ extern const char grx500_flow_stats_names[GRX500_FLOW_STATS_COUNT][ETH_GSTRING_L
 struct grx500_flow *grx500_flow_create(struct device *dev, void __iomem *gsw,
 				       struct net_device *lan,
 				       struct net_device *wan);
+int grx500_flow_bp_queues(struct grx500_flow *flow, void __iomem *gsw,
+			  u32 queues[3]);
+int grx500_flow_bp_publish(struct grx500_flow *flow, void __iomem *gsw,
+			   const u32 queues[3]);
 void grx500_flow_destroy(struct grx500_flow *flow);
 void grx500_flow_stop(struct grx500_flow *flow);
 void grx500_flow_get_stats(struct grx500_flow *flow, u64 *data);
