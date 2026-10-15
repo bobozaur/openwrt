@@ -26,9 +26,12 @@ if (!ubus) {
 }
 
 let notify_path = `network.interface.${iface_name}`;
+let token = getenv('NETIFD_PROTO_TOKEN');
 
 function proto_notify(data)
 {
+	if (token)
+		data['proto-token'] = token;
 	return ubus.call(notify_path, "notify_proto", data);
 }
 
@@ -75,6 +78,10 @@ let proto = {
 		if (ifname)
 			msg.ifname = ifname;
 		return proto_notify(msg);
+	},
+
+	clear_host_dependencies: function() {
+		return proto_notify({ action: 8 });
 	},
 
 	setup_failed: function() {
