@@ -1,0 +1,56 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+. /lib/functions.sh
+[ "$(board_name)" = 'tplink,archer-ax50-v1' ] || exit 0
+
+internet_blue=0
+internet_orange=0
+internet_stock=
+inspect_internet_led() {
+	local sysfs trigger dev name mode
+	config_get sysfs "$1" sysfs
+	case "$sysfs" in
+		orange:internet) internet_orange=$((internet_orange + 1)) ;;
+		blue:internet)
+			internet_blue=$((internet_blue + 1))
+			config_get trigger "$1" trigger
+			config_get dev "$1" dev
+			config_get name "$1" name
+			config_get mode "$1" mode
+			# Migrate only the previous board-generated mapping.
+			if [ "$1" = led_wan ] && [ "$name" = WAN ] &&
+			   [ "$trigger" = netdev ] && [ "$dev" = wan ] &&
+			   [ "$mode" = 'link tx rx' ]; then
+				internet_stock="$1"
+			fi
+			;;
+	esac
+}
+add_internet_led() {
+	local section
+	section="$(uci add system led)" || return 1
+	uci set "system.$section.name=$1" &&
+		uci set "system.$section.sysfs=$2" &&
+		uci set "system.$section.trigger=internet"
+}
+
+config_load system
+config_foreach inspect_internet_led led
+if [ "$internet_blue" = 1 ] && [ "$internet_orange" = 0 ] && [ -n "$internet_stock" ]; then
+	uci set "system.$internet_stock.trigger=internet" || exit 1
+	uci -q delete "system.$internet_stock.dev"
+	uci -q delete "system.$internet_stock.mode"
+	add_internet_led 'Internet unavailable' 'orange:internet' || exit 1
+elif [ "$internet_blue" = 0 ] && [ "$internet_orange" = 0 ]; then
+	add_internet_led 'Internet reachable' 'blue:internet' &&
+		add_internet_led 'Internet unavailable' 'orange:internet' || exit 1
+fi
+uci commit system || exit 1
+
+# The package's untouched default is replaced with the board uplink profile.
+# Configured user probes and custom LED mappings remain user-owned.
+if cmp -s /etc/config/pingcheck /usr/share/pingcheck/default.config; then
+	cp /usr/share/pingcheck/ax50.config /etc/config/pingcheck || exit 1
+fi
+exit 0
