@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+case "$FIRMWARE" in
+cal_wlan0.bin|cal_wlan2.bin|cal_wlan4.bin)
+	partition=calibration
+	extractor=/usr/sbin/ax50-caldata
+	destination=/tmp/wave/$FIRMWARE
+	;;
+lantiq/grx500-phy11g-a21.bin)
+	partition=gphyfirmware
+	extractor=/usr/sbin/ax50-gphy
+	destination=/tmp/grx500-phy11g-a21.bin
+	;;
+*) exit 0 ;;
+esac
+
+. /lib/functions.sh
+. /lib/functions/system.sh
+
+[ "$(board_name)" = tplink,archer-ax50-v1 ] || exit 0
+[ -f "/lib/firmware/$FIRMWARE" ] && exit 0
+
+# Generic links in /lib/firmware point here. The validated per-device bytes
+# stay in RAM and the normal procd firmware handler supplies them to Linux.
+umask 077
+mkdir -p "${destination%/*}" || exit 1
+output=$(mktemp "$destination.XXXXXX") || exit 1
+set -- "$(find_mtd_chardev "$partition")"
+[ "$partition" != calibration ] || set -- "$@" "$FIRMWARE"
+if "$extractor" "$@" > "$output"; then
+	mv "$output" "$destination"
+else
+	rm -f "$output"
+	logger -t ax50 'Factory firmware or calibration is invalid or unavailable'
+	exit 1
+fi
