@@ -1,0 +1,32 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] MIPS: execmem: ignore NULL before address classification
+
+The module loader frees every init memory region, including absent regions
+represented by NULL. Return before decoding the address to preserve the
+NULL-free contract. On EVA platforms whose cached-address classifier also
+accepts NULL, passing it to free_phys() corrupts unrelated page metadata.
+Both non-NULL free paths remain unchanged.
+
+This depends on OpenWrt's 301-01 execmem hooks and 301-02 allocator.
+It repairs that OpenWrt-specific implementation and introduces no
+board-specific allocation or address-mapping policy.
+
+Upstream-Status: Inappropriate [OpenWrt-specific execmem override]
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+ arch/mips/kernel/module.c | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+--- a/arch/mips/kernel/module.c
++++ b/arch/mips/kernel/module.c
+@@ -176,6 +176,10 @@ static inline bool is_phys_addr(void *pt
+ /* Free memory returned from module_alloc */
+ void arch_execmem_free(void *ptr)
+ {
++	/* Absent module init regions must be a no-op, before address decoding. */
++	if (!ptr)
++		return;
++
+ 	if (is_phys_addr(ptr))
+ 		free_phys(ptr);
+ 	else
