@@ -1,0 +1,248 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] odhcpd: derive advertisement MTU from live IPv6 state
+
+Retain configured RA MTU as a requested cap and derive each server or relay
+advertisement from the current IPv6 interface MTU. Track netdevice MTU
+separately and schedule an RA on valid-range MTU events without restarting
+healthy DHCP/RA sockets.
+
+Preserve service reload for missing sockets, link changes or transitions
+below IPv6 minimum MTU, where multicast memberships must be rebuilt. Do not
+let extended netlink flags appear as changes to ioctl-initialized flags.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/src/config.c
++++ b/src/config.c
+@@ -1168,6 +1168,10 @@ int config_parse_interface(void *data, s
+ 
+ 		if ((iface->ifflags = odhcpd_get_flags(iface)) < 0)
+ 			goto err;
++
++		/* Seed the netdevice MTU before the first link notification. */
++		int mtu = odhcpd_get_mtu(iface);
++		iface->if_mtu = mtu > 0 ? (uint32_t)mtu : 0;
+ 	}
+ 
+ 	if (get_addrs) {
+@@ -1544,7 +1548,6 @@ int config_parse_interface(void *data, s
+ 			     iface_attrs[IFACE_ATTR_RA_HOPLIMIT].name, iface->name, iface->ra_hoplimit);
+ 	}
+ 
+-	iface->if_mtu = odhcpd_get_interface_config(iface->ifname, "mtu");
+ 	if ((c = tb[IFACE_ATTR_RA_MTU])) {
+ 		uint32_t original_ra_mtu, ra_mtu;
+ 		original_ra_mtu = ra_mtu = blobmsg_get_u32(c);
+@@ -1552,9 +1555,6 @@ int config_parse_interface(void *data, s
+ 			ra_mtu = RA_MTU_MIN;
+ 		else if (ra_mtu > RA_MTU_MAX)
+ 			ra_mtu = RA_MTU_MAX;
+-		if (iface->if_mtu && ra_mtu > iface->if_mtu)
+-			ra_mtu = iface->if_mtu;
+-
+ 		iface->ra_mtu = ra_mtu;
+ 
+ 		if (original_ra_mtu != ra_mtu) {
+@@ -1563,13 +1563,6 @@ int config_parse_interface(void *data, s
+ 		}
+ 	}
+ 
+-	/* Default RA MTU to the interface MTU if no value is assigned */
+-	if (!iface->ra_mtu && iface->if_mtu) {
+-		iface->ra_mtu = iface->if_mtu;
+-		info("Defaulted %s value for interface '%s' to %d",
+-		     iface_attrs[IFACE_ATTR_RA_MTU].name, iface->name, iface->ra_mtu);
+-	}
+-
+ 	if ((c = tb[IFACE_ATTR_RA_SLAAC]))
+ 		iface->ra_slaac = blobmsg_get_bool(c);
+ 
+--- a/src/netlink.c
++++ b/src/netlink.c
+@@ -25,9 +25,11 @@
+ #include <netlink/attr.h>
+ 
+ #include <arpa/inet.h>
++#include <net/if.h>
+ #include <libubox/list.h>
+ 
+ #include "odhcpd.h"
++#include "router.h"
+ 
+ struct event_socket {
+ 	struct odhcpd_event ev;
+@@ -248,6 +250,24 @@ static void refresh_iface_addr6(int ifin
+ 	free(oaddrs6);
+ }
+ 
++static bool link_services_ready(const struct interface *iface)
++{
++	if (!(iface->ifflags & IFF_RUNNING))
++		return true;
++
++	if ((iface->ra != MODE_DISABLED && iface->router_event.uloop.fd < 0) ||
++	    (iface->dhcpv6 != MODE_DISABLED && iface->dhcpv6_event.uloop.fd < 0) ||
++	    (iface->ndp == MODE_RELAY &&
++	     (iface->ndp_event.uloop.fd < 0 || iface->ndp_ping_fd < 0)))
++		return false;
++
++#ifdef DHCPV4_SUPPORT
++	if (iface->dhcpv4 != MODE_DISABLED && iface->dhcpv4_event.uloop.fd < 0)
++		return false;
++#endif
++	return true;
++}
++
+ static int handle_rtm_link(struct nlmsghdr *hdr)
+ {
+ 	struct ifinfomsg *ifi = nlmsg_data(hdr);
+@@ -271,6 +291,9 @@ static int handle_rtm_link(struct nlmsgh
+ 		if (strcmp(iface->ifname, ifname))
+ 			continue;
+ 
++		int old_flags = iface->ifflags;
++		uint32_t old_mtu = iface->if_mtu;
++
+ 		iface->ifflags = ifi->ifi_flags;
+ 
+ 		/* store current MTU if available */
+@@ -286,6 +309,21 @@ static int handle_rtm_link(struct nlmsgh
+ 		 * RUNNING state of the interface.
+ 		 */
+ 		if (iface->ifindex == ifi->ifi_index) {
++			/* SIOCGIFFLAGS initialization exposes only the low 16 bits;
++			 * extended netlink flags must not look like a service change.
++			 */
++			if (!((old_flags ^ iface->ifflags) & 0xffff) && old_mtu >= RA_MTU_MIN &&
++			    iface->if_mtu >= RA_MTU_MIN && link_services_ready(iface)) {
++				/* Valid-range MTU changes and duplicate link events keep
++				 * sockets. Below IPv6's minimum, the kernel destroys its
++				 * multicast state; regrowth must rejoin memberships.
++				 */
++				if (old_mtu != iface->if_mtu && (iface->ifflags & IFF_RUNNING)) {
++					event_info.iface = iface;
++					call_netevent_handler_list(NETEV_MTU_CHANGE, &event_info);
++				}
++				continue;
++			}
+ 			reload_services(iface);
+ 			continue;
+ 		}
+--- a/src/odhcpd.c
++++ b/src/odhcpd.c
+@@ -240,6 +240,17 @@ int odhcpd_get_flags(const struct interf
+ 	return ifr.ifr_flags;
+ }
+ 
++int odhcpd_get_mtu(const struct interface *iface)
++{
++	struct ifreq ifr = {0};
++
++	strncpy(ifr.ifr_name, iface->ifname, sizeof(ifr.ifr_name) - 1);
++	if (ioctl(ioctl_sock, SIOCGIFMTU, &ifr) < 0)
++		return -1;
++
++	return ifr.ifr_mtu;
++}
++
+ 
+ /* Forwards a packet on a specific interface with optional source address */
+ ssize_t odhcpd_send_with_src(int socket, struct sockaddr_in6 *dest,
+--- a/src/odhcpd.h
++++ b/src/odhcpd.h
+@@ -143,6 +143,7 @@ struct netevent_handler_info {
+ 
+ enum netevents {
+ 	NETEV_IFINDEX_CHANGE,
++	NETEV_MTU_CHANGE,
+ 	NETEV_ADDR_ADD,
+ 	NETEV_ADDR_DEL,
+ 	NETEV_ADDRLIST_CHANGE,
+@@ -365,7 +366,7 @@ struct interface {
+ 	int ifindex;
+ 	char *ifname;
+ 	const char *name;
+-	uint32_t if_mtu;
++	uint32_t if_mtu; /* Netdevice MTU, not the IPv6 MTU advertised in RAs. */
+ 	bool update_statefile;
+ 
+ 	// IPv6 runtime data
+@@ -437,7 +438,7 @@ struct interface {
+ 	uint32_t ra_reachabletime;
+ 	uint32_t ra_retranstime;
+ 	uint32_t ra_hoplimit;
+-	uint32_t ra_mtu;
++	uint32_t ra_mtu; /* Configured request; zero derives from current IPv6 MTU. */
+ 	uint32_t max_preferred_lifetime;
+ 	uint32_t max_valid_lifetime;
+ 
+@@ -555,6 +556,7 @@ int odhcpd_get_interface_linklocal_addr(
+ int odhcpd_get_interface_config(const char *ifname, const char *what);
+ int odhcpd_get_mac(const struct interface *iface, uint8_t mac[6]);
+ int odhcpd_get_flags(const struct interface *iface);
++int odhcpd_get_mtu(const struct interface *iface);
+ struct interface* odhcpd_get_interface_by_index(int ifindex);
+ void odhcpd_urandom(void *data, size_t len);
+ 
+--- a/src/router.c
++++ b/src/router.c
+@@ -259,6 +259,7 @@ static void router_netevent_cb(unsigned
+ 				uloop_timeout_set(&iface->timer_rs, 1000);
+ 		}
+ 		break;
++	case NETEV_MTU_CHANGE:
+ 	case NETEV_ADDR6LIST_CHANGE:
+ 		iface = info->iface;
+ 		if (iface && iface->ra == MODE_SERVER && !iface->master)
+@@ -270,6 +271,21 @@ static void router_netevent_cb(unsigned
+ }
+ 
+ 
++/* IPv6 MTU changes made through sysctl have no netlink notification. Derive
++ * each advertisement from current state without overwriting configured policy.
++ */
++static uint32_t router_effective_mtu(const struct interface *iface)
++{
++	int mtu = odhcpd_get_interface_config(iface->ifname, "mtu");
++
++	if (mtu < RA_MTU_MIN)
++		mtu = RA_MTU_MIN;
++	else if (mtu > RA_MTU_MAX)
++		mtu = RA_MTU_MAX;
++
++	return iface->ra_mtu ? min(iface->ra_mtu, (uint32_t)mtu) : (uint32_t)mtu;
++}
++
+ static bool router_icmpv6_valid(struct sockaddr_in6 *source, uint8_t *data, size_t len)
+ {
+ 	struct icmp6_hdr *hdr = (struct icmp6_hdr *)data;
+@@ -690,7 +706,7 @@ static int send_router_advert(struct int
+ 	adv.mtu.nd_opt_mtu_type = ND_OPT_MTU;
+ 	adv.mtu.nd_opt_mtu_len = 1;
+ 
+-	adv.mtu.nd_opt_mtu_mtu = htonl(iface->ra_mtu);
++	adv.mtu.nd_opt_mtu_mtu = htonl(router_effective_mtu(iface));
+ 
+ 	iov[IOV_RA_ADV].iov_base = &adv;
+ 	iov[IOV_RA_ADV].iov_len = sizeof(adv);
+@@ -1335,13 +1351,14 @@ static void forward_router_advertisement
+ 			}
+ 		}
+ 
+-		/* Rewrite MTU option if local RA MTU is configured */
+-		if (c->ra_mtu && mtu_opt) {
+-			if (ingress_mtu_val != c->ra_mtu) {
++		/* Each downstream has its own current IPv6 MTU and configured cap. */
++		if (mtu_opt) {
++			uint32_t mtu = router_effective_mtu(c);
++			if (ingress_mtu_val != mtu) {
+ 				debug("Rewriting RA MTU from %u to %u on %s",
+-				      ingress_mtu_val, c->ra_mtu, c->name);
+-				mtu_opt->nd_opt_mtu_mtu = htonl(c->ra_mtu);
++				      ingress_mtu_val, mtu, c->name);
+ 			}
++			mtu_opt->nd_opt_mtu_mtu = htonl(mtu);
+ 		}
+ 
+ 		info("Forward a RA on %s", c->name);
