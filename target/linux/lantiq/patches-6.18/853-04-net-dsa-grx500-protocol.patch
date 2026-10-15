@@ -1,0 +1,29 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] net: dsa: allocate a GRX500 PMAC tag protocol
+
+Give the GRX500 PMAC tagger a protocol value shared with the switch driver.
+The value is a downstream allocation pending coordination with DSA
+maintainers; it does not change any existing protocol value.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -25,6 +25,7 @@
+ struct dsa_8021q_context;
+ struct tc_action;
+ 
++#define DSA_TAG_PROTO_GRX500_VALUE		32
+ #define DSA_TAG_PROTO_NONE_VALUE		0
+ #define DSA_TAG_PROTO_BRCM_VALUE		1
+ #define DSA_TAG_PROTO_BRCM_PREPEND_VALUE	2
+@@ -58,6 +59,7 @@
+ 
+ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_NONE		= DSA_TAG_PROTO_NONE_VALUE,
++	DSA_TAG_PROTO_GRX500		= DSA_TAG_PROTO_GRX500_VALUE,
+ 	DSA_TAG_PROTO_BRCM		= DSA_TAG_PROTO_BRCM_VALUE,
+ 	DSA_TAG_PROTO_BRCM_LEGACY	= DSA_TAG_PROTO_BRCM_LEGACY_VALUE,
+ 	DSA_TAG_PROTO_BRCM_LEGACY_FCS	= DSA_TAG_PROTO_BRCM_LEGACY_FCS_VALUE,
