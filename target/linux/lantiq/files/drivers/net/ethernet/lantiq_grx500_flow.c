@@ -98,14 +98,17 @@ struct grx500_flow_entry {
 	struct rcu_head rcu;
 	unsigned long cookie;
 	struct grx500_flow_binding *binding;
-	struct grx500_flow_path __rcu *path;
-	struct grx500_flow_tuple before, after;
-	u8 source_mac[ETH_ALEN], dest_mac[ETH_ALEN];
-	u32 generation;
-	u16 slot, resource;
-	u16 source_mac_index, dest_mac_index;
-	u8 domain, mtu_index, protocol;
-	bool hardware_valid, source_nat, port_nat, nat, ipv6;
+	unsigned long retire_state;
+	struct_group(incarnation,
+		struct grx500_flow_path __rcu *path;
+		struct grx500_flow_tuple before, after;
+		u8 source_mac[ETH_ALEN], dest_mac[ETH_ALEN];
+		u32 generation;
+		u16 slot, resource;
+		u16 source_mac_index, dest_mac_index;
+		u8 domain, mtu_index, protocol;
+		bool hardware_valid, resources_owned, source_nat, port_nat, nat, ipv6;
+	);
 	spinlock_t stats_lock;
 	u64 packets, bytes;
 	u64 reported_packets, reported_bytes;
@@ -153,6 +156,7 @@ struct grx500_flow {
 	u16 mtu_value[8], mtu_users[8];
 	u8 next_extension;
 	atomic_t epoch;
+	atomic_t admission_seq; /* Cold neighbour validation interval only. */
 	struct work_struct invalidate_work;
 	struct notifier_block netdev_nb, netevent_nb, fib_nb;
 	atomic64_t returns, return_bytes, stale_returns, invalid_returns;
@@ -665,7 +669,7 @@ static void gf_mac_put(struct grx500_flow *f, u16 index)
 static void gf_mac_release(struct grx500_flow *f, struct grx500_flow_entry *entry)
 {
 	/* Index metadata remains immutable for existing RCU readers. Each
-	 * entry has exactly one release, after retirement or before publication.
+	 * incarnation releases once after retirement or before publication.
 	 */
 	gf_mac_put(f, entry->source_mac_index);
 	gf_mac_put(f, entry->dest_mac_index);
@@ -694,6 +698,18 @@ static int gf_mtu_get(struct grx500_flow *f, u16 mtu)
 		return i;
 	}
 	return -ENOSPC;
+}
+
+/* A retained cookie/statistics record does not retain live table leases. */
+static void gf_resources_release(struct grx500_flow *f,
+				 struct grx500_flow_entry *entry)
+{
+	if (!entry->resources_owned)
+		return;
+	gf_mac_release(f, entry);
+	clear_bit(entry->resource, f->resources);
+	f->mtu_users[entry->mtu_index]--;
+	entry->resources_owned = false;
 }
 
 static int gf_session(struct grx500_flow *f, struct grx500_flow_entry *entry,
@@ -905,7 +921,7 @@ static int gf_domain_get(struct grx500_flow *f, struct net_device *dev, u16 port
 }
 
 static int gf_parse(struct grx500_flow *f, struct flow_cls_offload *cls,
-		    struct grx500_flow_entry *entry)
+		    struct grx500_flow_entry *entry, u32 epoch)
 {
 	u64 keys = BIT_ULL(FLOW_DISSECTOR_KEY_META) |
 		BIT_ULL(FLOW_DISSECTOR_KEY_CONTROL) |
@@ -923,7 +939,6 @@ static int gf_parse(struct grx500_flow *f, struct flow_cls_offload *cls,
 	struct grx500_flow_path *path;
 	struct net_device *input, *logical, *output = NULL;
 	u8 mac_fields = 0;
-	u32 epoch = atomic_read(&f->epoch);
 	bool snat, dnat;
 	int i, ret = -EOPNOTSUPP;
 
@@ -1127,8 +1142,11 @@ static int gf_retire(struct grx500_flow *f, struct grx500_flow_entry *entry)
 	path = rcu_replace_pointer(entry->path, NULL, lockdep_is_held(&f->lock));
 	if (rcu_access_pointer(f->slots[entry->slot]) == entry)
 		RCU_INIT_POINTER(f->slots[entry->slot], NULL);
-	if (path)
+	if (path) {
+		/* Snapshot after both lookup owners detach, before later reuse. */
+		entry->retire_state = get_state_synchronize_rcu();
 		call_rcu(&path->rcu, gf_path_free);
+	}
 	if (entry->hardware_valid) {
 		ret = gf_session(f, entry, false);
 		if (ret) {
@@ -1138,6 +1156,7 @@ static int gf_retire(struct grx500_flow *f, struct grx500_flow_entry *entry)
 		entry->hardware_valid = false;
 		f->active--;
 	}
+	gf_resources_release(f, entry);
 	return ret;
 }
 
@@ -1207,18 +1226,29 @@ static int gf_netevent(struct notifier_block *nb, unsigned long event, void *dat
 	struct grx500_flow_entry *entry;
 	struct grx500_flow_path *path;
 	unsigned int i;
+	u8 ha[MAX_ADDR_LEN], nud_state;
 
 	if (event != NETEVENT_NEIGH_UPDATE)
 		return NOTIFY_DONE;
 	rcu_read_lock();
+	/* Fence first/unpublished admissions without broadening the existing
+	 * published-slot invalidation policy to every relevant notification.
+	 */
+	if (gf_ports(f, neigh->dev)) {
+		atomic_inc(&f->admission_seq);
+		/* Paired with the staged-slot publisher before its sequence check. */
+		smp_mb__after_atomic();
+	}
+	nud_state = READ_ONCE(neigh->nud_state);
+	neigh_ha_snapshot(ha, neigh, neigh->dev);
 	for (i = 0; i < GF_SESSIONS; i++) {
 		entry = rcu_dereference(f->slots[i]);
 		if (!entry)
 			continue;
 		path = rcu_dereference(entry->path);
 		if (path && path->egress == neigh->dev &&
-		    (!(READ_ONCE(neigh->nud_state) & NUD_VALID) ||
-		     !ether_addr_equal(entry->dest_mac, neigh->ha))) {
+		    (!(nud_state & NUD_VALID) ||
+		     !ether_addr_equal(entry->dest_mac, ha))) {
 			gf_invalidate_async(f);
 			break;
 		}
@@ -1266,6 +1296,7 @@ static int gf_netdev_event(struct notifier_block *nb, unsigned long event, void 
 		upper = ((struct netdev_notifier_changeupper_info *)data)->upper_dev;
 		break;
 	case NETDEV_PRECHANGEMTU:
+	case NETDEV_CHANGEMTU:
 	case NETDEV_PRE_CHANGEADDR:
 	case NETDEV_CHANGEADDR:
 	case NETDEV_GOING_DOWN:
@@ -1275,6 +1306,16 @@ static int gf_netdev_event(struct notifier_block *nb, unsigned long event, void 
 	default:
 		return NOTIFY_DONE;
 	}
+	/* Close the admission interval before waiting on the publisher's lock.
+	 * It may be installing the first rule, with no slot/domain to scan yet.
+	 */
+	rcu_read_lock();
+	relevant = gf_port(f, dev) >= 0 || gf_ports(f, dev) ||
+		(upper && gf_ports(f, upper));
+	rcu_read_unlock();
+	if (relevant)
+		atomic_inc(&f->epoch);
+
 	/* The finite extension namespace belongs to actual ingress identities.
 	 * Unrelated WLAN/WG/veth lifetimes must not consume it.
 	 */
@@ -1322,19 +1363,49 @@ static int gf_netdev_event(struct notifier_block *nb, unsigned long event, void 
 	return NOTIFY_DONE;
 }
 
+static bool gf_rule_equal(const struct grx500_flow_entry *old,
+			  const struct grx500_flow_path *old_path,
+			  const struct grx500_flow_entry *entry,
+			  const struct grx500_flow_path *path)
+{
+	return old_path && old_path->epoch == path->epoch &&
+		old_path->ingress == path->ingress && old_path->egress == path->egress &&
+		old_path->source_ports == path->source_ports && old_path->mtu == path->mtu &&
+		ether_addr_equal(old_path->ingress_mac, path->ingress_mac) &&
+		!memcmp(&old->before, &entry->before, sizeof(entry->before)) &&
+		!memcmp(&old->after, &entry->after, sizeof(entry->after)) &&
+		ether_addr_equal(old->source_mac, entry->source_mac) &&
+		ether_addr_equal(old->dest_mac, entry->dest_mac) &&
+		old->protocol == entry->protocol && old->ipv6 == entry->ipv6 &&
+		old->nat == entry->nat && old->source_nat == entry->source_nat &&
+		old->port_nat == entry->port_nat;
+}
+
 static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding,
 		      struct flow_cls_offload *cls)
 {
-	struct grx500_flow_entry *entry;
-	struct grx500_flow_path *path;
+	struct grx500_flow_entry *entry, *old;
+	struct grx500_flow_path *path, *old_path;
 	unsigned int resource, slot;
 	int ret, domain, mtu;
+	bool retained = false;
+	u32 epoch, admission_seq;
 
 	if (f->stopping || f->faulted || binding->detached ||
 	    !netif_running(f->lan) || !netif_running(f->wan))
 		return -EOPNOTSUPP;
 
-	if (rhashtable_lookup_fast(&f->cookies, &cls->cookie, grx500_flow_hash_params))
+	/* Validate the actual native source inside this admission interval.
+	 * Atomic notifiers fence every later relevant change, including before
+	 * a first slot exists. No provider lock/context survives this call.
+	 */
+	epoch = atomic_read(&f->epoch);
+	admission_seq = atomic_read(&f->admission_seq);
+	if (cls->validate && !cls->validate(cls->validate_priv))
+		return -EAGAIN;
+
+	old = rhashtable_lookup_fast(&f->cookies, &cls->cookie, grx500_flow_hash_params);
+	if (old && old->binding != binding)
 		return -EEXIST;
 
 	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
@@ -1343,14 +1414,35 @@ static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding
 	entry->cookie = cls->cookie;
 	entry->binding = binding;
 	spin_lock_init(&entry->stats_lock);
-	ret = gf_parse(f, cls, entry);
+	ret = gf_parse(f, cls, entry, epoch);
 	if (ret)
 		goto free;
 	path = rcu_dereference_protected(entry->path, lockdep_is_held(&f->lock));
 
-	if (path->epoch != atomic_read(&f->epoch)) {
+	if (path->epoch != atomic_read(&f->epoch) ||
+	    admission_seq != atomic_read(&f->admission_seq)) {
 		ret = -EAGAIN;
 		goto free_path;
+	}
+
+	if (old) {
+		old_path = rcu_dereference_protected(old->path, lockdep_is_held(&f->lock));
+		if (old->hardware_valid && gf_rule_equal(old, old_path, entry, path)) {
+			ret = 0;
+			goto free_path;
+		}
+		ret = gf_retire(f, old);
+		if (ret)
+			goto free_path;
+		/* Old completions retain immutable rule data and update these same
+		 * statistics until their read-side section finishes. Never reset the
+		 * cookie, hash/list membership, binding reference or counters.
+		 */
+		cond_synchronize_rcu(old->retire_state);
+		old->incarnation = entry->incarnation;
+		kfree(entry);
+		entry = old;
+		retained = true;
 	}
 
 	domain = gf_domain_get(f, path->ingress, path->source_ports, path->ingress_mac);
@@ -1379,6 +1471,7 @@ static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding
 	}
 	entry->mtu_index = mtu;
 	set_bit(resource, f->resources);
+	entry->resources_owned = true;
 
 	if (entry->ipv6) {
 		ret = gf_ip6_write(f, resource * 12, &entry->before.src6);
@@ -1412,51 +1505,63 @@ static int gf_replace(struct grx500_flow *f, struct grx500_flow_binding *binding
 		goto free_resource;
 	}
 
-	ret = rhashtable_insert_fast(&f->cookies, &entry->node, grx500_flow_hash_params);
-	if (ret)
-		goto free_resource;
-	/* The entry may outlive callback removal, including a failed checked
-	 * table retirement. Its RCU release owns this separate reference.
-	 */
-	refcount_inc(&binding->refs);
-	list_add_tail(&entry->list, &f->entries);
+	if (!retained) {
+		ret = rhashtable_insert_fast(&f->cookies, &entry->node, grx500_flow_hash_params);
+		if (ret)
+			goto free_resource;
+		/* The entry may outlive callback removal, including a failed checked
+		 * table retirement. Its RCU release owns this separate reference.
+		 */
+		refcount_inc(&binding->refs);
+		list_add_tail(&entry->list, &f->entries);
+	}
 	/* Host return owner is ready before hardware validity is published. */
 	rcu_assign_pointer(f->slots[slot], entry);
+	/* A notifier either sees this staged path or this admission observes its
+	 * sequence change before hardware validity can expose a stale action.
+	 */
+	smp_mb();
+	if (admission_seq != atomic_read(&f->admission_seq) ||
+	    path->epoch != atomic_read(&f->epoch)) {
+		ret = -EAGAIN;
+		goto retire;
+	}
 	entry->hardware_valid = true;
 	f->active++;
 
 	ret = gf_session(f, entry, true);
-	if (!ret && path->epoch == atomic_read(&f->epoch))
+	if (!ret && path->epoch == atomic_read(&f->epoch) &&
+	    admission_seq == atomic_read(&f->admission_seq))
 		return 0;
 	if (!ret)
 		ret = -EAGAIN;
 	else
 		gf_fault(f, ret);
+retire:
 	/* A failed publication is never reported as hardware support. Keep
 	 * resources pinned if the checked invalidation also fails.
 	 */
 	if (gf_retire(f, entry))
 		return ret;
+	if (retained)
+		return ret;
 	list_del(&entry->list);
 	rhashtable_remove_fast(&f->cookies, &entry->node, grx500_flow_hash_params);
-	gf_mac_release(f, entry);
-	clear_bit(resource, f->resources);
-	f->mtu_users[mtu]--;
 	call_rcu(&entry->rcu, gf_entry_free);
 	return ret;
 
 free_resource:
-	gf_mac_release(f, entry);
-	clear_bit(resource, f->resources);
-	f->mtu_users[mtu]--;
+	gf_resources_release(f, entry);
 free_path:
 	if (ret == -ENOSPC)
 		atomic64_inc(&f->capacity_fallbacks);
+	RCU_INIT_POINTER(entry->path, NULL);
 	dev_put(path->ingress);
 	dev_put(path->egress);
 	kfree(path);
 free:
-	kfree(entry);
+	if (!retained)
+		kfree(entry);
 	return ret;
 }
 
@@ -1469,9 +1574,6 @@ static int gf_remove_entry(struct grx500_flow *f, struct grx500_flow_entry *entr
 		return ret;
 	rhashtable_remove_fast(&f->cookies, &entry->node, grx500_flow_hash_params);
 	list_del(&entry->list);
-	gf_mac_release(f, entry);
-	clear_bit(entry->resource, f->resources);
-	f->mtu_users[entry->mtu_index]--;
 	call_rcu(&entry->rcu, gf_entry_free);
 	return 0;
 }
@@ -1850,6 +1952,7 @@ struct grx500_flow *grx500_flow_create(struct device *dev, void __iomem *gsw,
 	INIT_WORK(&f->invalidate_work, gf_invalidate_work);
 	f->next_extension = 4;
 	atomic_set(&f->epoch, 1);
+	atomic_set(&f->admission_seq, 0);
 	ret = rhashtable_init(&f->cookies, &grx500_flow_hash_params);
 	if (ret)
 		goto free;
