@@ -89,14 +89,14 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		   struct nft_flowtable *ft);
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -7,6 +7,7 @@
- #include <linux/netdevice.h>
- #include <net/ip.h>
- #include <net/ip6_route.h>
-+#include <net/neighbour.h>
- #include <net/netfilter/nf_flow_table.h>
- #include <net/netfilter/nf_conntrack.h>
+@@ -13,6 +13,7 @@
  #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
++#include <net/neighbour.h>
+ 
+ static DEFINE_MUTEX(flowtable_lock);
+ static LIST_HEAD(flowtables);
 @@ -127,6 +128,11 @@
  		       ETH_ALEN);
  		flow_tuple->out.ifidx = route->tuple[dir].out.ifindex;
