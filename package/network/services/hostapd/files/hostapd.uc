@@ -329,11 +329,13 @@ function iface_add(phy, config, phy_status)
 		return true;
 
 	let iface = hostapd.interfaces[phy];
-	if (!iface)
-		return false;
+	if (iface && iface.start(iface_freq_info(iface, config, phy_status)))
+		return true;
 
-	let freq_info = iface_freq_info(iface, config, phy_status);
-	return iface.start(freq_info) >= 0;
+	// A failed native start still owns the added interface. Retire it before
+	// the pending setup retries without the supplicant-provided channel.
+	hostapd.remove_iface(phy);
+	return false;
 }
 
 function bss_macaddr_name(group, bss)

@@ -241,6 +241,24 @@ function enrollment_candidate(ifname, iface, cred)
 	entry.candidates[sprintf('%d', cred.network_id)] = cred;
 }
 
+// Internal radio serialization keeps the native interface, accepted profiles
+// and exact enrollment owner. Netdev down releases the driver's station role.
+function iface_pause(owner)
+{
+	let ifname = owner.config.iface;
+	let iface = wpas.interfaces[ifname];
+	if (!owner.running || !iface)
+		return true;
+	if (owner.paused == iface)
+		return true;
+	owner.paused = iface;
+	if (wdev_set_up(ifname, false)) {
+		delete owner.paused;
+		return false;
+	}
+	return true;
+}
+
 function iface_stop(iface)
 {
 	let ifname = iface.config.iface;
@@ -253,6 +271,7 @@ function iface_stop(iface)
 	delete wpas.data.iface_phy[ifname];
 	wpas.remove_iface(ifname);
 	wdev_remove(ifname);
+	delete iface.paused;
 	iface.running = false;
 }
 
@@ -280,8 +299,16 @@ function iface_start(phydev, iface)
 {
 	let phy = phydev.name;
 
-	if (iface.running && wpas.interfaces[iface.config.iface])
+	if (iface.running && wpas.interfaces[iface.config.iface]) {
+		if (!iface.paused)
+			return true;
+		let native = wpas.interfaces[iface.config.iface];
+		if (iface.paused != native || native.status().state != 'INTERFACE_DISABLED' ||
+		    wdev_set_up(iface.config.iface, true))
+			return false;
+		delete iface.paused;
 		return true;
+	}
 	iface.running = false;
 
 	let ifname = iface.config.iface;
@@ -384,6 +411,14 @@ function iface_network_apply(ifname, old_data, new_data, freq_list)
 function iface_cb(new_if, old_if, generation)
 {
 	enrollment_reconcile(old_if, new_if, generation);
+	// A new configuration incarnation retires a paused old resource directly;
+	// never bring the old profile up briefly while applying its replacement.
+	if (old_if?.paused) {
+		iface_stop(old_if);
+		if (new_if)
+			new_if.macaddr = old_if.macaddr;
+		return;
+	}
 	if (old_if && new_if)
 		new_if.macaddr = old_if.macaddr;
 
@@ -740,19 +775,67 @@ function mld_bss_allowed(data, bss) {
 	return index(data.freq_list, bss.freq) >= 0;
 }
 
-function phy_transition_finish(phy)
+function phy_transition_finish(phy, resume, force)
 {
 	let transition = phy.transition;
 	if (!transition)
-		return;
-	if (transition.lease)
-		transition.lease.cancel();
+		return true;
+	resume ??= true;
+	transition.request?.reply(null, libubus.STATUS_UNKNOWN_ERROR);
+	delete transition.request;
+	if (resume && !force) {
+		for (let ifname in transition.freq_list) {
+			let iface = wpas.interfaces[ifname];
+			if (iface && phy.data[ifname]?.paused == iface &&
+			    iface.status().state != 'INTERFACE_DISABLED') {
+				// A queued DOWN notification is ignored if the netdev is
+				// already UP. Keep the existing lease until DOWN is observed.
+				transition.finishing = true;
+				return true;
+			}
+		}
+	}
+	transition.lease?.cancel();
 	delete phy.transition;
+	let success = true;
 	for (let ifname, freqs in transition.freq_list) {
 		let iface = wpas.interfaces[ifname];
-		if (iface)
-			iface.config('freq_list', freqs);
+		if (!iface)
+			continue;
+		iface.config('freq_list', freqs);
+		let owner = phy.data[ifname];
+		if (!resume || owner?.paused != iface)
+			continue;
+		if (wdev_set_up(ifname, true)) {
+			wpas.printf(`Failed to resume station ${ifname}`);
+			success = false;
+		} else {
+			delete owner.paused;
+		}
 	}
+	return success;
+}
+
+function phy_transition_ready(phy)
+{
+	let transition = phy.transition;
+	if (!transition || transition.phase != 'paused')
+		return;
+	if (transition.finishing) {
+		phy_transition_finish(phy);
+		return;
+	}
+	if (!transition.request)
+		return;
+	for (let ifname in transition.freq_list) {
+		let iface = wpas.interfaces[ifname];
+		if (phy.data[ifname]?.paused &&
+		    (phy.data[ifname].paused != iface ||
+		     iface.status().state != 'INTERFACE_DISABLED'))
+			return;
+	}
+	transition.request.reply({ generation: phy.generation, token: transition.token });
+	delete transition.request;
 }
 
 function phy_transition_lease(name, phy, milliseconds)
@@ -764,7 +847,7 @@ function phy_transition_lease(name, phy, milliseconds)
 		if (phy.transition != transition)
 			return;
 		wpas.printf(`AP/STA transition on ${name} expired; restoring station operation`);
-		phy_transition_finish(phy);
+		phy_transition_finish(phy, true, true);
 		start_pending(name);
 	});
 }
@@ -783,7 +866,7 @@ function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_ba
 	}
 
 	phy.radio = radio;
-	phy_transition_finish(phy);
+	phy_transition_finish(phy, false);
 	let previous_generation = phy.generation;
 	phy.generation = ++wpas.data.config_generation;
 	phy.ap_phy = ap_phy;
@@ -998,38 +1081,55 @@ let main_obj = {
 				if (transition && transition.token != req.args.token &&
 				    transition.token != req.args.replaces)
 					return libubus.STATUS_PERMISSION_DENIED;
-				if (transition?.token == req.args.token)
+				if (transition?.token == req.args.token) {
+					if (transition.request || transition.finishing)
+						return libubus.STATUS_PERMISSION_DENIED;
 					return { generation: phy.generation, token: transition.token };
+				}
 				let previous_freqs = transition?.freq_list;
-				phy_transition_finish(phy);
+				// Transfer only the same native paused resources, without UP.
+				phy_transition_finish(phy, false);
 				transition = phy.transition = {
 					token: req.args.token, owner: req.args.owner,
 					generation: phy.generation, phase: 'paused', freq_list: {},
 				};
+				phy_transition_lease(req.args.phy, phy, 30000);
 				for (let ifname, entry in phy.data) {
 					let iface = wpas.interfaces[ifname];
 					let previous = previous_freqs && index(keys(previous_freqs), ifname) >= 0;
 					transition.freq_list[ifname] = previous ? previous_freqs[ifname] :
 						(iface ? iface.config('freq_list') : null);
-					iface_stop(entry);
-					if (wpas.interfaces[ifname]) {
+					if (!iface_pause(entry)) {
 						phy_transition_finish(phy);
 						start_pending(req.args.phy);
 						return libubus.STATUS_UNKNOWN_ERROR;
 					}
 				}
-				phy_transition_lease(req.args.phy, phy, 30000);
-				return { generation: phy.generation, token: transition.token };
+				req.defer();
+				transition.request = req;
+				phy_transition_ready(phy);
+				return;
 			}
-			if (!transition && req.args.action == 'cancel')
+			if (!transition && req.args.action == 'cancel') {
+				// A previous UP failure retains its exact native owner. The
+				// ordinary start path can restore that resource without re-add.
+				for (let ifname, entry in phy.data)
+					if (entry.paused) {
+						start_pending(req.args.phy);
+						break;
+					}
+				for (let ifname, entry in phy.data)
+					if (entry.paused)
+						return libubus.STATUS_UNKNOWN_ERROR;
 				return 0;
+			}
 			if (!transition || transition.token != req.args.token ||
 			    transition.generation != phy.generation)
 				return libubus.STATUS_NOT_FOUND;
 			if (req.args.action == 'cancel') {
-				phy_transition_finish(phy);
+				let restored = phy_transition_finish(phy);
 				start_pending(req.args.phy);
-				return 0;
+				return restored ? 0 : libubus.STATUS_UNKNOWN_ERROR;
 			}
 			if (req.args.action == 'renew') {
 				if (req.args.lease_ms <= 0)
@@ -1039,12 +1139,25 @@ let main_obj = {
 			}
 			if (req.args.action != 'resume' || req.args.frequency < 0)
 				return libubus.STATUS_INVALID_ARGUMENT;
+			if (transition.request || transition.finishing)
+				return libubus.STATUS_PERMISSION_DENIED;
 			transition.phase = 'resuming';
 			transition.frequency = req.args.frequency;
-			if (!transition.frequency)
-				phy_transition_finish(phy);
-			else
+			if (!transition.frequency) {
+				if (!phy_transition_finish(phy))
+					return libubus.STATUS_UNKNOWN_ERROR;
+			} else {
 				phy_transition_lease(req.args.phy, phy, 35000);
+				for (let ifname, entry in phy.data) {
+					let iface = wpas.interfaces[ifname];
+					if (!iface || entry.paused != iface)
+						continue;
+					if (!iface.config('freq_list', [ transition.frequency ]) ||
+					    wdev_set_up(ifname, true))
+						return libubus.STATUS_UNKNOWN_ERROR;
+					delete entry.paused;
+				}
+			}
 			start_pending(req.args.phy);
 			for (let ifname in phy.data)
 				if (!wpas.interfaces[ifname])
@@ -1654,6 +1767,8 @@ return {
 	bss_allowed: function(ifname, bss) {
 		let phy = wpas.data.config[wpas.data.iface_phy[ifname]];
 		let transition = phy?.transition;
+		if (transition?.phase == 'paused')
+			return false;
 		if (transition?.phase == 'resuming' && transition.frequency > 0 &&
 		    bss.freq != transition.frequency)
 			return false;
@@ -1704,6 +1819,9 @@ return {
 		event_data.name = ifname;
 		iface_event("state", ifname, event_data);
 		try {
+			let transition_phy = wpas.data.config[wpas.data.iface_phy[ifname]];
+			if (state == 'INTERFACE_DISABLED' && transition_phy)
+				phy_transition_ready(transition_phy);
 			enrollment_persist(ifname, iface);
 			iface_hostapd_notify(ifname, iface, state);
 
