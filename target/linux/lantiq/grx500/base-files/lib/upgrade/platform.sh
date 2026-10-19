@@ -127,7 +127,7 @@ ax50_initial_install_cleanup() {
 }
 
 ax50_initial_install() {
-	local dir id created_a=0 created_b=0 dev_a= dev_b= selection_attempted=0
+	local dir id preserved created_a=0 created_b=0 dev_a= dev_b= selection_attempted=0
 	ax50_is_initial_install && [ "$(board_name)" = tplink,archer-ax50-v1 ] &&
 		[ -z "$UPGRADE_BACKUP" ] && ax50_check_initial_layout &&
 		ax50_check_initial_bootenv || return 1
@@ -141,6 +141,9 @@ ax50_initial_install() {
 		trap 'exit 1' HUP INT TERM
 		tar -xOf "$1" "$AX50_IMAGE_DIR/root" > "$dir/root"
 		tar -xOf "$1" "$AX50_IMAGE_DIR/kernelB" > "$dir/kernel"
+		# Hash whole logical volumes, not just their image prefixes. No copy
+		# of fallback A or shared factory data is staged or written to NAND.
+		preserved=$(sha256sum /dev/ubi0_0 /dev/ubi0_1 /dev/ubi0_4)
 		ubimkvol /dev/ubi0 -n 6 -N ax50_overlayA -t dynamic -s 16252928
 		created_a=1
 		dev_a=$(cat /sys/class/ubi/ubi0_6/dev)
@@ -160,6 +163,7 @@ ax50_initial_install() {
 		mount -t ubifs ubi0:ax50_overlayB "$dir/overlay"
 		sync
 		umount "$dir/overlay"
+		[ "$(sha256sum /dev/ubi0_0 /dev/ubi0_1 /dev/ubi0_4)" = "$preserved" ]
 		ax50_check_layout
 		ax50_check_initial_bootenv
 		# A lost acknowledgement may still have selected B. Retain both new
