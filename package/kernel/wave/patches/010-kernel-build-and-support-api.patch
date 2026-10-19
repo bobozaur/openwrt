@@ -5,7 +5,6 @@ Use the staged backports headers and symbols, current timer/netlink interfaces
 and bounded wire layouts. Keep support-module and driver builds coherent.
 
 This is the final native integration against the pinned vendor source.
-Firmware-dependent policy remains downstream with exact image admission.
 
 Upstream-Status: Pending
 Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
@@ -495,15 +494,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      return t_usec;
 --- a/wireless/driver/Makefile.am
 +++ b/wireless/driver/Makefile.am
-@@ -41,7 +41,7 @@
- 
- EXTRA_DIST =  linux/Kbuild \
-               linux/compat.h \
--              linux/core.c \
-+              linux/core.c linux/wave_pmf.c linux/wave_pmf.h \
-               shared/core_dut.c shared/core_common.c \
-               linux/core.h shared/core_common.h \
-               linux/core_ab.c \
 @@ -54,6 +54,8 @@
                linux/l2nat.c linux/l2nat.h \
                linux/log_osdep.c linux/log_osdep.h \
@@ -527,9 +517,8 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  obj-m := mtlk.o
  
--mtlk-objs := core.o core_ab.o wave_radio_ab.o core_pdb.o\
+ mtlk-objs := core.o core_ab.o wave_radio_ab.o core_pdb.o\
 -   eth_parser.o mcast.o utils.o osal_defs.o l2nat.o \
-+mtlk-objs := wave_pmf.o core.o core_ab.o wave_radio_ab.o core_pdb.o\
 +   eth_parser.o mcast.o wave_mc_native.o wave_mc_policy.o utils.o osal_defs.o l2nat.o \
     mtlk_serializer_osdep.o mtlk_fast_mem.o \
     mib_osdep.o \

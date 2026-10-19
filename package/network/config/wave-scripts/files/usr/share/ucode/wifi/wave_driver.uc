@@ -99,6 +99,9 @@ function setup(data) {
 
 	let config = data.config;
 	validate('device', config);
+	// The OEM firmware uses one fixed color for all VAPs.
+	config.he_bss_color_enabled = true;
+	config.he_bss_color = 4;
 	if (config.frag)
 		return fail('WAVE_FRAG_UNSUPPORTED');
 	if (config.radio != null && config.radio >= 0)
@@ -110,6 +113,13 @@ function setup(data) {
 	for (let _, v in data.interfaces) {
 		if (v.config.mode != 'ap' && v.config.mode != 'sta')
 			return fail('WAVE_MODE_UNSUPPORTED');
+		let security = { ...v.config };
+		iface.parse_encryption(security, config);
+		// Reject requested PMF before native generators can choose a fallback.
+		if (+v.config.ieee80211w > 0 || +v.config.dpp ||
+		    security.auth_type in [ 'sae', 'psk-sae', 'psk-sae-compat',
+			'eap2', 'eap192', 'eap-eap2', 'owe', 'dpp' ])
+			return fail('WAVE_PMF_UNSUPPORTED');
 		let multi_ap = int(v.config.multi_ap ?? 0);
 		if (multi_ap < 0 || multi_ap > (v.config.mode == 'ap' ? 3 : 1))
 			return fail('WAVE_MULTI_AP_ROLE_UNSUPPORTED');
