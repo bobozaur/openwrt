@@ -410,19 +410,24 @@ EOF
 	print "\tdefault \"\"\n";
 
 	my %kver;
+	# Package gates also reference maintained families without active targets.
+	foreach my $kernel (glob "$FindBin::Bin/../target/linux/generic/kernel-*") {
+		$kernel =~ /\/kernel-(\d+(?:\.\d+)+)$/ or next;
+		$kver{kver($1)} = 1;
+	}
 	foreach my $target (@target) {
 		foreach my $tv ($target->{version}, $target->{testing_version}) {
 			next unless $tv;
-			my $v = kver($tv);
-			next if $kver{$v};
-			$kver{$v} = 1;
-			print <<EOF;
+			$kver{kver($tv)} = 1;
+		}
+	}
+	foreach my $v (sort keys %kver) {
+		print <<EOF;
 
 config LINUX_$v
 	bool
 
 EOF
-		}
 	}
 	foreach my $def (sort keys %defaults) {
 		print <<EOF;
