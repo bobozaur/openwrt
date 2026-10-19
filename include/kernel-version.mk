@@ -1,6 +1,6 @@
 
 # Use the default kernel version if the Makefile doesn't override it
-LINUX_RELEASE?=3
+LINUX_RELEASE?=4
 
 ifdef CONFIG_TESTING_KERNEL
   KERNEL_PATCHVER:=$(KERNEL_TESTING_PATCHVER)
