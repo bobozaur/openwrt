@@ -337,6 +337,14 @@ config KERNEL_KCOV_INSTRUMENT_ALL
 	  filesystem fuzzing with AFL) then you will want to enable coverage
 	  for more specific subsets of files, and should say n here.
 
+config KERNEL_SCHEDSTATS
+	bool "Compile the kernel with scheduler statistics"
+	help
+	  Collect scheduler run time and runqueue delay in /proc/schedstat
+	  and /proc/<pid>/schedstat. Enable collection at runtime with the
+	  kernel.sched_schedstats sysctl. Timestamp precision depends on the
+	  platform scheduler clock.
+
 config KERNEL_TASKSTATS
 	bool "Compile the kernel with task resource/io statistics and accounting"
 	help
