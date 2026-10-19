@@ -6,7 +6,6 @@ Keep host state, pending messages, applied firmware groups and descriptor pins
 alive until their actual owners retire; quarantine uncertain transport.
 
 This is the final native integration against the pinned vendor source.
-Firmware-dependent policy remains downstream with exact image admission.
 
 Upstream-Status: Pending
 Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
