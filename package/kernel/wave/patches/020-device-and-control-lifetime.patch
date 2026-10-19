@@ -10,7 +10,6 @@ Join netlink callback removal with native generic-netlink dispatch, publishing
 recovery and logger callbacks only while their state remains initialized.
 
 This is the final native integration against the pinned vendor source.
-Firmware-dependent policy remains downstream with exact image admission.
 
 Upstream-Status: Pending
 Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
@@ -372,7 +371,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        tasklet_kill(&obj->irq_tasklet[i]);
      }
    }
-@@ -1265,26 +1289,74 @@
+@@ -1265,26 +1289,47 @@
    if (obj->ihd_pending) tasklet_kill(&obj->irq_tasklets_global[0]);
  }
  
@@ -437,37 +436,10 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +   * the line. This preserves the retained driver's PCI/device ordering. */
 +  mtlk_hw_mmb_set_msi_intr_mode(obj->hw_api->hw, obj->irq_mode);
 +  return MTLK_ERR_OK;
-+}
-+
-+/* Reuse the requested IRQ identities after the hardware owner has masked
-+ * sources, fenced PCI DMA, joined IRQs/tasklets, and reset the device. */
-+int wave_mmb_drv_restart_dma(struct device *dev)
-+{
-+  mtlk_mmb_drv_t *obj = dev_get_drvdata(dev);
-+  tasklet_func **tasklets;
-+  unsigned int i;
-+
-+  if (obj->ihd_pending || obj->tasklets_initialized)
-+    return MTLK_ERR_NOT_READY;
-+  switch (obj->nof_irqs) {
-+    case 6: tasklets = tasklets_8; break;
-+    case 4: tasklets = tasklets_4; break;
-+    case 1: tasklets = tasklets_1; break;
-+    default: return MTLK_ERR_NOT_SUPPORTED;
-+  }
-+  for (i = 0; i < obj->nof_irqs; i++) {
-+    if (!test_bit(i, &obj->irqs_requested))
-+      continue;
-+    /* Do not overwrite irq_handler_data: shared IRQs still reference it. */
-+    obj->irq_handler_data[i].status = MTLK_IRQ_NONE;
-+    tasklet_init(&obj->irq_tasklet[i], tasklets[i], (mtlk_handle_t)&obj->irq_handler_data[i]);
-+    set_bit(i, &obj->tasklets_initialized);
-+  }
-+  return wave_pci_start_dma(obj);
  }
  
  /**
-@@ -1301,13 +1373,11 @@
+@@ -1301,13 +1346,11 @@
    }
  
    if (is_rollback) {
@@ -486,7 +458,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    MTLK_CLEANUP_BEGIN(mmb_drv, MTLK_OBJ_PTR(obj))
      MTLK_CLEANUP_STEP(mmb_drv, MMB_RCVRY_INIT_FINALIZE, MTLK_OBJ_PTR(obj),
-@@ -1334,6 +1404,8 @@
+@@ -1334,6 +1377,8 @@
                        wave_radio_deinit, (radio_descr));
      MTLK_CLEANUP_STEP(mmb_drv, MMB_CARD_START, MTLK_OBJ_PTR(obj),
                        mtlk_hw_mmb_stop_card, (obj->hw_api->hw));
@@ -495,7 +467,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #ifndef MTCFG_USE_INTERRUPT_POLLING
      MTLK_CLEANUP_STEP(mmb_drv, MMB_IRQ_START, MTLK_OBJ_PTR(obj),
                        _mmb_drv_irq_stop, (obj));
-@@ -1356,7 +1428,7 @@
+@@ -1356,7 +1401,7 @@
      MTLK_CLEANUP_STEP(mmb_drv, MMB_RADIO_NUMBER_GET, MTLK_OBJ_PTR(obj),
                        MTLK_NOACTION, ());
      MTLK_CLEANUP_STEP(mmb_drv, MMB_RCVRY_INIT, MTLK_OBJ_PTR(obj),
@@ -504,7 +476,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_CLEANUP_STEP(mmb_drv, MMB_HW_RADIO_BAND_INIT, MTLK_OBJ_PTR(obj),
                        MTLK_NOACTION, ());
      MTLK_CLEANUP_STEP(mmb_drv, MMB_EEPROM_PSDB_INIT, MTLK_OBJ_PTR(obj),
-@@ -1396,6 +1468,7 @@
+@@ -1396,6 +1441,7 @@
      obj->irq_handler_data[i] = ihd_defaults[i];
      if (_mmb_drv_is_irqno_required(obj->hw_api->hw, obj->irq_handler_data[i].irq_no)) {
        tasklet_init(&obj->irq_tasklet[i], tasklets[i], (mtlk_handle_t) &obj->irq_handler_data[i]);
@@ -512,7 +484,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
    }
  
-@@ -1520,6 +1593,8 @@
+@@ -1520,6 +1566,8 @@
      ILOG2_S("%s IRQ polling mode", DRV_NAME);
  #endif /* not MTCFG_USE_INTERRUPT_POLLING */
  
@@ -521,7 +493,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_INIT_STEP(mmb_drv, MMB_CARD_START, MTLK_OBJ_PTR(obj),
                     mtlk_hw_mmb_start_card, (hw));
  #if defined(MTCFG_G6_FPGA_IRAM_TEST)
-@@ -1598,6 +1673,9 @@
+@@ -1598,6 +1646,9 @@
      return -ENODEV;
    }
  
@@ -531,7 +503,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    obj = mtlk_fast_mem_alloc(MTLK_FM_USER_MMBDRV, sizeof(*obj));
    if (NULL == obj) {
      return -ENOMEM;
-@@ -1615,8 +1693,9 @@
+@@ -1615,8 +1666,9 @@
      return res;
    }
  
@@ -543,7 +515,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      goto _pci_probe_error;
    }
  
-@@ -1631,20 +1710,8 @@
+@@ -1631,20 +1683,8 @@
  _pci_probe_error:
    ELOG_SD("PCI %s Initialization failure (%d)", pci_name(pdev), res);
  
@@ -566,7 +538,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return res;
  }
  
-@@ -1654,7 +1721,6 @@
+@@ -1654,7 +1694,6 @@
  static void
  _pci_remove (struct pci_dev *pdev)
  {
@@ -574,7 +546,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_mmb_drv_t *obj = pci_get_drvdata(pdev);
  
    if (NULL == obj)
-@@ -1662,11 +1728,7 @@
+@@ -1662,11 +1701,7 @@
  
    ILOG2_S("PCI %s CleanUp", pci_name(pdev));
  
@@ -587,7 +559,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _mmb_drv_cleanup(obj, FALSE);
    }
  
-@@ -1675,6 +1737,30 @@
+@@ -1675,6 +1710,30 @@
    ILOG2_S("PCI %s Stop done", pci_name(pdev));
  
    ILOG2_S("PCI %s CleanUp finished", pci_name(pdev));
@@ -618,7 +590,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  #endif /* MTCFG_BUS_PCI_PCIE */
-@@ -1703,6 +1789,7 @@
+@@ -1703,6 +1762,7 @@
    .id_table = mmb_pci_tbl,
    .probe    = _pci_probe,
    .remove   = _pci_remove,
@@ -626,7 +598,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  };
  #endif /* MTCFG_BUS_PCI_PCIE */
  
-@@ -1718,6 +1805,7 @@
+@@ -1718,6 +1778,7 @@
  
  MTLK_INIT_STEPS_LIST_BEGIN(bus_drv_mod)
    MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_DFG_INIT)
@@ -634,7 +606,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_RCVRY_INIT)
  #ifdef MTCFG_PMCU_SUPPORT
    MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_PMCU_INIT)
-@@ -1742,6 +1830,8 @@
+@@ -1742,6 +1803,8 @@
  #endif /* MTCFG_PMCU_SUPPORT */
      MTLK_CLEANUP_STEP(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
                        wave_rcvry_cleanup, ());
@@ -643,7 +615,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_CLEANUP_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
                        mtlk_dfg_cleanup, ());
    MTLK_CLEANUP_END(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
-@@ -1761,6 +1851,9 @@
+@@ -1761,6 +1824,9 @@
    MTLK_INIT_TRY(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
      MTLK_INIT_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
                     mtlk_dfg_init, ());
@@ -653,19 +625,18 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_INIT_STEP_VOID(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
                          wave_rcvry_init, ());
  #ifdef MTCFG_PMCU_SUPPORT
-@@ -1828,4 +1921,3 @@
+@@ -1828,4 +1894,3 @@
  /* Register entry and termination pints for MMB driver */
  module_init(_init_module);
  module_exit(_exit_module);
 -
 --- a/wireless/driver/linux/mtlk_mmb_drv.h
 +++ b/wireless/driver/linux/mtlk_mmb_drv.h
-@@ -80,4 +80,7 @@
+@@ -80,4 +80,6 @@
  mtlk_mmb_drv_get_pci_dev(struct _mtlk_mmb_drv_t *mmb_drv);
  
  
 +void wave_mmb_drv_drain_dma(struct device *dev);
-+int wave_mmb_drv_restart_dma(struct device *dev);
 +
  #endif /* __MTLK_MMB_DRV_H_INCLUDED__ */
 --- a/wireless/driver/linux/mtlk_vap_manager.c
@@ -929,17 +900,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_INIT_FINALLY(wave_rcvry_nl_ctx, MTLK_OBJ_PTR(pnl_ctx))
    MTLK_INIT_RETURN(wave_rcvry_nl_ctx, MTLK_OBJ_PTR(pnl_ctx), _rcvry_nl_cleanup, (pnl_ctx))
  }
-@@ -693,7 +748,8 @@
- {
-   vap_info->vap_handle = vap_handle;
-   vap_info->vap_number = mtlk_vap_get_id(vap_handle);
--  vap_info->was_connected = mtlk_core_get_net_state(mtlk_vap_get_core(vap_handle));
-+  vap_info->was_connected = wave_hw_monitor_recovery_state(mtlk_vap_get_hw(vap_handle),
-+      vap_handle, mtlk_core_get_net_state(mtlk_vap_get_core(vap_handle)));
-   vap_info->slave_sync_mutex = NULL;
-   vap_info->slave_release_mutex = NULL;
- 
-@@ -1184,7 +1240,7 @@
+@@ -1184,7 +1239,7 @@
  
    ILOG1_D("CID-%04x: Master Recovery FW Dump Evacuation Step started", oid);
  
@@ -948,20 +909,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (MTLK_ERR_OK == res)
      ILOG1_D("CID-%04x: Master Recovery FW Dump Evacuation Step finished successfully", oid);
-@@ -1333,6 +1389,12 @@
- 
-   ILOG1_D("CID-%04x: Master Recovery FW Isolation Step started", oid);
- 
-+  if (wave_hw_monitor_held(pcard->hw_ctx) && wave_hw_monitor_dirty(pcard->hw_ctx)) {
-+    wave_hw_monitor_suspend_rx(pcard->hw_ctx);
-+    res = wave_hw_monitor_fence(pcard->hw_ctx);
-+    if (res != MTLK_ERR_OK)
-+      return res;
-+  }
-   mtlk_hw_mmb_isolate(pcard->hw_ctx);
- 
-   for (i = 0; i < rcvry_ctx->max_radios_number; i++) {
-@@ -1349,14 +1411,14 @@
+@@ -1349,14 +1404,14 @@
    return res;
  }
  
@@ -978,7 +926,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      res = core_on_rcvry_restore(mtlk_vap_get_core(vap_info_temp->vap_handle), rcvry_type);
      if (MTLK_ERR_OK != res)
        return res;
-@@ -1365,7 +1427,7 @@
+@@ -1365,7 +1420,7 @@
    return res;
  }
  
@@ -987,7 +935,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    int res;
    wave_rcvry_task_ctx_t *rcvry_ctx = &pcard->rcvry_ctx;
-@@ -1382,7 +1444,7 @@
+@@ -1382,7 +1437,7 @@
      uint32 i;
  
      for (i = 0; i < rcvry_ctx->max_radios_number; i++) {
@@ -996,31 +944,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        if (MTLK_ERR_OK != res)
          break;
      }
-@@ -1452,6 +1514,8 @@
-   else
-     ELOG_DD("CID-%04x: Master Recovery FW Reconfiguration Step finished with error: res=%d", oid, res);
- 
-+  if (res == MTLK_ERR_OK && wave_hw_monitor_held(pcard->hw_ctx))
-+    wave_hw_monitor_restarted(pcard->hw_ctx);
-   return res;
- }
- 
-@@ -1614,6 +1678,14 @@
- {
-   int res;
- 
-+  /* A monitor stream has no per-stream drain. Fence before the ordinary
-+   * host-only HALTED VAP cleanup, including genuine fault recovery. */
-+  if (wave_hw_monitor_held(pcard->hw_ctx) && wave_hw_monitor_dirty(pcard->hw_ctx)) {
-+    wave_hw_monitor_suspend_rx(pcard->hw_ctx);
-+    res = wave_hw_monitor_fence(pcard->hw_ctx);
-+    if (res != MTLK_ERR_OK)
-+      return res;
-+  }
-   /* Execute VAP Deactivation step */
-   res = _rcvry_step_vap_deactivation(&pcard->rcvry_ctx, oid);
-   if (MTLK_ERR_OK != res)
-@@ -1679,7 +1751,7 @@
+@@ -1679,7 +1734,7 @@
        if (MTLK_ERR_OK != res)
          break;
        /* Execute FW Restoration step */
@@ -1029,119 +953,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        if (MTLK_ERR_OK != res)
          break;
        /* Execute FW Reconfiguration step */
-@@ -1978,6 +2050,111 @@
-   return res;
- }
- 
-+/* Monitor mode changes card-global firmware classification. Its normal stop
-+ * therefore uses the existing complete recovery stages, not REMOVE_STREAM or
-+ * module unload. No fault budget/assertion/dump is manufactured. The caller is
-+ * the cfg80211/RTNL netdevice owner, outside every core serializer. */
-+int wave_rcvry_monitor_restart(mtlk_hw_t *hw)
-+{
-+  wave_rcvry_card_cfg_t *pcard = _rcvry_card_hw_ctx_get(hw);
-+  wave_rcvry_task_ctx_t *ctx;
-+  unsigned int r, v;
-+  uint16 oid;
-+  int res = MTLK_ERR_NOT_READY, start_res;
-+
-+  if (!pcard || !wave_hw_monitor_held(hw) || !wave_hw_monitor_dirty(hw))
-+    return res;
-+  ctx = &pcard->rcvry_ctx;
-+  if (!_rcvry_is_initialized(ctx))
-+    return res;
-+  /* The same type lock excludes ordinary fault recovery throughout this
-+   * synchronous lifetime; normal user commands remain admission-blocked. */
-+  mtlk_osal_lock_acquire(&ctx->lock);
-+  if (ctx->rcvry_type_current != RCVRY_TYPE_UNDEF) {
-+    mtlk_osal_lock_release(&ctx->lock);
-+    return MTLK_ERR_BUSY;
-+  }
-+  ctx->rcvry_type_current = RCVRY_TYPE_FULL;
-+  mtlk_osal_lock_release(&ctx->lock);
-+  _rcvry_task_vap_info_prepare(ctx);
-+  res = _rcvry_task_scan_info_prepare(ctx);
-+  if (res != MTLK_ERR_OK)
-+    goto done;
-+  for (r = 0; r < ctx->max_radios_number; r++) {
-+    wave_rcvry_radio_ctx_t *radio = &ctx->radio_ctx[r];
-+
-+    if (radio->scan_info->scan_type_current != RCVRY_NO_SCAN) {
-+      res = MTLK_ERR_BUSY;
-+      goto done;
-+    }
-+    for (v = 0; radio->vap_info[v]; v++) {
-+      if (radio->vap_info[v]->was_connected &
-+          (NET_STATE_ACTIVATING | NET_STATE_CONNECTED | NET_STATE_DEACTIVATING)) {
-+        res = MTLK_ERR_BUSY;
-+        goto done;
-+      }
-+    }
-+  }
-+  /* Stop the statistics producer before closing its serializer. Completion
-+   * only releases the pending request; it cannot rearm a stopped timer. */
-+  for (r = 0; r < ctx->max_radios_number; r++)
-+    for (v = 0; ctx->radio_ctx[r].vap_info[v]; v++)
-+      mtlk_df_on_rcvry_isol(mtlk_vap_get_df(ctx->radio_ctx[r].vap_info[v]->vap_handle));
-+
-+  /* Accepted control commands may be blocked waiting for firmware. Native
-+   * recovery cancellation must release them before joining their workers.
-+   * Queues/storage stay owned until the existing DMA fence and restore. */
-+  mtlk_txmm_pause(mtlk_hw_mmb_get_txmm_base(hw));
-+  mtlk_txmm_pause(mtlk_hw_mmb_get_txdm_base(hw));
-+
-+  /* Native serializer stop drains accepted commands and joins each worker.
-+   * Unlike the fault queue this requires no new asynchronous allocation and
-+   * cannot leave a partial set of blocked slave recovery commands. */
-+  for (r = 0; r < ctx->max_radios_number; r++)
-+    for (v = 0; ctx->radio_ctx[r].vap_info[v]; v++)
-+      mtlk_serializer_stop(&mtlk_vap_get_core(ctx->radio_ctx[r].vap_info[v]->vap_handle)->slow_ctx->serializer);
-+
-+  oid = mtlk_vap_get_oid(ctx->radio_ctx[0].master_vap_handle);
-+  res = wave_hw_monitor_fence(hw);
-+  /* Ordinary fault recovery deliberately ignores this step's errors. A
-+   * synchronous monitor transition must not restart over a failed VAP stop. */
-+  for (r = 0; r < ctx->max_radios_number && res == MTLK_ERR_OK; r++) {
-+    wave_rcvry_radio_ctx_t *radio = &ctx->radio_ctx[r];
-+    mtlk_core_t *master = mtlk_vap_get_core(radio->master_vap_handle);
-+
-+    for (v = 0; radio->vap_info[v] && res == MTLK_ERR_OK; v++)
-+      res = core_recovery_deactivate(master, mtlk_vap_get_core(radio->vap_info[v]->vap_handle));
-+  }
-+  if (res == MTLK_ERR_OK)
-+    res = _rcvry_step_fw_isolation(pcard, oid);
-+  if (res == MTLK_ERR_OK)
-+    res = _rcvry_step_fw_restoration(pcard, oid, FALSE);
-+  if (res == MTLK_ERR_OK)
-+    res = _rcvry_step_fw_reconfiguration(pcard, oid);
-+  if (res != MTLK_ERR_OK)
-+    wave_hw_mmb_quiesce(hw);
-+
-+  /* Recreate the same native workers even on failure so ordinary object
-+   * destruction retains its owner. A failed card remains terminal-fenced. */
-+  for (r = 0; r < ctx->max_radios_number; r++) {
-+    for (v = 0; ctx->radio_ctx[r].vap_info[v]; v++) {
-+      start_res = mtlk_serializer_start(&mtlk_vap_get_core(ctx->radio_ctx[r].vap_info[v]->vap_handle)->slow_ctx->serializer);
-+      if (start_res != MTLK_ERR_OK && res == MTLK_ERR_OK)
-+        res = start_res;
-+    }
-+  }
-+  if (res == MTLK_ERR_OK) {
-+    wave_hw_monitor_restarted(hw);
-+    for (r = 0; r < ctx->max_radios_number; r++)
-+      for (v = 0; ctx->radio_ctx[r].vap_info[v]; v++)
-+        mtlk_df_on_rcvry_restore(mtlk_vap_get_df(ctx->radio_ctx[r].vap_info[v]->vap_handle), TRUE);
-+  } else
-+    wave_hw_mmb_quiesce(hw);
-+done:
-+  __rcvry_type_current_set(ctx, RCVRY_TYPE_UNDEF);
-+  return res;
-+}
-+
- BOOL wave_rcvry_is_configured (const mtlk_hw_t *hw_ctx)
- {
-   wave_rcvry_card_cfg_t *pcard = _rcvry_card_hw_ctx_get(hw_ctx);
-@@ -2012,27 +2189,17 @@
+@@ -2012,27 +2067,17 @@
  void wave_rcvry_nl_process_rxmsg (uint8 subcmd_id, uint8 card_idx)
  {
    wave_rcvry_nl_ctx_t *pnl_ctx = &wave_rcvry.nl_ctx;
@@ -1180,7 +992,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int _rcvry_nl_send_msg_dump_evac_req (const uint8 card_idx)
-@@ -2040,57 +2207,104 @@
+@@ -2040,57 +2085,104 @@
    return _rcvry_nl_send_msg(WAVE_FAPI_SUBCMDID_RCVRY_DUMP_EVAC_REQ, card_idx, NULL, 0, "Dump Evacuation request");
  }
  
@@ -1329,7 +1141,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int wave_rcvry_nl_send_msg_complete_rcvry_req (const uint8 card_idx)
-@@ -2388,6 +2602,9 @@
+@@ -2388,6 +2480,9 @@
    if (!pcard)
      return;
  
@@ -1341,18 +1153,15 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
 --- a/wireless/driver/shared/fw_recovery.h
 +++ b/wireless/driver/shared/fw_recovery.h
-@@ -47,7 +47,10 @@
-   uint8 fw_dump;                /* enable FW dumps evacuation after crash */
+@@ -48,6 +48,7 @@
  } wave_rcvry_cfg_t;
  
-+int wave_rcvry_monitor_restart(mtlk_hw_t *hw);
-+
  int wave_rcvry_card_add(void *mmb_base, void *hw_ctx);
 +void wave_rcvry_card_remove(void *hw_ctx);
  int wave_rcvry_init(void);
  void wave_rcvry_cleanup(void);
  int wave_rcvry_init_finalize(mtlk_hw_t *hw_ctx);
-@@ -81,8 +84,9 @@
+@@ -81,8 +82,9 @@
  int wave_rcvry_task_initiate(mtlk_hw_t *hw_ctx);
  
  void wave_rcvry_nl_process_rxmsg(uint8 subcmd_id, uint8 card_idx);
@@ -1445,16 +1254,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    uint16                max_sid;
    uint8                 noise_offs;
    uint8                 rssi_offs;
-@@ -324,6 +333,8 @@
-   BOOL   is_broadcast;
-   IEEE_ADDR dst_addr;
-   mtlk_nbuf_t *skb;
-+  struct wave_pmf *pmf;
-+  u8 pmf_slot;
-   BOOL   power_mgmt_on;
-   uint32 tid;
- };
-@@ -383,11 +394,13 @@
+@@ -383,11 +392,12 @@
  MTLK_INIT_INNER_STEPS_BEGIN(mmb_basic_bdr)
  MTLK_INIT_STEPS_LIST_END(mmb_basic_bdr);
  
@@ -1465,11 +1265,10 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static int            _mtlk_hw_set_prop(mtlk_hw_t *hw, mtlk_hw_prop_e prop_id, void *buffer, uint32 size);
  static int            _mtlk_hw_get_prop(mtlk_hw_t *hw, mtlk_hw_prop_e prop_id, void *buffer, uint32 size)                   __MTLK_INT_HANDLER_SECTION;
 +static void wave_hw_mmb_quiesce_locked(mtlk_hw_t *hw);
-+static void wave_hw_monitor_flush_tx(mtlk_hw_t *hw);
  static int            _mtlk_hw_load_file(mtlk_hw_t *hw, const char *name, mtlk_df_fw_file_buf_t *fb);
  static void           _mtlk_hw_unload_file(mtlk_hw_t *hw, mtlk_df_fw_file_buf_t *fb);
  static int            _mtlk_hw_get_info(mtlk_hw_t *card, char *hw_info, uint32 size);
-@@ -404,7 +417,7 @@
+@@ -404,7 +414,7 @@
  static uint32   __MTLK_IFUNC _mtlk_hw_mmb_interrupt_recover_mon(mtlk_osal_timer_t *timer, mtlk_handle_t usr_data);
  #endif
  
@@ -1478,7 +1277,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  static __INLINE mtlk_hw_mirror_hdr_t *
  _mtlk_basic_bdr_get_mirror_bd_hdr (mtlk_mmb_basic_bdr_t *bbdr, uint32 index)
-@@ -661,12 +674,11 @@
+@@ -661,12 +671,11 @@
  {
    mtlk_mmb_advanced_bdr_t bdr_data;      /* Tx Data BDs */
    uint32                  nof_free_bds;  /* Number of free REQ BD descriptors */
@@ -1492,7 +1291,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #endif
  #ifdef BD_DBG
    volatile unsigned long *used_bd_map;   /* bitmap of BD buffers, currently being processed within FW, one per BD */
-@@ -682,8 +694,6 @@
+@@ -682,8 +691,6 @@
    mtlk_nbuf_t            *last_fragment; /* fragments received and not yet sent up */
  #ifdef MTLK_DEBUG
    uint32                  max_received_pckts;       /* max received packets within one tasklet */
@@ -1501,7 +1300,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #endif
  };
  
-@@ -720,6 +730,9 @@
+@@ -720,6 +727,9 @@
  {
    mtlk_mc_addr_t mc_addr;
    uint32         ref_cnt;
@@ -1511,28 +1310,16 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  } mtlk_hw_mc_t;
  
  
-@@ -847,6 +860,20 @@
+@@ -847,6 +857,8 @@
  
  struct _mtlk_hw_t
  {
 +  struct mutex          quiesce_lock;
-+  struct mutex          airtime_lock; /* Global native MU/ATF policy exclusion. */
-+  unsigned long         airtime_radios;
 +  bool                  quiescing;
-+  spinlock_t            monitor_lock;
-+  struct wave_monitor __rcu *monitor;
-+  mtlk_vap_handle_t     monitor_vap;
-+  unsigned int          monitor_users;
-+  u32                   monitor_saved_net_state;
-+  u32                   fw_features;
-+  bool                  monitor_dirty;
-+  bool                  monitor_fenced;
-+  bool                  monitor_irqs_blocked; /* protected by reg_lock */
-+  bool                  monitor_tx_enabled; /* protected by BSS tx_bdr.lock */
    mtlk_ccr_t            *ccr;
    mtlk_hw_mmb_t         *mmb;
    unsigned char         *mmb_base;
-@@ -883,6 +910,7 @@
+@@ -883,6 +895,7 @@
  
    void                   *calibr_buffer;  /* Calibration Extension related */
    uint32                 calibr_dma_addr;
@@ -1540,7 +1327,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    uint8                  fw_log_is_supported;    /* FW Logger Extension related */
    uint8                  fw_log_is_supported_ex;
-@@ -897,14 +925,8 @@
+@@ -897,14 +910,8 @@
    mtlk_hw_ind_req_bd_t   bds;     /* IND/REQ BD */
  
    struct mtlk_tx         tx;      /* DAT TX-related variables */
@@ -1555,7 +1342,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    mtlk_mmb_advanced_bdr_t tx_man;  /* Tx MM related */
    mtlk_mmb_basic_bdr_t    rx_man;  /* Rx MM related */
-@@ -937,6 +959,9 @@
+@@ -937,6 +944,9 @@
  
    /* todo: will be moved to radio module */
    hw_phy_rx_status_t    phy_rx_status;
@@ -1565,7 +1352,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw_psdb_t             psdb;
  
    uint8                 tx_ant_num;    /* Number of TX antennas */
-@@ -1545,6 +1570,22 @@
+@@ -1545,6 +1555,22 @@
  #endif
  #define _mtlk_mmb_nbuf_free(nbuf)   mtlk_df_nbuf_free(nbuf)
  
@@ -1588,7 +1375,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  /* Convert card index to wlan interface index of the master AP VAP
   * for hw idx 0/1/2 interface names are wlan0/wlan2/wlan4 respectively
   * AP interfaces use the even numbers while sta interfaces use the odd indexes */
-@@ -1678,36 +1719,88 @@
+@@ -1678,36 +1704,88 @@
    return MTLK_ERR_OK;
  }
  
@@ -1700,7 +1487,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return data_req;
  }
  
-@@ -1715,6 +1808,12 @@
+@@ -1715,6 +1793,12 @@
  _mtlk_mmb_free_sent_msg_to_data_pool(mtlk_hw_t                 *hw,
                                       mtlk_hw_data_req_mirror_t *data_req)
  {
@@ -1713,7 +1500,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
    /* remove from the "used" list */
    mtlk_dlist_remove(&hw->tx.bdr_data.used_list,
-@@ -1722,7 +1821,8 @@
+@@ -1722,7 +1806,8 @@
    /* add to the "free" list */
    mtlk_dlist_push_back(&hw->tx.bdr_data.free_list,
                         &data_req->hdr.list_entry);
@@ -1723,7 +1510,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
  
    ILOG4_DD("%u msg freed, %u free msgs", data_req->hdr.index, hw->tx.nof_free_bds);
-@@ -1805,6 +1905,7 @@
+@@ -1805,6 +1890,7 @@
  _mtlk_mmb_handle_dat_cfm (mtlk_hw_t *hw,
                            HOST_DSC  *hd)
  {
@@ -1731,7 +1518,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_hw_data_req_mirror_t  *data_req;
    uint32 u32BdIndex    = HD_BD_INDEX_GET(hd);
    uint32 u32frameInfo0 = LE32_TO_CPU(hd->u32frameInfo0);
-@@ -1833,30 +1934,9 @@
+@@ -1833,30 +1919,9 @@
  #endif
  
    /* TODO: use shift instead of multiplication */
@@ -1764,7 +1551,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (data_req->dma_addr) { /* NULL keep-alive packets are not mapped */
      ILOG5_DDD("handling CFM: index %d, payload %08X, HD payload %08X", u32BdIndex, data_req->dma_addr, LE32_TO_CPU(hd->u32HostPayloadAddr));
-@@ -1865,7 +1945,31 @@
+@@ -1865,7 +1930,31 @@
                                     data_req->dma_addr,
                                     data_req->size,
                                     MTLK_DATA_TO_DEVICE);
@@ -1797,7 +1584,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* at this time status is not returned by FW */
    data_req->status          = (UMI_STATUS)UMI_OK; //MTLK_BFIELD_GET(info, IND_REQ_TX_STATUS);
-@@ -1874,8 +1978,15 @@
+@@ -1874,8 +1963,15 @@
    data_req->nof_retries     = 0;
  
    mtlk_vap_get_core_vft(vap_handle)->release_tx_data(vap_handle, data_req);
@@ -1813,270 +1600,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* TODO: get rid of used list */
    _mtlk_mmb_free_sent_msg_to_data_pool(hw, data_req);
    return;
-@@ -1990,6 +2101,262 @@
- #define DBG_DUMP_HD     0   /* FIXME: HDs debug */
- #define DBG_HW_LOGGER   0   /* FIXME: HW Logger */
- #define OWN_ITER_CNTR   100
-+
-+/* The same card owns both native radios. Normal user commands enter/leave
-+ * this admission gate at execution, not at asynchronous submission. */
-+bool wave_hw_monitor_user_get(mtlk_hw_t *hw)
-+{
-+  unsigned long flags;
-+  bool allowed;
-+
-+  spin_lock_irqsave(&hw->monitor_lock, flags);
-+  allowed = !hw->monitor && !hw->quiescing;
-+  if (allowed)
-+    hw->monitor_users++;
-+  spin_unlock_irqrestore(&hw->monitor_lock, flags);
-+  return allowed;
-+}
-+
-+void wave_hw_monitor_user_put(mtlk_hw_t *hw)
-+{
-+  unsigned long flags;
-+
-+  spin_lock_irqsave(&hw->monitor_lock, flags);
-+  if (WARN_ON_ONCE(!hw->monitor_users)) {
-+    spin_unlock_irqrestore(&hw->monitor_lock, flags);
-+    return;
-+  }
-+  hw->monitor_users--;
-+  spin_unlock_irqrestore(&hw->monitor_lock, flags);
-+}
-+
-+bool wave_hw_fw_feature_supported(mtlk_hw_t *hw, u32 feature)
-+{
-+  return (READ_ONCE(hw->fw_features) & feature) == feature;
-+}
-+
-+bool wave_hw_monitor_supported(mtlk_hw_t *hw)
-+{
-+  return mtlk_hw_type_is_gen6(hw) && !mtlk_hw_type_is_gen6_b0(hw) &&
-+         wave_hw_mmb_card_is_asic(hw) &&
-+         !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA &&
-+         wave_hw_fw_feature_supported(hw, WAVE_FW_FEATURE_RX_STREAM);
-+}
-+
-+bool wave_hw_monitor_held(mtlk_hw_t *hw)
-+{
-+  return READ_ONCE(hw->monitor) != NULL;
-+}
-+
-+bool wave_hw_monitor_is_owner(mtlk_hw_t *hw, const struct wave_monitor *mon)
-+{
-+  return READ_ONCE(hw->monitor) == mon && !READ_ONCE(hw->quiescing);
-+}
-+
-+/* Callers hold their radio master serializer before this card-wide lock.
-+ * Neither native confirmations nor DMA/IRQ retirement acquire this lock. */
-+void wave_hw_airtime_lock(mtlk_hw_t *hw) { mutex_lock(&hw->airtime_lock); }
-+void wave_hw_airtime_unlock(mtlk_hw_t *hw) { mutex_unlock(&hw->airtime_lock); }
-+bool wave_hw_airtime_owned(mtlk_hw_t *hw)
-+{
-+  lockdep_assert_held(&hw->airtime_lock);
-+  return hw->airtime_radios != 0;
-+}
-+void wave_hw_airtime_mark(mtlk_hw_t *hw, unsigned radio, bool owned)
-+{
-+  lockdep_assert_held(&hw->airtime_lock);
-+  if (WARN_ON(radio >= BITS_PER_LONG))
-+    return;
-+  if (owned)
-+    hw->airtime_radios |= BIT(radio);
-+  else
-+    hw->airtime_radios &= ~BIT(radio);
-+}
-+
-+bool wave_hw_monitor_fenced(mtlk_hw_t *hw)
-+{
-+  return smp_load_acquire(&hw->monitor_fenced);
-+}
-+
-+bool wave_hw_monitor_set_tx(mtlk_hw_t *hw, const struct wave_monitor *mon, bool enable)
-+{
-+  bool valid = false;
-+
-+  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR))
-+    return false;
-+  mtlk_osal_lock_acquire(&hw->bss_mgmt.tx_bdr.lock);
-+  if (READ_ONCE(hw->monitor) == mon) {
-+    /* Sniffer TX has no qualified over-air contract. Keep the existing
-+     * queue-lock publication boundary, but never grant transmit ownership. */
-+    valid = !enable;
-+    WRITE_ONCE(hw->monitor_tx_enabled, false);
-+  }
-+  mtlk_osal_lock_release(&hw->bss_mgmt.tx_bdr.lock);
-+  return valid;
-+}
-+
-+static void wave_hw_monitor_disable_tx(mtlk_hw_t *hw)
-+{
-+  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR)) {
-+    WRITE_ONCE(hw->monitor_tx_enabled, false);
-+    return;
-+  }
-+  mtlk_osal_lock_acquire(&hw->bss_mgmt.tx_bdr.lock);
-+  WRITE_ONCE(hw->monitor_tx_enabled, false);
-+  mtlk_osal_lock_release(&hw->bss_mgmt.tx_bdr.lock);
-+}
-+
-+
-+bool wave_hw_monitor_dirty(mtlk_hw_t *hw)
-+{
-+  return READ_ONCE(hw->monitor_dirty);
-+}
-+
-+int wave_hw_monitor_claim(mtlk_hw_t *hw, mtlk_vap_handle_t vap,
-+                          struct wave_monitor *mon)
-+{
-+  unsigned long flags;
-+  unsigned int r, v;
-+  int res = MTLK_ERR_BUSY;
-+
-+  if (!wave_hw_monitor_supported(hw) || wave_vap_radio_id_get(vap) != 0 ||
-+      !mtlk_vap_is_master_ap(vap) || mtlk_vap_get_id(vap) != 0)
-+    return MTLK_ERR_NOT_SUPPORTED;
-+  spin_lock_irqsave(&hw->monitor_lock, flags);
-+  if (hw->monitor || hw->monitor_users || !wave_hw_mmb_ready(hw) ||
-+      wave_rcvry_type_current_get(hw) != RCVRY_TYPE_UNDEF)
-+    goto out;
-+  for (r = 0; r < hw->radio_descr->num_radios; r++) {
-+    wave_radio_t *radio = wave_radio_descr_wave_radio_get(hw->radio_descr, r);
-+    mtlk_vap_manager_t *manager = wave_radio_descr_vap_manager_get(hw->radio_descr, r);
-+    mtlk_core_t *master = wave_radio_master_core_get(radio);
-+
-+    if (!master || wave_radio_get_sta_vifs_exist(radio) ||
-+        mtlk_vap_manager_get_active_vaps_number(manager) ||
-+        mtlk_core_scan_is_running(master) || wave_radio_cac_active(radio))
-+      goto out;
-+    for (v = 0; v < wave_radio_max_vaps_get(radio); v++) {
-+      mtlk_vap_handle_t existing;
-+      mtlk_core_t *core;
-+
-+      if (mtlk_vap_manager_get_vap_handle(manager, v, &existing) != MTLK_ERR_OK)
-+        continue;
-+      core = mtlk_vap_get_core(existing);
-+      if (mtlk_core_get_net_state(core) &
-+          (NET_STATE_ACTIVATING | NET_STATE_CONNECTED | NET_STATE_DEACTIVATING))
-+        goto out;
-+      if (core->is_stopping || core->is_iface_stopping)
-+        goto out;
-+    }
-+  }
-+  hw->monitor_vap = vap;
-+  hw->monitor_saved_net_state = mtlk_core_get_net_state(mtlk_vap_get_core(vap));
-+  hw->monitor_dirty = false;
-+  WRITE_ONCE(hw->monitor_tx_enabled, false);
-+  rcu_assign_pointer(hw->monitor, mon);
-+  res = MTLK_ERR_OK;
-+out:
-+  spin_unlock_irqrestore(&hw->monitor_lock, flags);
-+  return res;
-+}
-+
-+void wave_hw_monitor_release(mtlk_hw_t *hw, struct wave_monitor *mon)
-+{
-+  unsigned long flags;
-+
-+  wave_hw_monitor_set_tx(hw, mon, false);
-+
-+  spin_lock_irqsave(&hw->monitor_lock, flags);
-+  if (hw->monitor == mon) {
-+    /* A failed restart retains the terminal fence, never an unfenced stream. */
-+    WARN_ON_ONCE(hw->monitor_dirty && !hw->quiescing);
-+    RCU_INIT_POINTER(hw->monitor, NULL);
-+    hw->monitor_vap = NULL;
-+  }
-+  spin_unlock_irqrestore(&hw->monitor_lock, flags);
-+  synchronize_net();
-+}
-+
-+int wave_hw_monitor_activation_begin(mtlk_vap_handle_t vap, BOOL monitor)
-+{
-+  mtlk_hw_t *hw = mtlk_vap_get_hw(vap);
-+
-+  if (monitor)
-+    return wave_hw_monitor_held(hw) && READ_ONCE(hw->monitor_vap) == vap &&
-+           !READ_ONCE(hw->quiescing) ? MTLK_ERR_OK : MTLK_ERR_NOT_READY;
-+  if (wave_hw_monitor_held(hw) && wave_rcvry_type_current_get(hw) != RCVRY_TYPE_UNDEF)
-+    return MTLK_ERR_OK; /* Only the joined/blocked recovery owner can reach this. */
-+  return wave_hw_monitor_user_get(hw) ? MTLK_ERR_OK : MTLK_ERR_BUSY;
-+}
-+
-+void wave_hw_monitor_activation_end(mtlk_vap_handle_t vap, BOOL monitor)
-+{
-+  mtlk_hw_t *hw = mtlk_vap_get_hw(vap);
-+
-+  if (!monitor && !(wave_hw_monitor_held(hw) && wave_rcvry_type_current_get(hw) != RCVRY_TYPE_UNDEF))
-+    wave_hw_monitor_user_put(hw);
-+}
-+
-+u32 wave_hw_monitor_recovery_state(mtlk_hw_t *hw, mtlk_vap_handle_t vap, u32 state)
-+{
-+  return READ_ONCE(hw->monitor_vap) == vap ? hw->monitor_saved_net_state : state;
-+}
-+
-+const u8 wave_monitor_header[44] = {
-+  0x02,0x52,0x58,0x31,0x15,0x01, 0x02,0x52,0x58,0x31,0x15,0x02,
-+  0x08,0x00, 0x45,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x11,0x00,0x00,
-+  0xc6,0x12,0x5d,0x01,0xc6,0x12,0x5d,0x02,
-+  0xbf,0x77,0xbf,0x78,0x00,0x00,0x00,0x00,0xca,0xfe
-+};
-+
-+int wave_hw_monitor_template(mtlk_vap_handle_t vap)
-+{
-+  mtlk_hw_t *hw = mtlk_vap_get_hw(vap);
-+  mtlk_txmm_msg_t msg;
-+  mtlk_txmm_data_t *entry;
-+  UMI_ADD_STREAM_REQ_t *req;
-+  unsigned int i;
-+  u32 sum = 0;
-+  int res = MTLK_ERR_NOT_READY;
-+
-+  if (wave_hw_monitor_activation_begin(vap, TRUE) != MTLK_ERR_OK)
-+    return res;
-+  /* Intent precedes submission. Only complete card restart retires this mode,
-+   * including a missing confirmation or an ADD_VAP failure. */
-+  WRITE_ONCE(hw->monitor_dirty, true);
-+  entry = mtlk_txmm_msg_init_with_empty_data(&msg, mtlk_vap_get_txmm(vap), &res);
-+  if (!entry)
-+    return res;
-+  entry->id = UM_MAN_HW_LOGGER_ADD_STREAM_REQ;
-+  entry->payload_size = sizeof(*req);
-+  req = (UMI_ADD_STREAM_REQ_t *)entry->payload;
-+  memset(req, 0, sizeof(*req));
-+  req->be1 = 1;
-+  for (i = 14; i < 34; i += 2)
-+    sum += ((u32)wave_monitor_header[i] << 8) | wave_monitor_header[i + 1];
-+  while (sum >> 16)
-+    sum = (sum & 0xffff) + (sum >> 16);
-+  req->swPreCalcChecksum = HOST_TO_MAC32(sum);
-+  MTLK_STATIC_ASSERT(sizeof(req->udpHeader) == sizeof(wave_monitor_header));
-+  memcpy(req->udpHeader, wave_monitor_header, sizeof(wave_monitor_header));
-+  res = mtlk_txmm_msg_send_blocked(&msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
-+  if (res == MTLK_ERR_OK && MAC_TO_HOST16(req->u16Status) != UMI_OK)
-+    res = MTLK_ERR_MAC;
-+  mtlk_txmm_msg_cleanup(&msg);
-+  return res;
-+}
-+
-+static bool wave_hw_monitor_rx(mtlk_hw_t *hw, const struct sk_buff *skb)
-+{
-+  struct wave_monitor *mon;
-+
-+  rcu_read_lock();
-+  mon = rcu_dereference(hw->monitor);
-+  if (mon)
-+    wv_cfg80211_monitor_rx(mon, skb);
-+  rcu_read_unlock();
-+  return mon != NULL;
-+}
- 
- static __INLINE int _mtlk_mmb_handle_dat_ind (mtlk_hw_t *hw, volatile HOST_DSC *pHD)
- {
-@@ -2009,6 +2376,7 @@
+@@ -2009,6 +2105,7 @@
    uint8                      radio_id;
    uint8                      frame_type;
    uint8                      frag_type;
@@ -2084,7 +1608,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    u32frameInfo3 = LE32_TO_CPU(pHD->u32frameInfo3);
    if (__UNLIKELY(MTLK_OWNER_FW == MTLK_BFIELD_GET(u32frameInfo3, TX_DATA_INFO_OWN_BIT))) {
-@@ -2027,6 +2395,7 @@
+@@ -2027,6 +2124,7 @@
      }
    }
  
@@ -2092,7 +1616,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    u32BdIndex    = HD_BD_INDEX_GET(pHD);
    u32frameInfo0 = LE32_TO_CPU(pHD->u32frameInfo0);
    u32frameInfo1 = LE32_TO_CPU(pHD->u32frameInfo1);
-@@ -2053,6 +2422,8 @@
+@@ -2053,6 +2151,8 @@
                           &radio_id,
                           &vap_id);
  
@@ -2101,7 +1625,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    data_ind = _mtlk_basic_bdr_get_mirror_bd(&hw->rx.bdr_data, u32BdIndex, mtlk_hw_data_ind_mirror_t);
  
    MTLK_ASSERT(data_size < data_ind->size);
-@@ -2076,6 +2447,12 @@
+@@ -2076,6 +2176,12 @@
    }
  
    total_size    = offset + data_size;
@@ -2114,7 +1638,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #if DBG_DUMP_HD
    {
-@@ -2090,7 +2467,7 @@
+@@ -2090,7 +2196,7 @@
    mtlk_df_nbuf_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
                                 data_ind->nbuf,
                                 data_ind->dma_addr,
@@ -2123,20 +1647,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
                                 MTLK_DATA_FROM_DEVICE);
  
    if (__UNLIKELY(total_size > mtlk_df_nbuf_get_tail_room_size(data_ind->nbuf))) {
-@@ -2101,6 +2478,12 @@
- 
-   mtlk_df_nbuf_put(data.nbuf, total_size);  /* offset + data_size */
-   mtlk_df_nbuf_pull(data.nbuf, offset);
-+  if (wave_hw_monitor_rx(hw, data.nbuf)) {
-+    mtlk_df_nbuf_push(data.nbuf, offset);
-+    mtlk_df_nbuf_trim(data.nbuf, 0);
-+    res = MTLK_ERR_OK;
-+    goto buf_return;
-+  }
- 
-   vap_handle = _mtlk_mmb_get_vap_handle_from_vap_id(hw, radio_id, vap_id);
- 
-@@ -2155,7 +2538,9 @@
+@@ -2155,7 +2261,9 @@
                             total_size += nbuf->len;
                           }
  
@@ -2147,7 +1658,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
                           if (__UNLIKELY(comb_nbuf == NULL)) {
                             _mtlk_mmb_rx_free_all_fragments(hw);
                             res = MTLK_ERR_OK;
-@@ -2200,6 +2585,28 @@
+@@ -2200,6 +2308,28 @@
                         }
  
                         if (FRAME_TYPE_EAPOL != frame_type) {
@@ -2176,7 +1687,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
                           res = mtlk_vap_get_core_vft(vap_handle)->handle_rx_data(vap_handle, &data);
                           break;
                         } else {
-@@ -2227,6 +2634,15 @@
+@@ -2227,6 +2357,15 @@
      _mtlk_mmb_nbuf_free(data.nbuf);
    }
  
@@ -2192,7 +1703,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #if MTLK_USE_DIRECTCONNECT_DP_API
      data_ind->nbuf = mtlk_df_dcdp_nbuf_alloc(mtlk_vap_get_df(vap_handle), data_ind->size);
    if (NULL == data_ind->nbuf)
-@@ -2250,6 +2666,14 @@
+@@ -2250,6 +2389,14 @@
                                                       data_ind->nbuf,
                                                       data_ind->size,
                                                       MTLK_DATA_FROM_DEVICE);
@@ -2207,7 +1718,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #ifdef MTCFG_WAVE_FPGA
    data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
  #endif
-@@ -2294,7 +2718,7 @@
+@@ -2294,7 +2441,7 @@
  
    mtlk_nbuf_start_tracking(skb);
  
@@ -2216,7 +1727,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      res = DC_DP_SUCCESS;
      goto finish;
    }
-@@ -2344,8 +2768,9 @@
+@@ -2344,8 +2491,9 @@
        mtlk_handle_eapol(vap_handle, skb->data, skb->len);
        mtlk_df_nbuf_free(skb);
      } else {
@@ -2227,7 +1738,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        tx_data.dst_sta = NULL;
        tx_data.rx_if = rxif;
        tx_data.rx_subif = rx_subif;
-@@ -2537,7 +2962,7 @@
+@@ -2537,7 +2685,7 @@
    switch (type) {
    case ARRAY_MAN_IND:
      CPU_STAT_SPECIFY_TRACK(CPU_STAT_ID_RX_MM);
@@ -2236,7 +1747,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        _mtlk_mmb_handle_cm_ind(hw, TRUE, &msg);
      break;
    case ARRAY_MAN_REQ:
-@@ -2547,7 +2972,7 @@
+@@ -2547,7 +2695,7 @@
      break;
    case ARRAY_DBG_IND:
      CPU_STAT_SPECIFY_TRACK(CPU_STAT_ID_RX_MM);
@@ -2245,7 +1756,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        _mtlk_mmb_handle_cm_ind(hw, FALSE, &msg);
      break;
    case ARRAY_DBG_REQ:
-@@ -2601,7 +3026,7 @@
+@@ -2601,7 +2749,7 @@
  static int  _mtlk_hw_send_data(mtlk_hw_t *hw,
      mtlk_vap_handle_t vap_handle, mtlk_hw_data_req_mirror_t *data_req)          __MTLK_INT_HANDLER_SECTION;
  
@@ -2254,7 +1765,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      HOST_DSC *pHD, mtlk_ring_buffer *ring)                                      __MTLK_INT_HANDLER_SECTION;
  
  static int _mtlk_mmb_data_txout_process (mtlk_irq_handler_data *ihd)            __MTLK_INT_HANDLER_SECTION;
-@@ -2628,7 +3053,7 @@
+@@ -2628,7 +2776,7 @@
    int res;
    mtlk_hw_t *hw = ihd->hw;
  
@@ -2263,7 +1774,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      return MTLK_ERR_OK;
    }
  
-@@ -2688,25 +3113,12 @@
+@@ -2688,25 +2836,12 @@
  _mtlk_mmb_data_txout_process (mtlk_irq_handler_data *ihd)
  {
    int res = MTLK_ERR_OK;
@@ -2290,7 +1801,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      hds_to_process = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->tx.ring.regs);
      MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_TXOUT_START, hds_to_process);
-@@ -2714,6 +3126,7 @@
+@@ -2714,6 +2849,7 @@
        MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_TXOUT_END, 0);
        return MTLK_ERR_OK;
      }
@@ -2298,7 +1809,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      if (hds_to_process > hw->data_txout_lim) {
        hds_to_process = hw->data_txout_lim;
-@@ -2739,12 +3152,6 @@
+@@ -2739,12 +2875,6 @@
        hw->tx.max_received_cfm = hds_to_process;
      }
  
@@ -2311,7 +1822,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #endif
  
      mtlk_ccr_ring_clear_interrupt(hw->ccr, &hw->tx.ring.regs, hds_to_process);
-@@ -2762,23 +3169,10 @@
+@@ -2762,23 +2892,10 @@
  _mtlk_mmb_data_rx_process (mtlk_irq_handler_data *ihd)
  {
    int res = MTLK_ERR_OK;
@@ -2335,7 +1846,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    hds_to_process = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->rx.ring.regs);
    MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_DATA_RX_START, hds_to_process);
-@@ -2787,6 +3181,7 @@
+@@ -2787,6 +2904,7 @@
      return MTLK_ERR_OK;
    }
  
@@ -2343,7 +1854,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (hds_to_process > hw->data_rx_lim) {
      hds_to_process = hw->data_rx_lim;
      res = MTLK_ERR_PENDING;
-@@ -2798,7 +3193,7 @@
+@@ -2798,7 +2916,7 @@
    for (cur_hd = 0; cur_hd < hds_to_process; cur_hd++) {
      CPU_STAT_BEGIN_TRACK(CPU_STAT_ID_RX_DAT);
      CPU_STAT_BEGIN_TRACK(CPU_STAT_ID_RX_HW);
@@ -2352,7 +1863,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        _mtlk_mmb_handle_dat_ind(hw, hw->rx.ring.base_addr + hw->rx.ring.read_ptr);
      } else {
        /* must confirm w/o processing */
-@@ -2816,12 +3211,6 @@
+@@ -2816,12 +2934,6 @@
      hw->rx.max_received_pckts = hds_to_process;
    }
  
@@ -2365,7 +1876,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #endif
  
    mtlk_ccr_ring_clear_interrupt(hw->ccr, &hw->rx.ring.regs, hds_to_process);
-@@ -2916,7 +3305,7 @@
+@@ -2916,7 +3028,7 @@
  
    hw->bss_ind_num++;
  
@@ -2374,7 +1885,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      uint32 cur_hd, hds_to_process = 0;
  
      hds_to_process = mtlk_ccr_ring_get_hds_to_process(hw->ccr, &hw->bss_mgmt.rx_ring.regs);
-@@ -3045,6 +3434,9 @@
+@@ -3045,6 +3157,9 @@
  {
    uint32 pas_offset;
    uint32 val = 0;
@@ -2384,7 +1895,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    MTLK_ASSERT(mips_no < _hw_num_cores(hw));
  
-@@ -3289,6 +3681,12 @@
+@@ -3289,6 +3404,12 @@
                                                       data_ind->nbuf,
                                                       data_ind->size,
                                                       MTLK_DATA_FROM_DEVICE);
@@ -2397,7 +1908,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #ifdef MTCFG_WAVE_FPGA
    data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
  #endif
-@@ -3319,6 +3717,12 @@
+@@ -3319,6 +3440,12 @@
                                                       data_ind->size,
                                                       MTLK_DATA_FROM_DEVICE);
  
@@ -2410,68 +1921,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #ifdef MTCFG_WAVE_FPGA
    data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
  #endif
-@@ -3842,6 +4246,12 @@
-   return res;
- }
- 
-+static const u8 wave_monitor_fw_span[] = { 0x00, 0x42, 0x0c, 0x12, 0x84, 0x00, 0x8a, 0x20, 0xc9, 0x06, 0x2c, 0x74, 0x85, 0x01, 0x6f, 0xf5, 0x6c, 0x70, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78, 0xe0, 0x78 };
-+#include "fixed_data_fw.h"
-+#include "rts_threshold_fw.h"
-+#include "txop_read_fw.h"
-+
-+
- static int
- _mtlk_mmb_load_firmware(mtlk_hw_t* hw)
- {
-@@ -3851,6 +4261,7 @@
-   int cpu = 0;
-   int res = MTLK_ERR_FW;
- 
-+  WRITE_ONCE(hw->fw_features, 0);
-   /* WAVE600: TODO: do it for the first radio now, but rework later! */
-   mode = mtlk_vap_manager_get_mode(wave_radio_descr_vap_manager_get(hw->radio_descr, 0));
- 
-@@ -3892,6 +4303,30 @@
- 
-     if (MTLK_ERR_OK == res) {
-       _mtlk_mmb_notify_firmware(hw, cpu, fw_info.fname, &fb);
-+      /* Bind capability to the actual successfully loaded A0 producer, not
-+       * an installed package name or an ACK-only unpatched UMI handler. */
-+      if (cpu == CHI_CPU_NUM_UM && mtlk_hw_type_is_gen6(hw) &&
-+          !mtlk_hw_type_is_gen6_b0(hw) && fb.size >= 0x63d0c + sizeof(wave_monitor_fw_span) &&
-+          !memcmp((const u8 *)fb.buffer + 0x63d0c, wave_monitor_fw_span, sizeof(wave_monitor_fw_span)))
-+        hw->fw_features |= WAVE_FW_FEATURE_RX_STREAM;
-+      /* New eight-byte FixedPower policy is paired with both lower copies.
-+       * A package/version string or an ACK-only OEM handler is insufficient. */
-+      if (cpu == CHI_CPU_NUM_UM && mtlk_hw_type_is_gen6(hw) &&
-+          !mtlk_hw_type_is_gen6_b0(hw) &&
-+          wave_fixed_data_fw_matches(fb.buffer, fb.size))
-+        hw->fw_features |= WAVE_FW_FEATURE_FIXED_DATA;
-+      /* The new wrapper forwards the unchanged admitted FIXED route. Also
-+       * require every RTS hook, startup reservation and lower code span. */
-+      if (cpu == CHI_CPU_NUM_UM &&
-+          (hw->fw_features & WAVE_FW_FEATURE_FIXED_DATA) &&
-+          wave_rts_threshold_fw_matches(fb.buffer, fb.size))
-+        hw->fw_features |= WAVE_FW_FEATURE_RTS_THRESHOLD;
-+      /* This admits only the complete non-mutating UMI GET and both
-+       * lower saved-policy readers, never a version-string assertion. */
-+      if (cpu == CHI_CPU_NUM_UM && mtlk_hw_type_is_gen6(hw) &&
-+          !mtlk_hw_type_is_gen6_b0(hw) &&
-+          wave_txop_read_fw_matches(fb.buffer, fb.size))
-+        hw->fw_features |= WAVE_FW_FEATURE_TXOP_READ;
-     }
- 
-     /* WAVE600: TODO: do it for the first radio now, but rework later! */
-@@ -3904,6 +4339,8 @@
-     }
-   }
- 
-+  if (res != MTLK_ERR_OK)
-+    WRITE_ONCE(hw->fw_features, 0);
-   return res;
- }
- 
-@@ -4027,10 +4464,6 @@
+@@ -4027,10 +4154,6 @@
      res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_PRGMDL_LOAD_CHUNK_TIMEOUT);
      if (res != MTLK_ERR_OK) {
        ELOG_D("Can't download programming model, timed-out. Err#%d", res);
@@ -2482,7 +1932,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        goto FINISH;
      }
  
-@@ -4060,9 +4493,13 @@
+@@ -4060,6 +4183,10 @@
  {
    MTLK_ASSERT(NULL != hw->ccr);
  
@@ -2493,10 +1943,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_ccr_disable_interrupts(hw->ccr, MTLK_IRQ_ALL);
    mtlk_ccr_clear_interrupts_if_pending(hw->ccr, (uint32) -1);
    mtlk_ccr_switch_to_iram_boot(hw->ccr);
-   hw->perform_isr_action = isr_action_init;
-   MTLK_HW_INIT_EVT_RESET(hw);
-   mtlk_ccr_enable_interrupts(hw->ccr, MTLK_IRQ_ALL);
-@@ -4438,13 +4875,13 @@
+@@ -4438,13 +4565,13 @@
  static void _mtlk_mmb_free_hd_ring(mtlk_hw_t *hw, mtlk_ring_buffer *ring)
  {
      uint32 total_ring_size = ring->size * sizeof(HOST_DSC);
@@ -2517,7 +1964,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void
-@@ -4684,36 +5121,17 @@
+@@ -4684,36 +4811,17 @@
  
    ILOG0_DD("ring_size:%d total_ring_size:%d", ring_size, total_ring_size);
  
@@ -2564,7 +2011,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG0_DDD("Ring virtual addr:%x dma_addr:%x base_addr:%x",(uintptr_t)ring->v_base_addr, (uintptr_t)ring->dma_addr,
                                                              (uintptr_t)ring->base_addr);
  
-@@ -4879,6 +5297,7 @@
+@@ -4879,6 +4987,7 @@
  
    hw->tx.nof_free_bds = hw->tx.ring.size;
    hw->tx.max_used_bds = 0;
@@ -2572,7 +2019,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw->flags |= HW_FLAGS_PREPARED_DATA_REQ_BDR;
    return res;
  
-@@ -5001,6 +5420,11 @@
+@@ -5001,6 +5110,11 @@
                                     MTLK_DATA_TO_DEVICE);
      }
  
@@ -2584,7 +2031,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      /* Simply free the buffers without any statistic update due to with next steps
         card will be completely deleted. */
      mtlk_df_nbuf_free(data_req->nbuf);
-@@ -5080,18 +5504,20 @@
+@@ -5080,18 +5194,20 @@
        mtlk_hw_data_ind_mirror_t *data_ind =
          _mtlk_basic_bdr_get_mirror_bd(&hw->rx.bdr_data, i, mtlk_hw_data_ind_mirror_t);
  
@@ -2607,7 +2054,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
    }
  
-@@ -5103,7 +5529,7 @@
+@@ -5103,7 +5219,7 @@
  }
  
  static int
@@ -2616,7 +2063,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    uint32 i;
    mtlk_hw_data_ind_mirror_t *data_ind;
-@@ -5112,6 +5538,7 @@
+@@ -5112,6 +5228,7 @@
  
    data_ring_size = hw->chi_area.sBasic.sRdPOOL.u32NumRdsInPool;
    ares  = MTLK_ERR_OK;
@@ -2624,7 +2071,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if(!mtlk_mmb_dcdp_path_available(hw)) { /* DataPath driver allocates for FastPath */
      for (i = 0; i < data_ring_size ; i++) {
-@@ -5126,6 +5553,8 @@
+@@ -5126,6 +5243,8 @@
          /* BRD pointer hole produced here (NULL-pointer) */
           ILOG2_D("WARNING: Can't preallocate buffer of %d bytes.",
               (int)RX_DATA_FRAME_SIZE);
@@ -2633,7 +2080,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
           return MTLK_ERR_NO_MEM;
        }
      }
-@@ -5147,21 +5576,34 @@
+@@ -5147,21 +5266,34 @@
    return MTLK_ERR_OK;
  }
  
@@ -2669,7 +2116,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
        #ifdef MTCFG_WAVE_FPGA
          data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
-@@ -5176,6 +5618,10 @@
+@@ -5176,6 +5308,10 @@
    hw->flags |= HW_FLAGS_PREPARED_RX_MGMT_BUFFERS;
  
    return MTLK_ERR_OK;
@@ -2680,7 +2127,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void
-@@ -5202,6 +5648,7 @@
+@@ -5202,6 +5338,7 @@
                                bss_ind->dma_addr,
                                bss_ind->size,
                                MTLK_DATA_FROM_DEVICE);
@@ -2688,7 +2135,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
  
    hw->flags &= ~HW_FLAGS_PREPARED_RX_MGMT_BUFFERS;
-@@ -5218,6 +5665,10 @@
+@@ -5218,6 +5355,10 @@
    ILOG5_D("MSG WRITE: 0x%08x", descriptor);
  
    lock_val = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
@@ -2699,7 +2146,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    _mtlk_mmb_pas_put(hw,
                      "new BD descriptor",
                      hw->bds.req.offset + (hw->bds.req.idx * sizeof(descriptor)), /* DB Array [BD Idx] */
-@@ -5282,43 +5733,62 @@
+@@ -5282,43 +5423,62 @@
  {
    /* NOTE: mac_events_stopped must be also set here to avoid additional checks
     * in _mtlk_mmb_handle_received_msg() (hw->mac_events_stopped || hw->mac_events_stopped_completely) */
@@ -2778,7 +2225,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  #define __CCR_IO_MASK__         ((1u << 24) - 1) /* 16M - accessible from the host */
-@@ -5350,8 +5820,8 @@
+@@ -5350,8 +5510,8 @@
                                                MTLK_MEM_TAG_EXTENSION);
  
    if (hw->calibr_buffer) {
@@ -2789,7 +2236,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    else {
      WLOG_D("Can't allocate Calibration buffer of %d bytes",
-@@ -5703,6 +6173,7 @@
+@@ -5703,6 +5863,7 @@
      UMI_GET_STATISTICS_DATA *req;
      hw_mhi_stats_t          *mhi_stats;
      uint32                   dma_addr;
@@ -2797,7 +2244,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      int                      res = MTLK_ERR_UNKNOWN;
  
      /* prepare msg for the FW */
-@@ -5712,6 +6183,9 @@
+@@ -5712,6 +5873,9 @@
      }
  
      mhi_stats = &hw->hw_mhi_stats;
@@ -2807,7 +2254,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
                                            mhi_stats->db_data,
-@@ -5731,8 +6205,6 @@
+@@ -5731,8 +5895,6 @@
                                dma_addr, mhi_stats->db_size,
                                MTLK_DATA_FROM_DEVICE);
  
@@ -2816,7 +2263,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (res != MTLK_ERR_OK) {
          ELOG_DD("card_idx %d: Sending failed, err=%i", hw->card_idx, res);
      } else if (UMI_OK != req->u8status) {
-@@ -5740,18 +6212,26 @@
+@@ -5740,18 +5902,26 @@
          res = MTLK_ERR_MAC;
      }
  
@@ -2843,7 +2290,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      return res;
  }
  
-@@ -5815,6 +6295,7 @@
+@@ -5815,6 +5985,7 @@
      int                  res = MTLK_ERR_NOT_SUPPORTED;
  
      mhi_stats = &hw->hw_mhi_stats;
@@ -2851,7 +2298,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      total = mhi_stats->db_size; /* total data size */
      num   = mhi_stats->tab_size / sizeof(StatsEntryDecoded_t);
      if (mhi_stats->tab_size != (num * sizeof(StatsEntryDecoded_t))) {
-@@ -5854,12 +6335,27 @@
+@@ -5854,12 +6025,27 @@
              entry->nextIdxOffset,
              size);
  
@@ -2880,7 +2327,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
  
      /* Check for HW power table sizes and fill offset's table */
-@@ -5965,8 +6461,7 @@
+@@ -5965,14 +6151,15 @@
                                dma_addr, mhi_stats->tab_size,
                                MTLK_DATA_FROM_DEVICE);
  
@@ -2890,16 +2337,15 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (res != MTLK_ERR_OK) {
          ELOG_DD("card_idx %d: Sending failed, err=%i", hw->card_idx, res);
      } else if (UMI_OK != req->u8status) {
-@@ -5974,6 +6469,8 @@
+         ELOG_D("Failed to retrieve MHI statistics, error %d", req->u8status);
          res = MTLK_ERR_MAC;
      }
- 
-+    mtlk_txmm_msg_cleanup(&man_msg);
 +
++    mtlk_txmm_msg_cleanup(&man_msg);
+ 
      /* without lock because it is called once during init */
      if (res == MTLK_ERR_OK) {
-         ILOG0_DDPD("CID-%02x: MHI statistics table: size %d, buffer 0x%p, phys_addr 0x%08X",
-@@ -6128,11 +6625,12 @@
+@@ -6128,11 +6315,12 @@
    uint8             *db_data = hw->hw_mhi_stats.db_copy;
    mhi_stats_offs_t  *offsets = hw->hw_mhi_stats.stats_sta_offs_table;
    mhi_stats_offs_t  *tx_time_offs = &hw->hw_mhi_stats.tx_time_offs;
@@ -2913,7 +2359,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* Get TX Time from MAC Statistics */
    new_tx_time_p = (void *)db_data + tx_time_offs->start_offset + (sta_sid * tx_time_offs->next_idx_offs);
-@@ -6153,8 +6651,19 @@
+@@ -6153,8 +6341,19 @@
    for (i = 0; i < STAT_STA_CNTR_TOTAL; i++) {
      db_offs = offsets[i].start_offset + (sta_sid * offsets[i].next_idx_offs);
      hw_cntr = (void *)hw->hw_mhi_stats.db_copy + db_offs;
@@ -2934,7 +2380,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
  
    delta_bytes = (values[STAT_STA_CNTR_RX_BYTES] - rx_bytes) + (values[STAT_STA_CNTR_TX_BYTES] - tx_bytes);
-@@ -6207,6 +6716,8 @@
+@@ -6207,6 +6406,8 @@
  
      mhi_stats = &hw->hw_mhi_stats;
      memset(mhi_stats, 0, sizeof(*mhi_stats));
@@ -2943,7 +2389,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      res = mtlk_osal_lock_init(&mhi_stats->lock);
      if (MTLK_ERR_OK != res) {
-@@ -6278,6 +6789,9 @@
+@@ -6278,6 +6479,9 @@
  
      /* Get Statistics Table */
      res = _mtlk_hw_mhi_get_table(hw);
@@ -2953,7 +2399,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      for (i = 0; i < hw->radio_descr->num_radios; i++) {
          res = mtlk_df_ui_mhi_stats_create(mtlk_df_get_user(mtlk_vap_manager_get_master_df(wave_radio_descr_vap_manager_get(hw->radio_descr, i))), db_size);
          if (MTLK_ERR_OK != res) {
-@@ -6462,6 +6976,10 @@
+@@ -6462,6 +6666,10 @@
  
      *size = phy_rx_status->db_size;
      mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
@@ -2964,7 +2410,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      memcpy(buff, phy_rx_status->db_data, *size);
      mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
  
-@@ -6497,6 +7015,49 @@
+@@ -6497,6 +6705,49 @@
  _mtlk_hw_is_sid_valid (mtlk_hw_t *hw, uint32 sid)
  {
      return (sid < __mtlk_hw_get_max_sid(hw));
@@ -3014,7 +2460,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static BOOL
-@@ -6660,15 +7221,19 @@
+@@ -6660,15 +6911,19 @@
      if (sta) {
        do {
          sta_sid = mtlk_sta_get_sid(sta);
@@ -3040,7 +2486,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
              mtlk_sta_update_mhi_peers_stats((sta_entry *)sta);
          }
  
-@@ -6707,6 +7272,8 @@
+@@ -6707,6 +6962,8 @@
        goto FINISH;
      }
  
@@ -3049,7 +2495,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
                                            phy_rx_status->db_data,
                                            phy_rx_status->db_size,
-@@ -6730,7 +7297,14 @@
+@@ -6730,7 +6987,14 @@
          goto FINISH;
      }
  
@@ -3064,7 +2510,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _wave_hw_phy_rx_status_update_dev_info(hw, core);
  
  FINISH:
-@@ -6913,9 +7487,148 @@
+@@ -6913,9 +7177,75 @@
  static void _mtlk_mmb_data_path_unregister(mtlk_hw_t *hw);
  static int _mtlk_mmb_data_path_uninit(mtlk_hw_t *hw, BOOL is_recovery);
  
@@ -3090,77 +2536,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  return true;
 +}
 +
-+/* Called only after all native core serializers have been joined, or after
-+ * the existing recovery owner has blocked all its slave VAP serializers.
-+ * It has the same PCI/IRQ/tasklet/DMA/reset boundary as terminal quiesce but
-+ * retains restartable TXMM and core objects. It never clears quiescing. */
-+static int _wave_hw_monitor_fence_locked(mtlk_hw_t *hw)
-+{
-+  mtlk_handle_t flags;
-+  int res = MTLK_ERR_NOT_READY;
-+
-+  lockdep_assert_held(&hw->quiesce_lock);
-+  if (hw->quiescing || !wave_hw_monitor_held(hw))
-+    goto out;
-+  if (hw->monitor_fenced) {
-+    res = MTLK_ERR_OK;
-+    goto out;
-+  }
-+  wave_hw_monitor_disable_tx(hw);
-+  flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
-+  /* Shared IRQs can still call our handler after PCI INTx is disabled.
-+   * Close admission before the join; monitor_fenced means reset completed. */
-+  hw->monitor_irqs_blocked = true;
-+  WRITE_ONCE(hw->state, MTLK_HW_STATE_APPFATAL);
-+  _mtlk_mmb_stop_events_completely(hw);
-+  mtlk_ccr_disable_interrupts(hw->ccr, MTLK_IRQ_ALL);
-+  mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
-+  if (hw->flags & HW_FLAGS_PREPARED_DATA_REQ_BDR) {
-+    mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
-+    wave_hw_tx_stop_locked(hw);
-+    mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
-+  }
-+  mtlk_osal_timer_cancel_sync(&hw->rx.pending.timer);
-+#ifdef MTCFG_LEGACY_INT_RECOVERY_MON
-+  mtlk_osal_timer_cancel_sync(&hw->recover_timer);
-+#endif
-+  wave_mmb_drv_drain_dma(mtlk_ccr_get_device(hw->ccr));
-+  wave_rcvry_dump_before_reset(hw);
-+  _mtlk_mmb_cleanup_reset_mac(hw);
-+  mtlk_ccr_reset_mac(hw->ccr);
-+  smp_store_release(&hw->monitor_fenced, true);
-+  wave_hw_monitor_flush_tx(hw);
-+  res = MTLK_ERR_OK;
-+out:
-+  return res;
-+}
-+
-+int wave_hw_monitor_fence(mtlk_hw_t *hw)
-+{
-+  int res;
-+
-+  mutex_lock(&hw->quiesce_lock);
-+  res = _wave_hw_monitor_fence_locked(hw);
-+  mutex_unlock(&hw->quiesce_lock);
-+  return res;
-+}
-+
-+void wave_hw_monitor_restarted(mtlk_hw_t *hw)
-+{
-+  WRITE_ONCE(hw->monitor_dirty, false);
-+}
-+
-+void wave_hw_monitor_suspend_rx(mtlk_hw_t *hw)
-+{
-+  struct wave_monitor *mon;
-+
-+  rcu_read_lock();
-+  mon = rcu_dereference(hw->monitor);
-+  if (mon)
-+    wv_cfg80211_monitor_suspend(mon);
-+  rcu_read_unlock();
-+}
-+
 +/* Terminal for this probe. Only a fresh PCI probe may restart the card. */
 +static void wave_hw_mmb_quiesce_locked(mtlk_hw_t *hw)
 +{
@@ -3169,7 +2544,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  lockdep_assert_held(&hw->quiesce_lock);
 +  if (hw->quiescing)
 +    return;
-+  wave_hw_monitor_disable_tx(hw);
 +  flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
 +  WRITE_ONCE(hw->quiescing, true);
 +  WRITE_ONCE(hw->state, MTLK_HW_STATE_UNLOADING);
@@ -3196,7 +2570,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  wave_rcvry_dump_before_reset(hw);
 +  _mtlk_mmb_cleanup_reset_mac(hw);
 +  mtlk_ccr_reset_mac(hw->ccr);
-+  wave_hw_monitor_flush_tx(hw);
 +}
 +
 +void wave_hw_mmb_quiesce(mtlk_hw_t *hw)
@@ -3213,7 +2586,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_STOP_BEGIN(hw_mmb_card, MTLK_OBJ_PTR(hw))
      MTLK_STOP_STEP(hw_mmb_card, HW_FW_LOGGER, MTLK_OBJ_PTR(hw),
                     _mtlk_mmb_cleanup_fw_logger, (hw));
-@@ -6958,9 +7671,7 @@
+@@ -6958,9 +7288,7 @@
  #ifdef MTCFG_PMCU_SUPPORT
      MTLK_STOP_STEP(hw_mmb_card, HW_PMCU_INIT_CLIENT, MTLK_OBJ_PTR(hw), _mtlk_mmb_pmcu_unregister, (hw));
  #endif
@@ -3224,7 +2597,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_STOP_END(hw_mmb_card, MTLK_OBJ_PTR(hw))
  }
  
-@@ -6974,13 +7685,24 @@
+@@ -6974,13 +7302,24 @@
  
    MTLK_ASSERT(NULL != hw->ccr);
  
@@ -3250,7 +2623,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    MTLK_STOP_BEGIN(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin))
      MTLK_STOP_STEP(hw_mmb_card_fin, HW_PHY_RX_STATUS, MTLK_OBJ_PTR(&hw->hw_start_fin),
-@@ -6997,15 +7719,6 @@
+@@ -6997,15 +7336,6 @@
  #if !MTLK_DCDP_SEPARATE_REG
      MTLK_STOP_STEP(hw_mmb_card_fin, HW_DATA_PATH_REGISTER, MTLK_OBJ_PTR(&hw->hw_start_fin), _mtlk_mmb_data_path_unregister, (hw));
  #endif
@@ -3266,21 +2639,17 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      /* Disable Interrupts and recovery timer */
  #ifdef MTCFG_LEGACY_INT_RECOVERY_MON
-@@ -7110,6 +7823,13 @@
+@@ -7110,6 +7440,9 @@
    MTLK_ASSERT(NULL != radio_descr);
    MTLK_ASSERT(ARRAY_SIZE(hw->wss_hcntrs) == MTLK_HW_SOURCE_CNT_LAST);
  
 +  mutex_init(&hw->quiesce_lock);
-+  mutex_init(&hw->airtime_lock);
-+  hw->airtime_radios = 0;
-+  spin_lock_init(&hw->monitor_lock);
 +  hw->quiescing = false;
-+  hw->monitor_irqs_blocked = false;
 +
    hw->mmb_base = mmb_pas;
  
    /* Shared RAM offset depending on platform */
-@@ -7120,7 +7840,7 @@
+@@ -7120,7 +7453,7 @@
  
    hw->radio_descr = radio_descr;
    hw->is_sync_hostapd_done = TRUE;
@@ -3289,7 +2658,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw->irq_mode = MTLK_IRQ_MODE_INVALID;
  #ifdef MTCFG_LEGACY_INT_RECOVERY_MON
    hw->need_legacy_int_recovery = FALSE;
-@@ -7889,6 +8609,9 @@
+@@ -7889,6 +8222,9 @@
  {
    MTLK_ASSERT(hw != NULL);
  
@@ -3299,7 +2668,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* Don't control on FPGA */
    if (!__hw_mmb_card_is_fpga(hw)) {
      mtlk_ccr_reset_mac(hw->ccr);
-@@ -7966,9 +8689,9 @@
+@@ -7966,9 +8302,9 @@
      MTLK_START_STEP(hw_mmb_card, HW_BSS_MGMT, MTLK_OBJ_PTR(hw),
                      _mtlk_mmb_bss_mgmt_init, (hw));
      MTLK_START_STEP(hw_mmb_card, HW_RX_DATA_BUFFERS, MTLK_OBJ_PTR(hw),
@@ -3311,7 +2680,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #if 1 /* We need to read CHI area. BufSize will be checked inside */
      MTLK_START_STEP(
-@@ -8016,7 +8739,7 @@
+@@ -8016,7 +8352,7 @@
      MTLK_START_STEP(hw_mmb_card_fin, HW_TXDM, MTLK_OBJ_PTR(&hw->hw_start_fin),
                      mtlk_txmm_start, (&hw->txdm_base));
  
@@ -3320,7 +2689,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      hw->perform_isr_action = isr_action_normal;
  
  #if !MTLK_DCDP_SEPARATE_REG
-@@ -8048,7 +8771,7 @@
+@@ -8048,7 +8384,7 @@
      MTLK_START_STEP(hw_mmb_card_fin, HW_PHY_RX_STATUS, MTLK_OBJ_PTR(&hw->hw_start_fin),
                     _hw_init_phy_rx_status, (hw));
  
@@ -3329,7 +2698,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ILOG2_V("HW layer activated");
    MTLK_START_FINALLY(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin));
    MTLK_START_RETURN(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin), mtlk_hw_mmb_stop_card_finalize, (hw));
-@@ -8136,6 +8859,9 @@
+@@ -8136,6 +8472,9 @@
    void                    *iom      = _mtlk_mmb_cm_bdr_get_iom_bd(bbdr, req_obj->hdr.index, iom_size);
    uint32                  descr;
  
@@ -3339,7 +2708,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    _mtlk_mmb_dbg_verify_msg_send(req_obj);
  
    /* Must do this in order to deal with MsgID endianess */
-@@ -8164,6 +8890,8 @@
+@@ -8164,6 +8503,8 @@
    BOOL is_pending = FALSE;
    mtlk_vap_handle_t master_vap;
  
@@ -3348,7 +2717,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    WLOG_DD("CID-%02x: Resetting FW because of message timeout. Message ID is 0x%X",
            hw->card_idx, msg_id);
-@@ -8283,15 +9011,11 @@
+@@ -8283,15 +8624,11 @@
   * HW interface implementation for VFT
   **************************************************************/
  static mtlk_hw_msg_t*
@@ -3366,7 +2735,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    return HW_MSG_PTR(data_req);
  }
-@@ -8333,7 +9057,7 @@
+@@ -8333,7 +8670,7 @@
    mtlk_dump(0, hw->bss_mgmt.tx_ring.v_base_addr, hw->bss_mgmt.tx_ring.size * sizeof(HOST_DSC), "TX BSS HD ring");
  }
  
@@ -3375,7 +2744,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  _mtlk_mmb_put_hd_to_ring(mtlk_hw_t *hw, HOST_DSC *pHD, mtlk_ring_buffer *ring)
  {
    mtlk_handle_t lock_val;
-@@ -8348,21 +9072,22 @@
+@@ -8348,21 +8685,22 @@
    pHD->u32frameInfo3 = CPU_TO_LE32(u32frameInfo3);
  
    lock_val = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
@@ -3404,7 +2773,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int
-@@ -8371,6 +9096,10 @@
+@@ -8371,6 +8709,10 @@
  {
    int       res = MTLK_ERR_OK;
    HOST_DSC  tx_bd;
@@ -3415,7 +2784,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #if (defined MTLK_DEBUG_IPERF_PAYLOAD_RX) || (defined MTLK_DEBUG_IPERF_PAYLOAD_TX)
    data_req->ts           = mtlk_osal_timestamp();
-@@ -8384,6 +9113,10 @@
+@@ -8384,6 +8726,10 @@
                                      data_req->nbuf,
                                      data_req->size,
                                      MTLK_DATA_TO_DEVICE);
@@ -3426,7 +2795,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    else {
      data_req->dma_addr = 0;
-@@ -8466,7 +9199,17 @@
+@@ -8466,7 +8812,17 @@
    }
  #endif
  
@@ -3445,7 +2814,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    CPU_STAT_END_TRACK(CPU_STAT_ID_TX_HW);
    return res;
  }
-@@ -8490,6 +9233,191 @@
+@@ -8490,6 +8846,191 @@
                  DRV_VERSION, hw->if_version, hw->progmodel);
  
    mtlk_osal_lock_release(&hw->version_lock);
@@ -3637,7 +3006,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int
-@@ -8506,7 +9434,7 @@
+@@ -8506,7 +9047,7 @@
      if (size == sizeof(mtlk_hw_state_e))
      {
        mtlk_hw_state_e *val = (mtlk_hw_state_e *)buffer;
@@ -3646,7 +3015,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        res       = MTLK_ERR_OK;
        if (mtlk_hw_is_halted(hw->state)) {
          mtlk_txmm_halt(&hw->txmm_base);
-@@ -8585,105 +9513,8 @@
+@@ -8585,105 +9126,8 @@
      break;
  #endif
    case MTLK_HW_MC_GROUP_ID:
@@ -3754,7 +3123,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      break;
  
    case MTLK_HW_DATA_TXOUT_LIM:
-@@ -9008,22 +9839,6 @@
+@@ -9008,22 +9452,6 @@
        res  = MTLK_ERR_OK;
      }
      break;
@@ -3777,7 +3146,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    case MTLK_HW_FW_DATA_IN_TASKLET:
      if (size == sizeof(uint32))
      {
-@@ -9032,22 +9847,6 @@
+@@ -9032,22 +9460,6 @@
        res  = MTLK_ERR_OK;
      }
      break;
@@ -3800,7 +3169,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #endif /* MTLK_DEBUG */
  
    case MTLK_HW_CALIB_BUF_DMA_ADDR:
-@@ -9060,20 +9859,21 @@
+@@ -9060,20 +9472,21 @@
      }
      break;
    case MTLK_HW_MC_GROUP_ID:
@@ -3836,7 +3205,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
      }
      break;
-@@ -9406,7 +10206,7 @@
+@@ -9406,7 +9819,7 @@
  void __MTLK_IFUNC
  mtlk_hw_mmb_stop_mac_events (mtlk_hw_t *hw)
  {
@@ -3845,18 +3214,18 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  mtlk_hw_api_t * __MTLK_IFUNC
-@@ -9558,6 +10358,10 @@
+@@ -9558,6 +9971,10 @@
  
    lock = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
  
-+  if (hw->quiescing || hw->monitor_irqs_blocked) {
++  if (hw->quiescing) {
 +    mtlk_osal_lock_release_irq(&hw->reg_lock, lock);
 +    return 0;
 +  }
    irq_status = mtlk_ccr_is_interrupt_pending(hw->ccr);
    if (irq_status == 0xFFFFFFFF ) {
      /* PCIE bus stuck is detected. Do not reschedule timer */
-@@ -9620,6 +10424,7 @@
+@@ -9620,6 +10037,7 @@
  mtlk_hw_mmb_interrupt_handler_msi (mtlk_irq_handler_data *ihd)
  {
    mtlk_hw_t    *hw;
@@ -3864,12 +3233,12 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_ASSERT(NULL != ihd);
  
    hw = ihd->hw;
-@@ -9627,7 +10432,13 @@
+@@ -9627,7 +10045,13 @@
    MTLK_ASSERT(NULL != hw);
    MTLK_ASSERT(NULL != hw->ccr);
  
 +  lock = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
-+  if (hw->quiescing || hw->monitor_irqs_blocked) {
++  if (hw->quiescing) {
 +    mtlk_osal_lock_release_irq(&hw->reg_lock, lock);
 +    return MTLK_ERR_UNKNOWN;
 +  }
@@ -3878,19 +3247,19 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return MTLK_ERR_OK;
  }
  
-@@ -9645,6 +10456,11 @@
+@@ -9645,6 +10069,11 @@
    MTLK_ASSERT(NULL != hw->ccr);
  
    lock = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
 +
-+  if (hw->quiescing || hw->monitor_irqs_blocked) {
++  if (hw->quiescing) {
 +    mtlk_osal_lock_release_irq(&hw->reg_lock, lock);
 +    return MTLK_ERR_UNKNOWN;
 +  }
  
    CPU_STAT_BEGIN_TRACK(CPU_STAT_ID_ISR);
  
-@@ -9669,17 +10485,6 @@
+@@ -9669,17 +10098,6 @@
        MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_INTR_ENABLE_INT, MTLK_IRQ_ALL);
        break; /* do */
      }
@@ -3908,17 +3277,17 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      hw->perform_isr_action(hw, ihd);
  
-@@ -9702,7 +10507,8 @@
+@@ -9702,7 +10120,8 @@
  /* TODO: make a CPU optimization in IRQ_ENABLE_OR_RESCHEDULE (return rescheduling of tasklet) */
  #define IRQ_ENABLE_OR_RESCHEDULE(ihd){ \
      mtlk_handle_t lock_val = mtlk_osal_lock_acquire_irq(&ihd->hw->reg_lock); \
 -    mtlk_ccr_enable_interrupts(ihd->hw->ccr, ihd->irq_no); \
-+    if (!ihd->hw->quiescing && !ihd->hw->monitor_irqs_blocked) \
++    if (!ihd->hw->quiescing) \
 +      mtlk_ccr_enable_interrupts(ihd->hw->ccr, ihd->irq_no); \
      MTLK_TRACER_ADD_ENTRY(ihd->hw, MTLK_TR_INTR_ENABLE_INT, ihd->irq_no); \
      mtlk_osal_lock_release_irq(&ihd->hw->reg_lock, lock_val); }
  
-@@ -9937,20 +10743,37 @@
+@@ -9937,20 +10356,24 @@
    return res;
  }
  
@@ -3928,7 +3297,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +_wave_hw_mmb_restore (mtlk_hw_t *hw)
  {
    int res = MTLK_ERR_OK;
-+  bool fresh_monitor;
  
    MTLK_ASSERT(hw != NULL);
    /* MTLK_ASSERT(hw->vap_manager != NULL); */
@@ -3936,68 +3304,17 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +
 +  if (READ_ONCE(hw->quiescing))
 +    return MTLK_ERR_NOT_READY;
-+
-+  /* A monitor transition uses a complete fresh firmware/RX lifetime.
-+   * Its completed PCI/IRQ/DMA/CPU fence owns the old cache before unmap.
-+   * Ordinary fault recovery retains its native calibration-cache policy. */
-+  fresh_monitor = smp_load_acquire(&hw->monitor_fenced);
-+  if (fresh_monitor)
-+    _mtlk_mmb_cleanup_calibration_cache(hw);
  
    /* Reset FW and chip */
    _mtlk_mmb_reset_all_events(hw);
    mtlk_hw_mmb_reset_mac(hw);
    mtlk_hw_mmb_restore_irq_mode(hw);
    _mtlk_mmb_cleanup_reset_mac(hw);
-+  /* The old native policy/peers are now retired. New recovery configuration
-+   * may re-enable MU before hostapd admits fresh station/weight owners. */
-+  wave_hw_airtime_lock(hw);
-+  hw->airtime_radios = 0;
-+  wave_hw_airtime_unlock(hw);
 +  _wave_hw_stats_reset_lifetime(hw);
  
    /* STOP */
    if (mtlk_mmb_dcdp_path_available(hw)) {
-@@ -9972,6 +10795,22 @@
- #if MTLK_DCDP_SEPARATE_REG
-   _mtlk_mmb_data_path_unregister(hw);
- #endif
-+  if (fresh_monitor) {
-+    mtlk_handle_t flags;
-+
-+    hw->perform_isr_action = isr_action_init;
-+    /* Match cold startup: finish PCI/tasklet admission before power/PLL
-+     * initialization. The old DMA/rings and CPUs are already fenced.
-+     * Keep shared IRQ admission closed until the fresh firmware is loaded.
-+     * Even a partial restart must be refenced on failure. */
-+    flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
-+    WRITE_ONCE(hw->monitor_fenced, false);
-+    mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
-+    res = wave_mmb_drv_restart_dma(mtlk_ccr_get_device(hw->ccr));
-+    if (res != MTLK_ERR_OK)
-+      return res;
-+  }
-+
-   /* Power ON chip */
-   _mtlk_mmb_power_on(hw);
- 
-@@ -9993,6 +10832,15 @@
-     return res;
-   }
- 
-+  if (fresh_monitor) {
-+    mtlk_handle_t flags;
-+
-+    /* PCI/tasklets and PLL are ready; firmware CPUs are still reset.
-+     * Bootstrap IRQs may now run the existing initialization action. */
-+    flags = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
-+    hw->monitor_irqs_blocked = false;
-+    mtlk_osal_lock_release_irq(&hw->reg_lock, flags);
-+  }
-   _mtlk_mmb_run_firmware(hw);
- 
-   res = _mtlk_mmb_wait_chi_magic(hw);
-@@ -10072,16 +10920,22 @@
+@@ -10072,13 +10495,13 @@
      return res;
    }
  
@@ -4013,16 +3330,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (res != MTLK_ERR_OK) {
      ELOG_D("MMB_Restore _mtlk_mmb_prealloc_rx_mgmt_buffers failed(%d)", res);
      return res;
-+  }
-+
-+  if (fresh_monitor) {
-+    res = _mtlk_mmb_init_calibration_cache(hw);
-+    if (res != MTLK_ERR_OK)
-+      return res;
-   }
- 
-   if (hw->chi_area.sMipsControl.sData.u32DescriptorLocation) {
-@@ -10110,7 +10964,7 @@
+@@ -10110,7 +10533,7 @@
  
    hw->mac_reset_logic_initialized = TRUE;
  
@@ -4031,7 +3339,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw->perform_isr_action = isr_action_normal;
  
  #if !MTLK_DCDP_SEPARATE_REG
-@@ -10153,10 +11007,34 @@
+@@ -10153,10 +10576,23 @@
      return res;
    }
  
@@ -4046,117 +3354,26 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +mtlk_hw_mmb_restore(mtlk_hw_t *hw)
 +{
 +  int res;
-+  bool restore_monitor;
 +
 +  /* Terminal removal/failure may not interleave a new DMA enable with its
 +   * fence. quiescing is never cleared by the restartable recovery path. */
 +  mutex_lock(&hw->quiesce_lock);
-+  restore_monitor = wave_hw_monitor_fenced(hw);
 +  res = _wave_hw_mmb_restore(hw);
-+  if (res != MTLK_ERR_OK && restore_monitor) {
-+    /* PCI or tasklets may have restarted before any later init failure.
-+     * Retire that attempt before returning to either recovery caller. Keep
-+     * ordinary fault recovery restartable; the monitor netdev caller owns
-+     * its existing terminal-on-error decision. Preserve the original error. */
-+    if (_wave_hw_monitor_fence_locked(hw) != MTLK_ERR_OK &&
-+        !READ_ONCE(hw->quiescing))
-+      wave_hw_mmb_quiesce_locked(hw);
-+  }
 +  mutex_unlock(&hw->quiesce_lock);
 +  return res;
  }
  
  static int
-@@ -10309,6 +11187,117 @@
+@@ -10309,6 +10745,37 @@
    }
  }
  
-+static void wave_bss_complete_pmf(struct mtlk_hw_bss_req_mirror *entry)
-+{
-+  struct wave_pmf *pmf = xchg(&entry->pmf, NULL);
-+
-+  if (pmf)
-+    wave_pmf_complete(pmf, entry->pmf_slot);
-+}
-+
-+/* Called after terminal quiesce or the complete restartable monitor fence.
-+ * The VAP lifetime excludes process producers; both fences join IRQ/tasklet
-+ * producers and reset firmware before any pending PMF reference is detached. */
-+void wave_hw_mmb_detach_pmf(mtlk_hw_t *hw, struct wave_pmf *pmf)
-+{
-+  mtlk_mmb_basic_bdr_t *ring = &hw->bss_mgmt.tx_bdr.basic;
-+  unsigned int i;
-+
-+  if (WARN_ON(!READ_ONCE(hw->quiescing) && !wave_hw_monitor_fenced(hw)))
-+    return;
-+  for (i = 0; i < ring->nof_bds; i++) {
-+    struct mtlk_hw_bss_req_mirror *entry =
-+      _mtlk_basic_bdr_get_mirror_bd(ring, i, struct mtlk_hw_bss_req_mirror);
-+    if (READ_ONCE(entry->pmf) == pmf)
-+      wave_bss_complete_pmf(entry);
-+  }
-+}
-+
-+/* A successful queue publication holds the exact monitor netdev until native
-+ * CFM or post-DMA-fence retirement. This is not a mac80211 STA skb. */
-+static void wave_bss_complete_raw(struct mtlk_hw_bss_req_mirror *entry,
-+                                  bool completed)
-+{
-+  struct sk_buff *skb = xchg(&entry->skb, NULL);
-+  struct net_device *ndev;
-+
-+  if (!skb)
-+    return;
-+  ndev = skb->dev;
-+  if (completed) {
-+    ndev->stats.tx_packets++;
-+    ndev->stats.tx_bytes += skb->len;
-+  } else {
-+    ndev->stats.tx_dropped++;
-+    ndev->stats.tx_errors++;
-+  }
-+  dev_kfree_skb_any(skb);
-+  dev_put(ndev);
-+}
-+
-+static void wave_hw_monitor_flush_tx(mtlk_hw_t *hw)
-+{
-+  mtlk_mmb_advanced_bdr_t *queues[] = { &hw->bss_mgmt.tx_bdr, &hw->bss_mgmt.tx_res_bdr };
-+  unsigned int q, i;
-+
-+  if (WARN_ON(!READ_ONCE(hw->quiescing) && !wave_hw_monitor_fenced(hw)))
-+    return;
-+  if (!(hw->flags & HW_FLAGS_PREPARED_BSS_REQ_BDR))
-+    return;
-+  /* RAW producers have joined the queue gate; IRQ/tasklet/DMA are fenced.
-+   * Keep native BD/list ownership for its existing reset/free operation. */
-+  for (q = 0; q < ARRAY_SIZE(queues); q++) {
-+    for (i = 0; i < queues[q]->basic.nof_bds; i++) {
-+      struct mtlk_hw_bss_req_mirror *entry =
-+        _mtlk_basic_bdr_get_mirror_bd(&queues[q]->basic, i, struct mtlk_hw_bss_req_mirror);
-+      if (entry->extra_processing != PROCESS_RAW_DATA || !entry->skb)
-+        continue;
-+      if (entry->dma_addr) {
-+        mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), entry->dma_addr,
-+                                  entry->size, MTLK_DATA_TO_DEVICE);
-+        entry->dma_addr = 0;
-+      }
-+      wave_bss_complete_raw(entry, false);
-+    }
-+  }
-+}
-+
-+
 +static void wave_bss_discard_skb(mtlk_hw_t *hw, struct mtlk_hw_bss_req_mirror *entry)
 +{
 +  wave_radio_t *radio;
 +
 +  if (!entry->skb)
 +    return;
-+  if (entry->extra_processing == PROCESS_RAW_DATA) {
-+    wave_bss_complete_raw(entry, false);
-+    return;
-+  }
 +  radio = __mtlk_hw_wave_radio_get(hw, entry->radio_id);
 +  if (WARN_ON(!radio || !wave_radio_mac80211_get(radio)))
 +    return;
@@ -4185,7 +3402,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static void
  mtlk_mmb_free_bss_tx_buffers(mtlk_hw_t *hw, mtlk_mmb_advanced_bdr_t *control)
  {
-@@ -10321,6 +11310,16 @@
+@@ -10321,6 +10788,13 @@
      if (!bss_req->virt_addr)
        continue;
  
@@ -4194,15 +3411,12 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +                                bss_req->size, MTLK_DATA_TO_DEVICE);
 +      bss_req->dma_addr = 0;
 +    }
-+    if (bss_req->extra_processing == PROCESS_RAW_DATA)
-+      wave_bss_complete_raw(bss_req, false);
 +    /* Native VIF owners detach their pending references before destruction. */
-+    WARN_ON(bss_req->pmf);
 +    WARN_ON(bss_req->skb);
      mtlk_osal_mem_free(bss_req->virt_addr);
      bss_req->virt_addr = NULL;
    }
-@@ -10606,7 +11605,7 @@
+@@ -10606,7 +11080,7 @@
  mtlk_hw_mmb_fill_phy_info_by_default (mtlk_phy_info_t *phy_info)
  {
      MTLK_ASSERT(NULL != phy_info);
@@ -4211,7 +3425,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void
-@@ -10744,6 +11743,76 @@
+@@ -10744,6 +11218,76 @@
      } else { /* dummy */
        _mtlk_hw_mmb_fill_phy_info_by_default(phy_info);
      }
@@ -4288,7 +3502,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int _mtlk_mmb_handle_bss_ind (mtlk_hw_t *hw, volatile HOST_DSC *pHD)
-@@ -10761,7 +11830,10 @@
+@@ -10761,7 +11305,10 @@
    uint8                         type;
    mtlk_vap_handle_t             vap_handle;
    BOOL                          is_eapol;
@@ -4300,7 +3514,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    BOOL                          is_gen5 = _hw_type_is_gen5(hw);
    void                         *buf;
    mtlk_core_handle_rx_bss_t     data;
-@@ -10783,6 +11855,7 @@
+@@ -10783,6 +11330,7 @@
        goto critical_error;
      }
    }
@@ -4308,7 +3522,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    u32frameInfo0 = LE32_TO_CPU(pHD->u32frameInfo0);
    u32frameInfo1 = LE32_TO_CPU(pHD->u32frameInfo1);
    hostpayload   = LE32_TO_CPU(pHD->u32HostPayloadAddr);
-@@ -10812,21 +11885,42 @@
+@@ -10812,21 +11360,42 @@
      goto send_resp;
    }
  
@@ -4366,7 +3580,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if ((is_eapol) ||
         ((FRAME_TYPE_ETHERNET == frame_type) && type == (IEEE80211_FTYPE_DATA >> 2) && hw->bss_mgmt.rx_eapol.data_size))
-@@ -10852,7 +11946,7 @@
+@@ -10852,7 +11421,7 @@
        MTLK_ASSERT(size <= BSS_MGMT_FRAME_SIZE); /* size of frame */
        data.buf      = buf;
        data.size     = size;
@@ -4375,7 +3589,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        _mtlk_mmb_fill_phy_info_by_g6_rx_metrics(hw, phy_info, g6_rx_metrics);
      }
  
-@@ -10875,14 +11969,18 @@
+@@ -10875,14 +11444,18 @@
      }
    }
  
@@ -4396,68 +3610,29 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ELOG_D("CID-%02x: Critical error in bss ring", hw->card_idx);
      ELOG_DDDD("internal variables: hd_read_index %d hd_write_index %d rx_IN_copy %d OUT_cntr %d", hw->bss_mgmt.rx_ring.read_ptr, hw->bss_mgmt.rx_ring.write_ptr, hw->bss_mgmt.rx_ring.regs.IN_copy, hw->bss_mgmt.rx_ring.regs.int_OUT_cntr);
      mtlk_dump(0, (void *)pHD, sizeof(HOST_DSC), "HD in error");
-@@ -10899,6 +11997,7 @@
- #define  MTLK_HOST_TO_MAC_PAYLOAD(dma) CPU_TO_LE32(dma & ~7);
- #endif
- 
-+
- static int
- _mtlk_mmb_bss_mgmt_tx(mtlk_hw_t *hw,
-                       struct mtlk_hw_bss_req_mirror *bss_req, mtlk_vap_handle_t vap_handle)
-@@ -10910,6 +12009,14 @@
+@@ -10910,6 +11483,10 @@
    unsigned char *dst_addr;
    uint32 packet_length = bss_req->size;
    BOOL mcf;
 +
-+  /* Reject the private RAW representation before any descriptor publication.
-+   * Ordinary AP management, EAPOL and NULL requests retain their native path. */
-+  if (bss_req->extra_processing == PROCESS_RAW_DATA)
-+    return MTLK_ERR_NOT_SUPPORTED;
 +  if (READ_ONCE(hw->quiescing) ||
 +      wave_radio_dfs_tx_blocked(wave_vap_radio_get(vap_handle)))
 +    return MTLK_ERR_NOT_READY;
  
  #ifdef BD_DBG
    if (bss_req->hdr.index >= hw->bss_mgmt.tx_bdr.basic.nof_bds) {
-@@ -11022,9 +12129,29 @@
-         return MTLK_ERR_PKT_DROPPED;
-   }
- 
-+  if (bss_req->extra_processing == PROCESS_MANAGEMENT && mtlk_vap_is_ap(vap_handle)) {
-+    size_t length = bss_req->size;
-+    int slot = wave_pmf_protect(&nic->slow_ctx->pmf, bss_req->virt_addr,
-+                                &length, BSS_MGMT_FRAME_SIZE);
-+
-+    if (slot < 0)
-+      return MTLK_ERR_NOT_READY;
-+    bss_req->size = length;
-+    packet_length = length;
-+    if (slot < 2) {
-+      bss_req->pmf_slot = slot;
-+      smp_store_release(&bss_req->pmf, &nic->slow_ctx->pmf);
-+    }
-+  }
-+
+@@ -11025,6 +11602,10 @@
    /* do not touch the data payload after dma map */
    bss_req->dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->virt_addr,
                                                   bss_req->size, MTLK_DATA_TO_DEVICE);
 +  if (dma_mapping_error(mtlk_ccr_get_device(hw->ccr), bss_req->dma_addr)) {
 +    bss_req->dma_addr = 0;
-+    wave_bss_complete_pmf(bss_req);
 +    return MTLK_ERR_NO_MEM;
 +  }
    /* leave the u8Reserved, u8Status and retransmissions fields as 0 */
  
    bss_hd.u32BdIndex         = CPU_TO_LE32(bss_req->hdr.index);
-@@ -11063,13 +12190,23 @@
- 
-   mtlk_dump(3, &bss_hd, sizeof(bss_hd), "BSS Mgmt TX HD:");
- 
--  mtlk_core_on_bss_tx(mtlk_vap_get_core(vap_handle), bss_req->subtype);
-+  if (bss_req->extra_processing != PROCESS_RAW_DATA)
-+    mtlk_core_on_bss_tx(mtlk_vap_get_core(vap_handle), bss_req->subtype);
- 
- #ifdef BD_DBG
+@@ -11069,7 +11650,15 @@
     set_bit(bss_req->hdr.index, hw->bss_mgmt.used_bd_map);
  #endif
  
@@ -4469,20 +3644,17 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +#ifdef BD_DBG
 +    clear_bit(bss_req->hdr.index, hw->bss_mgmt.used_bd_map);
 +#endif
-+    wave_bss_complete_pmf(bss_req);
 +    return MTLK_ERR_NOT_READY;
 +  }
    return MTLK_ERR_OK;
  
  #ifdef BD_DBG
-@@ -11194,6 +12331,14 @@
+@@ -11194,6 +11783,12 @@
    mtlk_core_t *cur_core;
    struct mtlk_chan_def *ccd;
    uint32 net_state;
 +  int res;
 +
-+  if (extra_processing == PROCESS_RAW_DATA)
-+    return MTLK_ERR_NOT_SUPPORTED;
 +  if (READ_ONCE(hw->quiescing))
 +    return MTLK_ERR_NOT_READY;
 +  if (!buf || (extra_processing == PROCESS_EAPOL ? len < ETH_HLEN : len < 24))
@@ -4490,7 +3662,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    cur_core = mtlk_vap_get_core(vap_handle);
    net_state = mtlk_core_get_net_state(cur_core);
-@@ -11253,13 +12398,18 @@
+@@ -11253,13 +11848,18 @@
      }
  
      if (MAN_TYPE_ACTION == subtype) {
@@ -4510,7 +3682,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        uint8     ch_util;
        if((ie_bss) && (ie_bss->length == 5)) {
          /* update parameters */
-@@ -11281,6 +12431,10 @@
+@@ -11281,6 +11881,10 @@
    }
  
    mtlk_osal_lock_acquire(&bss_mgmt->tx_bdr.lock);
@@ -4521,15 +3693,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (!dont_wait_for_ack) {
      local_cookie = ++bss_mgmt->cookie_counter; /* at 4 billion mgmt frames per second, wraps in over 136 years */
-@@ -11321,6 +12475,7 @@
- 
-   bss_req = MTLK_LIST_GET_CONTAINING_RECORD(entry, struct mtlk_hw_bss_req_mirror, hdr.list_entry);
- 
-+  bss_req->pmf = NULL; /* Reserved plaintext entries have no key reference. */
-   bss_req->vap_id = mtlk_vap_get_id(vap_handle);
-   bss_req->radio_id = radio_id;
-   bss_req->cookie = local_cookie;
-@@ -11336,7 +12491,15 @@
+@@ -11336,7 +11940,15 @@
    bss_req->tid              = tid;
    if (transmit_now)
    {
@@ -4546,7 +3710,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    else
    {
-@@ -11366,7 +12529,7 @@
+@@ -11366,7 +11978,7 @@
        mtlk_df_user_t *df_user = mtlk_df_get_user(df);
        struct wireless_dev *wdev = mtlk_df_user_get_wdev(df_user);
        MTLK_ASSERT(NULL != wdev);
@@ -4555,7 +3719,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
      else
      {
-@@ -11375,14 +12538,25 @@
+@@ -11375,14 +11987,18 @@
        MTLK_ASSERT(NULL != skb);
        wv_ieee80211_tx_status(mac80211_hw, skb, FALSE);
      }
@@ -4563,15 +3727,8 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +    ieee80211_free_txskb(wave_radio_ieee80211_hw_get(radio), skb);
    }
    return MTLK_ERR_OK;
-+}
-+
-+
-+/* Rejection retains caller ownership of skb and leaves cookie untouched. */
-+int wave_hw_monitor_tx(mtlk_vap_handle_t vap, struct wave_monitor *owner,
-+                       struct sk_buff *skb, int frequency, uint64 *cookie)
-+{
-+  return MTLK_ERR_NOT_SUPPORTED;
  }
++
  
  /* This runs from the tasklet context, and possibly on a different CPU
   * than _mgmt_tx(), therefore a lock is needed in it (a simple spin_lock() will do) */
@@ -4581,15 +3738,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    struct mtlk_bss_management *bss_mgmt = &hw->bss_mgmt;
    struct mtlk_hw_bss_req_mirror *bss_req, *bss_req_res;
    struct wireless_dev *wdev;
-@@ -11399,6 +12573,7 @@
-   uint8  status = MTLK_BFIELD_GET(u32frameInfo0, TX_BSS_EXTRA_STATUS);
-   mtlk_vap_handle_t    vap_handle, vap_handle_res;
-   wave_radio_t *radio;
-+  bool raw;
- 
-   MTLK_ASSERT(hw);
- 
-@@ -11414,6 +12589,8 @@
+@@ -11414,6 +12030,8 @@
    ILOG3_D("BSS CFM: index=%hu", u32BdIndex);
  
    mtlk_osal_atomic_set(&bss_mgmt->tx_ring_last_cfm_ts, mtlk_osal_timestamp());
@@ -4598,30 +3747,23 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    bss_req = _mtlk_basic_bdr_get_mirror_bd(&bss_mgmt->tx_bdr.basic, u32BdIndex, struct mtlk_hw_bss_req_mirror);
  
  #ifdef BD_DBG
-@@ -11434,6 +12611,11 @@
+@@ -11434,6 +12052,7 @@
      goto the_trap;
    }
  #endif
 +
-+  raw = bss_req->extra_processing == PROCESS_RAW_DATA;
-+  if (raw && (!bss_req->skb || !bss_req->dma_addr ||
-+              radio_id != bss_req->radio_id || vap_id != bss_req->vap_id))
-+    goto the_trap;
  
    /* Confirmations can be received after VAP was traffic stopped */
    if (__UNLIKELY(_mtlk_mmb_get_vap_is_not_ready(hw, radio_id, vap_id))) {
-@@ -11458,6 +12640,10 @@
+@@ -11458,6 +12077,7 @@
    wifi_header = (frame_head_t *)bss_req->virt_addr;
  
    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->dma_addr, bss_req->size, MTLK_DATA_TO_DEVICE);
 +  bss_req->dma_addr = 0;
-+  wave_bss_complete_pmf(bss_req);
-+  if (raw)
-+    wave_bss_complete_raw(bss_req, status == 1);
  
    if (PROCESS_MANAGEMENT == bss_req->extra_processing)
    {
-@@ -11468,7 +12654,7 @@
+@@ -11468,7 +12088,7 @@
          wdev = mtlk_df_user_get_wdev(df_user); /* this checks df_user */
          MTLK_ASSERT(NULL != wdev);
          cfg80211_mgmt_tx_status(wdev, bss_req->cookie, bss_req->virt_addr, bss_req->size,
@@ -4630,7 +3772,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
        else
        {
-@@ -11476,6 +12662,7 @@
+@@ -11476,6 +12096,7 @@
          ILOG2_D("handle bss mgmt cfm status = %u", status);
          MTLK_ASSERT(NULL != mac80211_hw);
          wv_ieee80211_tx_status(mac80211_hw, bss_req->skb, status);
@@ -4638,7 +3780,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
      }
    }
-@@ -11485,7 +12672,7 @@
+@@ -11485,7 +12106,7 @@
      if (mtlk_vap_is_ap(vap_handle))
      {
        cfg80211_probe_status(ndev, wifi_header->dst_addr.au8Addr, bss_req->cookie,
@@ -4647,7 +3789,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
      else
      {
-@@ -11495,6 +12682,7 @@
+@@ -11495,6 +12116,7 @@
          ILOG2_D("handle bss null data packet cfm status = %u", status);
          MTLK_ASSERT(NULL != mac80211_hw);
          wv_ieee80211_tx_status(mac80211_hw, bss_req->skb, status);
@@ -4655,7 +3797,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
      }
    }
-@@ -11522,6 +12710,8 @@
+@@ -11522,6 +12144,8 @@
      bss_req->virt_addr = bss_req_res->virt_addr;
      bss_req_res->virt_addr = tmp_ptr;
  
@@ -4664,7 +3806,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      /* copy the relevant stuff */
      bss_req->size = bss_req_res->size;
      bss_req->cookie = bss_req_res->cookie;
-@@ -11533,6 +12723,9 @@
+@@ -11533,6 +12157,9 @@
      bss_req->is_broadcast     = bss_req_res->is_broadcast;
      bss_req->dst_addr         = bss_req_res->dst_addr;
      bss_req->skb              = bss_req_res->skb;
@@ -4674,29 +3816,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      mtlk_dlist_push_back(&bss_mgmt->tx_res_bdr.free_list, entry); /* push onto reserve free list */
      ILOG3_PD("Pushed entry onto reserve free list: 0x%p, %i remaining",
-@@ -11556,10 +12749,12 @@
-       continue;
-     }
- 
--    mtlk_core_on_bss_res_freed(mtlk_vap_get_core(vap_handle_res)); /* update counter */
-+    if (bss_req->extra_processing != PROCESS_RAW_DATA)
-+      mtlk_core_on_bss_res_freed(mtlk_vap_get_core(vap_handle_res)); /* update counter */
- 
-     /* core net state is NET_STATE_DEACTIVATING in case of VAP traffic was stopped */
--    if (0 == ((NET_STATE_CONNECTED | NET_STATE_DEACTIVATING) &
-+    if (bss_req->extra_processing != PROCESS_RAW_DATA &&
-+        0 == ((NET_STATE_CONNECTED | NET_STATE_DEACTIVATING) &
-         mtlk_core_get_net_state(mtlk_vap_get_core(vap_handle_res)))) {
-       WLOG_DD("Drop bss frame from reserved queue due to VAP is not active radio_id:%d, vap_id:%d",
-                bss_req->radio_id, bss_req->vap_id);
-@@ -11574,15 +12769,18 @@
- 
-     /* vap_handle from cfm frame we need to decrease it only after new frame
-        is sent for not having rase condition with waiting of unconf_bss */
--    mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
-+    if (!raw)
-+      mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
-     return MTLK_ERR_OK;
+@@ -11579,6 +12206,7 @@
    }
  
    /* No frames to send from reserved queue */
@@ -4704,13 +3824,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_dlist_remove(&bss_mgmt->tx_bdr.used_list, &bss_req->hdr.list_entry);
    mtlk_dlist_push_back(&bss_mgmt->tx_bdr.free_list, &bss_req->hdr.list_entry);
    mtlk_osal_lock_release(&bss_mgmt->tx_bdr.lock);
--  mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
-+  if (!raw)
-+    mtlk_core_on_bss_cfm(mtlk_vap_get_core(vap_handle), &bss_req->dst_addr, bss_req->extra_processing, bss_req->subtype, bss_req->is_broadcast);
-   return MTLK_ERR_OK;
- 
- the_trap:
-@@ -11787,7 +12985,7 @@
+@@ -11787,7 +12415,7 @@
  }
  
  void __MTLK_IFUNC
@@ -4719,7 +3833,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    /* Save irq_mode for recovery */
    hw->irq_mode = mode;
-@@ -12237,6 +13435,9 @@
+@@ -12237,6 +12865,9 @@
  static void _mtlk_hw_debug_print_ring_regs(mtlk_ring_regs *ring_regs, const char *reg_name)
  {
      uint32 reg_OUT_status, reg_OUT_counter, reg_IN_counter;
@@ -4729,7 +3843,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      reg_OUT_status  = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_OUT_status));
      reg_OUT_counter = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_OUT_cntr));
      reg_IN_counter  = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_IN_cntr));
-@@ -12499,7 +13700,7 @@
+@@ -12499,7 +13130,7 @@
  
    wave_rcvry_mac_hang_evt_reset(hw, core_no);
  
@@ -4740,10 +3854,11 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      WLOG_D("FW MAC#%d assert not done because not supported", core_no);
 --- a/wireless/driver/shared/hw_mmb.h
 +++ b/wireless/driver/shared/hw_mmb.h
-@@ -232,6 +232,36 @@
+@@ -231,6 +231,34 @@
+ 
  int __MTLK_IFUNC
  mtlk_hw_mmb_start_card_finalize(mtlk_hw_t   *hw);
- 
++
 +void wave_hw_mmb_quiesce(mtlk_hw_t *hw);
 +/* A successful pinned lookup transfers one reference to its caller. */
 +BOOL wave_hw_mc_get(mtlk_hw_t *hw, uint8 id, BOOL pin);
@@ -4770,60 +3885,11 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +void wave_hw_tx_queue_stop(mtlk_hw_t *hw, struct wave_tx_queue *queue);
 +int wave_hw_mc_alloc_native(mtlk_hw_t *hw);
 +void wave_hw_mc_release_native(mtlk_hw_t *hw, uint8 id);
-+struct wave_pmf;
-+void wave_hw_mmb_detach_pmf(mtlk_hw_t *hw, struct wave_pmf *pmf);
 +void wave_hw_mmb_flush_sta_tx(mtlk_hw_t *hw, unsigned int radio_id);
-+
+ 
  void __MTLK_IFUNC 
  mtlk_hw_mmb_stop_card(mtlk_hw_t *card);
- 
-@@ -363,6 +393,7 @@
-   PROCESS_MANAGEMENT = 0,
-   PROCESS_EAPOL,
-   PROCESS_NULL_DATA_PACKET,
-+  PROCESS_RAW_DATA,
- };
- 
- uint8 __MTLK_IFUNC
-@@ -375,6 +406,37 @@
- 
- void __MTLK_IFUNC
- mtlk_hw_reset_radar_cntr (mtlk_hw_t *hw);
-+
-+struct wave_monitor;
-+#define WAVE_FW_FEATURE_RX_STREAM BIT(0)
-+#define WAVE_FW_FEATURE_FIXED_DATA BIT(1)
-+#define WAVE_FW_FEATURE_TXOP_READ BIT(2)
-+#define WAVE_FW_FEATURE_RTS_THRESHOLD BIT(3)
-+bool wave_hw_fw_feature_supported(mtlk_hw_t *hw, u32 feature);
-+void wave_hw_airtime_lock(mtlk_hw_t *hw);
-+void wave_hw_airtime_unlock(mtlk_hw_t *hw);
-+bool wave_hw_airtime_owned(mtlk_hw_t *hw);
-+void wave_hw_airtime_mark(mtlk_hw_t *hw, unsigned radio, bool owned);
-+bool wave_hw_monitor_supported(mtlk_hw_t *hw);
-+bool wave_hw_monitor_held(mtlk_hw_t *hw);
-+bool wave_hw_monitor_is_owner(mtlk_hw_t *hw, const struct wave_monitor *mon);
-+bool wave_hw_monitor_dirty(mtlk_hw_t *hw);
-+bool wave_hw_monitor_fenced(mtlk_hw_t *hw);
-+bool wave_hw_monitor_set_tx(mtlk_hw_t *hw, const struct wave_monitor *mon, bool enable);
-+int wave_hw_monitor_tx(mtlk_vap_handle_t vap, struct wave_monitor *owner,
-+                       struct sk_buff *skb, int frequency, uint64 *cookie);
-+bool wave_hw_monitor_user_get(mtlk_hw_t *hw);
-+void wave_hw_monitor_user_put(mtlk_hw_t *hw);
-+int wave_hw_monitor_claim(mtlk_hw_t *hw, mtlk_vap_handle_t vap, struct wave_monitor *mon);
-+void wave_hw_monitor_release(mtlk_hw_t *hw, struct wave_monitor *mon);
-+int wave_hw_monitor_activation_begin(mtlk_vap_handle_t vap, BOOL monitor);
-+void wave_hw_monitor_activation_end(mtlk_vap_handle_t vap, BOOL monitor);
-+int wave_hw_monitor_template(mtlk_vap_handle_t vap);
-+u32 wave_hw_monitor_recovery_state(mtlk_hw_t *hw, mtlk_vap_handle_t vap, u32 state);
-+int wave_hw_monitor_fence(mtlk_hw_t *hw);
-+void wave_hw_monitor_restarted(mtlk_hw_t *hw);
-+void wave_hw_monitor_suspend_rx(mtlk_hw_t *hw);
-+extern const u8 wave_monitor_header[44];
- 
- BOOL __MTLK_IFUNC
- mtlk_hw_type_is_gen5(mtlk_hw_t *hw);
-@@ -455,6 +517,11 @@
+@@ -455,6 +483,11 @@
  int __MTLK_IFUNC
  mtlk_hw_mhi_get_stats (mtlk_hw_t *hw);
  
@@ -4900,24 +3966,22 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 -
 --- a/wireless/driver/shared/txmm.c
 +++ b/wireless/driver/shared/txmm.c
-@@ -24,6 +24,10 @@
+@@ -24,6 +24,8 @@
  */
  #define TXMM_FLAGS_ACTIVE              0x40000000
  #define TXMM_FLAGS_STOPPED             0x20000000
 +#define TXMM_FLAGS_INITIALIZED         0x10000000
 +#define TXMM_FLAGS_QUIESCED            0x08000000
-+#define TXMM_FLAGS_PAUSED              0x04000000
-+#define TXMM_FLAGS_UNAVAILABLE         (TXMM_FLAGS_QUIESCED | TXMM_FLAGS_PAUSED)
  
  struct _mtlk_txmm_block_t
  {
-@@ -336,6 +340,17 @@
+@@ -336,6 +338,17 @@
    int      res  = MTLK_ERR_UNKNOWN;
    PMSG_OBJ pmsg = *_pmsg;
  
 +  /* Called with the base lock held. An in-flight CFM may return its slot,
-+   * but cannot start queued work during recovery or terminal shutdown. */
-+  if (obj->flags & TXMM_FLAGS_UNAVAILABLE) {
++   * but must not start queued firmware work after terminal shutdown. */
++  if (obj->flags & TXMM_FLAGS_QUIESCED) {
 +    if (pmsg)
 +      obj->api.msg_free_to_pool(obj->api.usr_data, pmsg);
 +    *_pmsg = NULL;
@@ -4929,17 +3993,17 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG4_PD("PUMP: MSG=%p nU=%d", 
         pmsg, (int)obj->ques[MTLK_TXMMB_QUEUED].total);
  
-@@ -539,6 +554,9 @@
+@@ -539,6 +552,9 @@
    mtlk_txmm_base_t          *obj = HANDLE_T_PTR(mtlk_txmm_base_t, clb_usr_data);
    mtlk_osal_msec_t now_time = mtlk_osal_timestamp_to_ms(mtlk_osal_timestamp());
  
-+  if (READ_ONCE(obj->flags) & TXMM_FLAGS_UNAVAILABLE)
++  if (READ_ONCE(obj->flags) & TXMM_FLAGS_QUIESCED)
 +    return 0;
 +
    _mtlk_txmm_on_timer_que(obj, now_time, MTLK_TXMMB_SENT, MTLK_TXMM_CLBR_TIMEOUT_SENT, 0);
    _mtlk_txmm_on_timer_que(obj, now_time, MTLK_TXMMB_QUEUED, MTLK_TXMM_CLBR_TIMEOUT_UNSENT, 1);
  
-@@ -690,6 +708,7 @@
+@@ -690,6 +706,7 @@
      }
  
      mtlk_rmlock_acquire(&obj->bsend.rmlock);
@@ -4947,14 +4011,14 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    MTLK_INIT_FINALLY(txmm, MTLK_OBJ_PTR(obj))
    MTLK_INIT_RETURN(txmm, MTLK_OBJ_PTR(obj), mtlk_txmm_cleanup, (obj))
-@@ -697,16 +716,32 @@
+@@ -697,16 +714,32 @@
  
  int __MTLK_IFUNC mtlk_txmm_start(mtlk_txmm_base_t *obj)
  {
 +  BOOL unavailable;
 +
 +  mtlk_osal_lock_acquire(&obj->lock);
-+  unavailable = !!(obj->flags & TXMM_FLAGS_UNAVAILABLE);
++  unavailable = !!(obj->flags & TXMM_FLAGS_QUIESCED);
 +  mtlk_osal_lock_release(&obj->lock);
 +  if (unavailable)
 +    return MTLK_ERR_NOT_READY;
@@ -4973,7 +4037,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +      /* The timer step is complete. Recheck cancellation before admission;
 +       * native failed-start rollback cancels the timer outside this lock. */
 +      mtlk_osal_lock_acquire(&obj->lock);
-+      if (obj->flags & TXMM_FLAGS_UNAVAILABLE)
++      if (obj->flags & TXMM_FLAGS_QUIESCED)
 +        __res = MTLK_ERR_NOT_READY;
 +      else
 +        WRITE_ONCE(obj->flags, obj->flags | TXMM_FLAGS_ACTIVE);
@@ -4983,40 +4047,27 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_START_RETURN(txmm, MTLK_OBJ_PTR(obj), mtlk_txmm_stop, (obj))
  }
  
-@@ -748,13 +783,20 @@
-       MTLK_ASSERT(obj->ques[i].total == obj->cfg.max_msgs);
-     }
-   }
-+
-+  /* The existing card-recovery owner has joined users and fenced/reset
-+   * firmware before rebuilding these queues. Only start reopens admission;
-+   * terminal QUIESCED is deliberately retained and still rejects start. */
-+  mtlk_osal_lock_acquire(&obj->lock);
-+  WRITE_ONCE(obj->flags, obj->flags & ~TXMM_FLAGS_PAUSED);
-+  mtlk_osal_lock_release(&obj->lock);
- }
- 
- static void _mtlk_txmm_attach_data(mtlk_txmm_t *obj, mtlk_txmm_msg_t *msg)
+@@ -754,7 +787,7 @@
  {
    mtlk_txmm_block_t* block = NULL;
  
 -  if (!(obj->base->flags & TXMM_FLAGS_ACTIVE)) {
-+  if ((obj->base->flags & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_UNAVAILABLE)) != TXMM_FLAGS_ACTIVE) {
++  if ((obj->base->flags & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_QUIESCED)) != TXMM_FLAGS_ACTIVE) {
      goto FINISH;
    }
  
-@@ -818,6 +860,10 @@
+@@ -818,6 +851,10 @@
      block->send_time = mtlk_osal_timestamp_to_ms(mtlk_osal_timestamp());
  
    mtlk_osal_lock_acquire(&obj->base->lock);
-+  if (obj->base->flags & TXMM_FLAGS_UNAVAILABLE) {
++  if (obj->base->flags & TXMM_FLAGS_QUIESCED) {
 +    mtlk_osal_lock_release(&obj->base->lock);
 +    return MTLK_ERR_NOT_READY;
 +  }
    pmsg  = obj->base->api.msg_get_from_pool(obj->base->api.usr_data); /* get message slot */
  
    if (!obj->base->ques[MTLK_TXMMB_QUEUED].total && pmsg)
-@@ -853,7 +899,8 @@
+@@ -853,7 +890,8 @@
    mtlk_vap_handle_t master_vap;
    BOOL is_pending = FALSE;
  
@@ -5026,13 +4077,13 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    res = mtlk_vap_manager_get_master_vap(mtlk_vap_get_manager(obj->vap_handle), &master_vap);
    if (res != MTLK_ERR_OK) {
-@@ -875,13 +922,18 @@
+@@ -875,13 +913,18 @@
    mtlk_rmlock_acquire(&obj->base->bsend.rmlock);
    mtlk_osal_mutex_acquire(&obj->base->bsend.mutex);
  
 -  if ((obj->base->flags & TXMM_FLAGS_ACTIVE) == 0)
 +  mtlk_osal_lock_acquire(&obj->base->lock);
-+  if ((obj->base->flags & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_UNAVAILABLE)) != TXMM_FLAGS_ACTIVE)
++  if ((obj->base->flags & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_QUIESCED)) != TXMM_FLAGS_ACTIVE)
    { /* Cleanup issued. We must release all queued by mtlk_osal_mutex_acquire() threads */
 +    mtlk_osal_lock_release(&obj->base->lock);
 +    res = MTLK_ERR_NOT_READY;
@@ -5046,7 +4097,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    res = _mtlk_txmm_send_ex(obj,
                             data,
-@@ -899,6 +951,11 @@
+@@ -899,6 +942,11 @@
    res = mtlk_osal_event_wait(&obj->base->bsend.evt, timeout_ms);
    
    _mtlk_txmm_block_history_blocked_finalize_and_commit(_mtlk_txmm_block_by_data(data), obj->base, res);
@@ -5058,7 +4109,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (res != MTLK_ERR_OK)
    {
-@@ -913,6 +970,7 @@
+@@ -913,6 +961,7 @@
    }
    else if ((obj->base->flags & TXMM_FLAGS_ACTIVE) == 0) 
    {
@@ -5066,7 +4117,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ILOG4_V("send (b): cancelled by cleanup");
      goto FINISH;
    }
-@@ -982,24 +1040,61 @@
+@@ -982,24 +1031,45 @@
  
  void __MTLK_IFUNC mtlk_txmm_stop(mtlk_txmm_base_t *obj)
  {
@@ -5101,22 +4152,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  mtlk_txmm_stop(obj);
 +}
 +
-+void __MTLK_IFUNC mtlk_txmm_pause(mtlk_txmm_base_t *obj)
-+{
-+  if (!(READ_ONCE(obj->flags) & TXMM_FLAGS_INITIALIZED))
-+    return;
-+
-+  /* A serializer may be waiting for firmware. Close both blocked and
-+   * asynchronous admission before joining it, and wake its real waiter.
-+   * Use the same lock as blocked-send admission/event reset so this wake
-+   * cannot be lost. Keep all slots/storage until the normal reset/restore. */
-+  mtlk_osal_lock_acquire(&obj->lock);
-+  WRITE_ONCE(obj->flags, (obj->flags | TXMM_FLAGS_PAUSED) & ~TXMM_FLAGS_ACTIVE);
-+  mtlk_osal_event_set(&obj->bsend.evt);
-+  mtlk_osal_lock_release(&obj->lock);
-+  mtlk_txmm_stop(obj);
-+}
-+
  void __MTLK_IFUNC mtlk_txmm_cleanup(mtlk_txmm_base_t* obj)
  {
    int i = 0;
@@ -5132,7 +4167,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      mtlk_rmlock_release(&obj->bsend.rmlock); /* Release last reference to remove lock     */
    
      ILOG2_V("Wait until all the blocked sends are done...");
-@@ -1038,12 +1133,16 @@
+@@ -1038,12 +1108,16 @@
  
  void __MTLK_IFUNC mtlk_txmm_halt(mtlk_txmm_base_t* obj)
  {
@@ -5147,7 +4182,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  BOOL __MTLK_IFUNC mtlk_txmm_is_running(mtlk_txmm_base_t* obj)
  {
 -  return (BOOL) ((obj->flags & TXMM_FLAGS_ACTIVE) == TXMM_FLAGS_ACTIVE);
-+  return (READ_ONCE(obj->flags) & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_UNAVAILABLE)) == TXMM_FLAGS_ACTIVE;
++  return (READ_ONCE(obj->flags) & (TXMM_FLAGS_ACTIVE | TXMM_FLAGS_QUIESCED)) == TXMM_FLAGS_ACTIVE;
  }
  
  MTLK_INIT_STEPS_LIST_BEGIN(txmm_msg)
@@ -5164,22 +4199,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  /*! \fn       void mtlk_txmm_cleanup(mtlk_txmm_base_t *obj)
      \brief    cleans up TXMM object.
  
-@@ -549,6 +553,10 @@
- void __MTLK_IFUNC
- mtlk_txmm_terminate_waiting_msg(mtlk_txmm_base_t *base);
- 
-+/* Restartable cancellation: join users and fence/reset firmware before
-+ * mtlk_txmm_restore() and mtlk_txmm_start(). Never clears terminal quiesce. */
-+void __MTLK_IFUNC mtlk_txmm_pause(mtlk_txmm_base_t *base);
-+
- /*! \fn       void mtlk_txmm_base_get_stats(mtlk_txmm_base_t  *base,
-                                             mtlk_txmm_stats_t *stats)
-     \brief    retrieves TXMM base object statistics
-@@ -568,4 +576,3 @@
- #include "mtlkidefs.h"
- 
- #endif /* !_MTLK_TXMM_H_ */
--
 --- a/wireless/driver/linux/core_config.c
 +++ b/wireless/driver/linux/core_config.c
 @@ -5666,7 +5666,7 @@

@@ -5,7 +5,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=wave
 PKG_VERSION:=6.0.8.87.7
-PKG_RELEASE:=9
+PKG_RELEASE:=10
 PKG_SOURCE_VERSION:=06.00.08.00.87.00.07.d24084bd3447
 WAVE_SOURCE_BASE:=lq-wave-300-$(PKG_SOURCE_VERSION)
 PKG_SOURCE:=$(WAVE_SOURCE_BASE).gpl.wls.src.tar.bz2
@@ -72,7 +72,6 @@ define Build/Prepare
 	$(TAR) -xjf $(DL_DIR)/$(WAVE_SOURCE_BASE).rflib.wls.src.tar.bz2 -C $(PKG_BUILD_DIR) --strip-components=1
 	$(Build/Patch)
 	$(CP) ./files/openwrt.env $(PKG_BUILD_DIR)/support/
-	$(CP) ./files/wave_pmf.[ch] $(PKG_BUILD_DIR)/wireless/driver/linux/
 endef
 
 CONFIGURE_PATH:=build

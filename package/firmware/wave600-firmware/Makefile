@@ -4,7 +4,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wave600-firmware
 PKG_VERSION:=06.00.08.00.87
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION).tar
 PKG_SOURCE_URL:=file://$(DL_DIR)
 PKG_SOURCE_PROTO:=wave-firmware-local
@@ -42,10 +42,7 @@ endef
 
 Build/Configure:=
 
-define Build/Compile
-	$(STAGING_DIR_HOST)/bin/python3 $(CURDIR)/src/fix-firmware.py \
-		$(PKG_BUILD_DIR)/ap_ram_gen6_wrx_600_real_phy.bin
-endef
+Build/Compile:=
 
 define Package/wave600-firmware/install
 	$(INSTALL_DIR) $(1)/lib/firmware
