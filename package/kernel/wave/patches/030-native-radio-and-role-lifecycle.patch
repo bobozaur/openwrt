@@ -5018,7 +5018,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  };
  
  /**************************************************************
-@@ -232,6 +246,12 @@
+@@ -232,6 +246,14 @@
    uint8                 last_pm_freq; /* frequency of the last loaded programming model */
    BOOL                  is_interfdet_enabled; /* Interference Detection */
    BOOL                  init_done;
@@ -5028,10 +5028,12 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  char                  radio_led_name[64];
 +  spinlock_t            radio_led_lock;
 +  bool                  radio_led_ap;
++  bool                  watchdog_started, watchdog_replied;
++  unsigned long         watchdog_started_at, watchdog_last_reply;
    BOOL                  sta_vifs_exist;
    atomic_t              sta_cnt;
    BOOL                  progmodel_loaded;
-@@ -252,6 +272,7 @@
+@@ -252,6 +274,7 @@
    g52_80_ch_tab_t       g52_80_ch_tab;
    g52_160_ch_tab_t      g52_160_ch_tab;
    uint8                 calib_done_mask[1 + NUM_TOTAL_CHANS]; /* 0th entry not used */
@@ -5039,7 +5041,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    struct _wave_radio_radar_ctx_t radar_ctx; /* Radar Detection context */
    MTLK_DECLARE_INIT_STATUS;
    MTLK_DECLARE_START_STATUS;
-@@ -275,6 +296,7 @@
+@@ -275,6 +298,7 @@
  MTLK_START_STEPS_LIST_BEGIN(wave_radio)
    MTLK_START_STEPS_LIST_ENTRY(wave_radio, WAVE_RADIO_PDB_INIT)
    MTLK_START_STEPS_LIST_ENTRY(wave_radio, WAVE_RADIO_CONTEXT_INIT)
@@ -5047,7 +5049,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_START_STEPS_LIST_ENTRY(wave_radio, WAVE_RADIO_ABMGR_INIT)
    MTLK_START_STEPS_LIST_ENTRY(wave_radio, WAVE_RADIO_ABMGR_REGISTER)
  
-@@ -322,6 +344,7 @@
+@@ -322,6 +346,7 @@
  
  static int _wave_radio_create(wave_radio_t *radio, mtlk_work_mode_e work_mode)
  {
@@ -5055,7 +5057,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_INIT_TRY(wave_radio, MTLK_OBJ_PTR(radio));
      MTLK_INIT_STEP_EX(wave_radio, WAVE_RADIO_CFG80211_CREATE, MTLK_OBJ_PTR(radio),
                        wv_cfg80211_create, (),
-@@ -428,7 +451,7 @@
+@@ -428,7 +453,7 @@
                                      ndev_name,
                                      role,
                                      true,
@@ -5064,7 +5066,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    rtnl_unlock();
    return res;
  }
-@@ -528,7 +551,34 @@
+@@ -528,7 +553,34 @@
  
  static void _wave_radio_vap_delete(wave_radio_t *radio)
  {
@@ -5099,7 +5101,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void _wave_radio_scan_cleanup(wave_radio_t *radio)
-@@ -557,18 +607,41 @@
+@@ -557,18 +609,41 @@
      /* Instructs mac80211 to free allocated resources
       *   and unregister netdevices from the networking subsystem */
      if (NULL != radio->mac80211) {
@@ -5142,7 +5144,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int _wave_radio_mac80211_init (wave_radio_t *radio, struct device *dev)
-@@ -592,6 +665,28 @@
+@@ -592,6 +667,28 @@
  {
    wave_int i;
    int res = MTLK_ERR_OK;
@@ -5171,7 +5173,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    for(i = 0; i < radio_descr->num_radios; i++) {
      res = _wave_radio_mac80211_init(&radio_descr->radio[i], dev);
-@@ -603,44 +698,548 @@
+@@ -603,44 +700,548 @@
    return res;
  }
  
@@ -5755,7 +5757,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void _wave_radio_deinit(wave_radio_t *radio)
-@@ -681,6 +1280,8 @@
+@@ -681,6 +1282,8 @@
                     _wave_radio_ab_unregister, (radio));
      MTLK_STOP_STEP(wave_radio, WAVE_RADIO_ABMGR_INIT, MTLK_OBJ_PTR(radio),
                     mtlk_abmgr_delete, (radio->abmgr));
@@ -5764,7 +5766,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_STOP_STEP(wave_radio, WAVE_RADIO_CONTEXT_INIT, MTLK_OBJ_PTR(radio),
                     MTLK_NOACTION, ());
      MTLK_STOP_STEP(wave_radio, WAVE_RADIO_PDB_INIT, MTLK_OBJ_PTR(radio),
-@@ -724,6 +1325,8 @@
+@@ -724,6 +1327,8 @@
  
      MTLK_START_STEP(wave_radio, WAVE_RADIO_CONTEXT_INIT, MTLK_OBJ_PTR(radio),
                      _wave_radio_context_init, (radio));
@@ -5773,7 +5775,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      MTLK_START_STEP_EX(wave_radio, WAVE_RADIO_ABMGR_INIT, MTLK_OBJ_PTR(radio),
                         mtlk_abmgr_create, (),
-@@ -805,7 +1408,7 @@
+@@ -805,7 +1410,7 @@
    for (i = 0; i < radio_descr->num_radios; i++) {
      res = mtlk_vap_manager_get_master_vap(radio->vap_manager, &vap_handle);
      if (res != MTLK_ERR_OK)
@@ -5782,7 +5784,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      rtnl_lock();
      res = mtlk_vap_start(vap_handle);
-@@ -816,6 +1419,7 @@
+@@ -816,6 +1421,7 @@
      else {
        _info = (mtlk_vap_info_internal_t *)vap_handle;
        ELOG_DDD("CID-%04x: Can't start VAP num=%d res=%d", mtlk_vap_get_oid(vap_handle), _info->id, res);
@@ -5790,7 +5792,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
  
      radio++;
-@@ -829,6 +1433,36 @@
+@@ -829,6 +1435,36 @@
    mtlk_df_user_rtlog_register(mtlk_vap_manager_get_wlan_index(radio_descr->radio[0].vap_manager), vap_handle);
  
    return MTLK_ERR_OK;
@@ -5827,7 +5829,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  void wave_radio_deinit_finalize(wave_radio_descr_t *radio_descr)
-@@ -856,12 +1490,29 @@
+@@ -856,12 +1492,62 @@
    wave_int i;
  
    for (i = 0; i < radio_descr->num_radios; i++) {
@@ -5854,10 +5856,43 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  return READ_ONCE(radio->control_ready);
 +}
 +
++/* Observation only: proc readers must not acquire wiphy or wait for firmware.
++ * The radio outlives its VAP proc entries, including terminal core teardown.
++ */
++void wave_radio_watchdog_start(wave_radio_t *radio)
++{
++  WRITE_ONCE(radio->watchdog_started_at, jiffies);
++  WRITE_ONCE(radio->watchdog_replied, false);
++  smp_store_release(&radio->watchdog_started, true);
++}
++
++void wave_radio_watchdog_reply(wave_radio_t *radio)
++{
++  WRITE_ONCE(radio->watchdog_last_reply, jiffies);
++  smp_store_release(&radio->watchdog_replied, true);
++}
++
++bool wave_radio_health_get(wave_radio_t *radio, uint32 *age_ms, bool *replied)
++{
++  unsigned long stamp, age;
++  bool started = smp_load_acquire(&radio->watchdog_started);
++
++  *replied = smp_load_acquire(&radio->watchdog_replied);
++  stamp = *replied ? READ_ONCE(radio->watchdog_last_reply) :
++                    READ_ONCE(radio->watchdog_started_at);
++  age = jiffies - stamp;
++  *age_ms = started ? jiffies_to_msecs(age) : 0;
++  /* Retained firmware watchdog period50s + reply timeout30s + scheduling
++   * margin20s. Startup grace is explicitly distinct from a firmware reply.
++   */
++  return started && age < 100 * HZ &&
++         smp_load_acquire(&radio->control_ready) &&
++         wave_hw_mmb_ready(radio->hw_api->hw);
++}
  
  wave_uint wave_radio_id_get (wave_radio_t *radio)
  {
-@@ -1142,7 +1793,8 @@
+@@ -1142,7 +1828,8 @@
  void *wave_radio_virtual_interface_add(
    wave_radio_t *radio,
    mtlk_mbss_cfg_t *mbss_cfg,
@@ -5867,7 +5902,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    int res = MTLK_ERR_OK;
    mtlk_clpb_t *clpb = NULL;
-@@ -1181,6 +1833,20 @@
+@@ -1181,6 +1868,20 @@
      clpb_data = mtlk_clpb_enum_get_next(clpb, NULL);
      wdev = clpb_data ? *clpb_data : ERR_PTR(-EFAULT);
      mtlk_clpb_delete(clpb);
@@ -5888,7 +5923,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
  
    return wdev;
-@@ -1209,6 +1875,8 @@
+@@ -1209,6 +1910,8 @@
    _vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
  
    mbss_cfg.vap_handle = _vap_handle;
@@ -5897,7 +5932,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (!mtlk_vap_is_master(_vap_handle)){
      if (wave_radio_get_sta_vifs_exist(radio)) {
-@@ -1226,14 +1894,25 @@
+@@ -1226,14 +1929,25 @@
      }
    }
  
@@ -5925,7 +5960,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
-@@ -1265,6 +1944,127 @@
+@@ -1265,6 +1979,127 @@
    mb->dma_addr = 0;
  }
  
@@ -6053,7 +6088,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  int wave_radio_beacon_change(
    wave_radio_t *radio,
    struct net_device *ndev,
-@@ -1272,6 +2072,7 @@
+@@ -1272,6 +2107,7 @@
  {
    int res = MTLK_ERR_OK;
    mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
@@ -6061,7 +6096,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_vap_handle_t vap_handle;
    uint8 vap_idx;
    mtlk_beacon_data_t beacon_data;
-@@ -1286,14 +2087,25 @@
+@@ -1286,14 +2122,25 @@
    vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
    vap_idx = mtlk_vap_get_id(vap_handle);
  
@@ -6090,7 +6125,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
  
-@@ -1328,77 +2140,6 @@
+@@ -1328,77 +2175,6 @@
    return __wave_radio_chandef_copy(mcd, chandef);
  }
  
@@ -6168,7 +6203,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  int wave_radio_ap_chanwidth_set(
    struct wiphy *wiphy,
    wave_radio_t *radio,
-@@ -1409,8 +2150,6 @@
+@@ -1409,8 +2185,6 @@
    mtlk_clpb_t *clpb = NULL;
    struct set_chan_param_data cpd;
    mtlk_df_t *master_df = mtlk_vap_manager_get_master_df(radio->vap_manager);
@@ -6177,7 +6212,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
    mtlk_vap_handle_t vap_handle;
  
-@@ -1418,24 +2157,6 @@
+@@ -1418,24 +2192,6 @@
    MTLK_CHECK_DF_USER(df_user);
  
    vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
@@ -6202,7 +6237,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG1_DDDDD("center_freq1=%u, nl_width=%u, chan.nlband=%u, chan.center_freq=%hu, chan.flags=0x%08x, ",
      chandef->center_freq1, chandef->width, chandef->chan->band, chandef->chan->center_freq, chandef->chan->flags);
  
-@@ -1447,8 +2168,6 @@
+@@ -1447,8 +2203,6 @@
    res = _mtlk_df_user_invoke_core(master_df, WAVE_RADIO_REQ_SET_CHAN, &clpb, &cpd, sizeof(cpd));
    res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_RADIO_REQ_SET_CHAN, TRUE);
  
@@ -6211,7 +6246,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
-@@ -1460,64 +2179,52 @@
+@@ -1460,64 +2214,52 @@
    struct cfg80211_ap_settings *info)
  {
    int res = MTLK_ERR_PARAMS;
@@ -6302,7 +6337,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* Set security */
    {
-@@ -1526,7 +2233,8 @@
+@@ -1526,7 +2268,8 @@
  
      ILOG1_D("Authentication type:0x%x", info->auth_type);
      auth_cfg.wep_enabled = 0;
@@ -6312,7 +6347,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      switch (info->auth_type) {
      case NL80211_AUTHTYPE_OPEN_SYSTEM:
-@@ -1545,25 +2253,6 @@
+@@ -1545,25 +2288,6 @@
        goto finish;
      }
  
@@ -6338,7 +6373,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ILOG1_D("Number of ciphers pairwise:%d", info->crypto.n_ciphers_pairwise);
      for (i = 0; i < info->crypto.n_ciphers_pairwise; i++) {
        ILOG1_D("ciphers pairwise:0x%x", info->crypto.ciphers_pairwise[i]);
-@@ -1603,10 +2292,22 @@
+@@ -1603,10 +2327,22 @@
  #endif
  
  finish:
@@ -6365,7 +6400,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int wave_radio_ap_stop(
-@@ -1616,7 +2317,7 @@
+@@ -1616,7 +2352,7 @@
    int res = MTLK_ERR_OK;
    mtlk_clpb_t *clpb = NULL;
    mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
@@ -6374,7 +6409,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    int scan_paused = 0;
  
    MTLK_ASSERT(NULL != radio);
-@@ -1624,13 +2325,7 @@
+@@ -1624,13 +2360,7 @@
    ILOG1_SSD("%s: Invoked from %s (%i)", ndev->name, current->comm, current->pid);
    MTLK_CHECK_DF_USER(df_user);
  
@@ -6389,7 +6424,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (wave_radio_get_sta_vifs_exist(radio)) {
      res = _wave_radio_abort_and_prevent_scan(radio);
-@@ -1645,17 +2340,24 @@
+@@ -1645,17 +2375,24 @@
        goto finish;
      }
    }
@@ -6420,7 +6455,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  /* The next bitrate tables are filled according to values from hostapd */
-@@ -1694,13 +2396,67 @@
+@@ -1694,13 +2431,67 @@
             MTLK_VHT_MCS_MAP_INVALID == vht_mcs_info->tx_mcs_map);
  }
  
@@ -6491,7 +6526,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    uint32 flags_mask, flags_set;
    mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
    mtlk_df_t *df;
-@@ -1715,7 +2471,7 @@
+@@ -1715,7 +2506,7 @@
    param_db_core = mtlk_vap_get_param_db(vap_handle);
  
    memset(info, 0, sizeof(*info));
@@ -6500,7 +6535,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (mac == NULL) {
      ELOG_S("%s: MAC address is NULL", ndev->name);
-@@ -1727,20 +2483,20 @@
+@@ -1727,20 +2518,20 @@
      return MTLK_ERR_PARAMS;
    }
  
@@ -6526,7 +6561,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
        if (band_5ghz) {
          if (wave_radio_is_rate_80211ag(bitrate)) {
-@@ -1760,88 +2516,43 @@
+@@ -1760,88 +2551,43 @@
        }
      }
  
@@ -6649,7 +6684,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (params->sta_modify_mask & STATION_PARAM_APPLY_UAPSD) {
      info->uapsd_queues = params->uapsd_queues;
-@@ -1860,9 +2571,9 @@
+@@ -1860,9 +2606,9 @@
      MTLK_BFIELD_SET(info->flags, STA_FLAGS_MFP,
                      (flags_set & BIT(NL80211_STA_FLAG_MFP) ? 1 : 0));
      /* check for PBAC bit in RSNE capabilities */
@@ -6661,7 +6696,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
    }
  
-@@ -1873,38 +2584,65 @@
+@@ -1873,38 +2619,65 @@
  
    mtlk_osal_copy_eth_addresses(info->addr.au8Addr, mac);
  
@@ -6745,7 +6780,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_BFIELD_SET(info->flags, STA_FLAGS_11ax, 1);
      MTLK_BIT_SET(info->sta_net_modes, MTLK_WSSA_11AX_SUPPORTED, 1);
    }
-@@ -1927,7 +2665,7 @@
+@@ -1927,7 +2700,7 @@
  {
    int res = MTLK_ERR_OK;
    mtlk_clpb_t *clpb = NULL;
@@ -6754,7 +6789,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_df_user_t *df_user = mtlk_df_user_from_ndev(ndev);
  
    MTLK_ASSERT(NULL != radio);
-@@ -1941,16 +2679,24 @@
+@@ -1941,16 +2714,24 @@
      goto finish;
    }
  
@@ -6783,7 +6818,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  finish:
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
-@@ -1987,7 +2733,7 @@
+@@ -1987,7 +2768,7 @@
    if (!(params->sta_flags_mask & BIT(NL80211_STA_FLAG_AUTHORIZED))){
      ILOG2_SD("%s: Only authorizing/unauthorizing is supporting, change_flags:0x%x", ndev->name, params->sta_flags_mask);
      res = MTLK_ERR_OK;
@@ -6792,7 +6827,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
  
    MTLK_CFG_SET_ITEM_BY_FUNC_VOID(&t_authorizing, sta_addr, mtlk_osal_copy_eth_addresses, (t_authorizing.sta_addr.au8Addr, mac));
-@@ -1997,6 +2743,9 @@
+@@ -1997,6 +2778,9 @@
    res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user), WAVE_CORE_REQ_AUTHORIZING_STA, &clpb, &t_authorizing, sizeof(t_authorizing));
    res = _mtlk_df_user_process_core_retval_void(res, clpb, WAVE_CORE_REQ_AUTHORIZING_STA, TRUE);
  
@@ -6802,7 +6837,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  finish:
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
-@@ -2040,6 +2789,9 @@
+@@ -2040,6 +2824,9 @@
      res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_AP_DISCONNECT_STA, TRUE);
    }
  
@@ -6812,7 +6847,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  finish:
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
-@@ -2075,7 +2827,7 @@
+@@ -2075,7 +2862,7 @@
    res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_GET_STATION, TRUE);
  
  finish:
@@ -6821,7 +6856,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int wave_radio_bss_change (
-@@ -2100,6 +2852,7 @@
+@@ -2100,6 +2887,7 @@
    df = mtlk_df_user_get_df(df_user);
  
    memset(&bp, 0, sizeof(bp));
@@ -6829,7 +6864,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    bp.vap_id = mtlk_vap_get_id(mtlk_df_get_vap_handle(df));
    bp.use_cts_prot = params->use_cts_prot;
    bp.use_short_preamble = params->use_short_preamble;
-@@ -2109,7 +2862,8 @@
+@@ -2109,7 +2897,8 @@
    bp.p2p_ctwindow = params->p2p_ctwindow;
    bp.p2p_opp_ps = params->p2p_opp_ps;
    bp.basic_rates_len = params->basic_rates_len;
@@ -6839,7 +6874,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    wave_memcpy(bp.basic_rates, sizeof(bp.basic_rates), params->basic_rates, bp.basic_rates_len);
  
    /* Keep trying in case scan is in progress for the current radio */
-@@ -2217,9 +2971,10 @@
+@@ -2217,9 +3006,10 @@
      case IEEE80211_STYPE_ACTION:
        return "ACTION";
      default:
@@ -6853,7 +6888,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  void wave_radio_mgmt_frame_register(
-@@ -2477,7 +3232,6 @@
+@@ -2477,7 +3267,6 @@
    res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user), WAVE_RADIO_REQ_STOP_SCHED_SCAN, &clpb, NULL, 0); /* synchronous, pass the ptr!!! */
    res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_RADIO_REQ_STOP_SCHED_SCAN, TRUE);
  
@@ -6861,7 +6896,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
-@@ -2490,6 +3244,11 @@
+@@ -2490,6 +3279,11 @@
    int res = MTLK_ERR_OK;
    mtlk_df_user_t *df_user;
  
@@ -6873,7 +6908,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_ASSERT(NULL != radio);
  
    df_user = mtlk_df_get_user(mtlk_vap_manager_get_master_df(radio->vap_manager));
-@@ -2498,8 +3257,6 @@
+@@ -2498,8 +3292,6 @@
    ILOG1_SSD("%s: Invoked from %s (%i)", mtlk_df_user_get_name(df_user), current->comm, current->pid);
    ILOG1_D("changed = 0x%X", changed);
  
@@ -6882,7 +6917,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* ignore WIPHY_PARAM_RETRY_SHORT because it is hardcoded in FW */
  
    if (changed & WIPHY_PARAM_RETRY_LONG) {
-@@ -2582,8 +3339,8 @@
+@@ -2582,8 +3374,8 @@
    MTLK_CHECK_DF_USER(df_user);
  
    if (key_index >= MIB_WEP_N_DEFAULT_KEYS) {
@@ -6893,7 +6928,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      goto finish;
    }
  
-@@ -2636,7 +3393,8 @@
+@@ -2636,7 +3428,8 @@
  
      case WLAN_CIPHER_SUITE_TKIP:
        /* Validate key index */
@@ -6903,7 +6938,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
          ELOG_D("Invalid TKIP key index %d", key_index);
          res = MTLK_ERR_PARAMS;
          goto finish;
-@@ -2647,7 +3405,8 @@
+@@ -2647,7 +3440,8 @@
  
      case WLAN_CIPHER_SUITE_CCMP:
        /* Validate key index */
@@ -6913,7 +6948,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
          ELOG_D("Invalid CCMP key index %d", key_index);
          res = MTLK_ERR_PARAMS;
          goto finish;
-@@ -2657,15 +3416,8 @@
+@@ -2657,15 +3451,8 @@
        break;
  
      case WLAN_CIPHER_SUITE_AES_CMAC:
@@ -6931,7 +6966,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      case WLAN_CIPHER_SUITE_GCMP:
        /* Validate platform */
-@@ -2675,7 +3427,8 @@
+@@ -2675,7 +3462,8 @@
          goto finish;
        }
        /* Validate key index */
@@ -6941,7 +6976,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
          ELOG_D("Invalid GCMP key index %d", key_index);
          res = MTLK_ERR_PARAMS;
          goto finish;
-@@ -2692,7 +3445,8 @@
+@@ -2692,7 +3480,8 @@
          goto finish;
        }
        /* Validate key index */
@@ -6951,7 +6986,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
          ELOG_D("Invalid GCMP256 key index %d", key_index);
          res = MTLK_ERR_PARAMS;
          goto finish;
-@@ -2707,7 +3461,7 @@
+@@ -2707,7 +3496,7 @@
    }
  
    /* Validate and set the key lenght */
@@ -6960,7 +6995,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      WLOG_SD("%s: Invalid key length %u", ndev->name, params->key_len);
      res = MTLK_ERR_PARAMS;
      goto finish;
-@@ -2737,6 +3491,7 @@
+@@ -2737,6 +3526,7 @@
    res = _mtlk_df_user_process_core_retval_void(res, clpb, WAVE_CORE_REQ_SET_ENCEXT_CFG, TRUE);
  
  finish:
@@ -6968,7 +7003,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
  
-@@ -2892,46 +3647,20 @@
+@@ -2892,46 +3682,20 @@
    struct net_device *ndev,
    struct ieee80211_txq_params *params)
  {
@@ -7029,7 +7064,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int wave_radio_survey_dump(
-@@ -3055,33 +3784,26 @@
+@@ -3055,33 +3819,26 @@
    struct set_chan_param_data cpd;
    mtlk_df_t *master_df;
    mtlk_core_t *core;
@@ -7064,7 +7099,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    regd_code = core_cfg_get_regd_code(core);
    switch (regd_code) {
-@@ -3092,12 +3814,8 @@
+@@ -3092,12 +3849,8 @@
      break;
    }
  
@@ -7079,7 +7114,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    ILOG1_SSD("%s: Invoked from %s (%i)", ndev->name, current->comm, current->pid);
    ILOG1_DDDDDD("center_freq1=%u, nl_width=%u, chan.nlband=%u, chan.center_freq=%hu, chan.flags=0x%08x, cac_time=%i",
-@@ -3114,29 +3832,10 @@
+@@ -3114,29 +3867,10 @@
    res = _mtlk_df_user_invoke_core(master_df, WAVE_RADIO_REQ_SET_CHAN, &clpb, &cpd, sizeof(cpd));
    res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_RADIO_REQ_SET_CHAN, TRUE);
  
@@ -7109,7 +7144,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  /* HostAPD will call this for every VAP. Every time we'll do a set_channel (type CSA) and set_beacon.
-@@ -3155,10 +3854,9 @@
+@@ -3155,10 +3889,9 @@
    mtlk_df_t *master_df;
    mtlk_scan_support_t *scan_support;
    int beacon_period;
@@ -7121,7 +7156,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_sb_dfs_params_t *sb_dfs;
  
    MTLK_ASSERT(NULL != radio);
-@@ -3178,15 +3876,8 @@
+@@ -3178,15 +3911,8 @@
    vap_handle = mtlk_df_get_vap_handle(mtlk_df_user_get_df(df_user));
    scan_support = mtlk_core_get_scan_support(mtlk_vap_get_core(vap_handle));
  
@@ -7137,7 +7172,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    memset(&cpd, 0, sizeof(cpd));
    sb_dfs = &cpd.chandef.sb_dfs;
    wave_radio_chandef_copy(&cpd.chandef, &csas->chandef);
-@@ -3195,29 +3886,32 @@
+@@ -3195,29 +3921,32 @@
    cpd.vap_id = mtlk_vap_get_id(vap_handle);
  
    if (scan_support->dfs_debug_params.beacon_count > 0) {
@@ -7181,7 +7216,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
    }
  
-@@ -3245,8 +3939,6 @@
+@@ -3245,8 +3974,6 @@
    res = _mtlk_df_user_invoke_core(master_df, WAVE_RADIO_REQ_SET_CHAN, &clpb, &cpd, sizeof(cpd));
    res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_RADIO_REQ_SET_CHAN, TRUE);
  
@@ -7190,7 +7225,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
-@@ -3362,79 +4054,16 @@
+@@ -3362,79 +4089,16 @@
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
  
@@ -7276,7 +7311,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int wave_radio_sync_done(wave_radio_t *radio, struct net_device *ndev)
-@@ -3531,38 +4160,7 @@
+@@ -3531,38 +4195,7 @@
      const void *data,
      int data_len)
  {
@@ -7316,7 +7351,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int wave_radio_send_dfs_debug_radar_required_chan(
-@@ -4026,8 +4624,8 @@
+@@ -4026,8 +4659,8 @@
      current->comm, current->pid, total_len);
    MTLK_CHECK_DF_USER(df_user);
  
@@ -7327,7 +7362,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      res = MTLK_ERR_PARAMS;
      goto end;
    }
-@@ -4243,8 +4841,13 @@
+@@ -4243,8 +4876,13 @@
  void __MTLK_IFUNC
  wave_radio_set_sta_vifs_exist(wave_radio_t *radio, BOOL sta_exists)
  {
@@ -7341,7 +7376,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  BOOL __MTLK_IFUNC
-@@ -4254,6 +4857,62 @@
+@@ -4254,6 +4892,62 @@
    return radio->sta_vifs_exist;
  }
  
@@ -7404,7 +7439,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  void wave_radio_sta_cnt_inc (wave_radio_t *radio)
  {
    MTLK_ASSERT(radio != NULL);
-@@ -4294,7 +4953,7 @@
+@@ -4294,7 +4988,7 @@
  wave_radio_mac80211_get (wave_radio_t *radio)
  {
    MTLK_ASSERT(NULL != radio);
@@ -7413,19 +7448,22 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  void __MTLK_IFUNC
-@@ -5487,4 +6146,3 @@
+@@ -5487,4 +6181,3 @@
      *size = sizeof(mtlk_wssa_info_hdr_t);
    }
  }
 -
 --- a/wireless/driver/linux/wave_radio.h
 +++ b/wireless/driver/linux/wave_radio.h
-@@ -125,12 +125,19 @@
+@@ -125,12 +125,22 @@
  }
  
  wave_radio_descr_t* wave_radio_create(wave_int radio_num, mtlk_hw_api_t *hw_api, mtlk_work_mode_e work_mode);
 +unsigned int wave_radio_master_ifindex_get(wave_radio_t *radio);
 +bool wave_radio_control_ready_get(wave_radio_t *radio);
++void wave_radio_watchdog_start(wave_radio_t *radio);
++void wave_radio_watchdog_reply(wave_radio_t *radio);
++bool wave_radio_health_get(wave_radio_t *radio, uint32 *age_ms, bool *replied);
  int wave_radio_init(wave_radio_descr_t *radio_descr, struct device *dev);
  int wave_radio_init_finalize(wave_radio_descr_t *radio_descr);
  int wave_radio_mac80211_init(wave_radio_descr_t *radio_descr, struct device *dev);
@@ -7440,7 +7478,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  void wave_radio_prepare_stop(wave_radio_descr_t *radio_descr);
  void wave_radio_mac80211_deinit(wave_radio_descr_t *radio_descr);
  
-@@ -147,13 +154,23 @@
+@@ -147,13 +157,23 @@
  int   wave_radio_vap_handle_get (wave_radio_t *radio, mtlk_vap_handle_t  *vap_handle);
  void *wave_radio_beacon_man_private_get(wave_radio_t *radio);
  
@@ -7465,7 +7503,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  int wave_radio_sta_add(wave_radio_t *radio, struct net_device *ndev, const uint8 *mac, struct station_parameters *params);
  int wave_radio_sta_change(wave_radio_t *radio, struct net_device *ndev, const uint8 *mac, struct station_parameters *params);
  int wave_radio_sta_del(wave_radio_t *radio, struct net_device *ndev, const uint8 *mac);
-@@ -257,6 +274,11 @@
+@@ -257,6 +277,11 @@
  
  void    __MTLK_IFUNC wave_radio_set_sta_vifs_exist (wave_radio_t *radio, BOOL sta_exists);
  BOOL    __MTLK_IFUNC wave_radio_get_sta_vifs_exist (wave_radio_t *radio);
@@ -7477,7 +7515,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  void    __MTLK_IFUNC wave_radio_recover_sta_vifs (wave_radio_t *radio);
  
  void wave_radio_sta_cnt_inc(wave_radio_t *radio);
-@@ -280,7 +302,6 @@
+@@ -280,7 +305,6 @@
  void wave_radio_band_set(wave_radio_t *radio, wave_int ieee_band);
  wave_int wave_radio_band_get(wave_radio_t *radio);
  uint32 _wave_radio_chandef_width_get (const struct cfg80211_chan_def *c);
@@ -7485,7 +7523,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  void wave_radio_calibration_status_get(wave_radio_t *radio, uint8 idx, uint8 *calib_done_mask, uint8 *calib_failed_mask);
  
  int __MTLK_IFUNC wave_radio_send_hdk_config(wave_radio_t *radio, uint32 offline_mask, uint32 online_mask);
-@@ -300,7 +321,25 @@
+@@ -300,7 +324,25 @@
  void __MTLK_IFUNC
  wave_radio_ant_masks_num_sts_get (wave_radio_t *radio, u32 *tx_ant_mask, u32 *rx_ant_mask, u32 *num_sts);
  
@@ -7512,7 +7550,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  void wave_radio_on_rcvry_isolate(wave_radio_t *radio);
  
  wv_cfg80211_t * __MTLK_IFUNC wave_radio_cfg80211_get(wave_radio_t *radio);
-@@ -330,4 +369,3 @@
+@@ -330,4 +372,3 @@
                            const mtlk_guid_t *evt,
                            void              *buffer,
                            uint32            *size);

@@ -371,7 +371,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        tasklet_kill(&obj->irq_tasklet[i]);
      }
    }
-@@ -1265,26 +1289,47 @@
+@@ -1265,26 +1289,48 @@
    if (obj->ihd_pending) tasklet_kill(&obj->irq_tasklets_global[0]);
  }
  
@@ -435,11 +435,12 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +   * still masked and firmware CPUs held in reset. IRQ handlers already own
 +   * the line. This preserves the retained driver's PCI/device ordering. */
 +  mtlk_hw_mmb_set_msi_intr_mode(obj->hw_api->hw, obj->irq_mode);
++  mtlk_ccr_print_irq_regs(&obj->ccr);
 +  return MTLK_ERR_OK;
  }
  
  /**
-@@ -1301,13 +1346,11 @@
+@@ -1301,13 +1347,11 @@
    }
  
    if (is_rollback) {
@@ -458,7 +459,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    MTLK_CLEANUP_BEGIN(mmb_drv, MTLK_OBJ_PTR(obj))
      MTLK_CLEANUP_STEP(mmb_drv, MMB_RCVRY_INIT_FINALIZE, MTLK_OBJ_PTR(obj),
-@@ -1334,6 +1377,8 @@
+@@ -1334,6 +1378,8 @@
                        wave_radio_deinit, (radio_descr));
      MTLK_CLEANUP_STEP(mmb_drv, MMB_CARD_START, MTLK_OBJ_PTR(obj),
                        mtlk_hw_mmb_stop_card, (obj->hw_api->hw));
@@ -467,7 +468,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #ifndef MTCFG_USE_INTERRUPT_POLLING
      MTLK_CLEANUP_STEP(mmb_drv, MMB_IRQ_START, MTLK_OBJ_PTR(obj),
                        _mmb_drv_irq_stop, (obj));
-@@ -1356,7 +1401,7 @@
+@@ -1356,7 +1402,7 @@
      MTLK_CLEANUP_STEP(mmb_drv, MMB_RADIO_NUMBER_GET, MTLK_OBJ_PTR(obj),
                        MTLK_NOACTION, ());
      MTLK_CLEANUP_STEP(mmb_drv, MMB_RCVRY_INIT, MTLK_OBJ_PTR(obj),
@@ -476,7 +477,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_CLEANUP_STEP(mmb_drv, MMB_HW_RADIO_BAND_INIT, MTLK_OBJ_PTR(obj),
                        MTLK_NOACTION, ());
      MTLK_CLEANUP_STEP(mmb_drv, MMB_EEPROM_PSDB_INIT, MTLK_OBJ_PTR(obj),
-@@ -1396,6 +1441,7 @@
+@@ -1396,6 +1442,7 @@
      obj->irq_handler_data[i] = ihd_defaults[i];
      if (_mmb_drv_is_irqno_required(obj->hw_api->hw, obj->irq_handler_data[i].irq_no)) {
        tasklet_init(&obj->irq_tasklet[i], tasklets[i], (mtlk_handle_t) &obj->irq_handler_data[i]);
@@ -484,7 +485,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
    }
  
-@@ -1520,6 +1566,8 @@
+@@ -1520,6 +1567,8 @@
      ILOG2_S("%s IRQ polling mode", DRV_NAME);
  #endif /* not MTCFG_USE_INTERRUPT_POLLING */
  
@@ -493,7 +494,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_INIT_STEP(mmb_drv, MMB_CARD_START, MTLK_OBJ_PTR(obj),
                     mtlk_hw_mmb_start_card, (hw));
  #if defined(MTCFG_G6_FPGA_IRAM_TEST)
-@@ -1598,6 +1646,9 @@
+@@ -1598,6 +1647,9 @@
      return -ENODEV;
    }
  
@@ -503,7 +504,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    obj = mtlk_fast_mem_alloc(MTLK_FM_USER_MMBDRV, sizeof(*obj));
    if (NULL == obj) {
      return -ENOMEM;
-@@ -1615,8 +1666,9 @@
+@@ -1615,8 +1667,9 @@
      return res;
    }
  
@@ -515,7 +516,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      goto _pci_probe_error;
    }
  
-@@ -1631,20 +1683,8 @@
+@@ -1631,20 +1684,8 @@
  _pci_probe_error:
    ELOG_SD("PCI %s Initialization failure (%d)", pci_name(pdev), res);
  
@@ -538,7 +539,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return res;
  }
  
-@@ -1654,7 +1694,6 @@
+@@ -1654,7 +1695,6 @@
  static void
  _pci_remove (struct pci_dev *pdev)
  {
@@ -546,7 +547,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_mmb_drv_t *obj = pci_get_drvdata(pdev);
  
    if (NULL == obj)
-@@ -1662,11 +1701,7 @@
+@@ -1662,11 +1702,7 @@
  
    ILOG2_S("PCI %s CleanUp", pci_name(pdev));
  
@@ -559,7 +560,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _mmb_drv_cleanup(obj, FALSE);
    }
  
-@@ -1675,6 +1710,30 @@
+@@ -1675,6 +1711,30 @@
    ILOG2_S("PCI %s Stop done", pci_name(pdev));
  
    ILOG2_S("PCI %s CleanUp finished", pci_name(pdev));
@@ -590,7 +591,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  #endif /* MTCFG_BUS_PCI_PCIE */
-@@ -1703,6 +1762,7 @@
+@@ -1703,6 +1763,7 @@
    .id_table = mmb_pci_tbl,
    .probe    = _pci_probe,
    .remove   = _pci_remove,
@@ -598,7 +599,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  };
  #endif /* MTCFG_BUS_PCI_PCIE */
  
-@@ -1718,6 +1778,7 @@
+@@ -1718,6 +1779,7 @@
  
  MTLK_INIT_STEPS_LIST_BEGIN(bus_drv_mod)
    MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_DFG_INIT)
@@ -606,7 +607,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_RCVRY_INIT)
  #ifdef MTCFG_PMCU_SUPPORT
    MTLK_INIT_STEPS_LIST_ENTRY(bus_drv_mod, DRV_PMCU_INIT)
-@@ -1742,6 +1803,8 @@
+@@ -1742,6 +1804,8 @@
  #endif /* MTCFG_PMCU_SUPPORT */
      MTLK_CLEANUP_STEP(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
                        wave_rcvry_cleanup, ());
@@ -615,7 +616,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_CLEANUP_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
                        mtlk_dfg_cleanup, ());
    MTLK_CLEANUP_END(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
-@@ -1761,6 +1824,9 @@
+@@ -1761,6 +1825,9 @@
    MTLK_INIT_TRY(bus_drv_mod, MTLK_OBJ_PTR(&drv_state))
      MTLK_INIT_STEP(bus_drv_mod, DRV_DFG_INIT, MTLK_OBJ_PTR(&drv_state),
                     mtlk_dfg_init, ());
@@ -625,7 +626,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_INIT_STEP_VOID(bus_drv_mod, DRV_RCVRY_INIT, MTLK_OBJ_PTR(&drv_state),
                          wave_rcvry_init, ());
  #ifdef MTCFG_PMCU_SUPPORT
-@@ -1828,4 +1894,3 @@
+@@ -1828,4 +1895,3 @@
  /* Register entry and termination pints for MMB driver */
  module_init(_init_module);
  module_exit(_exit_module);
@@ -1932,7 +1933,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        goto FINISH;
      }
  
-@@ -4060,6 +4183,10 @@
+@@ -4060,9 +4183,14 @@
  {
    MTLK_ASSERT(NULL != hw->ccr);
  
@@ -1943,7 +1944,11 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_ccr_disable_interrupts(hw->ccr, MTLK_IRQ_ALL);
    mtlk_ccr_clear_interrupts_if_pending(hw->ccr, (uint32) -1);
    mtlk_ccr_switch_to_iram_boot(hw->ccr);
-@@ -4438,13 +4565,13 @@
++  mtlk_ccr_print_irq_regs(hw->ccr);
+   hw->perform_isr_action = isr_action_init;
+   MTLK_HW_INIT_EVT_RESET(hw);
+   mtlk_ccr_enable_interrupts(hw->ccr, MTLK_IRQ_ALL);
+@@ -4438,13 +4566,13 @@
  static void _mtlk_mmb_free_hd_ring(mtlk_hw_t *hw, mtlk_ring_buffer *ring)
  {
      uint32 total_ring_size = ring->size * sizeof(HOST_DSC);
@@ -1964,7 +1969,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void
-@@ -4684,36 +4811,17 @@
+@@ -4684,36 +4812,17 @@
  
    ILOG0_DD("ring_size:%d total_ring_size:%d", ring_size, total_ring_size);
  
@@ -2011,7 +2016,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG0_DDD("Ring virtual addr:%x dma_addr:%x base_addr:%x",(uintptr_t)ring->v_base_addr, (uintptr_t)ring->dma_addr,
                                                              (uintptr_t)ring->base_addr);
  
-@@ -4879,6 +4987,7 @@
+@@ -4879,6 +4988,7 @@
  
    hw->tx.nof_free_bds = hw->tx.ring.size;
    hw->tx.max_used_bds = 0;
@@ -2019,7 +2024,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw->flags |= HW_FLAGS_PREPARED_DATA_REQ_BDR;
    return res;
  
-@@ -5001,6 +5110,11 @@
+@@ -5001,6 +5111,11 @@
                                     MTLK_DATA_TO_DEVICE);
      }
  
@@ -2031,7 +2036,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      /* Simply free the buffers without any statistic update due to with next steps
         card will be completely deleted. */
      mtlk_df_nbuf_free(data_req->nbuf);
-@@ -5080,18 +5194,20 @@
+@@ -5080,18 +5195,20 @@
        mtlk_hw_data_ind_mirror_t *data_ind =
          _mtlk_basic_bdr_get_mirror_bd(&hw->rx.bdr_data, i, mtlk_hw_data_ind_mirror_t);
  
@@ -2054,7 +2059,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
    }
  
-@@ -5103,7 +5219,7 @@
+@@ -5103,7 +5220,7 @@
  }
  
  static int
@@ -2063,7 +2068,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    uint32 i;
    mtlk_hw_data_ind_mirror_t *data_ind;
-@@ -5112,6 +5228,7 @@
+@@ -5112,6 +5229,7 @@
  
    data_ring_size = hw->chi_area.sBasic.sRdPOOL.u32NumRdsInPool;
    ares  = MTLK_ERR_OK;
@@ -2071,7 +2076,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if(!mtlk_mmb_dcdp_path_available(hw)) { /* DataPath driver allocates for FastPath */
      for (i = 0; i < data_ring_size ; i++) {
-@@ -5126,6 +5243,8 @@
+@@ -5126,6 +5244,8 @@
          /* BRD pointer hole produced here (NULL-pointer) */
           ILOG2_D("WARNING: Can't preallocate buffer of %d bytes.",
               (int)RX_DATA_FRAME_SIZE);
@@ -2080,7 +2085,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
           return MTLK_ERR_NO_MEM;
        }
      }
-@@ -5147,21 +5266,34 @@
+@@ -5147,21 +5267,34 @@
    return MTLK_ERR_OK;
  }
  
@@ -2116,7 +2121,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
        #ifdef MTCFG_WAVE_FPGA
          data_ind->dma_addr |= FPGA_DMA_ADDR_MASK;
-@@ -5176,6 +5308,10 @@
+@@ -5176,6 +5309,10 @@
    hw->flags |= HW_FLAGS_PREPARED_RX_MGMT_BUFFERS;
  
    return MTLK_ERR_OK;
@@ -2127,7 +2132,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void
-@@ -5202,6 +5338,7 @@
+@@ -5202,6 +5339,7 @@
                                bss_ind->dma_addr,
                                bss_ind->size,
                                MTLK_DATA_FROM_DEVICE);
@@ -2135,7 +2140,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
  
    hw->flags &= ~HW_FLAGS_PREPARED_RX_MGMT_BUFFERS;
-@@ -5218,6 +5355,10 @@
+@@ -5218,6 +5356,10 @@
    ILOG5_D("MSG WRITE: 0x%08x", descriptor);
  
    lock_val = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
@@ -2146,7 +2151,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    _mtlk_mmb_pas_put(hw,
                      "new BD descriptor",
                      hw->bds.req.offset + (hw->bds.req.idx * sizeof(descriptor)), /* DB Array [BD Idx] */
-@@ -5282,43 +5423,62 @@
+@@ -5282,43 +5424,62 @@
  {
    /* NOTE: mac_events_stopped must be also set here to avoid additional checks
     * in _mtlk_mmb_handle_received_msg() (hw->mac_events_stopped || hw->mac_events_stopped_completely) */
@@ -2225,7 +2230,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  #define __CCR_IO_MASK__         ((1u << 24) - 1) /* 16M - accessible from the host */
-@@ -5350,8 +5510,8 @@
+@@ -5350,8 +5511,8 @@
                                                MTLK_MEM_TAG_EXTENSION);
  
    if (hw->calibr_buffer) {
@@ -2236,7 +2241,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    else {
      WLOG_D("Can't allocate Calibration buffer of %d bytes",
-@@ -5703,6 +5863,7 @@
+@@ -5703,6 +5864,7 @@
      UMI_GET_STATISTICS_DATA *req;
      hw_mhi_stats_t          *mhi_stats;
      uint32                   dma_addr;
@@ -2244,7 +2249,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      int                      res = MTLK_ERR_UNKNOWN;
  
      /* prepare msg for the FW */
-@@ -5712,6 +5873,9 @@
+@@ -5712,6 +5874,9 @@
      }
  
      mhi_stats = &hw->hw_mhi_stats;
@@ -2254,7 +2259,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
                                            mhi_stats->db_data,
-@@ -5731,8 +5895,6 @@
+@@ -5731,8 +5896,6 @@
                                dma_addr, mhi_stats->db_size,
                                MTLK_DATA_FROM_DEVICE);
  
@@ -2263,7 +2268,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (res != MTLK_ERR_OK) {
          ELOG_DD("card_idx %d: Sending failed, err=%i", hw->card_idx, res);
      } else if (UMI_OK != req->u8status) {
-@@ -5740,18 +5902,26 @@
+@@ -5740,18 +5903,26 @@
          res = MTLK_ERR_MAC;
      }
  
@@ -2290,7 +2295,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      return res;
  }
  
-@@ -5815,6 +5985,7 @@
+@@ -5815,6 +5986,7 @@
      int                  res = MTLK_ERR_NOT_SUPPORTED;
  
      mhi_stats = &hw->hw_mhi_stats;
@@ -2298,7 +2303,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      total = mhi_stats->db_size; /* total data size */
      num   = mhi_stats->tab_size / sizeof(StatsEntryDecoded_t);
      if (mhi_stats->tab_size != (num * sizeof(StatsEntryDecoded_t))) {
-@@ -5854,12 +6025,27 @@
+@@ -5854,12 +6026,27 @@
              entry->nextIdxOffset,
              size);
  
@@ -2327,7 +2332,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
  
      /* Check for HW power table sizes and fill offset's table */
-@@ -5965,14 +6151,15 @@
+@@ -5965,8 +6152,7 @@
                                dma_addr, mhi_stats->tab_size,
                                MTLK_DATA_FROM_DEVICE);
  
@@ -2337,15 +2342,54 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (res != MTLK_ERR_OK) {
          ELOG_DD("card_idx %d: Sending failed, err=%i", hw->card_idx, res);
      } else if (UMI_OK != req->u8status) {
-         ELOG_D("Failed to retrieve MHI statistics, error %d", req->u8status);
+@@ -5974,6 +6160,8 @@
          res = MTLK_ERR_MAC;
      }
-+
-+    mtlk_txmm_msg_cleanup(&man_msg);
  
++    mtlk_txmm_msg_cleanup(&man_msg);
++
      /* without lock because it is called once during init */
      if (res == MTLK_ERR_OK) {
-@@ -6128,11 +6315,12 @@
+         ILOG0_DDPD("CID-%02x: MHI statistics table: size %d, buffer 0x%p, phys_addr 0x%08X",
+@@ -5986,6 +6174,37 @@
+     }
+ 
+     return res;
++}
++
++int __MTLK_IFUNC
++mtlk_hw_seq_write_mhi_stats_layout(mtlk_hw_t *hw, struct seq_file *s)
++{
++    const hw_mhi_stats_t *stats = &hw->hw_mhi_stats;
++    const StatsEntryDecoded_t *entry;
++    unsigned i, subtype = 0, last_type = ~0U;
++
++    /* Published only after parsing succeeds. The layout is immutable and
++     * proc removal drains readers before freeing it, so no data lock is
++     * needed. The binary data itself remains in firmware little-endian order. */
++    mtlk_aux_seq_printf(s, "data_bytes %u\nentry_count %u\nbyte_order little\n",
++                        stats->db_size, stats->tab_size);
++    mtlk_aux_seq_printf(s, "type subtype offset unit_size dimensions dim1 dim2 next_index_offset stride\n");
++    for (i = 0; i < stats->tab_size; i++) {
++        entry = &stats->table[i];
++        /* Firmware does not fill entry->subtype. The parser validates the
++         * start of each contiguous type against the firmware type table. */
++        if (entry->type != last_type) {
++            last_type = entry->type;
++            subtype = 0;
++        }
++        mtlk_aux_seq_printf(s, "%u %u %u %u %u %u %u %u %u\n",
++                            (unsigned)entry->type, subtype++, (unsigned)entry->offset,
++                            (unsigned)entry->unitSize, (unsigned)entry->numOfDimensions,
++                            (unsigned)entry->dimension1, (unsigned)entry->dimension2,
++                            (unsigned)entry->nextIdxOffset,
++                            (unsigned)(entry->nextIdxOffset ? entry->nextIdxOffset : entry->unitSize));
++    }
++    return MTLK_ERR_OK;
+ }
+ 
+ int __MTLK_IFUNC
+@@ -6128,11 +6347,12 @@
    uint8             *db_data = hw->hw_mhi_stats.db_copy;
    mhi_stats_offs_t  *offsets = hw->hw_mhi_stats.stats_sta_offs_table;
    mhi_stats_offs_t  *tx_time_offs = &hw->hw_mhi_stats.tx_time_offs;
@@ -2359,7 +2403,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* Get TX Time from MAC Statistics */
    new_tx_time_p = (void *)db_data + tx_time_offs->start_offset + (sta_sid * tx_time_offs->next_idx_offs);
-@@ -6153,8 +6341,19 @@
+@@ -6153,8 +6373,19 @@
    for (i = 0; i < STAT_STA_CNTR_TOTAL; i++) {
      db_offs = offsets[i].start_offset + (sta_sid * offsets[i].next_idx_offs);
      hw_cntr = (void *)hw->hw_mhi_stats.db_copy + db_offs;
@@ -2380,7 +2424,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
  
    delta_bytes = (values[STAT_STA_CNTR_RX_BYTES] - rx_bytes) + (values[STAT_STA_CNTR_TX_BYTES] - tx_bytes);
-@@ -6207,6 +6406,8 @@
+@@ -6207,6 +6438,8 @@
  
      mhi_stats = &hw->hw_mhi_stats;
      memset(mhi_stats, 0, sizeof(*mhi_stats));
@@ -2389,7 +2433,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      res = mtlk_osal_lock_init(&mhi_stats->lock);
      if (MTLK_ERR_OK != res) {
-@@ -6278,6 +6479,9 @@
+@@ -6278,6 +6511,9 @@
  
      /* Get Statistics Table */
      res = _mtlk_hw_mhi_get_table(hw);
@@ -2399,7 +2443,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      for (i = 0; i < hw->radio_descr->num_radios; i++) {
          res = mtlk_df_ui_mhi_stats_create(mtlk_df_get_user(mtlk_vap_manager_get_master_df(wave_radio_descr_vap_manager_get(hw->radio_descr, i))), db_size);
          if (MTLK_ERR_OK != res) {
-@@ -6462,6 +6666,10 @@
+@@ -6462,6 +6698,10 @@
  
      *size = phy_rx_status->db_size;
      mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
@@ -2410,7 +2454,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      memcpy(buff, phy_rx_status->db_data, *size);
      mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
  
-@@ -6497,6 +6705,49 @@
+@@ -6497,6 +6737,49 @@
  _mtlk_hw_is_sid_valid (mtlk_hw_t *hw, uint32 sid)
  {
      return (sid < __mtlk_hw_get_max_sid(hw));
@@ -2460,7 +2504,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static BOOL
-@@ -6660,15 +6911,19 @@
+@@ -6660,15 +6943,19 @@
      if (sta) {
        do {
          sta_sid = mtlk_sta_get_sid(sta);
@@ -2486,7 +2530,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
              mtlk_sta_update_mhi_peers_stats((sta_entry *)sta);
          }
  
-@@ -6707,6 +6962,8 @@
+@@ -6707,6 +6994,8 @@
        goto FINISH;
      }
  
@@ -2495,7 +2539,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
                                            phy_rx_status->db_data,
                                            phy_rx_status->db_size,
-@@ -6730,7 +6987,14 @@
+@@ -6730,7 +7019,14 @@
          goto FINISH;
      }
  
@@ -2510,7 +2554,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _wave_hw_phy_rx_status_update_dev_info(hw, core);
  
  FINISH:
-@@ -6913,9 +7177,75 @@
+@@ -6913,9 +7209,75 @@
  static void _mtlk_mmb_data_path_unregister(mtlk_hw_t *hw);
  static int _mtlk_mmb_data_path_uninit(mtlk_hw_t *hw, BOOL is_recovery);
  
@@ -2586,7 +2630,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_STOP_BEGIN(hw_mmb_card, MTLK_OBJ_PTR(hw))
      MTLK_STOP_STEP(hw_mmb_card, HW_FW_LOGGER, MTLK_OBJ_PTR(hw),
                     _mtlk_mmb_cleanup_fw_logger, (hw));
-@@ -6958,9 +7288,7 @@
+@@ -6958,9 +7320,7 @@
  #ifdef MTCFG_PMCU_SUPPORT
      MTLK_STOP_STEP(hw_mmb_card, HW_PMCU_INIT_CLIENT, MTLK_OBJ_PTR(hw), _mtlk_mmb_pmcu_unregister, (hw));
  #endif
@@ -2597,7 +2641,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_STOP_END(hw_mmb_card, MTLK_OBJ_PTR(hw))
  }
  
-@@ -6974,13 +7302,24 @@
+@@ -6974,13 +7334,24 @@
  
    MTLK_ASSERT(NULL != hw->ccr);
  
@@ -2623,7 +2667,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    MTLK_STOP_BEGIN(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin))
      MTLK_STOP_STEP(hw_mmb_card_fin, HW_PHY_RX_STATUS, MTLK_OBJ_PTR(&hw->hw_start_fin),
-@@ -6997,15 +7336,6 @@
+@@ -6997,15 +7368,6 @@
  #if !MTLK_DCDP_SEPARATE_REG
      MTLK_STOP_STEP(hw_mmb_card_fin, HW_DATA_PATH_REGISTER, MTLK_OBJ_PTR(&hw->hw_start_fin), _mtlk_mmb_data_path_unregister, (hw));
  #endif
@@ -2639,7 +2683,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      /* Disable Interrupts and recovery timer */
  #ifdef MTCFG_LEGACY_INT_RECOVERY_MON
-@@ -7110,6 +7440,9 @@
+@@ -7110,6 +7472,9 @@
    MTLK_ASSERT(NULL != radio_descr);
    MTLK_ASSERT(ARRAY_SIZE(hw->wss_hcntrs) == MTLK_HW_SOURCE_CNT_LAST);
  
@@ -2649,7 +2693,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw->mmb_base = mmb_pas;
  
    /* Shared RAM offset depending on platform */
-@@ -7120,7 +7453,7 @@
+@@ -7120,7 +7485,7 @@
  
    hw->radio_descr = radio_descr;
    hw->is_sync_hostapd_done = TRUE;
@@ -2658,7 +2702,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw->irq_mode = MTLK_IRQ_MODE_INVALID;
  #ifdef MTCFG_LEGACY_INT_RECOVERY_MON
    hw->need_legacy_int_recovery = FALSE;
-@@ -7889,6 +8222,9 @@
+@@ -7889,6 +8254,9 @@
  {
    MTLK_ASSERT(hw != NULL);
  
@@ -2668,7 +2712,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* Don't control on FPGA */
    if (!__hw_mmb_card_is_fpga(hw)) {
      mtlk_ccr_reset_mac(hw->ccr);
-@@ -7966,9 +8302,9 @@
+@@ -7966,9 +8334,9 @@
      MTLK_START_STEP(hw_mmb_card, HW_BSS_MGMT, MTLK_OBJ_PTR(hw),
                      _mtlk_mmb_bss_mgmt_init, (hw));
      MTLK_START_STEP(hw_mmb_card, HW_RX_DATA_BUFFERS, MTLK_OBJ_PTR(hw),
@@ -2680,7 +2724,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #if 1 /* We need to read CHI area. BufSize will be checked inside */
      MTLK_START_STEP(
-@@ -8016,7 +8352,7 @@
+@@ -8016,7 +8384,7 @@
      MTLK_START_STEP(hw_mmb_card_fin, HW_TXDM, MTLK_OBJ_PTR(&hw->hw_start_fin),
                      mtlk_txmm_start, (&hw->txdm_base));
  
@@ -2689,7 +2733,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      hw->perform_isr_action = isr_action_normal;
  
  #if !MTLK_DCDP_SEPARATE_REG
-@@ -8048,7 +8384,7 @@
+@@ -8048,7 +8416,7 @@
      MTLK_START_STEP(hw_mmb_card_fin, HW_PHY_RX_STATUS, MTLK_OBJ_PTR(&hw->hw_start_fin),
                     _hw_init_phy_rx_status, (hw));
  
@@ -2698,7 +2742,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ILOG2_V("HW layer activated");
    MTLK_START_FINALLY(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin));
    MTLK_START_RETURN(hw_mmb_card_fin, MTLK_OBJ_PTR(&hw->hw_start_fin), mtlk_hw_mmb_stop_card_finalize, (hw));
-@@ -8136,6 +8472,9 @@
+@@ -8136,6 +8504,9 @@
    void                    *iom      = _mtlk_mmb_cm_bdr_get_iom_bd(bbdr, req_obj->hdr.index, iom_size);
    uint32                  descr;
  
@@ -2708,7 +2752,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    _mtlk_mmb_dbg_verify_msg_send(req_obj);
  
    /* Must do this in order to deal with MsgID endianess */
-@@ -8164,6 +8503,8 @@
+@@ -8164,6 +8535,8 @@
    BOOL is_pending = FALSE;
    mtlk_vap_handle_t master_vap;
  
@@ -2717,7 +2761,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    WLOG_DD("CID-%02x: Resetting FW because of message timeout. Message ID is 0x%X",
            hw->card_idx, msg_id);
-@@ -8283,15 +8624,11 @@
+@@ -8283,15 +8656,11 @@
   * HW interface implementation for VFT
   **************************************************************/
  static mtlk_hw_msg_t*
@@ -2735,7 +2779,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    return HW_MSG_PTR(data_req);
  }
-@@ -8333,7 +8670,7 @@
+@@ -8333,7 +8702,7 @@
    mtlk_dump(0, hw->bss_mgmt.tx_ring.v_base_addr, hw->bss_mgmt.tx_ring.size * sizeof(HOST_DSC), "TX BSS HD ring");
  }
  
@@ -2744,7 +2788,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  _mtlk_mmb_put_hd_to_ring(mtlk_hw_t *hw, HOST_DSC *pHD, mtlk_ring_buffer *ring)
  {
    mtlk_handle_t lock_val;
-@@ -8348,21 +8685,22 @@
+@@ -8348,21 +8717,22 @@
    pHD->u32frameInfo3 = CPU_TO_LE32(u32frameInfo3);
  
    lock_val = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
@@ -2773,7 +2817,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int
-@@ -8371,6 +8709,10 @@
+@@ -8371,6 +8741,10 @@
  {
    int       res = MTLK_ERR_OK;
    HOST_DSC  tx_bd;
@@ -2784,7 +2828,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #if (defined MTLK_DEBUG_IPERF_PAYLOAD_RX) || (defined MTLK_DEBUG_IPERF_PAYLOAD_TX)
    data_req->ts           = mtlk_osal_timestamp();
-@@ -8384,6 +8726,10 @@
+@@ -8384,6 +8758,10 @@
                                      data_req->nbuf,
                                      data_req->size,
                                      MTLK_DATA_TO_DEVICE);
@@ -2795,7 +2839,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    else {
      data_req->dma_addr = 0;
-@@ -8466,7 +8812,17 @@
+@@ -8466,7 +8844,17 @@
    }
  #endif
  
@@ -2814,7 +2858,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    CPU_STAT_END_TRACK(CPU_STAT_ID_TX_HW);
    return res;
  }
-@@ -8490,6 +8846,191 @@
+@@ -8490,6 +8878,191 @@
                  DRV_VERSION, hw->if_version, hw->progmodel);
  
    mtlk_osal_lock_release(&hw->version_lock);
@@ -3006,7 +3050,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int
-@@ -8506,7 +9047,7 @@
+@@ -8506,7 +9079,7 @@
      if (size == sizeof(mtlk_hw_state_e))
      {
        mtlk_hw_state_e *val = (mtlk_hw_state_e *)buffer;
@@ -3015,7 +3059,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        res       = MTLK_ERR_OK;
        if (mtlk_hw_is_halted(hw->state)) {
          mtlk_txmm_halt(&hw->txmm_base);
-@@ -8585,105 +9126,8 @@
+@@ -8585,105 +9158,8 @@
      break;
  #endif
    case MTLK_HW_MC_GROUP_ID:
@@ -3123,7 +3167,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      break;
  
    case MTLK_HW_DATA_TXOUT_LIM:
-@@ -9008,22 +9452,6 @@
+@@ -9008,22 +9484,6 @@
        res  = MTLK_ERR_OK;
      }
      break;
@@ -3146,7 +3190,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    case MTLK_HW_FW_DATA_IN_TASKLET:
      if (size == sizeof(uint32))
      {
-@@ -9032,22 +9460,6 @@
+@@ -9032,22 +9492,6 @@
        res  = MTLK_ERR_OK;
      }
      break;
@@ -3169,7 +3213,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #endif /* MTLK_DEBUG */
  
    case MTLK_HW_CALIB_BUF_DMA_ADDR:
-@@ -9060,20 +9472,21 @@
+@@ -9060,20 +9504,21 @@
      }
      break;
    case MTLK_HW_MC_GROUP_ID:
@@ -3205,7 +3249,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
      }
      break;
-@@ -9406,7 +9819,7 @@
+@@ -9406,7 +9851,7 @@
  void __MTLK_IFUNC
  mtlk_hw_mmb_stop_mac_events (mtlk_hw_t *hw)
  {
@@ -3214,7 +3258,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  mtlk_hw_api_t * __MTLK_IFUNC
-@@ -9558,6 +9971,10 @@
+@@ -9558,6 +10003,10 @@
  
    lock = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
  
@@ -3225,7 +3269,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    irq_status = mtlk_ccr_is_interrupt_pending(hw->ccr);
    if (irq_status == 0xFFFFFFFF ) {
      /* PCIE bus stuck is detected. Do not reschedule timer */
-@@ -9620,6 +10037,7 @@
+@@ -9620,6 +10069,7 @@
  mtlk_hw_mmb_interrupt_handler_msi (mtlk_irq_handler_data *ihd)
  {
    mtlk_hw_t    *hw;
@@ -3233,7 +3277,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_ASSERT(NULL != ihd);
  
    hw = ihd->hw;
-@@ -9627,7 +10045,13 @@
+@@ -9627,7 +10077,13 @@
    MTLK_ASSERT(NULL != hw);
    MTLK_ASSERT(NULL != hw->ccr);
  
@@ -3247,7 +3291,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return MTLK_ERR_OK;
  }
  
-@@ -9645,6 +10069,11 @@
+@@ -9645,6 +10101,11 @@
    MTLK_ASSERT(NULL != hw->ccr);
  
    lock = mtlk_osal_lock_acquire_irq(&hw->reg_lock);
@@ -3259,7 +3303,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    CPU_STAT_BEGIN_TRACK(CPU_STAT_ID_ISR);
  
-@@ -9669,17 +10098,6 @@
+@@ -9669,17 +10130,6 @@
        MTLK_TRACER_ADD_ENTRY(hw, MTLK_TR_INTR_ENABLE_INT, MTLK_IRQ_ALL);
        break; /* do */
      }
@@ -3277,7 +3321,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      hw->perform_isr_action(hw, ihd);
  
-@@ -9702,7 +10120,8 @@
+@@ -9702,7 +10152,8 @@
  /* TODO: make a CPU optimization in IRQ_ENABLE_OR_RESCHEDULE (return rescheduling of tasklet) */
  #define IRQ_ENABLE_OR_RESCHEDULE(ihd){ \
      mtlk_handle_t lock_val = mtlk_osal_lock_acquire_irq(&ihd->hw->reg_lock); \
@@ -3287,7 +3331,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_TRACER_ADD_ENTRY(ihd->hw, MTLK_TR_INTR_ENABLE_INT, ihd->irq_no); \
      mtlk_osal_lock_release_irq(&ihd->hw->reg_lock, lock_val); }
  
-@@ -9937,20 +10356,24 @@
+@@ -9937,20 +10388,24 @@
    return res;
  }
  
@@ -3314,7 +3358,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* STOP */
    if (mtlk_mmb_dcdp_path_available(hw)) {
-@@ -10072,13 +10495,13 @@
+@@ -10072,13 +10527,13 @@
      return res;
    }
  
@@ -3330,7 +3374,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (res != MTLK_ERR_OK) {
      ELOG_D("MMB_Restore _mtlk_mmb_prealloc_rx_mgmt_buffers failed(%d)", res);
      return res;
-@@ -10110,7 +10533,7 @@
+@@ -10110,7 +10565,7 @@
  
    hw->mac_reset_logic_initialized = TRUE;
  
@@ -3339,7 +3383,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw->perform_isr_action = isr_action_normal;
  
  #if !MTLK_DCDP_SEPARATE_REG
-@@ -10153,10 +10576,23 @@
+@@ -10153,10 +10608,23 @@
      return res;
    }
  
@@ -3364,7 +3408,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int
-@@ -10309,6 +10745,37 @@
+@@ -10309,6 +10777,37 @@
    }
  }
  
@@ -3402,7 +3446,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static void
  mtlk_mmb_free_bss_tx_buffers(mtlk_hw_t *hw, mtlk_mmb_advanced_bdr_t *control)
  {
-@@ -10321,6 +10788,13 @@
+@@ -10321,6 +10820,13 @@
      if (!bss_req->virt_addr)
        continue;
  
@@ -3416,7 +3460,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      mtlk_osal_mem_free(bss_req->virt_addr);
      bss_req->virt_addr = NULL;
    }
-@@ -10606,7 +11080,7 @@
+@@ -10606,7 +11112,7 @@
  mtlk_hw_mmb_fill_phy_info_by_default (mtlk_phy_info_t *phy_info)
  {
      MTLK_ASSERT(NULL != phy_info);
@@ -3425,7 +3469,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void
-@@ -10744,6 +11218,76 @@
+@@ -10744,6 +11250,78 @@
      } else { /* dummy */
        _mtlk_hw_mmb_fill_phy_info_by_default(phy_info);
      }
@@ -3496,13 +3540,15 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +    mapping->virt_addr = data->nbuf->data;
 +    mapping->dma_addr = data->dma_addr;
 +    mapping->size = data->size;
++    ILOG0_DDDD("BSS EAPOL borrows data RX: descriptor=%u owner=%u delta=%u allocation=%u",
++                index, candidate, address - data->dma_addr, data->size);
 +    return true;
 +  }
 +  return false;
  }
  
  int _mtlk_mmb_handle_bss_ind (mtlk_hw_t *hw, volatile HOST_DSC *pHD)
-@@ -10761,7 +11305,10 @@
+@@ -10761,7 +11339,10 @@
    uint8                         type;
    mtlk_vap_handle_t             vap_handle;
    BOOL                          is_eapol;
@@ -3514,7 +3560,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    BOOL                          is_gen5 = _hw_type_is_gen5(hw);
    void                         *buf;
    mtlk_core_handle_rx_bss_t     data;
-@@ -10783,6 +11330,7 @@
+@@ -10783,6 +11364,7 @@
        goto critical_error;
      }
    }
@@ -3522,7 +3568,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    u32frameInfo0 = LE32_TO_CPU(pHD->u32frameInfo0);
    u32frameInfo1 = LE32_TO_CPU(pHD->u32frameInfo1);
    hostpayload   = LE32_TO_CPU(pHD->u32HostPayloadAddr);
-@@ -10812,21 +11360,42 @@
+@@ -10812,21 +11394,45 @@
      goto send_resp;
    }
  
@@ -3558,6 +3604,9 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +             lead, size, owner->size);
 +    goto critical_error;
 +  }
++  if (is_eapol && lead >= RX_MGMT_ALIGN_SIZE)
++    ILOG0_DDDD("BSS RX EAPOL mapping: index=%u lead=%u length=%u allocation=%u",
++                HD_BD_INDEX_GET(pHD), lead, size, owner->size);
 +  total_size = lead + size;
 +  if (!is_eapol) {
 +    if (is_gen5) {
@@ -3580,7 +3629,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if ((is_eapol) ||
         ((FRAME_TYPE_ETHERNET == frame_type) && type == (IEEE80211_FTYPE_DATA >> 2) && hw->bss_mgmt.rx_eapol.data_size))
-@@ -10852,7 +11421,7 @@
+@@ -10852,7 +11458,7 @@
        MTLK_ASSERT(size <= BSS_MGMT_FRAME_SIZE); /* size of frame */
        data.buf      = buf;
        data.size     = size;
@@ -3589,7 +3638,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        _mtlk_mmb_fill_phy_info_by_g6_rx_metrics(hw, phy_info, g6_rx_metrics);
      }
  
-@@ -10875,14 +11444,18 @@
+@@ -10875,14 +11481,18 @@
      }
    }
  
@@ -3610,7 +3659,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ELOG_D("CID-%02x: Critical error in bss ring", hw->card_idx);
      ELOG_DDDD("internal variables: hd_read_index %d hd_write_index %d rx_IN_copy %d OUT_cntr %d", hw->bss_mgmt.rx_ring.read_ptr, hw->bss_mgmt.rx_ring.write_ptr, hw->bss_mgmt.rx_ring.regs.IN_copy, hw->bss_mgmt.rx_ring.regs.int_OUT_cntr);
      mtlk_dump(0, (void *)pHD, sizeof(HOST_DSC), "HD in error");
-@@ -10910,6 +11483,10 @@
+@@ -10910,6 +11520,10 @@
    unsigned char *dst_addr;
    uint32 packet_length = bss_req->size;
    BOOL mcf;
@@ -3621,7 +3670,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #ifdef BD_DBG
    if (bss_req->hdr.index >= hw->bss_mgmt.tx_bdr.basic.nof_bds) {
-@@ -11025,6 +11602,10 @@
+@@ -11025,6 +11639,10 @@
    /* do not touch the data payload after dma map */
    bss_req->dma_addr = mtlk_osal_map_to_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->virt_addr,
                                                   bss_req->size, MTLK_DATA_TO_DEVICE);
@@ -3632,7 +3681,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* leave the u8Reserved, u8Status and retransmissions fields as 0 */
  
    bss_hd.u32BdIndex         = CPU_TO_LE32(bss_req->hdr.index);
-@@ -11069,7 +11650,15 @@
+@@ -11069,7 +11687,15 @@
     set_bit(bss_req->hdr.index, hw->bss_mgmt.used_bd_map);
  #endif
  
@@ -3649,7 +3698,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return MTLK_ERR_OK;
  
  #ifdef BD_DBG
-@@ -11194,6 +11783,12 @@
+@@ -11194,6 +11820,12 @@
    mtlk_core_t *cur_core;
    struct mtlk_chan_def *ccd;
    uint32 net_state;
@@ -3662,7 +3711,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    cur_core = mtlk_vap_get_core(vap_handle);
    net_state = mtlk_core_get_net_state(cur_core);
-@@ -11253,13 +11848,18 @@
+@@ -11253,13 +11885,18 @@
      }
  
      if (MAN_TYPE_ACTION == subtype) {
@@ -3682,7 +3731,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        uint8     ch_util;
        if((ie_bss) && (ie_bss->length == 5)) {
          /* update parameters */
-@@ -11281,6 +11881,10 @@
+@@ -11281,6 +11918,10 @@
    }
  
    mtlk_osal_lock_acquire(&bss_mgmt->tx_bdr.lock);
@@ -3693,7 +3742,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (!dont_wait_for_ack) {
      local_cookie = ++bss_mgmt->cookie_counter; /* at 4 billion mgmt frames per second, wraps in over 136 years */
-@@ -11336,7 +11940,15 @@
+@@ -11336,7 +11977,15 @@
    bss_req->tid              = tid;
    if (transmit_now)
    {
@@ -3710,7 +3759,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    else
    {
-@@ -11366,7 +11978,7 @@
+@@ -11366,7 +12015,7 @@
        mtlk_df_user_t *df_user = mtlk_df_get_user(df);
        struct wireless_dev *wdev = mtlk_df_user_get_wdev(df_user);
        MTLK_ASSERT(NULL != wdev);
@@ -3719,7 +3768,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
      else
      {
-@@ -11375,14 +11987,18 @@
+@@ -11375,14 +12024,18 @@
        MTLK_ASSERT(NULL != skb);
        wv_ieee80211_tx_status(mac80211_hw, skb, FALSE);
      }
@@ -3738,7 +3787,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    struct mtlk_bss_management *bss_mgmt = &hw->bss_mgmt;
    struct mtlk_hw_bss_req_mirror *bss_req, *bss_req_res;
    struct wireless_dev *wdev;
-@@ -11414,6 +12030,8 @@
+@@ -11414,6 +12067,8 @@
    ILOG3_D("BSS CFM: index=%hu", u32BdIndex);
  
    mtlk_osal_atomic_set(&bss_mgmt->tx_ring_last_cfm_ts, mtlk_osal_timestamp());
@@ -3747,7 +3796,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    bss_req = _mtlk_basic_bdr_get_mirror_bd(&bss_mgmt->tx_bdr.basic, u32BdIndex, struct mtlk_hw_bss_req_mirror);
  
  #ifdef BD_DBG
-@@ -11434,6 +12052,7 @@
+@@ -11434,6 +12089,7 @@
      goto the_trap;
    }
  #endif
@@ -3755,7 +3804,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* Confirmations can be received after VAP was traffic stopped */
    if (__UNLIKELY(_mtlk_mmb_get_vap_is_not_ready(hw, radio_id, vap_id))) {
-@@ -11458,6 +12077,7 @@
+@@ -11458,6 +12114,7 @@
    wifi_header = (frame_head_t *)bss_req->virt_addr;
  
    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->dma_addr, bss_req->size, MTLK_DATA_TO_DEVICE);
@@ -3763,7 +3812,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (PROCESS_MANAGEMENT == bss_req->extra_processing)
    {
-@@ -11468,7 +12088,7 @@
+@@ -11468,7 +12125,7 @@
          wdev = mtlk_df_user_get_wdev(df_user); /* this checks df_user */
          MTLK_ASSERT(NULL != wdev);
          cfg80211_mgmt_tx_status(wdev, bss_req->cookie, bss_req->virt_addr, bss_req->size,
@@ -3772,7 +3821,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
        else
        {
-@@ -11476,6 +12096,7 @@
+@@ -11476,6 +12133,7 @@
          ILOG2_D("handle bss mgmt cfm status = %u", status);
          MTLK_ASSERT(NULL != mac80211_hw);
          wv_ieee80211_tx_status(mac80211_hw, bss_req->skb, status);
@@ -3780,7 +3829,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
      }
    }
-@@ -11485,7 +12106,7 @@
+@@ -11485,7 +12143,7 @@
      if (mtlk_vap_is_ap(vap_handle))
      {
        cfg80211_probe_status(ndev, wifi_header->dst_addr.au8Addr, bss_req->cookie,
@@ -3789,7 +3838,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
      else
      {
-@@ -11495,6 +12116,7 @@
+@@ -11495,6 +12153,7 @@
          ILOG2_D("handle bss null data packet cfm status = %u", status);
          MTLK_ASSERT(NULL != mac80211_hw);
          wv_ieee80211_tx_status(mac80211_hw, bss_req->skb, status);
@@ -3797,7 +3846,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
      }
    }
-@@ -11522,6 +12144,8 @@
+@@ -11522,6 +12181,8 @@
      bss_req->virt_addr = bss_req_res->virt_addr;
      bss_req_res->virt_addr = tmp_ptr;
  
@@ -3806,7 +3855,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      /* copy the relevant stuff */
      bss_req->size = bss_req_res->size;
      bss_req->cookie = bss_req_res->cookie;
-@@ -11533,6 +12157,9 @@
+@@ -11533,6 +12194,9 @@
      bss_req->is_broadcast     = bss_req_res->is_broadcast;
      bss_req->dst_addr         = bss_req_res->dst_addr;
      bss_req->skb              = bss_req_res->skb;
@@ -3816,7 +3865,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      mtlk_dlist_push_back(&bss_mgmt->tx_res_bdr.free_list, entry); /* push onto reserve free list */
      ILOG3_PD("Pushed entry onto reserve free list: 0x%p, %i remaining",
-@@ -11579,6 +12206,7 @@
+@@ -11579,6 +12243,7 @@
    }
  
    /* No frames to send from reserved queue */
@@ -3824,7 +3873,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_dlist_remove(&bss_mgmt->tx_bdr.used_list, &bss_req->hdr.list_entry);
    mtlk_dlist_push_back(&bss_mgmt->tx_bdr.free_list, &bss_req->hdr.list_entry);
    mtlk_osal_lock_release(&bss_mgmt->tx_bdr.lock);
-@@ -11787,7 +12415,7 @@
+@@ -11787,7 +12452,7 @@
  }
  
  void __MTLK_IFUNC
@@ -3833,7 +3882,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    /* Save irq_mode for recovery */
    hw->irq_mode = mode;
-@@ -12237,6 +12865,9 @@
+@@ -12237,6 +12902,9 @@
  static void _mtlk_hw_debug_print_ring_regs(mtlk_ring_regs *ring_regs, const char *reg_name)
  {
      uint32 reg_OUT_status, reg_OUT_counter, reg_IN_counter;
@@ -3843,7 +3892,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      reg_OUT_status  = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_OUT_status));
      reg_OUT_counter = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_OUT_cntr));
      reg_IN_counter  = LE32_TO_CPU(mtlk_raw_readl(ring_regs->p_IN_cntr));
-@@ -12499,7 +13130,7 @@
+@@ -12499,7 +13167,7 @@
  
    wave_rcvry_mac_hang_evt_reset(hw, core_no);
  
@@ -3889,7 +3938,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  void __MTLK_IFUNC 
  mtlk_hw_mmb_stop_card(mtlk_hw_t *card);
-@@ -455,6 +483,11 @@
+@@ -455,6 +483,15 @@
  int __MTLK_IFUNC
  mtlk_hw_mhi_get_stats (mtlk_hw_t *hw);
  
@@ -3897,6 +3946,10 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +wave_hw_stats_sta_connected (mtlk_hw_t *hw, uint32 sid);
 +void __MTLK_IFUNC
 +wave_hw_stats_sta_disconnected (mtlk_hw_t *hw, uint32 sid, uint64 generation);
++
++struct seq_file;
++int __MTLK_IFUNC
++mtlk_hw_seq_write_mhi_stats_layout(mtlk_hw_t *hw, struct seq_file *s);
 +
  int __MTLK_IFUNC
  mtlk_hw_mhi_copy_stats (mtlk_hw_t *hw, uint8 *buff, uint32 *size);

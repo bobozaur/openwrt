@@ -1429,7 +1429,89 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #if MTLK_USE_DIRECTCONNECT_DP_API
    _mtlk_df_ui_print_litepath(s, df_user);
-@@ -9096,16 +9752,31 @@
+@@ -7658,6 +8314,7 @@
+ /*------ MHI_STATISTICS ------*/
+ 
+ #define PROC_MHI_STATS "mhi_stats"
++#define PROC_MHI_STATS_LAYOUT "mhi_stats_layout"
+ 
+ static int
+ _mtlk_df_ui_mhi_stats_show(mtlk_seq_entry_t *s, void *data)
+@@ -7685,15 +8342,32 @@
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+ 
++static int
++_mtlk_df_ui_mhi_stats_layout_show(mtlk_seq_entry_t *s, void *data)
++{
++  mtlk_df_t *df = mtlk_df_proc_seq_entry_get_df(s);
++  mtlk_hw_t *hw = mtlk_vap_get_hw(mtlk_df_get_vap_handle(df));
++
++  return _mtlk_df_mtlk_to_linux_error_code(mtlk_hw_seq_write_mhi_stats_layout(hw, s));
++}
++
+ static int mtlk_df_ui_reg_mhi_stats_read(mtlk_df_user_t* df_user, unsigned size)
+ {
+-  /* only for master vap */
+-  if (mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df))) {
+-    return mtlk_df_proc_node_add_seq_entry_size(PROC_MHI_STATS,
+-             df_user->slow_ctx->proc_df_node, df_user->df, _mtlk_df_ui_mhi_stats_show, size);
+-  } else {
++  int res;
++
++  if (!mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df)))
+     return MTLK_ERR_OK;
+-  }
++
++  res = mtlk_df_proc_node_add_seq_entry_size(PROC_MHI_STATS,
++          df_user->slow_ctx->proc_df_node, df_user->df, _mtlk_df_ui_mhi_stats_show, size);
++  if (res != MTLK_ERR_OK)
++    return res;
++
++  res = mtlk_df_proc_node_add_seq_entry_size(PROC_MHI_STATS_LAYOUT,
++          df_user->slow_ctx->proc_df_node, df_user->df, _mtlk_df_ui_mhi_stats_layout_show, 0);
++  if (res != MTLK_ERR_OK)
++    mtlk_df_proc_node_remove_entry(PROC_MHI_STATS, df_user->slow_ctx->proc_df_node);
++  return res;
+ }
+ 
+ static int
+@@ -7711,6 +8385,7 @@
+ {
+   /* only for master vap */
+   if (mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df))) {
++    mtlk_df_proc_node_remove_entry(PROC_MHI_STATS_LAYOUT, df_user->slow_ctx->proc_df_node);
+     mtlk_df_proc_node_remove_entry(PROC_MHI_STATS, df_user->slow_ctx->proc_df_node);
+   }
+ }
+@@ -7817,10 +8492,26 @@
+     mtlk_df_proc_entry_write_f    write_func;
+ };
+ 
++static int
++_mtlk_df_radio_health(mtlk_seq_entry_t *s, void *data)
++{
++  mtlk_df_t *df = mtlk_df_proc_seq_entry_get_df(s);
++  wave_radio_t *radio = wave_vap_radio_get(mtlk_df_get_vap_handle(df));
++  uint32 age_ms;
++  bool replied, healthy;
++
++  MTLK_UNREFERENCED_PARAM(data);
++  healthy = wave_radio_health_get(radio, &age_ms, &replied);
++  mtlk_aux_seq_printf(s, "healthy=%u replied=%u age_ms=%u\n",
++                      healthy, replied, age_ms);
++  return 0;
++}
++
+ static const struct _proc_file_info _proc_files_list[] =
+ { /* WriteOnly */
+   { "do_debug_assert",  _NODBG_,  NULL, mtlk_df_do_debug_assert_write   },
+   /* SEQ */
++  { "radio_health",     _NODBG_,  _mtlk_df_radio_health         },
+ #ifdef EEPROM_DATA_ACCESS
+   { "eeprom",           _NODBG_,  _mtlk_df_ui_eeprom            },
+ #endif /* EEPROM_DATA_ACCESS */
+@@ -9096,16 +9787,31 @@
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
  
@@ -1469,7 +1551,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static void
-@@ -9113,15 +9784,10 @@
+@@ -9113,15 +9819,10 @@
  {
    int i;
  
@@ -1488,7 +1570,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  
      for (i = 0; MTLK_CLEANUP_ITERATONS_LEFT(MTLK_OBJ_PTR(df_user), PROC_INIT) > 0; i++)
-@@ -9141,8 +9807,6 @@
+@@ -9141,8 +9842,6 @@
                        MTLK_NOACTION, ());
  #endif
  
@@ -1497,7 +1579,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      MTLK_CLEANUP_STEP(df_user, STAT_TIMER, MTLK_OBJ_PTR(df_user),
                        mtlk_osal_timer_cleanup, (&df_user->slow_ctx->stat_timer));
-@@ -9150,6 +9814,8 @@
+@@ -9150,6 +9849,8 @@
                        _mtlk_df_ui_delete_debug_dir, (df_user));
      MTLK_CLEANUP_STEP(df_user, CREATE_CARD_DIR, MTLK_OBJ_PTR(df_user),
                        _mtlk_df_ui_delete_card_dir, (df_user));
@@ -1506,7 +1588,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_CLEANUP_STEP(df_user, NETDEV_INIT, MTLK_OBJ_PTR(df_user),
                        MTLK_NOACTION, ());
      MTLK_CLEANUP_STEP(df_user, DEBUG_BCL, MTLK_OBJ_PTR(df_user),
-@@ -9189,7 +9855,7 @@
+@@ -9189,7 +9890,7 @@
   *      - this function calls func_destructor(dev),
   *        then calls default destructor free_netdev(dev)
   */
@@ -1515,7 +1597,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    mtlk_df_user_p *df_user_pp;
    mtlk_df_user_t *df_user;
-@@ -9248,6 +9914,7 @@
+@@ -9248,6 +9949,7 @@
  
    /* link network device with wireless device */
    df_user->ndev->ieee80211_ptr = &df_user->wdev;
@@ -1523,7 +1605,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* initialize wireless device */
    df_user->wdev.wiphy = (struct wiphy *)ctx;
-@@ -9264,11 +9931,10 @@
+@@ -9264,11 +9966,10 @@
    _mtlk_df_user_fill_callbacks(df_user);
  
    /* setup destructor */
@@ -1539,7 +1621,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* Configure core and radio iwpriv handlers */
    if(mtlk_vap_is_master_ap(vap_handle)) {
        df_user->ndev->wireless_handlers = (struct iw_handler_def *)&wave_linux_iw_radio_handler_def;
-@@ -9276,125 +9942,206 @@
+@@ -9276,125 +9977,206 @@
        wave_linux_iw_core_handler_def.num_private_args = wave_df_get_core_privtab_size();
        df_user->ndev->wireless_handlers = (struct iw_handler_def *)&wave_linux_iw_core_handler_def;
    }
@@ -1856,7 +1938,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int
-@@ -9419,20 +10166,19 @@
+@@ -9419,20 +10201,19 @@
      MTLK_INIT_STEP(df_user, NETDEV_INIT, MTLK_OBJ_PTR(df_user),
                     _mtlk_df_user_netdev_init, (df_user, ctx, name));
  
@@ -1881,7 +1963,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #if MTLK_USE_PUMA6_UDMA
      MTLK_INIT_STEP_VOID(df_user, UDMA_INIT, MTLK_OBJ_PTR(df_user),
                     _mtlk_df_user_udma_init, (df_user));
-@@ -9450,14 +10196,8 @@
+@@ -9450,14 +10231,8 @@
      }
  
  
@@ -1898,7 +1980,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_INIT_FINALLY(df_user, MTLK_OBJ_PTR(df_user))
    MTLK_INIT_RETURN(df_user, MTLK_OBJ_PTR(df_user), _mtlk_df_user_cleanup, (df_user))
  }
-@@ -9476,6 +10216,15 @@
+@@ -9476,6 +10251,15 @@
      return NULL;
    }
    memset (df_user, 0, sizeof(mtlk_df_user_t));
@@ -1914,7 +1996,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* Create net_device for cfg80211 AP role VAP.
     * Use mac80211 allocated ndev for station role virtual interface*/
-@@ -9499,6 +10248,7 @@
+@@ -9499,6 +10283,7 @@
  
    /* link DF User with Linux network device */
    df_user->ndev = ndev;
@@ -1922,7 +2004,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (MTLK_ERR_OK != _mtlk_df_user_init(df_user, ctx, name)) {
      if (is_ap) {
-@@ -9518,6 +10268,15 @@
+@@ -9518,6 +10303,15 @@
    bool is_ap = mtlk_vap_is_ap(mtlk_df_get_vap_handle(df_user->df));
  
    _mtlk_df_user_cleanup(df_user);
@@ -1938,7 +2020,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (is_ap){
      if (ndev) {
        df_user->destructor_flags |= WAVE_DESTRUCT_DFUSER_DELETE_CALLED;
-@@ -10616,6 +11375,11 @@
+@@ -10616,6 +11410,11 @@
    mtlk_core_ui_mc_update_sta_db_t req;
    size_t                     mac_list_size;
  
