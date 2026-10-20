@@ -12,6 +12,10 @@ touch /etc/config/ubootenv
 board=$(board_name)
 
 case "$board" in
+tplink,archer-ax50-v1)
+	ubootenv_add_mtd "ubootconfigA" "0x0" "0x4000" "0x20000" "2"
+	ubootenv_add_mtd "ubootconfigB" "0x0" "0x4000" "0x20000" "2"
+	;;
 bt,homehub-v2b|\
 siemens,gigaset-sx76x)
 	ubootenv_add_uci_config "/dev/mtd1" "0x0" "0x10000" "0x10000" "1"

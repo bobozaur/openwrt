@@ -1,0 +1,22 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] dt-bindings: leds: describe WAVE physical radio triggers
+
+
+WAVE names radio-activity triggers by the physical PCI device and hardware
+radio ID so device recreation does not change the board binding. Describe the
+matching default-trigger form used by the Archer AX50 device tree.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/Documentation/devicetree/bindings/leds/common.yaml
++++ b/Documentation/devicetree/bindings/leds/common.yaml
+@@ -136,6 +136,8 @@
+       - pattern: "^mmc[0-9]+$"
+         # LED is triggered by WLAN activity
+       - pattern: "^phy[0-9]+tx$"
++        # WAVE physical radio activity, named by device and hardware radio ID
++      - pattern: "^wave-.+-[0-9]+-radio$"
+ 
+   led-pattern:
+     description: |
