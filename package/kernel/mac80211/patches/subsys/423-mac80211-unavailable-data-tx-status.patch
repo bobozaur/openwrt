@@ -1,0 +1,220 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] mac80211: distinguish unavailable data TX status from management ACKs
+
+Some drivers provide real management and NULL-frame TX status while a
+firmware-owned data path has no per-packet completion status. Keep that
+management feedback available to MLME without presenting its retry and
+failure counters as complete data statistics.
+
+Add an explicit hardware contract that suppresses only missing retry and
+failure defaults. Driver-supplied station/link/TID statistics remain valid;
+other drivers retain their existing defaults. Do not carry management-only
+removed-link retry/failure counters into an aggregate data total.
+
+Apply after the driver-counter removal snapshot changes. Preserve filled
+station, link and per-TID values when a link is removed; suppress only the
+software retry/failure fallback for hardware without DATA TX status. Keep
+accumulated values available to native station teardown reporting.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -2888,6 +2888,13 @@
+  *	Hardware can provide ack status reports of Tx frames to
+  *	the stack.
+  *
++ * @IEEE80211_HW_NO_DATA_TX_STATUS:
++ *	The driver does not provide complete TX status for data payload frames.
++ *	Management and NULL-frame ACK status may still be reported with
++ *	%IEEE80211_HW_REPORTS_TX_ACK_STATUS. Do not use mac80211 retry/failure
++ *	counters as complete station or per-TID totals in this case. The driver
++ *	may provide authoritative totals through the statistics callbacks.
++ *
+  * @IEEE80211_HW_CONNECTION_MONITOR:
+  *	The hardware performs its own connection monitoring, including
+  *	periodic keep-alives to the AP and probing the AP on beacon loss.
+@@ -3143,6 +3150,7 @@
+ 	IEEE80211_HW_STRICT,
+ 	IEEE80211_HW_SUPPORTS_NDP_BLOCKACK,
+ 	IEEE80211_HW_KEY_REPLACE_IN_PLACE,
++	IEEE80211_HW_NO_DATA_TX_STATUS,
+ 
+ 	/* keep last, obviously */
+ 	NUM_IEEE80211_HW_FLAGS
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -443,6 +443,7 @@
+ 	FLAG(SW_CRYPTO_CONTROL),
+ 	FLAG(SUPPORT_FAST_XMIT),
+ 	FLAG(REPORTS_TX_ACK_STATUS),
++	FLAG(NO_DATA_TX_STATUS),
+ 	FLAG(CONNECTION_MONITOR),
+ 	FLAG(QUEUE_CONTROL),
+ 	FLAG(SUPPORTS_PER_STA_GTK),
+--- a/net/mac80211/sta_info.c
++++ b/net/mac80211/sta_info.c
+@@ -409,12 +409,17 @@
+ 		sta_link_drv_filled(drv, BIT_ULL(NL80211_STA_INFO_RX_PACKETS)) ?
+ 		drv->rx_packets : link_sta->rx_stats.packets;
+ 	sta->rem_link_stats.rx_bytes += value;
+-	sta->rem_link_stats.tx_retries +=
+-		sta_link_drv_filled(drv, BIT_ULL(NL80211_STA_INFO_TX_RETRIES)) ?
+-		drv->tx_retries : link_sta->status_stats.retry_count;
+-	sta->rem_link_stats.tx_failed +=
+-		sta_link_drv_filled(drv, BIT_ULL(NL80211_STA_INFO_TX_FAILED)) ?
+-		drv->tx_failed : link_sta->status_stats.retry_failed;
++	/* Driver counters remain authoritative when DATA status is unavailable. */
++	if (sta_link_drv_filled(drv, BIT_ULL(NL80211_STA_INFO_TX_RETRIES))) {
++		sta->rem_link_stats.tx_retries += drv->tx_retries;
++		sta->rem_link_stats.filled |= BIT_ULL(NL80211_STA_INFO_TX_RETRIES);
++	} else if (!ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS))
++		sta->rem_link_stats.tx_retries += link_sta->status_stats.retry_count;
++	if (sta_link_drv_filled(drv, BIT_ULL(NL80211_STA_INFO_TX_FAILED))) {
++		sta->rem_link_stats.tx_failed += drv->tx_failed;
++		sta->rem_link_stats.filled |= BIT_ULL(NL80211_STA_INFO_TX_FAILED);
++	} else if (!ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS))
++		sta->rem_link_stats.tx_failed += link_sta->status_stats.retry_failed;
+ 	sta->rem_link_stats.rx_dropped_misc += link_sta->rx_stats.dropped;
+ 
+ 	thr = sta_get_expected_throughput(sta);
+@@ -422,6 +427,9 @@
+ 		sta->rem_link_stats.expected_throughput += thr;
+ 
+ 	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++) {
++		const struct cfg80211_tid_stats *tidstats =
++			drv && drv->pertid ? &drv->pertid[tid] : NULL;
++
+ 		do {
+ 			start = u64_stats_fetch_begin(&link_sta->rx_stats.syncp);
+ 			value = u64_stats_read(&link_sta->rx_stats.msdu[tid]);
+@@ -431,10 +439,24 @@
+ 		sta->rem_link_stats.pertid_stats.rx_msdu += value;
+ 		sta->rem_link_stats.pertid_stats.tx_msdu +=
+ 			link_sta->tx_stats.msdu[tid];
+-		sta->rem_link_stats.pertid_stats.tx_msdu_retries +=
+-			link_sta->status_stats.msdu_retries[tid];
+-		sta->rem_link_stats.pertid_stats.tx_msdu_failed +=
+-			link_sta->status_stats.msdu_failed[tid];
++		if (ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS) &&
++		    tidstats && (tidstats->filled & BIT(NL80211_TID_STATS_TX_MSDU_RETRIES))) {
++			sta->rem_link_stats.pertid_stats.tx_msdu_retries +=
++				tidstats->tx_msdu_retries;
++			sta->rem_link_stats.pertid_stats.filled |=
++				BIT(NL80211_TID_STATS_TX_MSDU_RETRIES);
++		} else if (!ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS))
++			sta->rem_link_stats.pertid_stats.tx_msdu_retries +=
++				link_sta->status_stats.msdu_retries[tid];
++		if (ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS) &&
++		    tidstats && (tidstats->filled & BIT(NL80211_TID_STATS_TX_MSDU_FAILED))) {
++			sta->rem_link_stats.pertid_stats.tx_msdu_failed +=
++				tidstats->tx_msdu_failed;
++			sta->rem_link_stats.pertid_stats.filled |=
++				BIT(NL80211_TID_STATS_TX_MSDU_FAILED);
++		} else if (!ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS))
++			sta->rem_link_stats.pertid_stats.tx_msdu_failed +=
++				link_sta->status_stats.msdu_failed[tid];
+ 	}
+ 
+ 	if (sta->sdata->vif.type == NL80211_IFTYPE_STATION) {
+@@ -2770,14 +2792,16 @@
+ 	}
+ 
+ 	if (!(tidstats->filled & BIT(NL80211_TID_STATS_TX_MSDU_RETRIES)) &&
+-	    ieee80211_hw_check(&local->hw, REPORTS_TX_ACK_STATUS)) {
++	    ieee80211_hw_check(&local->hw, REPORTS_TX_ACK_STATUS) &&
++	    !ieee80211_hw_check(&local->hw, NO_DATA_TX_STATUS)) {
+ 		tidstats->filled |= BIT(NL80211_TID_STATS_TX_MSDU_RETRIES);
+ 		tidstats->tx_msdu_retries =
+ 			link_sta_info->status_stats.msdu_retries[tid];
+ 	}
+ 
+ 	if (!(tidstats->filled & BIT(NL80211_TID_STATS_TX_MSDU_FAILED)) &&
+-	    ieee80211_hw_check(&local->hw, REPORTS_TX_ACK_STATUS)) {
++	    ieee80211_hw_check(&local->hw, REPORTS_TX_ACK_STATUS) &&
++	    !ieee80211_hw_check(&local->hw, NO_DATA_TX_STATUS)) {
+ 		tidstats->filled |= BIT(NL80211_TID_STATS_TX_MSDU_FAILED);
+ 		tidstats->tx_msdu_failed =
+ 			link_sta_info->status_stats.msdu_failed[tid];
+@@ -2850,11 +2874,15 @@
+ 	sinfo->rx_bytes = sta->rem_link_stats.rx_bytes;
+ 	sinfo->tx_retries = sta->rem_link_stats.tx_retries;
+ 	sinfo->tx_failed = sta->rem_link_stats.tx_failed;
++	if (ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS))
++		sinfo->filled |= sta->rem_link_stats.filled;
+ 	sinfo->rx_dropped_misc = sta->rem_link_stats.rx_dropped_misc;
+ 	sinfo->beacon_loss_count = sta->rem_link_stats.beacon_loss_count;
+ 	sinfo->expected_throughput = sta->rem_link_stats.expected_throughput;
+ 
+ 	if (sinfo->pertid) {
++		if (ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS))
++			sinfo->pertid->filled |= sta->rem_link_stats.pertid_stats.filled;
+ 		sinfo->pertid->rx_msdu =
+ 			sta->rem_link_stats.pertid_stats.rx_msdu;
+ 		sinfo->pertid->tx_msdu =
+@@ -2968,13 +2996,15 @@
+ 		link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
+ 	}
+ 
+-	if (!(link_sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_RETRIES))) {
++	if (!(link_sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_RETRIES)) &&
++	    !ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS)) {
+ 		link_sinfo->tx_retries =
+ 			link_sta_info->status_stats.retry_count;
+ 		link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_RETRIES);
+ 	}
+ 
+-	if (!(link_sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_FAILED))) {
++	if (!(link_sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_FAILED)) &&
++	    !ieee80211_hw_check(&sta->local->hw, NO_DATA_TX_STATUS)) {
+ 		link_sinfo->tx_failed =
+ 			link_sta_info->status_stats.retry_failed;
+ 		link_sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_FAILED);
+@@ -3231,12 +3261,14 @@
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_RX_PACKETS);
+ 	}
+ 
+-	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_RETRIES))) {
++	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_RETRIES)) &&
++	    !ieee80211_hw_check(&local->hw, NO_DATA_TX_STATUS)) {
+ 		sinfo->tx_retries = sta->deflink.status_stats.retry_count;
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_RETRIES);
+ 	}
+ 
+-	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_FAILED))) {
++	if (!(sinfo->filled & BIT_ULL(NL80211_STA_INFO_TX_FAILED)) &&
++	    !ieee80211_hw_check(&local->hw, NO_DATA_TX_STATUS)) {
+ 		sinfo->tx_failed = sta->deflink.status_stats.retry_failed;
+ 		sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_FAILED);
+ 	}
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -604,6 +604,10 @@
+  *	from this station for removed links.
+  * @expected_throughput: expected throughput in kbps (including 802.11
+  *	headers) towards this station for removed links
++ * @filled: retry/failure fields supplied by the driver, using
++ *	&enum nl80211_sta_info bits; used when software DATA status is unavailable
++ * @pertid_stats.filled: driver-supplied retry/failure fields, using
++ *	&enum nl80211_tid_stats bits, when software DATA status is unavailable
+  * @pertid_stats: accumulated per-TID statistics for removed link of
+  *	station
+  * @pertid_stats.rx_msdu : accumulated number of received MSDUs towards
+@@ -617,6 +621,7 @@
+  *	MSDUs towards this station for removed links
+  */
+ struct ieee80211_sta_removed_link_stats {
++	u64 filled;
+ 	u32 rx_packets;
+ 	u32 tx_packets;
+ 	u64 rx_bytes;
+@@ -627,6 +632,7 @@
+ 	u32 beacon_loss_count;
+ 	u32 expected_throughput;
+ 	struct {
++		u32 filled;
+ 		u64 rx_msdu;
+ 		u64 tx_msdu;
+ 		u64 tx_msdu_retries;
