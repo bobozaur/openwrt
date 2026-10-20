@@ -223,6 +223,7 @@ proto_ppp_teardown() {
 
 proto_pppoe_init_config() {
 	ppp_generic_init_config
+	no_device_mtu=1
 	proto_config_add_string "ac"
 	proto_config_add_string "service"
 	proto_config_add_string "ac_mac"
