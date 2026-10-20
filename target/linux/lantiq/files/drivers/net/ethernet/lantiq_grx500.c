@@ -29,6 +29,7 @@
 #include <linux/reset.h>
 #include <linux/workqueue.h>
 #include "lantiq_grx500_pce.h"
+#include "lantiq_grx500_flow.h"
 
 #define RX_COUNT	32
 #define TX_COUNT	8
@@ -37,8 +38,6 @@
 #define PMAC_SIZE	8
 #define P2P_CHANNEL	1
 #define PAE_SESSIONS	4096
-#define PAE_RETURN_PORT	7
-#define PAE_RETURN_MARK	0xa
 #define R_INTERNAL_VID	4095
 #define R_ACTIVE_PORTS	(BIT(0) | GENMASK(5, 2) | BIT(15))
 #define FW_SIZE		SZ_64K
@@ -231,6 +230,7 @@ struct grx500_eth_board {
 	struct net_device *netdev[2];
 	struct reset_control *phy_resets;
 	struct grx500_switch_pdata switch_data;
+	struct grx500_flow *flow;
 	void *firmware;
 	dma_addr_t firmware_dma;
 	/* One allocation, owned by both P2P endpoints until both stop. CPU code
@@ -878,6 +878,8 @@ static void grx500_wan_get_strings(struct net_device *netdev, u32 stringset,
 		ethtool_puts(&data, grx500_wan_rmon_counters[i].name);
 	ethtool_puts(&data, "rmon_read_failures");
 	ethtool_puts(&data, "rmon_last_read_ok");
+	for (i = 0; i < GRX500_FLOW_STATS_COUNT; i++)
+		ethtool_puts(&data, grx500_flow_stats_names[i]);
 	for (i = 0; i < ARRAY_SIZE(grx500_cpu_rmon_counters); i++)
 		ethtool_puts(&data, grx500_cpu_rmon_counters[i].name);
 	ethtool_puts(&data, "cpu_port_rmon_read_failures");
@@ -889,7 +891,7 @@ static int grx500_wan_get_sset_count(struct net_device *netdev, int sset)
 {
 	if (sset != ETH_SS_STATS)
 		return -EOPNOTSUPP;
-	return ARRAY_SIZE(grx500_wan_rmon_counters) + 2 +
+	return ARRAY_SIZE(grx500_wan_rmon_counters) + 2 + GRX500_FLOW_STATS_COUNT +
 		ARRAY_SIZE(grx500_cpu_rmon_counters) + 3;
 }
 
@@ -972,8 +974,10 @@ static void grx500_wan_get_ethtool_stats(struct net_device *netdev,
 	data[ARRAY_SIZE(grx500_wan_rmon_counters)] = stats->read_failures;
 	data[ARRAY_SIZE(grx500_wan_rmon_counters) + 1] = !ret;
 	mutex_unlock(&eth->bm_lock);
+	grx500_flow_get_stats(eth->board->flow,
+			      data + ARRAY_SIZE(grx500_wan_rmon_counters) + 2);
 	grx500_cpu_get_rmon_stats(eth,
-		data + ARRAY_SIZE(grx500_wan_rmon_counters) + 2);
+		data + ARRAY_SIZE(grx500_wan_rmon_counters) + 2 + GRX500_FLOW_STATS_COUNT);
 }
 
 static const struct ethtool_ops grx500_wan_ethtool_ops = {
@@ -1094,70 +1098,21 @@ out:
 	return ret;
 }
 
-static int grx500_backpressure_map(void __iomem *gsw, unsigned int channel,
-				   u32 ports, u32 queues)
-{
-	u32 values[] = { ports, queues & 0xffff, queues >> 16 };
-	unsigned int i;
-	int ret;
-
-	ret = grx500_table_idle(gsw, PMAC_TABLE_CTRL);
-	if (ret)
-		return ret;
-	grx500_writel(gsw, PMAC_TABLE_ADDR, channel);
-	for (i = 0; i < ARRAY_SIZE(values); i++)
-		grx500_writel(gsw, PMAC_TABLE_VAL(i), values[i]);
-	grx500_writel(gsw, PMAC_TABLE_CTRL, TABLE_BUSY | TABLE_WRITE);
-	ret = grx500_table_idle(gsw, PMAC_TABLE_CTRL);
-	if (ret)
-		return ret;
-	grx500_writel(gsw, PMAC_TABLE_ADDR, channel);
-	grx500_writel(gsw, PMAC_TABLE_CTRL, TABLE_BUSY);
-	ret = grx500_table_idle(gsw, PMAC_TABLE_CTRL);
-	if (ret)
-		return ret;
-	for (i = 0; i < ARRAY_SIZE(values); i++)
-		if ((__raw_readl(gsw + PMAC_TABLE_VAL(i)) & 0xffff) != values[i])
-			return -EIO;
-	return 0;
-}
-
-/* Probe exclusively owns GSW-R PCE/PMAC staging until board->ready. Couple
- * backpressure to the CPU and WAN queues before either transmitter can start.
- * BM reads still share their lock with ethtool on the registered WAN netdev.
+/* Source-defined PMAC congestion masks couple only the R CPU/P2P injectors.
+ * This runs before board->ready and before any channel can be opened. Flow,
+ * BM and publication domains are acquired separately, never nested.
  */
 static int grx500_backpressure_init(struct grx500_eth_board *board)
 {
-	static const unsigned int ports[] = { 0, 15 };
+	static const unsigned int ports[] = { 0, 7, 15 };
 	struct grx500_eth *wan = netdev_priv(board->netdev[1]);
-	void __iomem *gsw = board->gsw[1];
-	u32 queues[ARRAY_SIZE(ports)] = {}, value;
-	unsigned int p, bypass, tc, queue, count, owner, redirect;
+	u32 queues[3], value;
+	unsigned int p, queue, owner, redirect;
 	int ret;
 
-	count = (__raw_readl(gsw + 0x007 * 4) >> 8) & 0x7f;
-	for (p = 0; p < ARRAY_SIZE(ports); p++) {
-		for (bypass = 0; bypass < 2; bypass++) {
-			for (tc = 0; tc < 16; tc++) {
-				ret = grx500_table_idle(gsw, PCE_TABLE_CTRL);
-				if (!ret)
-					ret = grx500_table_idle(gsw, PAE_TABLE_CTRL);
-				if (ret)
-					return ret;
-				grx500_writel(gsw, PCE_TABLE_ADDR,
-					      ports[p] << 4 | tc | bypass << 8);
-				grx500_writel(gsw, PCE_TABLE_CTRL, TABLE_BUSY | 0x11);
-				ret = grx500_table_idle(gsw, PCE_TABLE_CTRL);
-				if (ret)
-					return ret;
-				queue = __raw_readl(gsw + PCE_TABLE_VAL(0)) & 0x3f;
-				grx500_writel(gsw, PCE_TABLE_CTRL, 0);
-				if (queue >= count || queue >= 32)
-					return -ERANGE;
-				queues[p] |= BIT(queue);
-			}
-		}
-	}
+	ret = grx500_flow_bp_queues(board->flow, board->gsw[1], queues);
+	if (ret)
+		return ret;
 	mutex_lock(&wan->bm_lock);
 	for (p = 0; p < ARRAY_SIZE(ports); p++) {
 		for (queue = 0; queue < 32; queue++) {
@@ -1176,12 +1131,8 @@ static int grx500_backpressure_init(struct grx500_eth_board *board)
 	}
 out:
 	mutex_unlock(&wan->bm_lock);
-	if (ret)
-		return ret;
-	ret = grx500_backpressure_map(gsw, 0, BIT(0), queues[1]);
 	if (!ret)
-		ret = grx500_backpressure_map(gsw, 1, GENMASK(5, 2),
-					     queues[0] | queues[1]);
+		ret = grx500_flow_bp_publish(board->flow, board->gsw[1], queues);
 	return ret;
 }
 
@@ -1393,15 +1344,16 @@ static int grx500_receive(struct grx500_eth *eth, int budget)
 		valid = (status & (DESC_SOP | DESC_EOP)) == (DESC_SOP | DESC_EOP) &&
 			length >= ETH_HLEN + PMAC_SIZE && length <= MAX_FRAME &&
 			length + offset <= BUF_SIZE;
-		if (valid && eth->wan) {
-			u32 dw1 = be32_to_cpu(READ_ONCE(desc->dw1));
-
-			/* An inherited PAE return may already be translated. Never
-			 * feed it through ordinary IP receive a second time.
+		if (valid && eth->wan &&
+		    grx500_flow_receive(eth->board->flow, &eth->napi,
+			be32_to_cpu(READ_ONCE(desc->dw0)),
+			be32_to_cpu(READ_ONCE(desc->dw1)), frame, length)) {
+			/* The completed path owns its skb and does not enter IP
+			 * receive a second time. The DMA allocation stays native.
 			 */
-			if (((dw1 >> 8) & 0xf) == PAE_RETURN_PORT ||
-			    ((dw1 >> 4) & 0xf) == PAE_RETURN_MARK)
-				valid = false;
+			grx500_rearm_rx(eth, index);
+			WRITE_ONCE(eth->rx_next, (index + 1) % RX_COUNT);
+			continue;
 		}
 		if (valid) {
 			/* Both CPU RX paths have one PMAC format. WAN physical ingress
@@ -1620,6 +1572,7 @@ static void grx500_halt(struct net_device *netdev)
 	unsigned int i;
 
 	ASSERT_RTNL();
+	grx500_flow_invalidate(board->flow);
 	netif_tx_disable(netdev);
 	spin_lock_irqsave(&eth->lock, flags);
 	eth->running = false;
@@ -1630,8 +1583,8 @@ static void grx500_halt(struct net_device *netdev)
 	if (grx500_dma_stop(eth->tx_dma, 0))
 		panic("GRX500 Ethernet: CPU TX did not stop; reset required");
 	if (!eth->wan) {
-		/* Once producer and consumer are fenced, the CPU miss service
-		 * can stop without stranding a DMA reference.
+		/* No sessions are admitted. Once producer/consumer are both fenced,
+		 * the CPU miss service can stop without stranding a DMA reference.
 		 */
 		grx500_p2p_stop(board);
 		grx500_rx_stop(lan);
@@ -1780,6 +1733,14 @@ static void grx500_get_stats(struct net_device *netdev, struct rtnl_link_stats64
 	spin_unlock_irqrestore(&eth->lock, flags);
 }
 
+static int grx500_setup_tc(struct net_device *netdev, enum tc_setup_type type,
+			  void *type_data)
+{
+	struct grx500_eth *eth = netdev_priv(netdev);
+
+	return grx500_flow_setup_tc(eth->board->flow, type, type_data);
+}
+
 static const struct net_device_ops grx500_netdev_ops = {
 	.ndo_open = grx500_open,
 	.ndo_stop = grx500_stop,
@@ -1788,6 +1749,7 @@ static const struct net_device_ops grx500_netdev_ops = {
 	.ndo_get_stats64 = grx500_get_stats,
 	.ndo_set_mac_address = eth_mac_addr,
 	.ndo_validate_addr = eth_validate_addr,
+	.ndo_setup_tc = grx500_setup_tc,
 };
 
 static void grx500_free_dma(struct grx500_eth *eth)
@@ -1884,6 +1846,8 @@ static int grx500_register_port(struct platform_device *pdev,
 	netif_napi_set_irq(&eth->napi, eth->rx_irq);
 
 	netdev->netdev_ops = &grx500_netdev_ops;
+	netdev->hw_features |= NETIF_F_HW_TC;
+	netdev->features |= NETIF_F_HW_TC;
 	netdev->watchdog_timeo = 5 * HZ;
 	netdev->min_mtu = ETH_MIN_MTU;
 	netdev->max_mtu = ETH_DATA_LEN + (port ? 0 : 8);
@@ -1949,6 +1913,7 @@ static void grx500_board_release(struct grx500_eth_board *board)
 	int port;
 
 	WRITE_ONCE(board->ready, false);
+	grx500_flow_stop(board->flow);
 	of_platform_depopulate(board->device);
 	/* WAN's receive ring may serve an administratively-up LAN conduit.
 	 * Close both netdevs before freeing either netdev/ring/NAPI instance.
@@ -1968,6 +1933,8 @@ static void grx500_board_release(struct grx500_eth_board *board)
 			grx500_unregister_port(board->netdev[port]);
 			board->netdev[port] = NULL;
 		}
+	grx500_flow_destroy(board->flow);
+	board->flow = NULL;
 	/* Both DMA pairs and phylib are now stopped. All five PHYs must stop
 	 * fetching instructions before their single shared allocation is freed.
 	 */
@@ -2043,11 +2010,21 @@ static int grx500_eth_probe(struct platform_device *pdev)
 			goto release_board;
 	}
 	platform_set_drvdata(pdev, board);
+	board->flow = grx500_flow_create(device, board->gsw[1],
+					board->netdev[0], board->netdev[1]);
+	if (IS_ERR(board->flow)) {
+		dev_warn(device, "PAE assistance unavailable (%ld); using software forwarding\n",
+			 PTR_ERR(board->flow));
+		board->flow = NULL;
+	}
 	ret = grx500_backpressure_init(board);
 	if (ret)
 		goto release_board;
 	board->switch_data.base = board->gsw[0];
 	board->switch_data.cpu_rx_channel = P2P_CHANNEL;
+	board->switch_data.flow_owner = board->flow;
+	board->switch_data.invalidate_flows = grx500_flow_invalidate;
+	board->switch_data.software_flow_ingress = grx500_flow_software_ingress;
 	WRITE_ONCE(board->ready, true);
 	{
 		const struct of_dev_auxdata aux[] = {
@@ -2081,6 +2058,7 @@ static void grx500_eth_shutdown(struct platform_device *pdev)
 	 * fencing the shared P2P path, but retain all backing allocations.
 	 */
 	WRITE_ONCE(board->ready, false);
+	grx500_flow_stop(board->flow);
 	rtnl_lock();
 	for (port = 0; port < 2; port++)
 		if (netif_running(board->netdev[port]))
