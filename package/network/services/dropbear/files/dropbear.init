@@ -10,6 +10,7 @@ PROG=/usr/sbin/dropbear
 NAME=dropbear
 
 extra_command "killclients" "Kill ${NAME} processes except servers and yourself"
+extra_command "restart_service" "Perform the restart queued through procd"
 
 # most of time real_stat() will be failing
 # due to missing "stat" binary (by default)
@@ -417,10 +418,29 @@ start_service()
 	config_foreach validate_section_dropbear dropbear dropbear_instance
 }
 
+restart()
+{
+	# SSH sessions belong to the server's service cgroup. Deleting that
+	# service also kills the restart caller, so PID1 must own stop and start.
+	# An additive update registers the trigger even while stopped without
+	# replacing any current instance or applying changed configuration here.
+	procd_open_service "${NAME}" "$initscript"
+	procd_close_service add || return $?
+	ubus call service event '{ "type": "dropbear.restart", "data": {} }'
+}
+
+restart_service()
+{
+	# procd's queued command survives removal of the service and its triggers.
+	stop
+	start
+}
+
 service_triggers()
 {
 	local interfaces vrf_trigger
 
+	procd_add_raw_trigger "dropbear.restart" "$PROCD_RELOAD_DELAY" /etc/init.d/dropbear restart_service
 	procd_add_config_trigger "config.change" "${NAME}" /etc/init.d/dropbear reload
 
 	config_load "${NAME}"
