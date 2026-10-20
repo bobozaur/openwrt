@@ -1,0 +1,343 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: retain ownership when replacing IPv6 prefix addresses
+
+Linux address replacement does not change an existing IPv6 prefix length.
+Query the exact assigned address, replace a differing mask and retain its
+previous attributes and remaining lifetimes for rollback on failure.
+Leave other enabled owners and unrelated deprecated addresses untouched.
+
+Ownership checks walk published prefix assignments during address updates.
+Move renewal assignments with list_splice_init() and publish the new prefix
+before callbacks run, so the old head cannot retain a link into the new
+list and both renewal and expiry traversal remain finite.
+
+A live length change can publish a replacement before the old prefix retires.
+Retry disabled assignments after retirement through the same ownership check,
+so a surviving owner still blocks takeover. Initialize non-owner sentinels too.
+
+Keep the ownership check and assignment-list publication in one change;
+introducing the check without that list lifetime would expose an invalid
+intermediate state.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/interface-ip.c
++++ b/interface-ip.c
+@@ -1038,6 +1038,41 @@ generate_ifaceid(struct interface *iface
+ 	return ret;
+ }
+ 
++static bool
++interface_prefix_address_in_use(const struct device_prefix_assignment *assignment,
++		const struct device *dev)
++{
++	struct interface *iface;
++	struct device_addr *addr;
++	struct device_prefix *prefix;
++	struct device_prefix_assignment *other;
++
++	vlist_for_each_element(&interfaces, iface, node) {
++		if (!iface->l3_dev.dev || iface->l3_dev.dev->ifindex != dev->ifindex)
++			continue;
++
++		struct interface_ip_settings *settings[] = { &iface->config_ip, &iface->proto_ip };
++		for (size_t i = 0; i < ARRAY_SIZE(settings); i++)
++			vlist_for_each_element(&settings[i]->addr, addr, node)
++				if (addr->enabled && !addr->failed &&
++				    (addr->flags & DEVADDR_FAMILY) == DEVADDR_INET6 &&
++				    IN6_ARE_ADDR_EQUAL(&addr->addr.in6, &assignment->addr))
++					return true;
++	}
++
++	list_for_each_entry(prefix, &prefixes, head)
++		list_for_each_entry(other, &prefix->assignments, head)
++			if (other != assignment && other->enabled &&
++			    IN6_ARE_ADDR_EQUAL(&other->addr, &assignment->addr)) {
++				iface = vlist_find(&interfaces, other->name, iface, node);
++				if (iface && iface->l3_dev.dev &&
++				    iface->l3_dev.dev->ifindex == dev->ifindex)
++					return true;
++			}
++
++	return false;
++}
++
+ static void
+ interface_set_prefix_address(struct device_prefix_assignment *assignment,
+ 		const struct device_prefix *prefix, struct interface *iface, bool add)
+@@ -1094,10 +1129,12 @@ interface_set_prefix_address(struct devi
+ 		interface_set_route_info(iface, &route);
+ 
+ 		system_del_route(l3_downlink, &route);
+-		if (addr.valid_until)
+-			system_add_address(l3_downlink, &addr);
+-		else
+-			system_del_address(l3_downlink, &addr);
++		if (!interface_prefix_address_in_use(assignment, l3_downlink)) {
++			if (addr.valid_until)
++				system_add_address(l3_downlink, &addr);
++			else
++				system_del_address(l3_downlink, &addr);
++		}
+ 
+ 		assignment->addr = in6addr_any;
+ 		assignment->enabled = false;
+@@ -1112,8 +1149,11 @@ interface_set_prefix_address(struct devi
+ 			route.addr = addr.addr;
+ 		}
+ 
++		if (interface_prefix_address_in_use(assignment, l3_downlink))
++			return;
++
+ 		addr.flags |= DEVADDR_OFFLINK;
+-		if (system_add_address(l3_downlink, &addr))
++		if (system_add_prefix_address(l3_downlink, &addr))
+ 			return;
+ 
+ 		if (!assignment->enabled) {
+@@ -1236,6 +1276,7 @@ static void interface_update_prefix_assi
+ 	c->length = 64;
+ 	c->name[0] = 0;
+ 	c->addr = in6addr_any;
++	c->enabled = false;
+ 	list_add(&c->head, &prefix->assignments);
+ 
+ 	/* Excluded prefix */
+@@ -1251,6 +1292,7 @@ static void interface_update_prefix_assi
+ 			c->assigned = ntohl(prefix->excl_addr.s6_addr32[1]) & mask;
+ 			c->length = prefix->excl_length;
+ 			c->addr = in6addr_any;
++			c->enabled = false;
+ 			memcpy(c->name, name, sizeof(name));
+ 			list_add(&c->head, &prefix->assignments);
+ 		}
+@@ -1408,10 +1450,18 @@ interface_update_prefix(struct vlist_tre
+ 	struct interface *iface;
+ 	bool new_valid = node_new && !(prefix_new->valid_until && prefix_new->valid_until - 1 <= system_get_rtime());
+ 
++	if (node_old && node_new)
++		list_splice_init(&prefix_old->assignments, &prefix_new->assignments);
++
++	/* Ownership checks walk the published prefixes during address updates.
++	 * Publish the new list before callbacks, and leave the old list empty:
++	 * plain list_splice() leaves its head pointing into the new head's ring.
++	 */
++	if (node_new && (!prefix_new->iface || !prefix_new->iface->proto_ip.no_delegation))
++		list_add(&prefix_new->head, &prefixes);
++
+ 	if (node_old && node_new) {
+ 		/* Move assignments and refresh addresses to update valid times */
+-		list_splice(&prefix_old->assignments, &prefix_new->assignments);
+-
+ 		list_for_each_entry(c, &prefix_new->assignments, head)
+ 			if ((iface = vlist_find(&interfaces, c->name, iface, node)))
+ 				interface_set_prefix_address(c, prefix_new, iface, new_valid);
+@@ -1435,10 +1485,21 @@ interface_update_prefix(struct vlist_tre
+ 		if (prefix_old->head.next)
+ 			list_del(&prefix_old->head);
+ 		free(prefix_old);
+-	}
+ 
+-	if (node_new && (!prefix_new->iface || !prefix_new->iface->proto_ip.no_delegation))
+-		list_add(&prefix_new->head, &prefixes);
++		/* A replacement can be blocked by a prefix retired later in the
++		 * same update. Retry only after its old address/route owner is gone.
++		 * The normal ownership check still excludes competing assignments.
++		 */
++		list_for_each_entry(prefix_new, &prefixes, head) {
++			if (prefix_new->valid_until &&
++			    prefix_new->valid_until - 1 <= system_get_rtime())
++				continue;
++			list_for_each_entry(c, &prefix_new->assignments, head)
++				if (!c->enabled &&
++				    (iface = vlist_find(&interfaces, c->name, iface, node)))
++					interface_set_prefix_address(c, prefix_new, iface, true);
++		}
++	}
+ 
+ }
+ 
+--- a/system-dummy.c
++++ b/system-dummy.c
+@@ -412,3 +412,8 @@ void system_tcp_l3mdev(bool enable)
+ void system_udp_l3mdev(bool enable)
+ {
+ }
++
++int system_add_prefix_address(struct device *dev, struct device_addr *addr)
++{
++	return system_add_address(dev, addr);
++}
+--- a/system-linux.c
++++ b/system-linux.c
+@@ -3816,6 +3816,159 @@ int system_del_address(struct device *de
+ 	return system_addr(dev, addr, RTM_DELADDR);
+ }
+ 
++struct prefix_address_query {
++	struct device *dev;
++	struct device_addr *addr;
++	struct nl_msg *old;
++	int pending;
++	int error;
++};
++
++static int cb_prefix_address_valid(struct nl_msg *msg, void *arg)
++{
++	struct prefix_address_query *q = arg;
++	struct nlmsghdr *hdr = nlmsg_hdr(msg);
++	struct ifaddrmsg *ifa = nlmsg_data(hdr);
++	struct nlattr *tb[IFA_MAX + 1], *local;
++
++	if (hdr->nlmsg_type != RTM_NEWADDR || !nlmsg_valid_hdr(hdr, sizeof(*ifa)) ||
++	    ifa->ifa_family != AF_INET6 || ifa->ifa_index != (unsigned int)q->dev->ifindex)
++		return NL_SKIP;
++	if (nlmsg_parse(hdr, sizeof(*ifa), tb, IFA_MAX, NULL))
++		return NL_SKIP;
++	local = tb[IFA_LOCAL] ?: tb[IFA_ADDRESS];
++	if (!local || nla_len(local) != (int)sizeof(q->addr->addr.in6) ||
++	    memcmp(nla_data(local), &q->addr->addr.in6, sizeof(q->addr->addr.in6)))
++		return NL_SKIP;
++
++	if (!q->old)
++		q->old = nlmsg_convert(hdr);
++	if (!q->old)
++		q->error = -ENOMEM;
++	return NL_OK;
++}
++
++static int cb_prefix_address_ack(struct nl_msg *msg, void *arg)
++{
++	struct prefix_address_query *q = arg;
++
++	q->pending = 0;
++	return NL_STOP;
++}
++
++static int cb_prefix_address_error(struct sockaddr_nl *nla, struct nlmsgerr *err, void *arg)
++{
++	struct prefix_address_query *q = arg;
++
++	q->pending = 0;
++	q->error = err->error;
++	return NL_STOP;
++}
++
++static void prefix_address_message(struct nl_msg *msg, int type)
++{
++	struct nlmsghdr *hdr = nlmsg_hdr(msg);
++
++	hdr->nlmsg_type = type;
++	hdr->nlmsg_flags = NLM_F_REQUEST;
++	if (type == RTM_NEWADDR)
++		hdr->nlmsg_flags |= NLM_F_CREATE | NLM_F_REPLACE;
++	hdr->nlmsg_seq = NL_AUTO_SEQ;
++	hdr->nlmsg_pid = 0;
++}
++
++/* A prefix assignment owns this exact local address. Linux REPLACE does not
++ * change an existing IPv6 prefix length, so read the current kernel object.
++ * Leave other addresses, including deprecated predecessors, untouched.
++ */
++int system_add_prefix_address(struct device *dev, struct device_addr *addr)
++{
++	struct prefix_address_query q = { .dev = dev, .addr = addr, .pending = 1 };
++	struct ifaddrmsg ifa = { .ifa_family = AF_INET6, .ifa_index = dev->ifindex };
++	struct nl_cb *cb;
++	struct nl_msg *msg, *del;
++	struct nlattr *tb[IFA_MAX + 1];
++	time_t started = system_get_rtime();
++	int ret = -ENOMEM;
++	bool deleted;
++
++	cb = nl_cb_alloc(NL_CB_DEFAULT);
++	if (!cb)
++		return ret;
++	msg = nlmsg_alloc_simple(RTM_GETADDR, 0);
++	if (!msg)
++		goto out;
++	if (nlmsg_append(msg, &ifa, sizeof(ifa), 0) ||
++	    nla_put(msg, IFA_LOCAL, sizeof(addr->addr.in6), &addr->addr.in6))
++		goto free_query;
++
++	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, cb_prefix_address_valid, &q);
++	nl_cb_set(cb, NL_CB_ACK, NL_CB_CUSTOM, cb_prefix_address_ack, &q);
++	nl_cb_err(cb, NL_CB_CUSTOM, cb_prefix_address_error, &q);
++	ret = nl_send_auto_complete(sock_rtnl, msg);
++	if (ret < 0)
++		goto free_query;
++	while (q.pending) {
++		ret = nl_recvmsgs(sock_rtnl, cb);
++		if (ret < 0)
++			break;
++	}
++	if (q.error == -EADDRNOTAVAIL) {
++		ret = system_add_address(dev, addr);
++		goto free_query;
++	}
++	if (q.error || ret < 0 || !q.old) {
++		ret = q.error ?: (ret < 0 ? ret : -EIO);
++		goto free_query;
++	}
++	if (((struct ifaddrmsg *)nlmsg_data(nlmsg_hdr(q.old)))->ifa_prefixlen == addr->mask) {
++		ret = system_add_address(dev, addr);
++		goto free_query;
++	}
++
++	del = nlmsg_convert(nlmsg_hdr(q.old));
++	if (!del) {
++		ret = -ENOMEM;
++		goto free_query;
++	}
++	prefix_address_message(del, RTM_DELADDR);
++	ret = system_rtnl_call(del);
++	deleted = !ret;
++	if (ret && ret != -NLE_NOADDR && ret != -NLE_OBJ_NOTFOUND)
++		goto free_query;
++
++	ret = system_add_address(dev, addr);
++	if (ret && deleted) {
++		/* Roll back the actual previous flags and remaining lifetimes,
++		 * without refreshing a deprecated address's expiry on retries.
++		 */
++		if (nlmsg_parse(nlmsg_hdr(q.old), sizeof(ifa), tb, IFA_MAX, NULL) ||
++		    !tb[IFA_CACHEINFO] || nla_len(tb[IFA_CACHEINFO]) < (int)sizeof(struct ifa_cacheinfo))
++			goto free_query;
++		struct ifa_cacheinfo *cache = nla_data(tb[IFA_CACHEINFO]);
++		time_t elapsed = system_get_rtime() - started;
++		uint64_t age = elapsed < 0 ? 0 : elapsed;
++		if (cache->ifa_valid != UINT32_MAX && age >= cache->ifa_valid)
++			goto free_query;
++		if (cache->ifa_valid != UINT32_MAX)
++			cache->ifa_valid -= age;
++		if (cache->ifa_prefered != UINT32_MAX)
++			cache->ifa_prefered = age >= cache->ifa_prefered ? 0 : cache->ifa_prefered - age;
++		prefix_address_message(q.old, RTM_NEWADDR);
++		if (system_rtnl_call(q.old))
++			netifd_log_message(L_WARNING, "Failed to restore prior IPv6 address on '%s'\n", dev->ifname);
++		q.old = NULL;
++	}
++
++free_query:
++	nlmsg_free(msg);
++	if (q.old)
++		nlmsg_free(q.old);
++out:
++	nl_cb_put(cb);
++	return ret;
++}
++
+ static int system_neigh(struct device *dev, struct device_neighbor *neighbor, int cmd)
+ {
+ 	int alen = ((neighbor->flags & DEVADDR_FAMILY) == DEVADDR_INET4) ? 4 : 16;
+--- a/system.h
++++ b/system.h
+@@ -291,6 +291,7 @@ void system_if_apply_settings_after_up(s
+ 
+ int system_add_address(struct device *dev, struct device_addr *addr);
+ int system_del_address(struct device *dev, struct device_addr *addr);
++int system_add_prefix_address(struct device *dev, struct device_addr *addr);
+ 
+ int system_add_route(struct device *dev, struct device_route *route);
+ int system_del_route(struct device *dev, struct device_route *route);
