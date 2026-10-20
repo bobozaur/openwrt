@@ -1,0 +1,10 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-2.0-only
+
+START=09
+
+boot() {
+	# Complete the read-only mount or legacy migration before S10boot's
+	# kmodloader can initialize the radios.
+	/usr/sbin/wave600-firmware-import --migrate
+}
