@@ -107,7 +107,7 @@ function setup(data) {
 	if (config.band != '2g' && config.band != '5g')
 		return fail('WAVE_BAND_UNSUPPORTED');
 
-	let modes = {};
+	let modes = {}, station_count = 0;
 	for (let _, v in data.interfaces) {
 		if (v.config.mode != 'ap' && v.config.mode != 'sta')
 			return fail('WAVE_MODE_UNSUPPORTED');
@@ -135,10 +135,12 @@ function setup(data) {
 			v.config.wds = true;
 		}
 		modes[v.config.mode] = true;
+		station_count += v.config.mode == 'sta';
 	}
-	if (modes.ap && modes.sta)
-		return fail('WAVE_CONCURRENT_ROLES_UNSUPPORTED');
-	let mode = modes.sta ? 'sta' : 'ap';
+	let mixed = modes.ap && modes.sta;
+	if (mixed && station_count != 1)
+		return fail('WAVE_SINGLE_UPLINK_REQUIRED');
+	let mode = modes.ap ? 'ap' : 'sta';
 	data.phy = radio[mode].phy;
 	if (!wiphy_band(wiphy_info(data.phy), config.band))
 		return fail('WAVE_BAND_UNSUPPORTED');
@@ -153,11 +155,13 @@ function setup(data) {
 	    (data.data?.sta_phy != radio.sta.phy && !reset_phy(radio.sta.phy)))
 		return fail('WAVE_TEARDOWN_FAILED');
 	let owner = { wave: true, phy: data.phy, ap_phy: radio.ap.phy, sta_phy: radio.sta.phy,
-		macaddr_group: modes.sta ? `wave/${radio.sta.phy}` : null };
+		macaddr_group: modes.sta && !mixed ? `wave/${radio.sta.phy}` : null };
 	netifd.set_data(owner);
 	configure_radio(radio.ap.phy, config);
-	let ap_data = { ...data, phy: radio.ap.phy, config: { ...config } };
-	let sta_data = { ...data, phy: radio.sta.phy, config: { ...config } };
+	let ap_data = { ...data, phy: radio.ap.phy, config: { ...config },
+		station_phy: mixed ? radio.sta.phy : null, channel_follow: !!mixed };
+	let sta_data = { ...data, phy: radio.sta.phy, config: { ...config },
+		ap_phy: mixed ? radio.ap.phy : null };
 	let master_mac = trim(fs.readfile(`/sys/class/net/${radio.master}/address`) ?? '');
 	if (!master_mac)
 		return fail('WAVE_MASTER_MAC_UNAVAILABLE');
