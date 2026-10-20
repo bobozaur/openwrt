@@ -1,0 +1,1592 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wave: preserve Linux netdev and bridge ownership
+
+Preserve ordinary Linux bridge forwarding, hairpin and accepted counters.
+Keep proc readers and private netdev state alive through native retirement.
+Register native notification events without the optional vendor command ABI.
+
+This is the final native integration against the pinned vendor source.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+---
+--- a/wireless/driver/linux/mtlk_dbg_osdep.h
++++ b/wireless/driver/linux/mtlk_dbg_osdep.h
+@@ -12,7 +12,7 @@
+ 
+ #if defined (CONFIG_ARCH_STR9100) /* Star boards */
+ 
+-#include <linux/time.h>
++#include <linux/timekeeping.h>
+ 
+ extern u32 APB_clock;
+ 
+@@ -52,17 +52,17 @@
+ 
+ #else /* Using Linux default - do_gettimeofday() - precision is NOT GUARANTEED! */
+ 
+-#include <linux/time.h>
++#include <linux/timekeeping.h>
+ 
+ #define MTLK_DBG_HRES_INIT() \
+   return MTLK_ERR_OK
+ 
+ #define MTLK_DBG_HRES_CLEANUP()
+ 
+-typedef struct timespec mtlk_dbg_hres_ts_t;
++typedef struct timespec64 mtlk_dbg_hres_ts_t;
+ 
+ #define MTLK_DBG_HRES_TS(ts)                    \
+-  getnstimeofday(ts)
++  ktime_get_real_ts64(ts)
+ 
+ #define __MTLK_DBG_HRES_TS_TO_US(ts)            \
+   ((((uint64)(ts)->tv_sec) * NSEC_PER_SEC) + (ts)->tv_nsec)
+--- a/wireless/driver/linux/mtlk_df_linux.c
++++ b/wireless/driver/linux/mtlk_df_linux.c
+@@ -392,10 +392,8 @@
+ err_clpb_create:
+   mtlk_osal_mem_free(invocation_context);
+ err_ctx_alloc:
+-  if(MTLK_ERR_OK != res)
+-  {
++  if (clb && MTLK_ERR_OK != res)
+     clb(ctx, res, NULL);
+-  }
+ }
+ 
+ int
+--- a/wireless/driver/linux/mtlk_df_proc_impl.c
++++ b/wireless/driver/linux/mtlk_df_proc_impl.c
+@@ -57,7 +57,7 @@
+ #endif
+ 
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(3,10,0)
+-#define PDE_DATA(inode) (PDE((inode))->data)
++#define pde_data(inode) (PDE((inode))->data)
+ #define proc_set_size(pde, size)    (pde)->size = (size);
+ #endif
+ 
+@@ -225,7 +225,7 @@
+ _mtlk_df_proc_open(struct inode *inode,
+                    struct file *file)
+ {
+-  file->private_data = PDE_DATA(inode);
++  file->private_data = pde_data(inode);
+ 
+   return 0;
+ }
+@@ -307,11 +307,11 @@
+   return retval;
+ }
+ 
+-struct file_operations _mtlk_df_proc_entry_fops = {
+-  .owner   = THIS_MODULE,
+-  .open    = _mtlk_df_proc_open,
+-  .read    = _mtlk_df_proc_read,
+-  .write   = _mtlk_df_proc_write
++static const struct proc_ops _mtlk_df_proc_entry_fops = {
++
++  .proc_open = _mtlk_df_proc_open,
++  .proc_read = _mtlk_df_proc_read,
++  .proc_write = _mtlk_df_proc_write
+ };
+ 
+ /***
+@@ -482,8 +482,7 @@
+   if ( *pos == 0 )
+     return &counter;
+   else {
+-    /* no => it's the end of the sequence, return NULL to stop reading */
+-    *pos = 0;
++    /* Preserve EOF across partial reads; seq_lseek handles rewinding. */
+     return NULL;
+   }
+ }
+@@ -539,7 +538,7 @@
+ static int
+ _mtlk_df_proc_seq_entry_open_ops(struct inode *inode, struct file *file)
+ {
+-  struct mtlk_seq_ops   *ops = PDE_DATA(inode);
++  struct mtlk_seq_ops   *ops = pde_data(inode);
+   unsigned size;
+ 
+   size = ops->data_size;
+@@ -554,17 +553,18 @@
+   };
+ 
+   /* we've got semaphore, so proceed */
+-  if (size) {
+-    return _seq_open_size(file, ops, size);
+-  } else {
+-    return seq_open(file, &ops->seq_ops);
++  {
++    int ret = size ? _seq_open_size(file, ops, size) : seq_open(file, &ops->seq_ops);
++    if (ret)
++      up(&ops->sem);
++    return ret;
+   }
+ }
+ 
+ static int
+ _mtlk_df_proc_seq_entry_release_ops(struct inode *inode, struct file *file)
+ {
+-  struct mtlk_seq_ops *ops = PDE_DATA(inode);
++  struct mtlk_seq_ops *ops = pde_data(inode);
+ 
+   /* release semaphore acquired in the .open function */
+   up(&ops->sem);
+@@ -577,12 +577,12 @@
+  * method releases per-file semaphore and calls
+  * seq_release.
+  */
+-struct file_operations _mtlk_df_proc_seq_entry_fops = {
+-  .owner   = THIS_MODULE,
+-  .open    = _mtlk_df_proc_seq_entry_open_ops,
+-  .read    = seq_read,
+-  .llseek  = seq_lseek,
+-  .release = _mtlk_df_proc_seq_entry_release_ops
++static const struct proc_ops _mtlk_df_proc_seq_entry_fops = {
++
++  .proc_open = _mtlk_df_proc_seq_entry_open_ops,
++  .proc_read = seq_read,
++  .proc_lseek = seq_lseek,
++  .proc_release = _mtlk_df_proc_seq_entry_release_ops
+ };
+ 
+ 
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -36,8 +36,12 @@
+ #include <linux/if_arp.h>
+ #include <linux/inet.h>
+ #include <net/iw_handler.h>
+-#include <asm/unaligned.h>
++#include <linux/unaligned.h>
+ #include <net/cfg80211.h>
++#include <net/gro_cells.h>
++#include <net/sch_generic.h>
++#include <linux/if_bridge.h>
++#include <linux/atomic.h>
+ 
+ #if MTLK_USE_PUMA6_UDMA
+ #include <linux/udma_api.h> /* PUMA6 UDMA API*/
+@@ -135,6 +139,7 @@
+   /*******************/
+ 
+   mtlk_osal_timer_t       stat_timer;
++  atomic_t                stat_pending;
+ 
+   mtlk_df_proc_fs_node_t  *proc_df_node;
+   mtlk_df_proc_fs_node_t  *proc_df_debug_node;
+@@ -221,6 +226,10 @@
+   struct wireless_dev wdev;
+   struct net_device *ndev;
+   BOOL               ndev_registered;
++  struct wave_tx_queue tx_queue;
++  struct gro_cells   rx_gro;
++  spinlock_t         rx_gro_lock;
++  bool               rx_gro_accepting;
+   char   name[IFNAMSIZ];
+   BOOL   frame_registered[FRAME_SUBTYPE_SIZE];
+   unsigned  destructor_flags;
+@@ -238,10 +247,17 @@
+   BOOL                 hs20_enabled;
+   mtlk_hs20_notify_entry_t hs20_notify_entry;
+ 
+-  struct work_struct       propagate_dfs_state_work;
+-  struct workqueue_struct *propagate_dfs_state_wq;
+-  mtlk_dlist_t             propagate_dfs_state_list;
+-  mtlk_osal_mutex_t        prop_dfs_mutex;
++  /* Only AP channel completion needs the target wiphy's control lock. */
++  struct wiphy_work channel_notify_work;
++  spinlock_t channel_notify_lock;
++  struct cfg80211_chan_def channel_notify_chandef;
++  bool channel_notify_pending;
++  bool channel_notify_stopping;
++  struct wiphy_work ap_stop_work;
++  bool ap_stop_pending; /* protected by the AP wiphy lock */
++
++  spinlock_t assoc_lock;
++  struct wave_assoc_metadata assoc_metadata[16];
+ 
+   int corrupted_packets_counter;
+ 
+@@ -299,7 +315,7 @@
+  *****************************************************************************/
+ void __MTLK_IFUNC mtlk_df_user_assert (mtlk_slid_t caller_slid)
+ {
+-    ELOG_DDDD("ERROR, cannot to get private data " MTLK_SLID_FMT,
++    ELOG_DDDD("ERROR, cannot to get private data [SLID:%u:%u:%u:%u]",
+         mtlk_slid_get_oid(caller_slid),
+         mtlk_slid_get_gid(caller_slid),
+         mtlk_slid_get_fid(caller_slid),
+@@ -311,22 +327,22 @@
+ void __MTLK_IFUNC
+ mtlk_assert_log_s (mtlk_slid_t caller_slid, const char *msg)
+ {
+-    ELOG_DDDDS("[SLID:%u:%u:%u:%u] %s", msg,
++    ELOG_DDDDS("[SLID:%u:%u:%u:%u] %s",
+         mtlk_slid_get_oid(caller_slid),
+         mtlk_slid_get_gid(caller_slid),
+         mtlk_slid_get_fid(caller_slid),
+-        mtlk_slid_get_lid(caller_slid));
++        mtlk_slid_get_lid(caller_slid), msg);
+     MTLK_ASSERT(FALSE);
+ }
+ 
+ void __MTLK_IFUNC
+ mtlk_assert_log_ss (mtlk_slid_t caller_slid, const char *msg1, const char *msg2)
+ {
+-    ELOG_DDDDSS("[SLID:%u:%u:%u:%u] %s: %s", msg1, msg2,
++    ELOG_DDDDSS("[SLID:%u:%u:%u:%u] %s: %s",
+         mtlk_slid_get_oid(caller_slid),
+         mtlk_slid_get_gid(caller_slid),
+         mtlk_slid_get_fid(caller_slid),
+-        mtlk_slid_get_lid(caller_slid));
++        mtlk_slid_get_lid(caller_slid), msg1, msg2);
+     MTLK_ASSERT(FALSE);
+ }
+ 
+@@ -383,6 +399,7 @@
+       break;
+ 
+     case MTLK_ERR_NOT_READY:
++    case MTLK_ERR_RETRY:
+       linux_res = -EAGAIN;
+       break;
+ 
+@@ -433,7 +450,7 @@
+   return df_user->name;
+ }
+ 
+-const uint32
++uint32
+ mtlk_df_user_get_flags(mtlk_df_user_t *df_user)
+ {
+   MTLK_ASSERT(NULL != df_user);
+@@ -499,7 +516,7 @@
+   MTLK_ASSERT(NULL != df_user->ndev);
+ 
+   rtnl_lock();
+-  res = dev_change_flags(df_user->ndev, newflags);
++  res = dev_change_flags(df_user->ndev, newflags, NULL);
+   rtnl_unlock();
+ 
+   return res;
+@@ -526,7 +543,7 @@
+   MTLK_ASSERT(NULL != df);
+   MTLK_ASSERT(NULL != mac_addr);
+ 
+-  mtlk_osal_copy_eth_addresses(mtlk_df_get_user(df)->ndev->dev_addr, mac_addr);
++  eth_hw_addr_set(mtlk_df_get_user(df)->ndev, mac_addr);
+ }
+ 
+ const uint8* __MTLK_IFUNC
+@@ -555,21 +572,15 @@
+ #endif
+ }
+ 
+-/* FIXME: register netdev on init, but unregister on stop */
+-/*  For this we need REGISTER_DEVICE in both INIT and START */
+-#define _REG_NETDEV_WORKAROUND_     TRUE
+ 
+ MTLK_INIT_STEPS_LIST_BEGIN(df_user)
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, ALLOC_SLOW_CTX)
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, DEBUG_BCL)
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, NETDEV_INIT)
++  MTLK_INIT_STEPS_LIST_ENTRY(df_user, STA_GRO)
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, CREATE_CARD_DIR)
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, CREATE_DEBUG_DIR)
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, STAT_TIMER)
+-#if _REG_NETDEV_WORKAROUND_
+-  /* WAVE600: TODO: moved from start. Check this approach later */
+-  MTLK_INIT_STEPS_LIST_ENTRY(df_user, REGISTER_DEVICE)
+-#endif
+ #if MTLK_USE_PUMA6_UDMA
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, UDMA_INIT)
+ #endif
+@@ -577,9 +588,6 @@
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, IRB_PINGER_INIT)
+ #endif
+   MTLK_INIT_STEPS_LIST_ENTRY(df_user, PROC_INIT)
+-  MTLK_INIT_STEPS_LIST_ENTRY(df_user, PROP_DFS_MUTEX)
+-  MTLK_INIT_STEPS_LIST_ENTRY(df_user, PROP_DFS_LIST)
+-  MTLK_INIT_STEPS_LIST_ENTRY(df_user, PROP_DFS_WQ)
+ MTLK_INIT_INNER_STEPS_BEGIN(df_user)
+ MTLK_INIT_STEPS_LIST_END(df_user);
+ 
+@@ -599,13 +607,14 @@
+ #endif
+ 
+ static __INLINE int
+-_mtlk_df_user_start_skb_tx (struct sk_buff *skb, mtlk_df_user_t *df_user)
++_mtlk_df_user_start_skb_tx (struct sk_buff *skb, mtlk_df_user_t *df_user,
++                          mtlk_hw_msg_t *msg)
+ {
+ #ifdef MTCFG_PER_PACKET_STATS
+   mtlk_nbuf_priv_init(mtlk_nbuf_priv(skb));
+ #endif
+   mtlk_nbuf_start_tracking(skb);
+-  mtlk_core_handle_tx_data(mtlk_df_get_vap_handle(df_user->df), skb);
++  mtlk_core_handle_tx_data(mtlk_df_get_vap_handle(df_user->df), skb, msg);
+   return NETDEV_TX_OK;
+ }
+ 
+@@ -618,35 +627,33 @@
+     return NETDEV_TX_OK;
+   }
+ 
+-  return _mtlk_df_user_start_skb_tx(skb, df_user);
++  return _mtlk_df_user_start_skb_tx(skb, df_user, NULL);
+ }
+ /* Public: to be called from wave_wifi_l2f.ko */
+ EXPORT_SYMBOL(_mtlk_df_user_start_tx);
+ 
+-/* Ensure that we got a packet from the correct network device */
++int __MTLK_IFUNC
++_mtlk_df_user_linux_start_tx(struct sk_buff *skb, struct net_device *ndev);
++
++/* AP and station netdevs both install this TX owner. Names can change through
++ * normal netifd/user configuration and cannot identify the private layout.
++ */
+ static __INLINE BOOL
+ _mtlk_validate_wlan_netdev (struct net_device *netdev)
+ {
+-  char buf[IFNAMSIZ+1];
+-
+-  if (sizeof(uint32) == sizeof(MTLK_NDEV_NAME)-1) {
+-    /* Optimized version */
+-    if (*(uint32*)netdev->name == *(uint32*)MTLK_NDEV_NAME)
+-      return TRUE;
+-  }
+-  else if (memcmp(netdev->name, MTLK_NDEV_NAME, sizeof(MTLK_NDEV_NAME)-1) == 0)
+-    return TRUE;
+-
+-  /* Try not to crash if name is not null-terminated */
+-  wave_strcopy(buf, netdev->name, sizeof(buf));
+-  ILOG0_S("Got a packet from a wrong network device: \"%s\"", buf);
+-  return FALSE;
++  return netdev && netdev->netdev_ops &&
++         netdev->netdev_ops->ndo_start_xmit == _mtlk_df_user_linux_start_tx;
+ }
+ 
+ int __MTLK_IFUNC
+ _mtlk_df_user_linux_start_tx (struct sk_buff *skb, struct net_device *ndev)
+ {
+   mtlk_df_user_t *df_user;
++  mtlk_vap_handle_t vap;
++  mtlk_hw_msg_t *msg;
++  struct ethhdr buffer;
++  const struct ethhdr *eth;
++  int error;
+ 
+   if (__UNLIKELY(!_mtlk_validate_wlan_netdev(ndev))) {
+     dev_kfree_skb_any(skb);
+@@ -655,6 +662,30 @@
+ 
+   df_user = mtlk_df_user_from_ndev(ndev);
+   if (__UNLIKELY(NULL == df_user)) {
++    goto drop;
++  }
++
++  if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN &&
++      !netif_running(df_user->ndev))
++    goto drop;
++
++  /* Header inspection must not modify an skb that may be returned BUSY. */
++  eth = skb_header_pointer(skb, 0, sizeof(buffer), &buffer);
++  if (!eth)
++    goto drop;
++  if (eth->h_proto == htons(ETH_P_PAE)) {
++    int res = MTLK_ERR_NO_MEM;
++
++    /* Authentication belongs to the parent BSS. Its management-ring path
++     * resolves DA independently and must never bypass a child binding.
++     */
++    if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN)
++      goto drop;
++    if (!skb_linearize(skb))
++      res = mtlk_core_tx_eapol(mtlk_df_get_vap_handle(df_user->df),
++                              skb->data, skb->len);
++    if (res != MTLK_ERR_OK)
++      dev_core_stats_tx_dropped_inc(ndev);
+     dev_kfree_skb_any(skb);
+     return NETDEV_TX_OK;
+   }
+@@ -686,10 +717,34 @@
+       ++df_user->dcdp.litepath_stats.tx_discarded_no_peers;
+   }
+ #endif
+-  return _mtlk_df_user_start_skb_tx(skb, df_user);
++  vap = mtlk_df_get_vap_handle(df_user->df);
++  msg = mtlk_hw_get_msg_to_send(mtlk_vap_get_hwapi(vap), vap, &error);
++  if (!msg) {
++    if (error == MTLK_ERR_NO_RESOURCES)
++      return NETDEV_TX_BUSY;
++    goto drop;
++  }
++  if (!pskb_may_pull(skb, ETH_HLEN)) {
++    mtlk_hw_release_msg_to_send(mtlk_vap_get_hwapi(vap), msg);
++    goto drop;
++  }
++  return _mtlk_df_user_start_skb_tx(skb, df_user, msg);
++drop:
++  dev_core_stats_tx_dropped_inc(ndev);
++  dev_kfree_skb_any(skb);
++  return NETDEV_TX_OK;
+ }
+ EXPORT_SYMBOL(_mtlk_df_user_linux_start_tx);
+ 
++bool wave_df_intra_bss_forwarding(mtlk_df_user_t *df_user)
++{
++#if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
++  return !netif_is_bridge_port(df_user->ndev);
++#else
++  return true;
++#endif
++}
++
+ 
+ /********************************************************************
+  * DirectConnect DP supporting functionality BEGIN
+@@ -729,7 +784,7 @@
+       /* The LitePath only is supported by DirectConnect.
+        * SW path must be processed by wlan driver */
+       skb->dev = tx_dev;
+-      return (NETDEV_TX_OK == _mtlk_df_user_start_skb_tx(skb, df_user)) ? 0 : -1;
++      return (NETDEV_TX_OK == _mtlk_df_user_start_skb_tx(skb, df_user, NULL)) ? 0 : -1;
+     } else {
+       /* Both LitePath + SW are supported by DirectConnect.
+        * CB function returns 1: skb was not consumed by driver; DC will take care about
+@@ -1280,7 +1335,7 @@
+   #endif
+   skb->dev = netdev;
+   df_user->udma.stats.tx_processed++;
+-  _mtlk_df_user_start_skb_tx(skb, df_user);
++  _mtlk_df_user_start_skb_tx(skb, df_user, NULL);
+   return;
+ 
+ drop_frame:
+@@ -1679,6 +1734,20 @@
+   }
+ }
+ 
++void wave_df_tx_queue_start(mtlk_df_user_t *df_user)
++{
++  wave_hw_tx_queue_start(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df_user->df)),
++                        &df_user->tx_queue);
++}
++
++void wave_df_tx_queue_stop(mtlk_df_user_t *df_user)
++{
++  /* Control owners serialize lifecycle. Cleanup may follow an earlier stop. */
++  if (!list_empty(&df_user->tx_queue.node))
++    wave_hw_tx_queue_stop(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df_user->df)),
++                         &df_user->tx_queue);
++}
++
+ /* Relevant only for AP role interface */
+ static int
+ _mtlk_df_user_iface_open(struct net_device *ndev)
+@@ -1706,6 +1775,7 @@
+     return -ENOTSUPP;
+   }
+ 
++  wave_df_tx_queue_start(df_user);
+   return (MTLK_ERR_OK == res) ? 0 : -EAGAIN;
+ }
+ 
+@@ -1719,13 +1789,14 @@
+   MTLK_CHECK_DF_USER(df_user);
+ 
+   ILOG0_SS("%s, %s: stop the interface", current->comm, mtlk_df_user_get_name(df_user));
++  wave_df_tx_queue_stop(df_user);
+ 
+   hw = mtlk_vap_get_hw(mtlk_df_get_vap_handle(df_user->df));
+ 
+   /* if error is occurred in _pci_probe then serializer is absent */
+   if (!wave_rcvry_pci_probe_error_get(wave_hw_mmb_get_mmb_base(hw)))
+   {
+-    int res;
++    int res, retry = 0;
+     mtlk_clpb_t *clpb = NULL;
+     /*
+       The following loop was implemented since the OS might not
+@@ -1736,9 +1807,16 @@
+     do {
+       res = _mtlk_df_user_invoke_core(df_user->df, WAVE_CORE_REQ_DEACTIVATE, &clpb, NULL, 0);
+       res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_DEACTIVATE, TRUE);
++      if (res != MTLK_ERR_RETRY)
++        break;
+       mtlk_osal_msleep(100);
+-    } while ((MTLK_ERR_OK != res) && (MTLK_ERR_FW != res));
++    } while (++retry < 20);
++    if (res != MTLK_ERR_OK) {
++      ELOG_D("Interface deactivation failed; fencing the card: %d", res);
++      wave_hw_mmb_quiesce(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df_user->df)));
++    }
+   }
++  wave_df_assoc_clear(df_user);
+ 
+   if (df_user->hs20_enabled)
+   {
+@@ -1780,7 +1858,7 @@
+   ILOG1_SY("%s: Handle request: connect to %Y", ndev->name, sa->sa_data);
+ 
+   res = _mtlk_df_user_invoke_core(df_user->df, WAVE_CORE_REQ_CONNECT_STA,
+-                                  &clpb, &sa->sa_data, sizeof(sa->sa_data));
++                                  &clpb, &sa->sa_data, ETH_ALEN);
+   res = _mtlk_df_user_process_core_retval_void(res, clpb, WAVE_CORE_REQ_CONNECT_STA, TRUE);
+ 
+ finish:
+@@ -1908,12 +1986,12 @@
+   }
+ 
+   res = _mtlk_df_user_invoke_core(df_user->df, WAVE_CORE_REQ_SET_MAC_ADDR,
+-                                  &clpb, addr->sa_data, sizeof(addr->sa_data));
++                                  &clpb, addr->sa_data, ETH_ALEN);
+   res = _mtlk_df_user_process_core_retval_void(res, clpb, WAVE_CORE_REQ_SET_MAC_ADDR, TRUE);
+ 
+   if(MTLK_ERR_OK == res)
+   {
+-    mtlk_osal_copy_eth_addresses(ndev->dev_addr, addr->sa_data);
++    eth_hw_addr_set(ndev, addr->sa_data);
+   }
+ 
+ finish:
+@@ -1926,6 +2004,14 @@
+   return _mtlk_df_user_set_mac_addr_internal(ndev, (struct sockaddr *)p);
+ }
+ 
++int wave_df_user_set_mac_addr(mtlk_df_user_t *df_user, const u8 *macaddr)
++{
++  struct sockaddr addr = { .sa_family = ARPHRD_ETHER };
++
++  ether_addr_copy((u8 *)addr.sa_data, macaddr);
++  return _mtlk_df_user_set_mac_addr_internal(df_user->ndev, &addr);
++}
++
+ int __MTLK_IFUNC
+ mtlk_df_ui_linux_ioctl_set_mac_addr (struct net_device *ndev,
+                                      struct iw_request_info *info,
+@@ -3249,7 +3335,7 @@
+     *intvec_length = 2;
+ }
+ 
+-static void
++static int
+ _mtlk_df_user_get_intvec_by_fixed_pwr_params (uint32 *intvec, uint16 max_length, uint16 *intvec_length, FixedPower_t *fixed_pwr_params)
+ {
+   MTLK_ASSERT(max_length >= 4);
+@@ -3264,7 +3350,10 @@
+   else {
+     ELOG_V("Fixed Power not Set, Getter invalid!");
+     *intvec_length = 0;
++    return MTLK_ERR_NOT_SUPPORTED;
+   }
++
++  return MTLK_ERR_OK;
+ }
+ 
+ static int
+@@ -4105,7 +4194,7 @@
+     _DF_USER_GET_ON_PARAM_MEMBER(PRM_ID_MU_OPERATION, WAVE_RADIO_REQ_GET_MASTER_CFG, FALSE, mtlk_master_core_cfg_t, master_cfg, mu_operation)
+       MTLK_CFG_GET_ITEM(master_cfg, mu_operation, *(uint32*)data);
+ 
+-    _DF_USER_GET_ON_PARAM(PRM_ID_HE_MU_OPERATION, WAVE_RADIO_REQ_GET_MASTER_CFG, FALSE, mtlk_master_core_cfg_t, master_cfg)
++    _DF_USER_GET_ON_PARAM_MEMBER(PRM_ID_HE_MU_OPERATION, WAVE_RADIO_REQ_GET_MASTER_CFG, FALSE, mtlk_master_core_cfg_t, master_cfg, he_mu_operation)
+       MTLK_CFG_GET_ITEM(master_cfg, he_mu_operation, *(uint32*)data);
+ 
+     _DF_USER_GET_ON_PARAM_MEMBER(PRM_ID_BF_MODE, WAVE_RADIO_REQ_GET_MASTER_CFG, FALSE, mtlk_master_core_cfg_t, master_cfg, bf_mode)
+@@ -4342,8 +4431,8 @@
+ 
+     /* Fixed TX management power */
+     _DF_USER_GET_ON_PARAM_MEMBER(PRM_ID_FIXED_POWER, WAVE_RADIO_REQ_GET_MASTER_CFG, FALSE, mtlk_master_core_cfg_t, master_core_cfg, fixed_pwr_params)
+-      MTLK_CFG_GET_ITEM_BY_FUNC_VOID(master_core_cfg, fixed_pwr_params, _mtlk_df_user_get_intvec_by_fixed_pwr_params,
+-                                     ((uint32*)data, max_length, length, &master_core_cfg->fixed_pwr_params));
++      MTLK_CFG_GET_ITEM_BY_FUNC(master_core_cfg, fixed_pwr_params, _mtlk_df_user_get_intvec_by_fixed_pwr_params,
++                                ((uint32*)data, max_length, length, &master_core_cfg->fixed_pwr_params), res);
+ 
+     /* Unconnected STA scan time */
+     _DF_USER_GET_ON_PARAM_MEMBER(PRM_ID_UNCONNECTED_STA_SCAN_TIME, WAVE_RADIO_REQ_GET_MASTER_CFG, FALSE, mtlk_master_core_cfg_t, master_cfg, unconnected_sta_scan_time)
+@@ -5098,7 +5187,7 @@
+ }
+ 
+ /* Relevant only for AP role interfaces */
+-static struct rtnl_link_stats64 *
++static void
+ _mtlk_df_user_get_stats (struct net_device *ndev, struct rtnl_link_stats64 *stats)
+ {
+   mtlk_df_user_t *df_user;
+@@ -5107,14 +5196,14 @@
+ 
+   /* Verify input pointer */
+   MTLK_ASSERT(stats);
+-  if (!stats) return NULL;
++  if (!stats) return;
+ 
+   df_user = mtlk_df_user_from_ndev(ndev);
+-  if (!df_user) return NULL;
++  if (!df_user) return;
+ 
+   radio = wave_vap_radio_get(mtlk_df_get_vap_handle(df_user->df));
+   MTLK_ASSERT(radio);
+-  if (!radio) return NULL;
++  if (!radio) return;
+ 
+   src = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_WLAN_COUNTERS_SRC);
+   switch (src) {
+@@ -5143,7 +5232,7 @@
+       }
+   }
+ 
+-  return stats;
++  return;
+ }
+ 
+ static void __MTLK_IFUNC
+@@ -5177,11 +5266,10 @@
+            sizeof(df_user->slow_ctx->linux_stats));
+   }
+ 
+-  if (!mtlk_osal_timer_is_cancelled(&df_user->slow_ctx->stat_timer)) {
+-    /* if timer has been already canceled, don't start it again,
+-       thus this callback can be performed from serializer later after timer stop */
+-    mtlk_osal_timer_set(&df_user->slow_ctx->stat_timer, _DF_STAT_POLL_PERIOD);
+-  }
++  /* Rejection/allocation failure can complete inline in the timer callback.
++   * Never synchronously cancel/rearm that running timer here. Completion
++   * also must not republish a timer after stop has joined its callback. */
++  atomic_set_release(&df_user->slow_ctx->stat_pending, 0);
+ }
+ 
+ static uint32
+@@ -5191,11 +5279,16 @@
+   mtlk_hw_t *hw = mtlk_vap_get_hw(mtlk_df_get_vap_handle(df_user->df));
+ 
+   /* if error is occurred in _pci_probe then serializer is absent */
+-  if (!wave_rcvry_pci_probe_error_get(wave_hw_mmb_get_mmb_base(hw))) {
++  if (wave_rcvry_pci_probe_error_get(wave_hw_mmb_get_mmb_base(hw)))
++    return 0;
++
++  /* The timer owns periodic rearm; at most one asynchronous request owns
++   * the cached statistics. Both inline and deferred completion release it. */
++  if (atomic_cmpxchg(&df_user->slow_ctx->stat_pending, 0, 1) == 0) {
+     _mtlk_df_user_invoke_core_async(df_user->df, WAVE_CORE_REQ_GET_STATUS,
+                                     NULL, 0, _mtlk_df_poll_stats_clb, HANDLE_T(df_user));
+   }
+-  return 0;
++  return _DF_STAT_POLL_PERIOD;
+ }
+ 
+ #define MAX_FW_RX_DATA_OFFSET 7
+@@ -5290,9 +5383,6 @@
+ 
+ MTLK_START_STEPS_LIST_BEGIN(df_user)
+ /* WAVE600: TODO: moved to init. Check this approach later */
+-#if _REG_NETDEV_WORKAROUND_
+-   MTLK_START_STEPS_LIST_ENTRY(df_user, REGISTER_DEVICE)
+-#endif
+ #ifdef MTCFG_LINUX_BACKPORT
+   MTLK_START_STEPS_LIST_ENTRY(df_user, NETIF_CARRIER)
+ #endif
+@@ -5303,36 +5393,34 @@
+ MTLK_START_INNER_STEPS_BEGIN(df_user)
+ MTLK_START_STEPS_LIST_END(df_user);
+ 
+-static int
+-_mtlk_df_user_reg_netdev (mtlk_df_user_t *df_user)
++static void _mtlk_netdev_destructor(struct net_device *ndev);
++
++/* These control-owner entry points must never run in the serializer. */
++int wave_df_register_netdev_locked(mtlk_df_user_t *df_user)
+ {
+-  int res = 0;
+-  /* For station mode interfaces net device registration is performed by mac80211 */
+-  BOOL is_ap = mtlk_vap_is_ap(mtlk_df_get_vap_handle(df_user->df));
+-  ILOG1_SDD("%s: is_ap=%d, is_reg=%d", df_user->ndev->name, (int)is_ap, (int)df_user->ndev_registered);
+-  if (is_ap && !df_user->ndev_registered) {
+-    res = register_netdevice(df_user->ndev);
+-    if (0 != res) {
+-      ELOG_D("register_netdevice failed, err %d", res);
+-    } else {
+-      df_user->ndev_registered = TRUE;
+-    }
+-  }
+-  return ((0 == res) ? MTLK_ERR_OK : MTLK_ERR_UNKNOWN);
++  struct wiphy *wiphy = df_user->ndev->ieee80211_ptr->wiphy;
++  int ret;
++
++  ASSERT_RTNL();
++  lockdep_assert_wiphy(wiphy);
++  if (df_user->ndev_registered)
++    return 0;
++  df_user->ndev->priv_destructor = NULL;
++  ret = cfg80211_register_netdevice(df_user->ndev);
++  df_user->ndev->priv_destructor = _mtlk_netdev_destructor;
++  if (ret)
++    return ret;
++  df_user->ndev_registered = true;
++  return 0;
+ }
+ 
+-static void
+-_mtlk_df_user_unreg_netdev (mtlk_df_user_t *df_user)
++void wave_df_unregister_netdev_locked(mtlk_df_user_t *df_user)
+ {
+-  /* For station mode interfaces net device unregistration is performed by mac80211 */
+-  BOOL is_ap = mtlk_vap_is_ap(mtlk_df_get_vap_handle(df_user->df));
+-  ILOG1_SDD("%s: is_ap=%d, is_reg=%d", df_user->ndev->name, (int)is_ap, (int)df_user->ndev_registered);
+-  if (is_ap && df_user->ndev_registered) {
+-    /* Can be called with rtnl locked already */
+-    int locked = rtnl_trylock();
+-    unregister_netdevice(df_user->ndev);
+-    if (locked) rtnl_unlock();
+-    df_user->ndev_registered = FALSE;
++  ASSERT_RTNL();
++  wave_df_notifications_stop_locked(df_user);
++  if (df_user->ndev_registered) {
++    df_user->ndev_registered = false;
++    cfg80211_unregister_netdevice(df_user->ndev);
+   }
+ }
+ 
+@@ -5359,10 +5447,6 @@
+                    MTLK_NOACTION, ());
+ #endif
+     /* WAVE600: TODO: moved to init. Check this approach later */
+-#if _REG_NETDEV_WORKAROUND_ /* register on init, unregister on stop */
+-    MTLK_STOP_STEP(df_user, REGISTER_DEVICE, MTLK_OBJ_PTR(df_user),
+-                   _mtlk_df_user_unreg_netdev, (df_user));
+-#endif
+   MTLK_STOP_END(df_user, MTLK_OBJ_PTR(df_user));
+ }
+ 
+@@ -5390,13 +5474,6 @@
+ 
+   MTLK_START_TRY(df_user, MTLK_OBJ_PTR(df_user))
+     /* WAVE600: TODO: moved to init. Check this approach later */
+-#if _REG_NETDEV_WORKAROUND_ /* register on init, unregister on stop */
+-     MTLK_START_STEP_VOID(df_user, REGISTER_DEVICE, MTLK_OBJ_PTR(df_user),
+-                     MTLK_NOACTION, ());
+-#else /* register on start */
+-    MTLK_START_STEP(df_user, REGISTER_DEVICE, MTLK_OBJ_PTR(df_user),
+-                    _mtlk_df_user_reg_netdev, (df_user));
+-#endif
+ #ifdef MTCFG_LINUX_BACKPORT
+     MTLK_START_STEP_VOID(df_user, NETIF_CARRIER, MTLK_OBJ_PTR(df_user),
+                          netif_carrier_off, (df_user->ndev));
+@@ -5417,8 +5494,8 @@
+ }
+ 
+ 
+-int __MTLK_IFUNC
+-mtlk_df_ui_indicate_rx_data(mtlk_df_t *df, mtlk_nbuf_t *nbuf)
++static int
++wave_df_indicate_rx_data(mtlk_df_t *df, mtlk_nbuf_t *nbuf, struct net_device *ndev)
+ {
+   int res;
+   mtlk_df_user_t *df_user;
+@@ -5435,7 +5512,7 @@
+ #endif
+ 
+   /* set pointer to dev, nbuf->protocol for DirectConnect case will be set within DirectConnect RX call back */
+-  nbuf->dev = df_user->ndev;
++  nbuf->dev = ndev;
+ 
+ #if MTLK_USE_DIRECTCONNECT_DP_API
+   if (__mtlk_df_user_litepath_is_registered(df_user)) {
+@@ -5503,8 +5580,23 @@
+ 
+   ILOG5_V("Send to Linux");
+   nbuf->protocol        = eth_type_trans(nbuf, nbuf->dev);
+-  res                   = netif_rx(nbuf);
+-  df_user->ndev->last_rx = jiffies;
++  if (mtlk_vap_is_ap(mtlk_df_get_vap_handle(df))) {
++    res = netif_rx(nbuf);
++  } else {
++    /* gro_cells uses a per-CPU queue: the receive handoff and stop gate
++     * share the network softirq lifetime. EAPOL keeps its separate path.
++     */
++    spin_lock_bh(&df_user->rx_gro_lock);
++    if (likely(df_user->rx_gro_accepting)) {
++      res = gro_cells_receive(&df_user->rx_gro, nbuf);
++    } else {
++      dev_core_stats_rx_dropped_inc(nbuf->dev);
++      dev_kfree_skb_any(nbuf);
++      res = NET_RX_DROP;
++    }
++    spin_unlock_bh(&df_user->rx_gro_lock);
++  }
++
+   if(NET_RX_SUCCESS != res) {
+     ILOG2_D("netif_rx failed: %d", res);
+     return MTLK_ERR_UNKNOWN;
+@@ -5513,6 +5605,17 @@
+   return MTLK_ERR_OK;
+ }
+ 
++
++int __MTLK_IFUNC
++mtlk_df_ui_indicate_rx_data(mtlk_df_t *df, mtlk_nbuf_t *nbuf)
++{
++  return wave_df_indicate_rx_data(df, nbuf, mtlk_df_get_user(df)->ndev);
++}
++
++/* src_sta comes from the received SID, not an Ethernet source/hostdb lookup.
++ * Keep RCU until netif_rx: child deletion then waits before unregistering and
++ * draining the network backlog. No skb queued to hardware retains a child.
++ */
+ BOOL __MTLK_IFUNC mtlk_df_ui_check_is_mc_group_member(mtlk_df_t *df,
+                                                   const uint8* group_addr)
+ {
+@@ -5599,15 +5702,16 @@
+ }
+ 
+ void __MTLK_IFUNC
+-mtlk_df_on_rcvry_restore (mtlk_df_t *df)
++mtlk_df_on_rcvry_restore (mtlk_df_t *df, BOOL start_stats)
+ {
+   MTLK_ASSERT(df != NULL);
+ 
+   /* Clear waiting events */
+   wave_rcvry_mac_hang_evt_reset_all(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df)));
+ 
+-  /* Start stat timer */
+-  mtlk_osal_timer_set(&mtlk_df_get_user(df)->slow_ctx->stat_timer, _DF_STAT_POLL_PERIOD);
++  /* Monitor recovery restarts its serializers after restoring the card. */
++  if (start_stats)
++    mtlk_osal_timer_set(&mtlk_df_get_user(df)->slow_ctx->stat_timer, _DF_STAT_POLL_PERIOD);
+ }
+ 
+ /**************************************************************
+@@ -6207,9 +6311,6 @@
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->fw_logger_packets_processed, "FW logger packets processed");
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->fw_logger_packets_dropped, "FW logger packets dropped");
+ 
+-  mtlk_aux_seq_printf(s, uint_fmt,  general_stats->tx_msdus_free, "TX MSDUs free");
+-  mtlk_aux_seq_printf(s, uint_fmt,  general_stats->tx_msdus_usage_peak, "TX MSDUs usage peak");
+-
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->dgaf_disabled_tx_pck_dropped, "DGAF disabled: TX DHCP packets converted to Unicast");
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->dgaf_disabled_tx_pck_converted, "DGAF disabled: TX Broadcast packets dropped");
+   mtlk_aux_seq_printf(s, uint_fmt, general_stats->radars_detected, "Radars detected");
+@@ -6220,11 +6321,7 @@
+ 
+ #ifdef MTLK_DEBUG
+   mtlk_aux_seq_printf(s, uint_fmt,  general_stats->tx_max_cfm_in_tasklet,      "TX max cfm in tasklet");
+-  mtlk_aux_seq_printf(s, luint_fmt, general_stats->tx_max_time_int_to_tasklet, "TX max time from interrupt to tasklet ns");
+-  mtlk_aux_seq_printf(s, luint_fmt, general_stats->tx_max_time_int_to_pck,     "TX max time from interrupt to processed packet ns");
+   mtlk_aux_seq_printf(s, uint_fmt,  general_stats->rx_max_pck_in_tasklet,      "RX max processed packets in tasklet");
+-  mtlk_aux_seq_printf(s, luint_fmt, general_stats->rx_max_time_int_to_tasklet, "RX max time from interrupt to tasklet ns");
+-  mtlk_aux_seq_printf(s, luint_fmt, general_stats->rx_max_time_int_to_pck,     "RX max time from interrupt to processed packet ns");
+ #endif
+ 
+   mtlk_aux_seq_printf(s, "\nBSS mgmt. related statistic\n\n");
+@@ -9096,16 +9193,31 @@
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+ 
++static int
++_mtlk_df_user_sta_gro_init(mtlk_df_user_t *df_user)
++{
++  if (mtlk_vap_is_ap(mtlk_df_get_vap_handle(df_user->df)))
++    return MTLK_ERR_OK;
++  /* STA borrows a registered mac80211 netdev. Its df_user is destroyed
++   * during remove_interface, before mac80211 unregisters the netdev.
++   * Keep AP's different netdev/destructor ownership unchanged.
++   */
++  if (gro_cells_init(&df_user->rx_gro, df_user->ndev))
++    return MTLK_ERR_NO_MEM;
++  WRITE_ONCE(df_user->rx_gro_accepting, true);
++  return MTLK_ERR_OK;
++}
++
+ static void
+-mtlk_df_user_uninit_prop_dfs_wq (mtlk_df_user_t *df_user)
++_mtlk_df_user_sta_gro_cleanup(mtlk_df_user_t *df_user)
+ {
+-  if (!mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df)))
++  if (mtlk_vap_is_ap(mtlk_df_get_vap_handle(df_user->df)))
+     return;
+-
+-  ILOG2_V("Uninit of DFS propagate state");
+-
+-  flush_workqueue(df_user->propagate_dfs_state_wq);
+-  destroy_workqueue(df_user->propagate_dfs_state_wq);
++  spin_lock_bh(&df_user->rx_gro_lock);
++  df_user->rx_gro_accepting = false;
++  spin_unlock_bh(&df_user->rx_gro_lock);
++  synchronize_net();
++  gro_cells_destroy(&df_user->rx_gro);
+ }
+ 
+ static void
+@@ -9113,15 +9225,10 @@
+ {
+   int i;
+ 
++  wave_df_tx_queue_stop(df_user);
+   MTLK_CLEANUP_BEGIN(df_user, MTLK_OBJ_PTR(df_user))
+-    MTLK_CLEANUP_STEP(df_user, PROP_DFS_WQ, MTLK_OBJ_PTR(df_user),
+-                      mtlk_df_user_uninit_prop_dfs_wq, (df_user));
+ 
+-    MTLK_CLEANUP_STEP(df_user, PROP_DFS_LIST, MTLK_OBJ_PTR(df_user),
+-                      mtlk_dlist_cleanup, (&df_user->propagate_dfs_state_list));
+ 
+-    MTLK_CLEANUP_STEP(df_user, PROP_DFS_MUTEX, MTLK_OBJ_PTR(df_user),
+-                      mtlk_osal_mutex_cleanup, (&df_user->prop_dfs_mutex));
+ 
+ 
+     for (i = 0; MTLK_CLEANUP_ITERATONS_LEFT(MTLK_OBJ_PTR(df_user), PROC_INIT) > 0; i++)
+@@ -9141,8 +9248,6 @@
+                       MTLK_NOACTION, ());
+ #endif
+ 
+-    MTLK_CLEANUP_STEP(df_user, REGISTER_DEVICE, MTLK_OBJ_PTR(df_user),
+-                      _mtlk_df_user_unreg_netdev, (df_user));
+ 
+     MTLK_CLEANUP_STEP(df_user, STAT_TIMER, MTLK_OBJ_PTR(df_user),
+                       mtlk_osal_timer_cleanup, (&df_user->slow_ctx->stat_timer));
+@@ -9150,6 +9255,8 @@
+                       _mtlk_df_ui_delete_debug_dir, (df_user));
+     MTLK_CLEANUP_STEP(df_user, CREATE_CARD_DIR, MTLK_OBJ_PTR(df_user),
+                       _mtlk_df_ui_delete_card_dir, (df_user));
++    MTLK_CLEANUP_STEP(df_user, STA_GRO, MTLK_OBJ_PTR(df_user),
++                      _mtlk_df_user_sta_gro_cleanup, (df_user));
+     MTLK_CLEANUP_STEP(df_user, NETDEV_INIT, MTLK_OBJ_PTR(df_user),
+                       MTLK_NOACTION, ());
+     MTLK_CLEANUP_STEP(df_user, DEBUG_BCL, MTLK_OBJ_PTR(df_user),
+@@ -9189,7 +9296,7 @@
+  *      - this function calls func_destructor(dev),
+  *        then calls default destructor free_netdev(dev)
+  */
+-void _mtlk_netdev_destructor (struct net_device *ndev)
++static void _mtlk_netdev_destructor (struct net_device *ndev)
+ {
+   mtlk_df_user_p *df_user_pp;
+   mtlk_df_user_t *df_user;
+@@ -9248,6 +9355,7 @@
+ 
+   /* link network device with wireless device */
+   df_user->ndev->ieee80211_ptr = &df_user->wdev;
++  df_user->wdev.netdev = df_user->ndev;
+ 
+   /* initialize wireless device */
+   df_user->wdev.wiphy = (struct wiphy *)ctx;
+@@ -9264,137 +9372,185 @@
+   _mtlk_df_user_fill_callbacks(df_user);
+ 
+   /* setup destructor */
+-  if (is_ap)
+-    df_user->ndev->destructor = ___mtlk_netdev_destructor;
+-  else
+-    df_user->ndev->destructor = free_netdev;
++  df_user->ndev->needs_free_netdev = true;
++  df_user->ndev->priv_destructor = _mtlk_netdev_destructor;
+ 
+-  /* Configure core and radio iwpriv handlers */
+-  if(mtlk_vap_is_master_ap(vap_handle)) {
+-      df_user->ndev->wireless_handlers = (struct iw_handler_def *)&wave_linux_iw_radio_handler_def;
+-  } else {
+-      wave_linux_iw_core_handler_def.num_private_args = wave_df_get_core_privtab_size();
+-      df_user->ndev->wireless_handlers = (struct iw_handler_def *)&wave_linux_iw_core_handler_def;
+-  }
+ 
+   return MTLK_ERR_OK;
+ }
+ 
+-/* Must be called from process context */
+-void __MTLK_IFUNC
+-mtlk_df_user_add_propagate_event (mtlk_df_user_t *df_user,
+-                                  const struct cfg80211_chan_def *chandef,
+-                                  enum nl80211_dfs_state dfs_state,
+-                                  enum nl80211_radar_event event,
+-                                  uint8 rbm,
+-                                  BOOL cac_started)
+-{
+-  mtlk_dfs_state_cfg_t *dfs_state_cfg;
+-  df_user = mtlk_df_get_user(mtlk_df_user_get_master_df(df_user));
+-
+-  dfs_state_cfg = mtlk_osal_mem_alloc(sizeof(*dfs_state_cfg), MTLK_MEM_TAG_PROP_DFS_STATE);
+-  if (NULL == dfs_state_cfg) {
+-    ELOG_V("Failed to allocate memory");
+-    return;
+-  }
+-
+-  memset(dfs_state_cfg, 0, sizeof(*dfs_state_cfg));
+-  dfs_state_cfg->chandef = *chandef;
+-  dfs_state_cfg->dfs_state = dfs_state;
+-  dfs_state_cfg->event = event;
+-  dfs_state_cfg->rbm = rbm;
+-  dfs_state_cfg->cac_started = cac_started;
+-
+-  ILOG2_V("Adding work");
+-
+-  mtlk_osal_mutex_acquire(&df_user->prop_dfs_mutex);
+-  mtlk_dlist_push_back_obj(&df_user->propagate_dfs_state_list, dfs_state_cfg, lentry);
+-  mtlk_osal_mutex_release(&df_user->prop_dfs_mutex);
+-}
+-
+-void mtlk_df_user_handle_radar_event (mtlk_df_user_t *df_user, struct wireless_dev *wdev,
+-                                      struct mtlk_chan_def *mcd, uint32 cac_started, uint8 rbm)
++/* The hardware already stopped TX before reporting radar. Native cfg80211
++ * safely queues cross-wiphy propagation; no private RTNL workqueue is needed. */
++void mtlk_df_user_handle_radar_event(mtlk_df_user_t *df_user,
++    struct wireless_dev *wdev, struct mtlk_chan_def *mcd,
++    uint32 cac_started, uint8 rbm)
+ {
+-  struct cfg80211_chan_def chandef;
++  struct cfg80211_chan_def chandef = {0};
+ 
+-  memset(&chandef, 0, sizeof(chandef));
+   chandef.chan = ieee80211_get_channel(wdev->wiphy, mcd->chan.center_freq);
+   chandef.width = mtlkcw2nlcw(mcd->width, mcd->is_noht);
+   chandef.center_freq1 = mcd->center_freq1;
+   chandef.center_freq2 = mcd->center_freq2;
++  if (chandef.chan && cfg80211_chandef_valid(&chandef))
++    wv_cfg80211_radar_event(wdev, &chandef, cac_started, rbm);
++}
+ 
+-  /* cfg80211_radar_event will be called in propagate DFS state workqueue callback */
+-  mtlk_df_user_add_propagate_event(df_user, &chandef, NL80211_DFS_UNAVAILABLE,
+-                                   NL80211_RADAR_DETECTED, rbm, cac_started);
+-  mtlk_df_user_schedule_prop_dfs_wq(df_user);
+-}
+-
+-static void mtlk_df_user_propagate_dfs_state (struct work_struct *work)
+-{
+-  mtlk_dlist_entry_t *head;
+-  mtlk_dlist_entry_t *entry;
+-  mtlk_dfs_state_cfg_t *dfs_state_cfg;
+-  struct wireless_dev *wdev;
+-  mtlk_df_user_t *df_user = MTLK_CONTAINER_OF(work, mtlk_df_user_t, propagate_dfs_state_work);
+-
+-  if (!mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df))) {
+-    ELOG_V("Not master DF User");
+-    return;
++void wave_df_assoc_record(mtlk_df_user_t *df_user,
++                          const struct wave_assoc_metadata *metadata)
++{
++  unsigned long flags;
++  unsigned int i, slot = 0;
++  int free_slot = -1;
++
++  spin_lock_irqsave(&df_user->assoc_lock, flags);
++  for (i = 0; i < ARRAY_SIZE(df_user->assoc_metadata); i++) {
++    struct wave_assoc_metadata *entry = &df_user->assoc_metadata[i];
++    if (ether_addr_equal(entry->mac, metadata->mac)) {
++      slot = i;
++      goto replace;
++    }
++    if (!is_valid_ether_addr(entry->mac) || time_after_eq(jiffies, entry->expires))
++      free_slot = i;
++    if (time_before(entry->expires, df_user->assoc_metadata[slot].expires))
++      slot = i;
++  }
++  if (free_slot >= 0)
++    slot = free_slot;
++replace:
++  df_user->assoc_metadata[slot] = *metadata;
++  df_user->assoc_metadata[slot].expires = jiffies + 30 * HZ;
++  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
++}
++
++bool wave_df_assoc_get(mtlk_df_user_t *df_user, const u8 *mac,
++                       struct wave_assoc_metadata *metadata)
++{
++  unsigned long flags;
++  unsigned int i;
++  bool found = false;
++
++  spin_lock_irqsave(&df_user->assoc_lock, flags);
++  for (i = 0; i < ARRAY_SIZE(df_user->assoc_metadata); i++) {
++    struct wave_assoc_metadata *entry = &df_user->assoc_metadata[i];
++    if (ether_addr_equal(entry->mac, mac) && time_before(jiffies, entry->expires)) {
++      /* RX and userspace MLME are asynchronous: several association
++       * requests may share the latest per-peer hints before NEW_STATION
++       * completes. Reading must not consume or extend this bounded cache.
++       */
++      *metadata = *entry;
++      found = true;
++      break;
++    }
+   }
++  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
++  return found;
++}
+ 
+-  wdev = mtlk_df_user_get_wdev(df_user);
++void wave_df_assoc_clear(mtlk_df_user_t *df_user)
++{
++  unsigned long flags;
+ 
+-  ILOG2_D("Doing %d works", df_user->propagate_dfs_state_list.depth);
++  spin_lock_irqsave(&df_user->assoc_lock, flags);
++  memset(df_user->assoc_metadata, 0, sizeof(df_user->assoc_metadata));
++  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
++}
+ 
+-  rtnl_lock();
+-  mtlk_osal_mutex_acquire(&df_user->prop_dfs_mutex);
++static void wave_df_channel_notify_work(struct wiphy *wiphy,
++                                       struct wiphy_work *work)
++{
++  mtlk_df_user_t *df_user = container_of(work, mtlk_df_user_t, channel_notify_work);
++  struct cfg80211_chan_def chandef;
++  unsigned long flags;
++  bool pending;
++
++  lockdep_assert_wiphy(wiphy);
++  spin_lock_irqsave(&df_user->channel_notify_lock, flags);
++  pending = df_user->channel_notify_pending && !df_user->channel_notify_stopping;
++  chandef = df_user->channel_notify_chandef;
++  df_user->channel_notify_pending = false;
++  spin_unlock_irqrestore(&df_user->channel_notify_lock, flags);
+ 
+-  mtlk_dlist_foreach(&df_user->propagate_dfs_state_list, entry, head) {
+-    dfs_state_cfg = MTLK_LIST_GET_CONTAINING_RECORD(entry, mtlk_dfs_state_cfg_t, lentry);
+-    wv_cfg80211_regulatory_propagate_dfs_state(wdev,
+-                                               &dfs_state_cfg->chandef,
+-                                               dfs_state_cfg->dfs_state,
+-                                               dfs_state_cfg->event,
+-                                               dfs_state_cfg->rbm);
+-    /* Special case if radar deteced, we must propagate DFS state before calling cfg80211_radar_event,
+-     * so calling cfg80211_radar_event is done here, as we must not take rtnl_lock from serializer context */
+-    if (dfs_state_cfg->event == NL80211_RADAR_DETECTED)
+-      wv_cfg80211_radar_event(wdev, &dfs_state_cfg->chandef, dfs_state_cfg->cac_started, dfs_state_cfg->rbm);
++  if (pending && df_user->ndev_registered && netif_running(df_user->ndev) &&
++      df_user->ndev->ieee80211_ptr->links[0].ap.beacon_interval)
++    cfg80211_ch_switch_notify(df_user->ndev, &chandef, 0);
++}
++
++void wave_df_queue_channel_notify(mtlk_df_user_t *df_user,
++                                 const struct cfg80211_chan_def *chandef)
++{
++  unsigned long flags;
+ 
+-    entry = mtlk_dlist_remove(&df_user->propagate_dfs_state_list, entry);
+-    mtlk_osal_mem_free(dfs_state_cfg);
++  spin_lock_irqsave(&df_user->channel_notify_lock, flags);
++  if (!df_user->channel_notify_stopping) {
++    df_user->channel_notify_chandef = *chandef;
++    df_user->channel_notify_pending = true;
++    /* Queue under the same lock as stop, so cancellation cannot race a
++     * producer that has published data but has not yet queued its work. */
++    wiphy_work_queue(df_user->ndev->ieee80211_ptr->wiphy,
++                     &df_user->channel_notify_work);
+   }
++  spin_unlock_irqrestore(&df_user->channel_notify_lock, flags);
++}
+ 
+-  ILOG2_V("Done");
++static void wave_df_ap_stop_work(struct wiphy *wiphy, struct wiphy_work *work)
++{
++  mtlk_df_user_t *df_user = container_of(work, mtlk_df_user_t, ap_stop_work);
++  struct wireless_dev *wdev = df_user->ndev->ieee80211_ptr;
+ 
+-  mtlk_osal_mutex_release(&df_user->prop_dfs_mutex);
+-  rtnl_unlock();
++  lockdep_assert_wiphy(wiphy);
++  if (!df_user->ap_stop_pending || !df_user->ndev_registered)
++    return;
++  if (wdev->links[0].ap.beacon_interval)
++    cfg80211_stop_iface(wiphy, wdev, GFP_KERNEL);
++  else
++    df_user->ap_stop_pending = false;
+ }
+ 
+-void __MTLK_IFUNC
+-mtlk_df_user_schedule_prop_dfs_wq (mtlk_df_user_t *df_user)
++bool wave_df_ap_blocked_locked(mtlk_df_user_t *df_user)
+ {
+-  df_user = mtlk_df_get_user(mtlk_df_user_get_master_df(df_user));
++  lockdep_assert_wiphy(df_user->ndev->ieee80211_ptr->wiphy);
++  return df_user->ap_stop_pending;
++}
++
++void wave_df_ap_stop_locked(mtlk_df_user_t *df_user)
++{
++  struct wiphy *wiphy = df_user->ndev->ieee80211_ptr->wiphy;
+ 
+-  ILOG2_V("Scheduling work");
+-  queue_work(df_user->propagate_dfs_state_wq, &df_user->propagate_dfs_state_work);
++  lockdep_assert_wiphy(wiphy);
++  df_user->ap_stop_pending = true;
++  wiphy_work_queue(wiphy, &df_user->ap_stop_work);
+ }
+ 
+-static int
+-mtlk_df_user_init_prop_dfs_wq (mtlk_df_user_t *df_user)
++void wave_df_ap_stopped_locked(mtlk_df_user_t *df_user)
+ {
+-  if (!mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df)))
+-    return MTLK_ERR_OK;
++  lockdep_assert_wiphy(df_user->ndev->ieee80211_ptr->wiphy);
++  df_user->ap_stop_pending = false;
++  wave_df_assoc_clear(df_user);
++}
+ 
+-  df_user->propagate_dfs_state_wq = create_workqueue("propagate_dfs_state");
+-  if (NULL == df_user->propagate_dfs_state_wq) {
+-    ELOG_V("Failed to create work queue");
+-    return MTLK_ERR_NO_RESOURCES;
+-  }
++void wave_df_notifications_start_locked(mtlk_df_user_t *df_user)
++{
++  unsigned long flags;
+ 
+-  INIT_WORK(&df_user->propagate_dfs_state_work, mtlk_df_user_propagate_dfs_state);
++  lockdep_assert_wiphy(df_user->ndev->ieee80211_ptr->wiphy);
++  spin_lock_irqsave(&df_user->channel_notify_lock, flags);
++  df_user->channel_notify_pending = false;
++  df_user->channel_notify_stopping = !df_user->ndev_registered;
++  spin_unlock_irqrestore(&df_user->channel_notify_lock, flags);
++}
+ 
+-  return MTLK_ERR_OK;
++void wave_df_notifications_stop_locked(mtlk_df_user_t *df_user)
++{
++  struct wiphy *wiphy = df_user->ndev->ieee80211_ptr->wiphy;
++  unsigned long flags;
++
++  lockdep_assert_wiphy(wiphy);
++  spin_lock_irqsave(&df_user->channel_notify_lock, flags);
++  df_user->channel_notify_stopping = true;
++  df_user->channel_notify_pending = false;
++  spin_unlock_irqrestore(&df_user->channel_notify_lock, flags);
++  wiphy_work_cancel(wiphy, &df_user->channel_notify_work);
++  wiphy_work_cancel(wiphy, &df_user->ap_stop_work);
+ }
+ 
+ static int
+@@ -9419,20 +9575,19 @@
+     MTLK_INIT_STEP(df_user, NETDEV_INIT, MTLK_OBJ_PTR(df_user),
+                    _mtlk_df_user_netdev_init, (df_user, ctx, name));
+ 
++    MTLK_INIT_STEP(df_user, STA_GRO, MTLK_OBJ_PTR(df_user),
++                   _mtlk_df_user_sta_gro_init, (df_user));
++
+     MTLK_INIT_STEP(df_user, CREATE_CARD_DIR, MTLK_OBJ_PTR(df_user),
+                    _mtlk_df_ui_create_card_dir, (df_user));
+ 
+     MTLK_INIT_STEP(df_user, CREATE_DEBUG_DIR, MTLK_OBJ_PTR(df_user),
+                    _mtlk_df_ui_create_debug_dir, (df_user));
+ 
++    atomic_set(&df_user->slow_ctx->stat_pending, 0);
+     MTLK_INIT_STEP(df_user, STAT_TIMER, MTLK_OBJ_PTR(df_user),
+                    mtlk_osal_timer_init, (&df_user->slow_ctx->stat_timer, _mtlk_df_poll_stats, HANDLE_T(df_user)));
+ 
+-#if _REG_NETDEV_WORKAROUND_ /* register on init, unregister on stop */
+-    /* WAVE600: TODO: moved from start. Check this approach later */
+-    MTLK_INIT_STEP(df_user, REGISTER_DEVICE, MTLK_OBJ_PTR(df_user),
+-                   _mtlk_df_user_reg_netdev, (df_user));
+-#endif
+ #if MTLK_USE_PUMA6_UDMA
+     MTLK_INIT_STEP_VOID(df_user, UDMA_INIT, MTLK_OBJ_PTR(df_user),
+                    _mtlk_df_user_udma_init, (df_user));
+@@ -9450,14 +9605,8 @@
+     }
+ 
+ 
+-    MTLK_INIT_STEP(df_user, PROP_DFS_MUTEX, MTLK_OBJ_PTR(df_user),
+-                   mtlk_osal_mutex_init, (&df_user->prop_dfs_mutex));
+ 
+-    MTLK_INIT_STEP_VOID(df_user, PROP_DFS_LIST, MTLK_OBJ_PTR(df_user),
+-                        mtlk_dlist_init, (&df_user->propagate_dfs_state_list));
+ 
+-    MTLK_INIT_STEP(df_user, PROP_DFS_WQ, MTLK_OBJ_PTR(df_user),
+-                   mtlk_df_user_init_prop_dfs_wq, (df_user));
+   MTLK_INIT_FINALLY(df_user, MTLK_OBJ_PTR(df_user))
+   MTLK_INIT_RETURN(df_user, MTLK_OBJ_PTR(df_user), _mtlk_df_user_cleanup, (df_user))
+ }
+@@ -9476,6 +9625,13 @@
+     return NULL;
+   }
+   memset (df_user, 0, sizeof(mtlk_df_user_t));
++  INIT_LIST_HEAD(&df_user->tx_queue.node);
++  spin_lock_init(&df_user->rx_gro_lock);
++  spin_lock_init(&df_user->assoc_lock);
++  spin_lock_init(&df_user->channel_notify_lock);
++  wiphy_work_init(&df_user->channel_notify_work, wave_df_channel_notify_work);
++  wiphy_work_init(&df_user->ap_stop_work, wave_df_ap_stop_work);
++  df_user->channel_notify_stopping = true;
+ 
+   /* Create net_device for cfg80211 AP role VAP.
+    * Use mac80211 allocated ndev for station role virtual interface*/
+@@ -9499,6 +9655,7 @@
+ 
+   /* link DF User with Linux network device */
+   df_user->ndev = ndev;
++  df_user->tx_queue.ndev = ndev;
+ 
+   if (MTLK_ERR_OK != _mtlk_df_user_init(df_user, ctx, name)) {
+     if (is_ap) {
+@@ -9518,6 +9675,15 @@
+   bool is_ap = mtlk_vap_is_ap(mtlk_df_get_vap_handle(df_user->df));
+ 
+   _mtlk_df_user_cleanup(df_user);
++  if (is_ap && ndev && (ndev->reg_state == NETREG_UNINITIALIZED ||
++                       ndev->reg_state == NETREG_UNREGISTERED)) {
++    /* Creation or registration failed before publishing this netdevice. */
++    *(mtlk_df_user_p *)netdev_priv(ndev) = NULL;
++    free_netdev(ndev);
++    df_user->ndev = ndev = NULL;
++  }
++  if (is_ap && ndev && ndev->reg_state == NETREG_UNREGISTERING)
++    free_netdev(ndev); /* Deferred by the network core until RTNL is released. */
+   if (is_ap){
+     if (ndev) {
+       df_user->destructor_flags |= WAVE_DESTRUCT_DFUSER_DELETE_CALLED;
+@@ -10616,6 +10782,11 @@
+   mtlk_core_ui_mc_update_sta_db_t req;
+   size_t                     mac_list_size;
+ 
++  /* DirectConnect supplies a full-width ID. Reject before uint8 narrowing;
++   * this helper names an explicit firmware group, never automatic allocation. */
++  if (grp_id < MC_MIN_GROUP || grp_id >= MC_GROUPS)
++    return;
++
+   df_user = mtlk_df_user_from_ndev(ndev);
+   if (!df_user) return;
+   df = mtlk_df_user_get_df(df_user);
+--- a/wireless/driver/linux/mtlk_df_user_priv.h
++++ b/wireless/driver/linux/mtlk_df_user_priv.h
+@@ -297,7 +297,7 @@
+ #define MTLK_IW_PRIV_SIZE(param)            (mtlk_iw_priv_item_size(param) * MTLK_IW_PRIV_LENGTH(param))
+ 
+ static __INLINE
+-size_t const mtlk_iw_priv_item_size(const mtlk_iwpriv_params_t param) {
++size_t mtlk_iw_priv_item_size(const mtlk_iwpriv_params_t param) {
+   switch MTLK_IW_PRIV_TYPE(param) {
+     case TEXT_ITEM : return TEXT_ITEM_SIZE;
+     case INT_ITEM  : return INT_ITEM_SIZE;
+@@ -307,7 +307,7 @@
+ }
+ 
+ static __INLINE
+-const char* const mtlk_iw_priv_item_type(const mtlk_iwpriv_params_t param) {
++const char* mtlk_iw_priv_item_type(const mtlk_iwpriv_params_t param) {
+   switch MTLK_IW_PRIV_TYPE(param) {
+     case TEXT_ITEM : return "TEXT";
+     case INT_ITEM  : return "INT";
+@@ -337,7 +337,7 @@
+ /* User-friendly interface/device name */
+ const char*
+ mtlk_df_user_get_name(mtlk_df_user_t *df_user);
+-const uint32
++uint32
+ mtlk_df_user_get_flags(mtlk_df_user_t *df_user);
+ struct net_device *
+ mtlk_df_user_get_ndev(mtlk_df_user_t *df_user);
+@@ -671,7 +671,7 @@
+ static __INLINE mtlk_df_user_t *
+ mtlk_df_user_from_wdev (struct wireless_dev *wdev)
+ {
+-  if (wdev->iftype == NL80211_IFTYPE_AP)
++  if (wdev->iftype == NL80211_IFTYPE_AP || wdev->iftype == NL80211_IFTYPE_AP_VLAN)
+     return *((mtlk_df_user_p*) netdev_priv(wdev->netdev));
+   else
+     return mtlk_df_user_ieee80211_ndev_to_dfuser(wdev->netdev);
+@@ -696,19 +696,45 @@
+   return mtlk_df_user_from_ndev(skb->dev);
+ }
+ 
+-void __MTLK_IFUNC
+-mtlk_df_user_add_propagate_event (mtlk_df_user_t *df_user,
+-                                  const struct cfg80211_chan_def *chandef,
+-                                  enum nl80211_dfs_state dfs_state,
+-                                  enum nl80211_radar_event event,
+-                                  uint8 rbm,
+-                                  BOOL cac_started);
+-void __MTLK_IFUNC
+-mtlk_df_user_handle_radar_event (mtlk_df_user_t *df_user, struct wireless_dev *wdev,
+-                                 struct mtlk_chan_def *mcd, uint32 cac_started, uint8 rbm);
+-
+-void __MTLK_IFUNC
+-mtlk_df_user_schedule_prop_dfs_wq (mtlk_df_user_t *df_user);
++/* Short-lived metadata from the actual received association request.
++ * Upstream nl80211 intentionally does not echo the raw request through ADD_STA.
++ * The firmware station ABI remains unchanged.
++ */
++struct wave_assoc_metadata {
++  u8 mac[ETH_ALEN];
++  s8 rssi;
++  u8 coexistence;
++  u8 vendor;
++  u8 opmode;
++  bool opmode_valid;
++  bool pbac;
++  unsigned long expires;
++};
++/* Latest received hints are independent of the installed peer/key owner.
++ * Lookups and peer removal preserve the snapshot without refreshing expiry.
++ * A new request replaces it; BSS stop clears it. Entries expire after 30 seconds. */
++void wave_df_assoc_record(mtlk_df_user_t *df_user,
++                          const struct wave_assoc_metadata *metadata);
++bool wave_df_assoc_get(mtlk_df_user_t *df_user, const u8 *mac,
++                       struct wave_assoc_metadata *metadata);
++void wave_df_assoc_clear(mtlk_df_user_t *df_user);
++bool wave_df_intra_bss_forwarding(mtlk_df_user_t *df_user);
++
++void wave_df_tx_queue_start(mtlk_df_user_t *df_user);
++void wave_df_tx_queue_stop(mtlk_df_user_t *df_user);
++int wave_df_register_netdev_locked(mtlk_df_user_t *df_user);
++int wave_df_user_set_mac_addr(mtlk_df_user_t *df_user, const u8 *macaddr);
++void wave_df_unregister_netdev_locked(mtlk_df_user_t *df_user);
++void mtlk_df_user_handle_radar_event(mtlk_df_user_t *df_user,
++    struct wireless_dev *wdev, struct mtlk_chan_def *mcd,
++    uint32 cac_started, uint8 rbm);
++bool wave_df_ap_blocked_locked(mtlk_df_user_t *df_user);
++void wave_df_ap_stop_locked(mtlk_df_user_t *df_user);
++void wave_df_ap_stopped_locked(mtlk_df_user_t *df_user);
++void wave_df_notifications_start_locked(mtlk_df_user_t *df_user);
++void wave_df_notifications_stop_locked(mtlk_df_user_t *df_user);
++void wave_df_queue_channel_notify(mtlk_df_user_t *df_user,
++                                 const struct cfg80211_chan_def *chandef);
+ 
+ int  __MTLK_IFUNC    mtlk_df_ui_phy_rx_status_create(mtlk_df_user_t *df_user, unsigned size);
+ void __MTLK_IFUNC    mtlk_df_ui_phy_rx_status_delete(mtlk_df_user_t *df_user);
+--- a/wireless/driver/linux/mtlk_df_user_tbl.c
++++ b/wireless/driver/linux/mtlk_df_user_tbl.c
+@@ -483,7 +483,7 @@
+ /********************************************************************
+  * IW private IOCTL handlers table
+  ********************************************************************/
+-static const iw_handler mtlk_linux_private_handler[] = {
++static const iw_handler __maybe_unused mtlk_linux_private_handler[] = {
+   [ 0] = mtlk_df_ui_linux_ioctl_set_int,
+   [ 1] = mtlk_df_ui_linux_ioctl_get_int,
+   [ 4] = mtlk_df_ui_linux_ioctl_set_intvec,
+@@ -517,28 +517,19 @@
+ 
+   [IW_IOCTL_IDX(SIOCSIWFREQ)] = (iw_handler) mtlk_df_ui_linux_ioctl_setfreq,
+   [IW_IOCTL_IDX(SIOCGIWFREQ)] = (iw_handler) mtlk_df_ui_linux_ioctl_getfreq,
+-  [IW_IOCTL_IDX(SIOCSIWMODE)] = (iw_handler) cfg80211_wext_siwmode,
+-  [IW_IOCTL_IDX(SIOCGIWMODE)] = (iw_handler) cfg80211_wext_giwmode,
+   [IW_IOCTL_IDX(SIOCSIWAP)] = (iw_handler) mtlk_df_ui_linux_ioctl_setap,
+   [IW_IOCTL_IDX(SIOCGIWAP)] = (iw_handler) mtlk_df_ui_linux_ioctl_getap,
+   [IW_IOCTL_IDX(SIOCSIWMLME)] = (iw_handler) mtlk_df_ui_linux_ioctl_setmlme,
+   [IW_IOCTL_IDX(SIOCGIWAPLIST)] = (iw_handler) mtlk_df_ui_linux_ioctl_getaplist,
+-  [IW_IOCTL_IDX(SIOCSIWSCAN)] = (iw_handler) cfg80211_wext_siwscan,
+-  [IW_IOCTL_IDX(SIOCGIWSCAN)] = (iw_handler) cfg80211_wext_giwscan,
+   [IW_IOCTL_IDX(SIOCSIWESSID)] = (iw_handler) mtlk_df_ui_linux_ioctl_setessid,
+   [IW_IOCTL_IDX(SIOCGIWESSID)] = (iw_handler) mtlk_df_ui_linux_ioctl_getessid,
+   [IW_IOCTL_IDX(SIOCSIWNICKN)] = (iw_handler) mtlk_df_ui_linux_ioctl_setnick,
+   [IW_IOCTL_IDX(SIOCGIWNICKN)] = (iw_handler) mtlk_df_ui_linux_ioctl_getnick,
+   [IW_IOCTL_IDX(SIOCSIWRATE)] = (iw_handler) NULL,
+   [IW_IOCTL_IDX(SIOCGIWRATE)] = (iw_handler) NULL,
+-  [IW_IOCTL_IDX(SIOCSIWRTS)] = (iw_handler) cfg80211_wext_siwrts,
+-  [IW_IOCTL_IDX(SIOCGIWRTS)] = (iw_handler) cfg80211_wext_giwrts,
+-  [IW_IOCTL_IDX(SIOCSIWFRAG)] = (iw_handler) cfg80211_wext_siwfrag,
+-  [IW_IOCTL_IDX(SIOCGIWFRAG)] = (iw_handler) cfg80211_wext_giwfrag,
+   [IW_IOCTL_IDX(SIOCSIWTXPOW)] = (iw_handler) NULL,
+   [IW_IOCTL_IDX(SIOCGIWTXPOW)] = (iw_handler) mtlk_df_ui_linux_ioctl_gettxpower,
+   [IW_IOCTL_IDX(SIOCSIWRETRY)] = (iw_handler) mtlk_df_ui_linux_ioctl_setretry,
+-  [IW_IOCTL_IDX(SIOCGIWRETRY)] = (iw_handler) cfg80211_wext_giwretry,
+   [IW_IOCTL_IDX(SIOCSIWENCODE)] = (iw_handler) mtlk_df_ui_linux_ioctl_setenc,
+   [IW_IOCTL_IDX(SIOCGIWENCODE)] = (iw_handler) mtlk_df_ui_linux_ioctl_getenc,
+   [IW_IOCTL_IDX(SIOCSIWPOWER)] = (iw_handler) NULL,
+@@ -553,11 +544,19 @@
+ 
+ struct iw_handler_def wave_linux_iw_radio_handler_def = {
+   .num_standard = ARRAY_SIZE(_cfg80211_handlers),
++#ifdef CONFIG_WEXT_PRIV
+   .num_private = ARRAY_SIZE(mtlk_linux_private_handler),
++#endif
++#ifdef CONFIG_WEXT_PRIV
+   .num_private_args = ARRAY_SIZE(wave_linux_iw_core_radio_privtab),
++#endif
+   .standard = (iw_handler *) _cfg80211_handlers,
++#ifdef CONFIG_WEXT_PRIV
+   .private = (iw_handler *) mtlk_linux_private_handler,
++#endif
++#ifdef CONFIG_WEXT_PRIV
+   .private_args = (struct iw_priv_args *) wave_linux_iw_core_radio_privtab,
++#endif
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(2,6,0)
+   .get_wireless_stats = mtlk_df_ui_linux_ioctl_get_iw_stats,
+ #endif
+@@ -565,11 +564,19 @@
+ 
+ struct iw_handler_def wave_linux_iw_core_handler_def = {
+   .num_standard = ARRAY_SIZE(_cfg80211_handlers),
++#ifdef CONFIG_WEXT_PRIV
+   .num_private = ARRAY_SIZE(mtlk_linux_private_handler),
++#endif
++#ifdef CONFIG_WEXT_PRIV
+   .num_private_args = 0,
++#endif
+   .standard = (iw_handler *) _cfg80211_handlers,
++#ifdef CONFIG_WEXT_PRIV
+   .private = (iw_handler *) mtlk_linux_private_handler,
++#endif
++#ifdef CONFIG_WEXT_PRIV
+   .private_args = (struct iw_priv_args *) wave_linux_iw_core_radio_privtab,
++#endif
+   .get_wireless_stats = mtlk_df_ui_linux_ioctl_get_iw_stats,
+ };
+ 
+--- a/wireless/driver/linux/mtlkdfdefs.h
++++ b/wireless/driver/linux/mtlkdfdefs.h
+@@ -15,6 +15,7 @@
+ struct _mtlk_hw_vft_t;
+ typedef struct _mtlk_vap_manager_t mtlk_vap_manager_t;
+ typedef struct _mtlk_hw_api_t      mtlk_hw_api_t;
++typedef struct _mtlk_hw_msg_t      mtlk_hw_msg_t;
+ typedef struct _mtlk_vap_handle_t *mtlk_vap_handle_t;
+ 
+ #define _mtlk_core_t nic
+--- a/wireless/driver/linux/vendor_events.c
++++ b/wireless/driver/linux/vendor_events.c
+@@ -0,0 +1,32 @@
++/******************************************************************************
++
++                               Copyright (c) 2012
++                            Lantiq Deutschland GmbH
++
++  For licensing information, see the file 'LICENSE' in the root folder of
++  this software module.
++
++******************************************************************************/
++
++#include "mtlkinc.h"
++#include "cfg80211.h"
++#include "vendor_cmds.h"
++
++#define VENDOR_EVT(cmd) {OUI_LTQ, (cmd)}
++
++static struct
++nl80211_vendor_cmd_info _wave_cfg80211_vendor_events[] = {
++  VENDOR_EVT(LTQ_NL80211_VENDOR_EVENT_RX_EAPOL),
++  VENDOR_EVT(LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS),
++  VENDOR_EVT(LTQ_NL80211_VENDOR_EVENT_CHAN_DATA),
++  VENDOR_EVT(LTQ_NL80211_VENDOR_EVENT_UNCONNECTED_STA),
++  VENDOR_EVT(LTQ_NL80211_VENDOR_EVENT_WDS_CONNECT),
++  VENDOR_EVT(LTQ_NL80211_VENDOR_EVENT_WDS_DISCONNECT),
++  VENDOR_EVT(LTQ_NL80211_VENDOR_EVENT_CSA_RECEIVED),
++};
++
++void _wave_cfg80211_register_vendor_evts(struct wiphy *wiphy)
++{
++  wiphy->vendor_events = _wave_cfg80211_vendor_events;
++  wiphy->n_vendor_events = ARRAY_SIZE(_wave_cfg80211_vendor_events);
++}
+--- a/wireless/driver/shared/mtlkaux.c
++++ b/wireless/driver/shared/mtlkaux.c
+@@ -158,13 +158,13 @@
+   case MTLK_NETWORK_11BG_MIXED: /* walk through */
+   case MTLK_NETWORK_11B_ONLY: /* walk through */
+   case MTLK_NETWORK_11G_ONLY:
+-  case MTLK_NETWORK_11BGNAX_MIXED:
+     return FALSE;
+   case MTLK_NETWORK_11ABGN_MIXED: /* walk through */
+   case MTLK_NETWORK_11ANAC_MIXED: /* walk through */
+   case MTLK_NETWORK_11ANACAX_MIXED: /* walk through */
+   case MTLK_NETWORK_11AN_MIXED: /* walk through */
+   case MTLK_NETWORK_11BGN_MIXED: /* walk through */
++  case MTLK_NETWORK_11BGNAX_MIXED: /* walk through */
+   case MTLK_NETWORK_11GN_MIXED: /* walk through */
+   case MTLK_NETWORK_11N_2_4_ONLY: /* walk through */
+   case MTLK_NETWORK_11N_5_ONLY:
