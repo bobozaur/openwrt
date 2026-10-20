@@ -1,0 +1,37 @@
+From 207d8feaf2a699ffb81f70de34b1f2d83cf99dd0 Mon Sep 17 00:00:00 2001
+From: Mauri Sandberg <maukka@ext.kapsi.fi>
+Date: Tue, 6 Oct 2026 21:59:21 +0300
+Subject: [PATCH] mount_root: honor fstools_overlay_name in done
+
+mount_root start uses fstools_overlay_name to select a named overlay,
+but done always looks for rootfs_data. On a device with a named
+overlay, this leaves its state pending.
+
+Signed-off-by: Mauri Sandberg <maukka@ext.kapsi.fi>
+---
+ mount_root.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/mount_root.c b/mount_root.c
+index 392e912..78a7366 100644
+--- a/mount_root.c
++++ b/mount_root.c
+@@ -115,7 +115,14 @@ stop(int argc, char *argv[1])
+ static int
+ done(int argc, char *argv[1])
+ {
+-	struct volume *v = volume_find("rootfs_data");
++	char dataparam[BUFLEN];
++	char *dataname = "rootfs_data";
++	struct volume *v;
++
++	if (get_var_from_file("/proc/cmdline", "fstools_overlay_name", dataparam, sizeof(dataparam)))
++		dataname = dataparam;
++
++	v = volume_find(dataname);
+ 
+ 	if (!v)
+ 		return -1;
+-- 
+2.43.0
+
