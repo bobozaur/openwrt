@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpio/lantiq,grx500-gpio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Lantiq GRX500 GPIO bank
+
+maintainers:
+  - OpenWrt Development List <openwrt-devel@lists.openwrt.org>
+
+description: |
+  Each bank has 32 GPIO lines and a separate pad configuration window.
+  The GPIO specifier contains the bank-local pin number and standard flags,
+  including polarity, drive type and pull configuration.
+
+properties:
+  compatible:
+    const: lantiq,grx500-gpio
+  reg:
+    items:
+      - description: GPIO data, direction and atomic set/clear registers
+      - description: Per-pin mux, drive and pull configuration
+  reg-names:
+    items:
+      - const: gpio
+      - const: pad
+  gpio-controller: true
+  '#gpio-cells':
+    const: 2
+  gpio-line-names:
+    maxItems: 32
+  lantiq,rcu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Shared reset-controller syscon containing the interface mux
+  lantiq,bbspi-en:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description: |
+      Board selection of the top-level BBSPI pad routing, specified on GPIO
+      bank 1. Zero disables BBSPI and one enables it. The setting is applied
+      before GPIO consumers can request pins. If absent, retain the firmware
+      routing configuration.
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - gpio-controller
+  - '#gpio-cells'
+
+dependencies:
+  lantiq,bbspi-en:
+    - lantiq,rcu
+
+additionalProperties: false
