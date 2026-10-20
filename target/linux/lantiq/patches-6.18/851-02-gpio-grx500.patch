@@ -1,0 +1,31 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] gpio: add GRX500 controller build support
+
+Register the GRX500 GPIO controller, including its atomic data/direction
+operations and shared reset-controller pad routing.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -217,3 +217,5 @@
+ obj-$(CONFIG_GPIO_ZEVIO)		+= gpio-zevio.o
+ obj-$(CONFIG_GPIO_ZYNQ)			+= gpio-zynq.o
+ obj-$(CONFIG_GPIO_ZYNQMP_MODEPIN)	+= gpio-zynqmp-modepin.o
++
++obj-$(CONFIG_GPIO_GRX500) += gpio-grx500.o
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -2053,3 +2053,10 @@
+ 
+ config DEV_SYNC_PROBE
+ 	tristate
++
++config GPIO_GRX500
++	bool "Lantiq GRX500 GPIO banks"
++	depends on GPIOLIB && MACH_GRX500 && OF
++	help
++	  GPIO data, direction and pad configuration on GRX500. Buttons
++	  without an interrupt line use the polled GPIO button driver.
