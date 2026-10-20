@@ -1,0 +1,60 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] ucode: use native channel centers for HT20 and HT40
+
+Keep the center-channel index from ieee80211_freq_to_chan on every band.
+Use the same native HT20/40 center-frequency conversion for fallback metadata
+so paired AP/STA comparisons match completed channel-switch notifications.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/wpa_supplicant/ucode.c
++++ b/wpa_supplicant/ucode.c
+@@ -201,7 +201,7 @@
+ 	ucv_object_add(ret, "oper_chwidth", ucv_int64_new(oper));
+ 	ucv_object_add(ret, "center_freq1", ucv_int64_new(cf1));
+ 	ucv_object_add(ret, "center_freq2", ucv_int64_new(cf2));
+-	ucv_object_add(ret, "center_seg0_idx", ucv_int64_new(freq < 3000 ? 0 : seg0));
++	ucv_object_add(ret, "center_seg0_idx", ucv_int64_new(seg0));
+ 	ucv_object_add(ret, "center_seg1_idx", ucv_int64_new(seg1));
+ 	return ret;
+ }
+--- a/src/utils/ucode.c
++++ b/src/utils/ucode.c
+@@ -173,6 +173,23 @@
+ 	ucv_object_add(ret, "sec_channel", ucv_int64_new(sec_channel));
+ 	ucv_object_add(ret, "frequency", ucv_int64_new(freq_val));
+ 
++	if (chanwidth == CONF_OPER_CHWIDTH_USE_HT) {
++		int center_freq = freq_val + sec_channel * 10;
++		u8 center_channel;
++
++		/* The same HT20/40 geometry as hostapd_set_freq_params(),
++		 * represented like the native channel-switch callback. */
++		if (ieee80211_freq_to_chan(center_freq, &center_channel) ==
++		    NUM_HOSTAPD_MODES) {
++			ucv_put(ret);
++			return NULL;
++		}
++		ucv_object_add(ret, "center_seg0_idx",
++			       ucv_int64_new(center_channel));
++		ucv_object_add(ret, "center_freq1", ucv_int64_new(center_freq));
++		return ret;
++	}
++
+ 	if (!sec_channel)
+ 		return ret;
+ 
+@@ -186,10 +203,7 @@
+ 	tmp_channel &= ~((8 << width) - 1);
+ 	center_idx = tmp_channel + center_ofs + (4 << width) - 1;
+ 
+-	if (freq_val < 3000)
+-		ucv_object_add(ret, "center_seg0_idx", ucv_int64_new(0));
+-	else
+-		ucv_object_add(ret, "center_seg0_idx", ucv_int64_new(center_idx));
++	ucv_object_add(ret, "center_seg0_idx", ucv_int64_new(center_idx));
+ 	center_idx = (center_idx - channel) * 5 + freq_val;
+ 	ucv_object_add(ret, "center_freq1", ucv_int64_new(center_idx));
+ 
