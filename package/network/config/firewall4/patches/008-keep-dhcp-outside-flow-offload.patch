@@ -1,0 +1,22 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] fw4: keep DHCP control traffic outside flow offload
+
+Keep DHCP client and relay endpoints on the regular packet path in both directions, so a former local conntrack cannot consume reacquisition replies.
+
+Upstream-Status: Pending
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/root/usr/share/firewall4/templates/ruleset.uc
++++ b/root/usr/share/firewall4/templates/ruleset.uc
+@@ -153,6 +153,10 @@
+ 
+ {% if (length(flowtable_devices)): %}
+ 	chain flow_offload {
++		meta nfproto ipv4 udp sport { 67, 68 } counter return comment "!fw4: Keep DHCPv4 source in slow path"
++		meta nfproto ipv4 udp dport { 67, 68 } counter return comment "!fw4: Keep DHCPv4 destination in slow path"
++		meta nfproto ipv6 udp sport { 546, 547 } counter return comment "!fw4: Keep DHCPv6 source in slow path"
++		meta nfproto ipv6 udp dport { 546, 547 } counter return comment "!fw4: Keep DHCPv6 destination in slow path"
+ 		meta l4proto { tcp, udp } flow offload @ft;
+ 	}
+ 
