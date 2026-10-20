@@ -1,0 +1,60 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] pppd: preserve MPPE strength masks in option parsing
+
+The require-mppe and +mppe options pass both strength bits through o_bool.
+That parser now writes the C Boolean type and reduces the mask from 3 to 1,
+leaving only 40-bit MPPE. Clearing 40-bit support then removes the wanted
+mask instead of retaining 128-bit encryption.
+
+Use a no-argument callback to set the unsigned-char strength mask directly.
+Retain option priority/alias handling, strength-specific mask operations and
+the Boolean parser used by other options.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/pppd/ccp.c
++++ b/pppd/ccp.c
+@@ -62,6 +62,9 @@ static int setbsdcomp (char **);
+ static int setdeflate (char **);
+ static char bsd_value[8];
+ static char deflate_value[8];
++#ifdef PPP_WITH_MPPE
++static int setmppe (char **);
++#endif
+ 
+ /*
+  * Option variables.
+@@ -111,12 +114,12 @@ static struct option ccp_option_list[] =
+ 
+ #ifdef PPP_WITH_MPPE
+     /* MPPE options are symmetrical ... we only set wantoptions here */
+-    { "require-mppe", o_bool, &ccp_wantoptions[0].mppe,
++    { "require-mppe", o_special_noarg, (void *)setmppe,
+       "require MPPE encryption",
+-      OPT_PRIO | MPPE_OPT_40 | MPPE_OPT_128 },
+-    { "+mppe", o_bool, &ccp_wantoptions[0].mppe,
++      OPT_PRIO },
++    { "+mppe", o_special_noarg, (void *)setmppe,
+       "require MPPE encryption",
+-      OPT_ALIAS | OPT_PRIO | MPPE_OPT_40 | MPPE_OPT_128 },
++      OPT_ALIAS | OPT_PRIO },
+     { "nomppe", o_bool, &ccp_wantoptions[0].mppe,
+       "don't allow MPPE encryption", OPT_PRIO },
+     { "-mppe", o_bool, &ccp_wantoptions[0].mppe,
+@@ -258,6 +261,15 @@ static int all_rejected[NUM_PPP];	/* we
+ /*
+  * Option parsing.
+  */
++#ifdef PPP_WITH_MPPE
++static int
++setmppe(char **argv)
++{
++    ccp_wantoptions[0].mppe = MPPE_OPT_40 | MPPE_OPT_128;
++    return 1;
++}
++#endif
++
+ static int
+ setbsdcomp(char **argv)
+ {
