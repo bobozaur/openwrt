@@ -1,0 +1,745 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] uci: serialize conditional package updates and preserve publication state
+
+A conditional configuration owner must load, check and publish against the
+same inode lifetime as ordinary save, commit and revert users. Retain package
+locks across atomic replacement, provide nonblocking acquisition before load,
+and preserve saved edits until configuration publication succeeds.
+
+Check output, synchronization and rename failures without consuming unpublished
+changes. Report already-published state distinctly so a caller does not blindly
+replay non-idempotent deltas. The public context and error interface require
+a matching libuci consumer ABI; session and wireless policy remain outside UCI.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/uci.h
++++ b/uci.h
+@@ -52,6 +52,9 @@
+ 	UCI_ERR_PARSE,
+ 	UCI_ERR_DUPLICATE,
+ 	UCI_ERR_UNKNOWN,
++	UCI_ERR_BUSY,
++	/* Publication succeeded, but synchronization or delta cleanup failed. */
++	UCI_ERR_PUBLISHED,
+ 	UCI_ERR_LAST
+ };
+ 
+@@ -228,6 +231,10 @@
+  * uci_save: save change delta for a package
+  * @ctx: uci context
+  * @p: uci_package struct
++ *
++ * UCI_ERR_PUBLISHED means the delta file was published but its directory
++ * synchronization failed. The in-memory delta was consumed at publication;
++ * inspect the saved state before retrying non-idempotent changes.
+  */
+ extern int uci_save(struct uci_context *ctx, struct uci_package *p);
+ 
+@@ -239,8 +246,34 @@
+  *
+  * committing may reload the whole uci_package data,
+  * the supplied pointer is updated accordingly
++ *
++ * Saved edits are consumed only after durable configuration publication.
++ * UCI_ERR_PUBLISHED may report the prerequisite uci_save publication, or a
++ * configuration publication followed by synchronization/delta cleanup failure.
++ * Inspect both committed and pending state before retrying; replaying
++ * non-idempotent deltas after that error can repeat their effects.
+  */
+ extern int uci_commit(struct uci_context *ctx, struct uci_package **p, bool overwrite);
++
++/**
++ * Serialize a conditional update of one file-backed package against save and
++ * commit in other libuci users. Load committed state again after acquiring the
++ * lock, perform the condition check and commit, then unlock. Delta paths remain
++ * the caller's responsibility. Nested locks in this context must name the same
++ * package; freeing the context also releases the lock. Direct file writers do
++ * not participate in this protocol.
++ */
++extern int uci_lock(struct uci_context *ctx, struct uci_package *p);
++
++/**
++ * Acquire a named file-backed package before loading it, using the same
++ * primary/secondary directory selection as uci_load(). Does not create a
++ * missing package or wait for a lock. Contention, interruption, or replacement
++ * during the single acquisition attempt returns UCI_ERR_BUSY. Load only after
++ * success and release with uci_unlock(). Delta files remain caller-owned.
++ */
++extern int uci_trylock(struct uci_context *ctx, const char *name);
++extern void uci_unlock(struct uci_context *ctx);
+ 
+ /**
+  * uci_list_configs: List available uci config files
+@@ -431,6 +464,9 @@
+ 	bool internal, nested;
+ 	char *buf;
+ 	int bufsz;
++	int lock_fd;
++	unsigned int lock_depth;
++	char *lock_path;
+ };
+ 
+ struct uci_package
+--- a/uci_internal.h
++++ b/uci_internal.h
+@@ -70,7 +70,10 @@
+ __private void uci_free_element(struct uci_element *e);
+ __private struct uci_element *uci_expand_ptr(struct uci_context *ctx, struct uci_ptr *ptr, bool complete);
+ 
+-__private int uci_load_delta(struct uci_context *ctx, struct uci_package *p, bool flush);
++__private int uci_load_delta(struct uci_context *ctx, struct uci_package *p);
++__private void uci_flush_delta(struct uci_context *ctx, struct uci_package *p);
++/* Takes ownership of path, including on failure. */
++__private void uci_lock_path(struct uci_context *ctx, char *path, bool wait);
+ 
+ static inline bool uci_validate_package(const char *str)
+ {
+--- a/util.c
++++ b/util.c
+@@ -176,12 +176,96 @@
+ 
+ 
+ 
+-/*
+- * open a stream and go to the right position
+- *
+- * note: when opening for write and seeking to the beginning of
+- * the stream, truncate the file
+- */
++__private void uci_lock_path(struct uci_context *ctx, char *path, bool wait)
++{
++	struct stat held, current;
++	int fd, error = UCI_ERR_IO;
++
++	if (ctx->lock_depth) {
++		bool same = !strcmp(ctx->lock_path, path);
++		free(path);
++		UCI_ASSERT(ctx, same);
++		ctx->lock_depth++;
++		return;
++	}
++
++	for (;;) {
++		fd = open(path, O_RDONLY | O_CLOEXEC | (wait ? O_CREAT : O_NONBLOCK), UCI_FILEMODE);
++		if (fd < 0) {
++			if (errno == ENOENT)
++				error = UCI_ERR_NOTFOUND;
++			break;
++		}
++		while (flock(fd, LOCK_EX | (wait ? 0 : LOCK_NB)) < 0) {
++			if (wait && errno == EINTR)
++				continue;
++			if (!wait && (errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR))
++				error = UCI_ERR_BUSY;
++			close(fd);
++			fd = -1;
++			break;
++		}
++		if (fd < 0)
++			break;
++		if (fstat(fd, &held) || stat(path, &current)) {
++			if (!wait && errno == ENOENT)
++				error = UCI_ERR_BUSY;
++			close(fd);
++			break;
++		}
++		if (!S_ISREG(held.st_mode)) {
++			error = UCI_ERR_INVAL;
++			close(fd);
++			break;
++		}
++		if (held.st_dev == current.st_dev && held.st_ino == current.st_ino) {
++			ctx->lock_fd = fd;
++			ctx->lock_depth = 1;
++			ctx->lock_path = path;
++			return;
++		}
++		/* A preceding committer replaced the inode while we waited. Its new
++		 * inode remains locked until publication finishes; acquire that one. */
++		close(fd);
++		if (!wait) {
++			error = UCI_ERR_BUSY;
++			break;
++		}
++	}
++	free(path);
++	UCI_THROW(ctx, error);
++}
++
++int uci_lock(struct uci_context *ctx, struct uci_package *p)
++{
++	char *path;
++	const char *confdir;
++
++	UCI_HANDLE_ERR(ctx);
++	UCI_ASSERT(ctx, p && p->backend == &uci_file_backend);
++	confdir = p->uses_conf2 ? ctx->conf2dir : ctx->confdir;
++	UCI_ASSERT(ctx, p->path || confdir);
++	if (p->path)
++		path = strdup(p->path);
++	else if (asprintf(&path, "%s/%s", confdir, p->e.name) < 0)
++		path = NULL;
++	if (!path)
++		UCI_THROW(ctx, UCI_ERR_MEM);
++	uci_lock_path(ctx, path, true);
++	return 0;
++}
++
++void uci_unlock(struct uci_context *ctx)
++{
++	if (!ctx || !ctx->lock_depth || --ctx->lock_depth)
++		return;
++	close(ctx->lock_fd);
++	free(ctx->lock_path);
++	ctx->lock_path = NULL;
++	ctx->lock_fd = -1;
++}
++
++/* Open a stream on the retained description when the package is locked. */
+ __private FILE *uci_open_stream(struct uci_context *ctx, const char *filename, const char *origfilename, int pos, bool write, bool create)
+ {
+ 	struct stat statbuf;
+@@ -191,6 +275,7 @@
+ 	mode_t mode = UCI_FILEMODE;
+ 	char *name = NULL;
+ 	char *filename2 = NULL;
++	bool held = ctx->lock_depth && !strcmp(ctx->lock_path, filename);
+ 
+ 	if (create) {
+ 		flags |= O_CREAT;
+@@ -214,11 +299,11 @@
+ 		UCI_THROW(ctx, UCI_ERR_NOTFOUND);
+ 	}
+ 
+-	fd = open(filename, flags, mode);
++	fd = held ? fcntl(ctx->lock_fd, F_DUPFD_CLOEXEC, 0) : open(filename, flags, mode);
+ 	if (fd < 0)
+ 		goto error;
+ 
+-	ret = flock(fd, (write ? LOCK_EX : LOCK_SH));
++	ret = held ? 0 : flock(fd, (write ? LOCK_EX : LOCK_SH));
+ 	if ((ret < 0) && (errno != ENOSYS))
+ 		goto error_close;
+ 
+@@ -232,7 +317,6 @@
+ 		goto done;
+ 
+ error_unlock:
+-	flock(fd, LOCK_UN);
+ error_close:
+ 	close(fd);
+ error:
+@@ -243,15 +327,11 @@
+ 
+ __private void uci_close_stream(FILE *stream)
+ {
+-	int fd;
+-
+ 	if (!stream)
+ 		return;
+ 
+ 	fflush(stream);
+-	fd = fileno(stream);
+-	flock(fd, LOCK_UN);
++	/* Closing the final descriptor releases its flock. Explicit LOCK_UN would
++	 * also release a transaction's retained duplicate of this description. */
+ 	fclose(stream);
+ }
+-
+-
+--- a/libuci.c
++++ b/libuci.c
+@@ -35,6 +35,8 @@
+ 	[UCI_ERR_PARSE] =     "Parse error",
+ 	[UCI_ERR_DUPLICATE] = "Duplicate entry",
+ 	[UCI_ERR_UNKNOWN] =   "Unknown error",
++	[UCI_ERR_BUSY] =      "Package is busy",
++	[UCI_ERR_PUBLISHED] = "Changes published; synchronization or cleanup failed",
+ };
+ 
+ #include "uci_internal.h"
+@@ -72,6 +74,8 @@
+ void uci_free_context(struct uci_context *ctx)
+ {
+ 	struct uci_element *e, *tmp;
++	while (ctx->lock_depth)
++		uci_unlock(ctx);
+ 
+ 	if (ctx->confdir != uci_confdir)
+ 		free(ctx->confdir);
+--- a/file.c
++++ b/file.c
+@@ -733,17 +733,34 @@
+ 	return filename;
+ }
+ 
++int uci_trylock(struct uci_context *ctx, const char *name)
++{
++	struct stat st;
++	char *path;
++
++	UCI_HANDLE_ERR(ctx);
++	UCI_ASSERT(ctx, name && ctx->backend == &uci_file_backend);
++	path = uci_config_path(ctx, name, true);
++	if (!path || stat(path, &st)) {
++		free(path);
++		path = uci_config_path(ctx, name, false);
++	}
++	uci_lock_path(ctx, path, false);
++	return 0;
++}
++
+ static void uci_file_commit(struct uci_context *ctx, struct uci_package **package, bool overwrite)
+ {
+-	struct uci_package *p = *package;
+-	FILE *f1, *f2 = NULL;
+-	char *volatile name = NULL;
++	struct uci_package *volatile p = *package, *volatile old = NULL;
++	FILE *volatile f1 = NULL, *volatile f2 = NULL;
+ 	char *volatile path = NULL;
+-	char *filename = NULL;
++	char *filename, *slash;
+ 	struct stat statbuf;
+-	volatile bool do_rename = false;
++	struct uci_element *e, *tmp;
++	volatile bool created = false, published = false;
+ 	const char *confdir;
+-	int fd, sz;
++	volatile int fd = -1, next_fd = -1, dir_fd = -1;
++	int sz, ret;
+ 
+ 	if (!p->path && overwrite)
+ 		p->path = uci_config_path(ctx, p->e.name, p->uses_conf2);
+@@ -755,78 +772,108 @@
+ 	filename = alloca(sz + 1);
+ 	snprintf(filename, sz + 1, "%s/.%s.uci-XXXXXX", confdir, p->e.name);
+ 
+-	/* open the config file for writing now, so that it is locked */
+-	f1 = uci_open_stream(ctx, p->path, NULL, SEEK_SET, true, true);
+-
+-	/* flush unsaved changes and reload from delta file */
++	UCI_INTERNAL(uci_lock, ctx, p);
+ 	UCI_TRAP_SAVE(ctx, done);
+-	if (p->has_delta) {
+-		if (!overwrite) {
+-			name = uci_strdup(ctx, p->e.name);
+-			path = uci_strdup(ctx, p->path);
+-			/* dump our own changes to the delta file */
+-			if (!uci_list_empty(&p->delta))
+-				UCI_INTERNAL(uci_save, ctx, p);
+-
+-			/*
+-			 * other processes might have modified the config
+-			 * as well. dump and reload
+-			 */
+-			uci_free_package(&p);
+-			uci_cleanup(ctx);
+-			UCI_INTERNAL(uci_import, ctx, f1, name, &p, true);
+-
+-			p->path = path;
+-			p->has_delta = true;
+-			*package = p;
+-
+-			/* freed together with the uci_package */
+-			path = NULL;
+-		}
+-
+-		/* flush delta */
+-		if (!uci_load_delta(ctx, p, true))
+-			goto done;
+-	}
++	f1 = uci_open_stream(ctx, p->path, NULL, SEEK_SET, false, false);
++	if (p->has_delta && !overwrite) {
++		if (!uci_list_empty(&p->delta))
++			UCI_INTERNAL(uci_save, ctx, p);
++		/* Retain the caller's package until its replacement has loaded.
++		 * On failure its saved edits and usable in-memory snapshot survive. */
++		old = p;
++		uci_list_del(&old->e.list);
++		p = NULL;
++		uci_cleanup(ctx);
++		UCI_INTERNAL(uci_import, ctx, f1, old->e.name,
++			     (struct uci_package **)&p, true);
++		p->path = uci_strdup(ctx, old->path);
++		p->has_delta = true;
++		p->uses_conf2 = old->uses_conf2;
++		if (!uci_load_delta(ctx, p))
++			goto finished;
++	}
++	/* overwrite publishes the supplied snapshot. Replaying its previously
++	 * applied saved deltas would duplicate operations such as list additions. */
++
++	path = realpath(p->path, NULL);
++	if (!path || fstat(fileno(f1), &statbuf))
++		UCI_THROW(ctx, UCI_ERR_IO);
++	slash = strrchr(path, '/');
++	*slash = 0;
++	dir_fd = open(path[0] ? path : "/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	*slash = '/';
++	if (dir_fd < 0)
++		UCI_THROW(ctx, UCI_ERR_IO);
+ 
+ 	fd = mkstemp(filename);
+-	if (fd == -1)
++	if (fd < 0)
+ 		UCI_THROW(ctx, UCI_ERR_IO);
+-
+-	if ((flock(fd, LOCK_EX) < 0) && (errno != ENOSYS))
++	created = true;
++	if (flock(fd, LOCK_EX) < 0)
+ 		UCI_THROW(ctx, UCI_ERR_IO);
+-
+-	if (lseek(fd, 0, SEEK_SET) < 0)
+-		UCI_THROW(ctx, UCI_ERR_IO);
+-
+ 	f2 = fdopen(fd, "w+");
+ 	if (!f2)
+ 		UCI_THROW(ctx, UCI_ERR_IO);
+-
+-	uci_export(ctx, f2, p, false);
+-
+-	fflush(f2);
+-	fsync(fileno(f2));
++	fd = -1;
++	UCI_INTERNAL(uci_export, ctx, f2, p, false);
++	if (ferror(f2) || fflush(f2) || fchmod(fileno(f2), statbuf.st_mode) ||
++	    fsync(fileno(f2)))
++		UCI_THROW(ctx, UCI_ERR_IO);
++	next_fd = fcntl(fileno(f2), F_DUPFD_CLOEXEC, 0);
++	if (next_fd < 0)
++		UCI_THROW(ctx, UCI_ERR_IO);
++	ret = fclose(f2);
++	f2 = NULL;
++	if (ret)
++		UCI_THROW(ctx, UCI_ERR_IO);
++	if (rename(filename, path))
++		UCI_THROW(ctx, UCI_ERR_IO);
++	published = true;
++
++	/* Keep both old and new inode locks through replacement. Waiting writers
++	 * revalidate the path after obtaining the old inode. Nested transactions
++	 * retain the new inode's lock until their outermost unlock. */
++	close(ctx->lock_fd);
++	ctx->lock_fd = next_fd;
++	next_fd = -1;
++	if (fsync(dir_fd))
++		UCI_THROW(ctx, UCI_ERR_IO);
++	/* Never consume saved edits until the configuration is durably published. */
++	if (p->has_delta)
++		uci_flush_delta(ctx, p);
++	uci_foreach_element_safe(&p->delta, tmp, e)
++		uci_free_delta(uci_to_delta(e));
++	uci_foreach_element_safe(&p->saved_delta, tmp, e)
++		uci_free_delta(uci_to_delta(e));
++finished:
++	UCI_TRAP_RESTORE(ctx);
++
++done:
++	if (old) {
++		uci_cleanup(ctx);
++		if (ctx->err && !published) {
++			uci_free_package((struct uci_package **)&p);
++			uci_list_add(&ctx->root, &old->e.list);
++			p = old;
++		} else {
++			uci_free_package((struct uci_package **)&old);
++		}
++		*package = p;
++	}
++	if (dir_fd >= 0)
++		close(dir_fd);
++	if (next_fd >= 0)
++		close(next_fd);
++	if (fd >= 0)
++		close(fd);
+ 	uci_close_stream(f2);
+-
+-	do_rename = true;
+-
+-	UCI_TRAP_RESTORE(ctx);
+-
+-done:
+-	free(name);
++	uci_close_stream(f1);
++	if (created && !published)
++		unlink(filename);
+ 	free(path);
+-	uci_close_stream(f1);
+-	if (do_rename) {
+-		path = realpath(p->path, NULL);
+-		if (!path || stat(path, &statbuf) || chmod(filename, statbuf.st_mode) || rename(filename, path)) {
+-			unlink(filename);
+-			UCI_THROW(ctx, UCI_ERR_IO);
+-		}
+-		free(path);
+-	}
++	uci_unlock(ctx);
+ 	if (ctx->err)
+-		UCI_THROW(ctx, ctx->err);
++		UCI_THROW(ctx, published ? UCI_ERR_PUBLISHED : ctx->err);
+ }
+ 
+ 
+@@ -952,7 +999,7 @@
+ 		package->uses_conf2 = conf2;
+ 		package->path = filename;
+ 		package->has_delta = confdir;
+-		uci_load_delta(ctx, package, false);
++		uci_load_delta(ctx, package);
+ 	}
+ 
+ done:
+--- a/delta.c
++++ b/delta.c
+@@ -23,6 +23,7 @@
+ #include <stdbool.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <errno.h>
+ #include <stdio.h>
+ #include <ctype.h>
+ #include <string.h>
+@@ -295,33 +296,27 @@
+ }
+ 
+ /* returns the number of changes that were successfully parsed */
+-static int uci_load_delta_file(struct uci_context *ctx, struct uci_package *p, char *filename, FILE *volatile *f, bool flush)
++static int uci_load_delta_file(struct uci_context *ctx, struct uci_package *p, char *filename)
+ {
+ 	FILE *volatile stream = NULL;
+ 	volatile int changes = 0;
+ 
+ 	UCI_TRAP_SAVE(ctx, done);
+-	stream = uci_open_stream(ctx, filename, NULL, SEEK_SET, flush, false);
++	stream = uci_open_stream(ctx, filename, NULL, SEEK_SET, false, false);
+ 	UCI_TRAP_RESTORE(ctx);
+-
+-	if (p)
+-		changes = uci_parse_delta(ctx, stream, p);
++	changes = uci_parse_delta(ctx, stream, p);
+ 
+ done:
+-	if (f)
+-		*f = stream;
+-	else
+-		uci_close_stream(stream);
++	uci_close_stream(stream);
+ 	return changes;
+ }
+ 
+ /* returns the number of changes that were successfully parsed */
+-__private int uci_load_delta(struct uci_context *ctx, struct uci_package *p, bool flush)
++__private int uci_load_delta(struct uci_context *ctx, struct uci_package *p)
+ {
+ 	struct uci_element *e;
+ 	char *filename = NULL;
+-	FILE *volatile f = NULL;
+-	volatile int changes = 0;
++	int changes = 0;
+ 
+ 	if (!p->has_delta)
+ 		return 0;
+@@ -330,26 +325,41 @@
+ 		if ((asprintf(&filename, "%s/%s", e->name, p->e.name) < 0) || !filename)
+ 			UCI_THROW(ctx, UCI_ERR_MEM);
+ 
+-		changes += uci_load_delta_file(ctx, p, filename, NULL, false);
++		changes += uci_load_delta_file(ctx, p, filename);
+ 		free(filename);
+ 	}
+ 
+-	if ((asprintf(&filename, "%s/%s", ctx->savedir, p->e.name) < 0) || !filename)
+-		UCI_THROW(ctx, UCI_ERR_MEM);
+-	uci_load_delta_file(ctx, NULL, filename, &f, flush);
+-
+-	if (flush && f && (changes > 0)) {
+-		if (ftruncate(fileno(f), 0) < 0) {
+-			free(filename);
+-			uci_close_stream(f);
+-			UCI_THROW(ctx, UCI_ERR_IO);
+-		}
+-	}
+-
+-	free(filename);
+-	uci_close_stream(f);
+ 	ctx->err = 0;
+ 	return changes;
++}
++
++/* Called only after durable configuration publication, with its package locked.
++ * Keep loading and consuming deltas separate: export/rename can still fail. */
++__private void uci_flush_delta(struct uci_context *ctx, struct uci_package *p)
++{
++	FILE *volatile f = NULL;
++	char *volatile filename = NULL;
++	struct stat st;
++
++	UCI_TRAP_SAVE(ctx, done);
++	if (asprintf((char **)&filename, "%s/%s", ctx->savedir, p->e.name) < 0)
++		UCI_THROW(ctx, UCI_ERR_MEM);
++	if (stat(filename, &st)) {
++		if (errno == ENOENT)
++			goto finished;
++		UCI_THROW(ctx, UCI_ERR_IO);
++	}
++	f = uci_open_stream(ctx, filename, NULL, SEEK_SET, true, false);
++	if (ftruncate(fileno(f), 0) || fsync(fileno(f)))
++		UCI_THROW(ctx, UCI_ERR_IO);
++finished:
++	UCI_TRAP_RESTORE(ctx);
++
++done:
++	uci_close_stream(f);
++	free(filename);
++	if (ctx->err)
++		UCI_THROW(ctx, ctx->err);
+ }
+ 
+ static void uci_filter_delta(struct uci_context *ctx, const char *name, const char *section, const char *option)
+@@ -426,6 +436,7 @@
+ 	UCI_HANDLE_ERR(ctx);
+ 	uci_expand_ptr(ctx, ptr, false);
+ 	UCI_ASSERT(ctx, ptr->p->has_delta);
++	UCI_INTERNAL(uci_lock, ctx, ptr->p);
+ 
+ 	/*
+ 	 * - flush unwritten changes
+@@ -456,6 +467,7 @@
+ 	free(package);
+ 	free(section);
+ 	free(option);
++	uci_unlock(ctx);
+ 	if (ctx->err)
+ 		UCI_THROW(ctx, ctx->err);
+ 	return 0;
+@@ -463,57 +475,100 @@
+ 
+ int uci_save(struct uci_context *ctx, struct uci_package *p)
+ {
+-	FILE *volatile f = NULL;
+-	char *filename = NULL;
++	FILE *volatile source = NULL, *volatile output = NULL;
++	char *volatile filename = NULL, *volatile temporary = NULL;
++	volatile int fd = -1, dir_fd = -1;
++	volatile bool created = false, published = false;
+ 	struct uci_element *e, *tmp;
+ 	struct stat statbuf;
++	char buffer[4096];
++	size_t len;
++	int ret;
+ 
+ 	UCI_HANDLE_ERR(ctx);
+ 	UCI_ASSERT(ctx, p != NULL);
+ 
+-	/*
+-	 * if the config file was outside of the /etc/config path,
+-	 * don't save the delta to a file, update the real file
+-	 * directly.
+-	 * does not modify the uci_package pointer
+-	 */
++	/* Configurations outside the normal directories have no saved deltas. */
+ 	if (!p->has_delta)
+ 		return uci_commit(ctx, &p, false);
+-
+ 	if (uci_list_empty(&p->delta))
+ 		return 0;
+ 
++	UCI_INTERNAL(uci_lock, ctx, p);
++	UCI_TRAP_SAVE(ctx, done);
++	mode_t mode = UCI_FILEMODE; /* Normal-flow state, outside longjmp cleanup. */
+ 	if (stat(ctx->savedir, &statbuf) < 0) {
+-		if (stat(ctx->confdir, &statbuf) == 0) {
++		if (stat(ctx->confdir, &statbuf) == 0)
+ 			mkdir(ctx->savedir, statbuf.st_mode);
+-		} else {
++		else
+ 			mkdir(ctx->savedir, UCI_DIRMODE);
+-		}
+ 	} else if ((statbuf.st_mode & S_IFMT) != S_IFDIR) {
+ 		UCI_THROW(ctx, UCI_ERR_IO);
+ 	}
+ 
+-	if ((asprintf(&filename, "%s/%s", ctx->savedir, p->e.name) < 0) || !filename)
++	if (asprintf((char **)&filename, "%s/%s", ctx->savedir, p->e.name) < 0 ||
++	    asprintf((char **)&temporary, "%s/.%s.uci-XXXXXX", ctx->savedir, p->e.name) < 0)
+ 		UCI_THROW(ctx, UCI_ERR_MEM);
+-
+-	ctx->err = 0;
+-	UCI_TRAP_SAVE(ctx, done);
+-	f = uci_open_stream(ctx, filename, NULL, SEEK_END, true, true);
++	dir_fd = open(ctx->savedir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	if (dir_fd < 0)
++		UCI_THROW(ctx, UCI_ERR_IO);
++	if (!stat(filename, &statbuf)) {
++		mode = statbuf.st_mode;
++		source = uci_open_stream(ctx, filename, NULL, SEEK_SET, false, false);
++	} else if (errno != ENOENT) {
++		UCI_THROW(ctx, UCI_ERR_IO);
++	} else if (p->path && !stat(p->path, &statbuf)) {
++		mode = statbuf.st_mode;
++	}
++	fd = mkstemp(temporary);
++	if (fd < 0)
++		UCI_THROW(ctx, UCI_ERR_IO);
++	created = true;
++	output = fdopen(fd, "w+");
++	if (!output)
++		UCI_THROW(ctx, UCI_ERR_IO);
++	fd = -1;
++	/* Copy existing delta bytes verbatim, including records this process did
++	 * not create. Failed writes leave that file and p->delta untouched. */
++	if (source) {
++		while ((len = fread(buffer, 1, sizeof(buffer), source)) != 0)
++			if (fwrite(buffer, 1, len, output) != len)
++				UCI_THROW(ctx, UCI_ERR_IO);
++		if (ferror(source))
++			UCI_THROW(ctx, UCI_ERR_IO);
++	}
++	uci_foreach_element(&p->delta, e)
++		uci_delta_save(ctx, output, p->e.name, uci_to_delta(e));
++	if (ferror(output) || fflush(output) || fchmod(fileno(output), mode) ||
++	    fsync(fileno(output)))
++		UCI_THROW(ctx, UCI_ERR_IO);
++	ret = fclose(output);
++	output = NULL;
++	if (ret || rename(temporary, filename))
++		UCI_THROW(ctx, UCI_ERR_IO);
++	published = true;
++	/* Publication transfers ownership to the saved file, including when a
++	 * later directory sync fails. Retrying must not append these nodes again. */
++	uci_foreach_element_safe(&p->delta, tmp, e)
++		uci_free_delta(uci_to_delta(e));
++	if (fsync(dir_fd))
++		UCI_THROW(ctx, UCI_ERR_IO);
+ 	UCI_TRAP_RESTORE(ctx);
+ 
+-	uci_foreach_element_safe(&p->delta, tmp, e) {
+-		struct uci_delta *h = uci_to_delta(e);
+-		uci_delta_save(ctx, f, p->e.name, h);
+-		uci_free_delta(h);
+-	}
+-
+ done:
+-	uci_close_stream(f);
++	if (fd >= 0)
++		close(fd);
++	if (dir_fd >= 0)
++		close(dir_fd);
++	uci_close_stream(output);
++	uci_close_stream(source);
++	if (created && !published)
++		unlink(temporary);
++	free(temporary);
+ 	free(filename);
++	uci_unlock(ctx);
+ 	if (ctx->err)
+-		UCI_THROW(ctx, ctx->err);
++		UCI_THROW(ctx, published ? UCI_ERR_PUBLISHED : ctx->err);
+ 
+ 	return 0;
+ }
+-
+-
