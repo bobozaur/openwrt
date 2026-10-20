@@ -8,7 +8,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=odhcp6c
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_SOURCE_PROTO:=git
 PKG_SOURCE_URL=$(PROJECT_GIT)/project/odhcp6c.git
@@ -28,7 +28,8 @@ define Package/odhcp6c
   SECTION:=net
   CATEGORY:=Network
   TITLE:=Embedded DHCPv6-client for OpenWrt
-  DEPENDS:=@IPV6 +libubox +libubus
+  DEPENDS:=@IPV6 +libubox +libubus +netifd
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r3)
 endef
 
 define Package/odhcp6c/conffiles
