@@ -1,0 +1,22 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] odhcpd: exclude the header from Reconfigure option length
+
+The DHCPv6 authentication option length describes its payload, excluding
+the four-byte option header. Subtract that header from the packed structure
+size so authenticated Reconfigure messages carry a valid option boundary.
+No lease or retransmission lifetime is changed.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/src/dhcpv6-ia.c
++++ b/src/dhcpv6-ia.c
+@@ -194,7 +194,7 @@ static int send_reconf(struct dhcpv6_lea
+ 	};
+ 	struct dhcpv6_auth_reconfigure auth = {
+ 		.type = htons(DHCPV6_OPT_AUTH),
+-		.len = htons(sizeof(struct dhcpv6_auth_reconfigure)),
++		.len = htons(sizeof(struct dhcpv6_auth_reconfigure) - DHCPV6_OPT_HDR_SIZE),
+ 		.protocol = 3,
+ 		.algorithm = 1,
+ 		.rdm = 0,
