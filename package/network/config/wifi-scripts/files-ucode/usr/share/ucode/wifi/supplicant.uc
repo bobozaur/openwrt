@@ -379,6 +379,8 @@ export function setup(config, data) {
 		num_global_macaddr: data.config.num_global_macaddr,
 		macaddr_base: data.config.macaddr_base ?? "",
 	};
+	if (data.ap_phy)
+		request.ap_phy = data.ap_phy;
 	let ret = global.ubus.call('wpa_supplicant', 'config_set', request);
 
 	if (ret) {
