@@ -51,14 +51,16 @@ endef
 
 define Package/ppp
 $(call Package/ppp/Default)
-  DEPENDS:= +USE_GLIBC:libcrypt-compat +kmod-ppp
+  DEPENDS:= +USE_GLIBC:libcrypt-compat +kmod-ppp +netifd
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)
   TITLE:=PPP daemon
   VARIANT:=default
 endef
 
 define Package/ppp-multilink
 $(call Package/ppp/Default)
-  DEPENDS:= +USE_GLIBC:libcrypt-compat +kmod-ppp
+  DEPENDS:= +USE_GLIBC:libcrypt-compat +kmod-ppp +netifd
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)
   TITLE:=PPP daemon (with multilink support)
   VARIANT:=multilink
 endef
