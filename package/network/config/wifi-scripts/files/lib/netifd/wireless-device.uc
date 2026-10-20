@@ -135,6 +135,7 @@ function wdev_config_init(wdev)
 		let iface = interfaces[vif_name] = {
 			name: vif.name,
 			config: vif.config,
+			uci: vif.uci,
 			vlans, stas,
 		};
 

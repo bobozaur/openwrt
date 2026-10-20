@@ -271,7 +271,7 @@ function iface_auth_type(config, band, eht) {
 	switch(config.auth_type) {
 	case 'none':
 	case 'owe':
-		config.wps_state = 1;
+		set_default(config, 'wps_state', 1);
 
 		append_string_vars(config, [ 'owe_transition_ssid' ]);
 		append_vars(config, [
@@ -302,10 +302,9 @@ function iface_auth_type(config, band, eht) {
 			config.wpa_passphrase = config.key;
 		}
 
-		if (config.auth_type in [ 'psk', 'psk-sae', 'psk-sae-compat' ] && band != '6g') {
-			set_default(config, 'wpa_psk_file', `/var/run/hostapd-${config.ifname}.psk`);
+		if (config.wpa_psk_file &&
+		    config.auth_type in [ 'psk', 'psk-sae', 'psk-sae-compat' ] && band != '6g')
 			touch_file(config.wpa_psk_file);
-		}
 
 		if (config.auth_type in [ 'sae', 'psk-sae', 'psk-sae-compat' ] || config.rsno2_sae) {
 			set_default(config, 'sae_password_file', `/var/run/hostapd-${config.ifname}.sae`);
@@ -477,6 +476,10 @@ function iface_vlan(interface, config, vlans) {
 /* hostapd uses only the last wpa_psk_file line, and the hostapd service
  * hashes one file per option, so the user's file is copied */
 function station_file_write(config, option, path, lines) {
+	// An empty generated PSK file changes WPS to per-device key ownership.
+	if (option == 'wpa_psk_file' && !config[option] && !length(lines))
+		return;
+
 	const user_entries = config[option] ? fs.readfile(config[option]) : null;
 
 	if (config[option] && user_entries == null)
