@@ -1,3 +1,20 @@
 #!/bin/sh
 
-[ "$ACTION" = "add" ] && /etc/init.d/led start "$DEVICENAME"
+case "$ACTION" in
+	add) ;;
+	change)
+		# A late driver trigger can attach after the original add event.
+		[ -n "$TRIGGER" ] && [ "$TRIGGER" != none ] || exit 0
+		[ "$(uci -q get system.@system[-1].leds_off)" = 1 ] || exit 0
+		. /lib/functions/leds.sh
+		for role in boot failsafe running upgrade; do
+			# Diagnostic and runtime indications retain their existing owner.
+			[ "$(get_dt_led "$role")" != "$DEVICENAME" ] || exit 0
+		done
+		;;
+	*) exit 0 ;;
+esac
+
+# Ignore an event whose class device has already disappeared or moved.
+[ "/sys$DEVPATH" -ef "/sys/class/leds/$DEVICENAME" ] || exit 0
+/etc/init.d/led start "$DEVICENAME"
