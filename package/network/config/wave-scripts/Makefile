@@ -13,7 +13,7 @@ define Package/wave-scripts
   CATEGORY:=Network
   TITLE:=WAVE radio configuration support
   DEPENDS:=+wifi-scripts +iw +kmod-wave +hostapd-common +@WIFI_SCRIPTS_UCODE
-  EXTRA_DEPENDS:=hostapd-common (>=2026.08.07~831364bf-r5), wifi-scripts (>=1.0-r5)
+  EXTRA_DEPENDS:=hostapd-common (>=2026.08.07~831364bf-r5), wifi-scripts (>=1.0-r6)
   PKGARCH:=all
 endef
 
