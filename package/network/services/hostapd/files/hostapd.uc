@@ -1,5 +1,6 @@
 let libubus = require("ubus");
 import * as uloop from "uloop";
+import * as nl80211 from "nl80211";
 import { open, readfile, access } from "fs";
 import { wdev_remove, is_equal, vlist_new, phy_is_fullmac, phy_open, wdev_set_radio_mask, wdev_set_up, macaddr_keep, macaddr_sync, macaddr_sync_defer, macaddr_sync_entry, macaddr_release_defer, mld_prev_match } from "common";
 
@@ -17,6 +18,8 @@ libubus.guard(ex_handler);
 hostapd.data.config = {};
 hostapd.data.pending_config = {};
 hostapd.data.apsta_freq = {};
+hostapd.data.apsta_pending = {};
+hostapd.data.apsta_sequence = 0;
 
 hostapd.data.file_fields = {
 	vlan_file: true,
@@ -63,6 +66,7 @@ hostapd.data.bss_info_fields = {
 
 hostapd.data.mld = {};
 hostapd.data.dpp_hooks = {};
+hostapd.data.station_macaddr = {};
 
 function iface_remove(cfg)
 {
@@ -105,6 +109,14 @@ start_disabled=1
 
 function iface_freq_info(iface, config, params)
 {
+	// A completed station or CSA supplies its negotiated channel definition.
+	// AP configuration is only the fallback when that information is absent.
+	if (params.chandef) {
+		if (params.chandef.frequency != params.frequency)
+			return null;
+		return { ...params.chandef };
+	}
+
 	let freq = params.frequency;
 	if (!freq)
 		return null;
@@ -144,8 +156,168 @@ function iface_freq_info(iface, config, params)
 	return hostapd.freq_info(freq, sec_offset, width);
 }
 
+function apsta_release(tx)
+{
+	tx.release = ubus.defer('wpa_supplicant', 'phy_transition', {
+		phy: tx.peer, owner: tx.phy, token: tx.token, action: 'cancel',
+	}, (ret) => {
+		delete tx.release;
+		if (ret && ret != libubus.STATUS_NOT_FOUND)
+			hostapd.printf(`STA release on ${tx.peer} was not acknowledged; owner lease remains bounded`);
+	});
+}
+
+function apsta_cancel(phy, stop)
+{
+	let tx = hostapd.data.apsta_pending[phy];
+	if (!tx)
+		return;
+	delete hostapd.data.apsta_pending[phy];
+	tx.canceled = true;
+	if (tx.timer)
+		tx.timer.cancel();
+	if (stop && tx.iface && hostapd.interfaces[phy] == tx.iface)
+		tx.iface.stop();
+	// The remote pause may have completed even if its acknowledgment was lost.
+	apsta_release(tx);
+}
+
+function apsta_fail(tx, reason)
+{
+	if (hostapd.data.apsta_pending[tx.phy] != tx)
+		return;
+	hostapd.printf(`AP/STA transition on ${tx.phy} failed: ${reason}`);
+	apsta_cancel(tx.phy, true);
+}
+
+function apsta_deadline(tx, milliseconds)
+{
+	if (tx.timer)
+		tx.timer.cancel();
+	tx.timer = uloop.timer(milliseconds, () => apsta_fail(tx, 'completion timeout'));
+	if (tx.paused)
+		tx.lease = ubus.defer('wpa_supplicant', 'phy_transition', {
+			phy: tx.peer, owner: tx.phy, token: tx.token, action: 'renew',
+			lease_ms: milliseconds + 5000,
+		}, (ret) => {
+			delete tx.lease;
+			if (ret)
+				apsta_fail(tx, 'STA pause lease rejected');
+		});
+}
+
+function apsta_check(tx)
+{
+	if (!tx.iface || hostapd.data.apsta_pending[tx.phy] != tx ||
+	    hostapd.interfaces[tx.phy] != tx.iface || tx.phase == 'pausing')
+		return;
+	let status = tx.iface.channel_status(tx.target);
+	if (!status)
+		return apsta_fail(tx, 'AP state unavailable');
+	if (tx.phase == 'resuming') {
+		if (!status.beaconing || (tx.target && !status.matches))
+			apsta_fail(tx, 'AP permission changed during STA resume');
+		return;
+	}
+	if (status.state == 'DFS') {
+		if (tx.phase != 'cac') {
+			tx.phase = 'cac';
+			apsta_deadline(tx, (status.cac_time_ms || 600000) + 10000);
+		}
+		return;
+	}
+	if (status.state == 'DISABLED' || status.state == 'NO_IR')
+		return apsta_fail(tx, `AP entered ${status.state}`);
+	if (!status.beaconing)
+		return;
+	if (tx.target && !status.matches)
+		return apsta_fail(tx, 'AP selected a different channel');
+	tx.phase = 'resuming';
+	apsta_deadline(tx, 30000);
+	tx.defer = ubus.defer('wpa_supplicant', 'phy_transition', {
+		phy: tx.peer, owner: tx.phy, token: tx.token, action: 'resume',
+		frequency: tx.follow ? tx.target.frequency : 0,
+	}, (ret) => {
+		delete tx.defer;
+		if (hostapd.data.apsta_pending[tx.phy] != tx)
+			return;
+		if (ret)
+			return apsta_fail(tx, 'STA resume rejected');
+		if (!tx.follow) {
+			delete hostapd.data.apsta_pending[tx.phy];
+			tx.timer.cancel();
+		}
+	});
+}
+
+function apsta_follow(phy, config, iface, target, follow, csa_count)
+{
+	let status = iface ? iface.channel_status(target) : {};
+	if (!status)
+		return false;
+	let previous = hostapd.data.apsta_pending[phy];
+	if (previous && previous.follow == follow && is_equal(previous.target, target))
+		return true;
+	apsta_cancel(phy, true);
+	if (!previous && target && status.beaconing &&
+	    status.needs_cac === false && !(csa_count != null && status.radar)) {
+		if (csa_count != null) {
+			// The native STA callback submits the single physical firmware
+			// switch. Confirmed AP notifications refresh its beacons below.
+			return true;
+		}
+		return iface.start(target);
+	}
+	let tx = {
+		phy, peer: config.station_phy, iface, target, follow,
+		token: `${hostapd.getpid()}:${++hostapd.data.apsta_sequence}`,
+		phase: 'pausing', paused: false,
+	};
+	hostapd.data.apsta_pending[phy] = tx;
+	apsta_deadline(tx, 10000);
+	let request = {
+		phy: tx.peer, owner: phy, token: tx.token, action: 'pause',
+	};
+	if (previous)
+		request.replaces = previous.token;
+	tx.defer = ubus.defer('wpa_supplicant', 'phy_transition', request, (ret, data) => {
+		delete tx.defer;
+		if (ret || data?.token != tx.token)
+			return apsta_fail(tx, 'STA pause rejected');
+		tx.paused = true;
+		if (tx.canceled || hostapd.data.apsta_pending[phy] != tx) {
+			apsta_release(tx);
+			return;
+		}
+		// ACS can take longer than removing a STA. CAC supplies its own native
+		// duration below; neither setup deadline establishes successful startup.
+		apsta_deadline(tx, 120000);
+		if (!tx.iface) {
+			let inline = iface_gen_config(config, true);
+			let ret = hostapd.add_iface(`bss_config=${phy}:${inline}`);
+			tx.iface = hostapd.interfaces[phy];
+			if (ret < 0 || !tx.iface)
+				return apsta_fail(tx, 'AP creation rejected');
+		}
+		tx.iface.stop();
+		tx.phase = 'starting';
+		if (!tx.iface.start(tx.target))
+			return apsta_fail(tx, 'AP start rejected');
+		apsta_check(tx);
+	});
+	return true;
+}
+
 function iface_add(phy, config, phy_status)
 {
+	if (config.station_phy) {
+		if (phy_status?.state == 'COMPLETED' && !phy_status.chandef)
+			return false;
+		// Interface initialization itself may enter ACS/CAC. Pause its peer
+		// before creating the native AP, not merely before enabling beacons.
+		return apsta_follow(phy, config, null, phy_status?.chandef ?? null,
+			!!phy_status?.chandef);
+	}
 	let config_inline = iface_gen_config(config, !!phy_status);
 
 	let bss = config.bss[0];
@@ -161,7 +333,6 @@ function iface_add(phy, config, phy_status)
 		return false;
 
 	let freq_info = iface_freq_info(iface, config, phy_status);
-
 	return iface.start(freq_info) >= 0;
 }
 
@@ -256,10 +427,70 @@ function iface_macaddr_sync(phydev, config)
 			   iface_macaddr_options(config));
 }
 
+// A channel-following AP and its station may expose separate wiphys for one
+// physical radio. Reserve the AP's real BSS addresses in the station allocator
+// before pending channel setup can resume that station. This is a separate
+// hostapd group, so neither role's ordinary per-PHY prune discards the mirror.
+function iface_station_macaddr_sync(name, config)
+{
+	let group = name + "/station";
+	let list = {};
+	if (config?.station_phy && config.station_phy != config.phy && length(config.bss)) {
+		let addresses = {};
+		for (let bss in config.bss) {
+			if (!bss.bssid)
+				return false;
+			addresses[lc(bss.bssid)] = true;
+		}
+		let phydev = phy_open(config.phy, config.radio_idx);
+		if (!phydev)
+			return false;
+		nl80211.error();
+		let wdevs = phydev.wdev_list();
+		if (nl80211.error())
+			return false;
+		// These aliases intentionally share a MAC, as in native netifd.
+		let shared = [ nl80211.const.NL80211_IFTYPE_AP_VLAN,
+			nl80211.const.NL80211_IFTYPE_MONITOR, nl80211.const.NL80211_IFTYPE_P2P_DEVICE ];
+		for (let wdev in wdevs)
+			if (index(shared, wdev.iftype) < 0 && wdev.mac)
+				addresses[lc(wdev.mac)] = true;
+		for (let address in addresses)
+			list[group + "/" + address] =
+				macaddr_sync_entry(config.station_phy, -1, address, { static: true });
+	}
+	if (!length(list) && !hostapd.data.station_macaddr[name])
+		return true;
+
+	// A refused sync can have applied other entries. Retain ownership until
+	// an empty sync is acknowledged, including after transport failure.
+	hostapd.data.station_macaddr[name] = true;
+	let result = macaddr_sync(ubus, "hostapd", group, list);
+	let error = ubus.error();
+	if (error || type(result) != "object" ||
+	    type(result.refused) != "array" || length(result.refused)) {
+		hostapd.printf(`Station MAC reservation failed on phy ${name}`);
+		return false;
+	}
+	if (!length(list))
+		delete hostapd.data.station_macaddr[name];
+	return true;
+}
+
+function iface_station_macaddr_require(name, config)
+{
+	if (iface_station_macaddr_sync(name, config))
+		return;
+	// Keep AP addresses reserved until its pending work and live BSSes have
+	// actually been removed. The existing ubus guard returns a native error.
+	iface_config_remove(name, config);
+	die(`Could not reserve station MAC addresses on phy ${name}\n`);
+}
+
 function iface_supplicant_start(phydev)
 {
 	ubus.defer("wpa_supplicant", "phy_set_state", {
-		phy: phydev.phy,
+		phy: hostapd.data.config[phydev.name]?.station_phy ?? phydev.phy,
 		radio: phydev.radio ?? -1,
 		stop: false,
 	});
@@ -290,13 +521,15 @@ function __iface_pending_next(pending, state, ret, data)
 			});
 			if (err) {
 				hostapd.printf(`Failed to create ${bss.ifname} on phy ${phy}: ${err}`);
+				if (config.station_phy)
+					die(`Could not create AP interface ${bss.ifname} on phy ${phy}\n`);
 				iface_supplicant_start(phydev);
 				return null;
 			}
 		}
 
 		pending.call("wpa_supplicant", "phy_status", {
-			phy: phydev.phy,
+			phy: config.station_phy ?? phydev.phy,
 			radio: phydev.radio ?? -1,
 		});
 		return "check_phy";
@@ -307,6 +540,12 @@ function __iface_pending_next(pending, state, ret, data)
 				return "done";
 
 			hostapd.printf(`Failed to bring up phy ${phy} ifname=${bss.ifname} with supplicant provided frequency`);
+		}
+		if (config.station_phy) {
+			// Keep the AP disabled until the physical owner has stopped STA.
+			if (!iface_add(phy, config, { state: 'INACTIVE' }))
+				die(`Could not add channel-following AP on phy ${phy}\n`);
+			return 'done';
 		}
 		pending.call("wpa_supplicant", "phy_set_state", {
 			phy: phydev.phy,
@@ -344,6 +583,15 @@ function iface_pending_next(ret, data)
 			}
 		} catch(e) {
 			hostapd.printf(`Exception: ${e}\n${e.stacktrace[0].context}`);
+			if (cfg.config.station_phy) {
+				cfg.error = `${e}`;
+				cfg.abort();
+				apsta_cancel(cfg.phy, true);
+				hostapd.remove_iface(cfg.phy);
+				iface_remove(cfg.config);
+				// The persistent radio master can remain after BSS removal.
+				// Keep its mirror until explicit reset or owner teardown.
+			}
 			return;
 		}
 		pending = !this.defer;
@@ -392,6 +640,8 @@ function iface_pending_init(phydev, config)
 
 	hostapd.data.pending_config[phy] = pending;
 	pending.next();
+	if (pending.error)
+		die(`Initial AP setup failed on phy ${phy}: ${pending.error}\n`);
 }
 
 function csa_timer_cancel(name)
@@ -422,6 +672,9 @@ function iface_restart(phydev, config, old_config)
 
 	iface_remove(old_config);
 	iface_remove(config);
+	if (hostapd.data.station_macaddr[phy] &&
+	    (hostapd.interfaces[phy] || !iface_station_macaddr_sync(phy, null)))
+		die(`Could not retire station MAC addresses on phy ${phy}\n`);
 
 	// an aborted setup can have stopped wpa_supplicant
 	if (!config.bss || !config.bss[0]) {
@@ -443,11 +696,14 @@ function iface_restart(phydev, config, old_config)
 		for (let cur in config.bss)
 			if (cur.default_macaddr)
 				delete cur.bssid;
+		if (config.station_phy)
+			die(`Could not allocate AP MAC addresses on phy ${phy}\n`);
 		if (pending)
 			iface_supplicant_start(phydev);
 		return;
 	}
 	iface_macaddr_sync(phydev, config);
+	iface_station_macaddr_require(phy, config);
 
 	iface_pending_init(phydev, config);
 }
@@ -847,15 +1103,18 @@ function iface_macaddr_move(phydev, config, old_config, bss_list_cfg)
 function iface_reload_config(name, phydev, config, old_config)
 {
 	let phy = phydev.name;
+	let channel_change = false;
 
-	if (!old_config)
+	if (!old_config || old_config.station_phy != config.station_phy)
 		return false;
 
 	switch (radio_reload_class(old_config.radio, config.radio)) {
 	case "restart":
 		return false;
 	case "channel":
-		if (!iface_channel_switch(name, config))
+		if (config.station_phy)
+			channel_change = true;
+		else if (!iface_channel_switch(name, config))
 			return false;
 		break;
 	}
@@ -867,6 +1126,9 @@ function iface_reload_config(name, phydev, config, old_config)
 	    (hostapd.interfaces[name] || hostapd.data.pending_config[name])) {
 		for (let i = 0; i < length(config.bss); i++)
 			config.bss[i].bssid = prev_macaddr_bss[i].bssid;
+		iface_station_macaddr_require(phy, config);
+		if (channel_change && !iface_channel_switch(name, config))
+			return false;
 		return true;
 	}
 
@@ -1059,6 +1321,9 @@ function iface_reload_config(name, phydev, config, old_config)
 		bsscfg.bssid = addr;
 	}
 
+	iface_station_macaddr_require(phy, config);
+	if (channel_change && !iface_channel_switch(name, config))
+		return false;
 	let config_inline = iface_gen_config(config);
 
 	// Step 7: fill in the gaps with new interfaces
@@ -1124,6 +1389,7 @@ function iface_reload_config(name, phydev, config, old_config)
 	}
 
 	iface_macaddr_sync(phydev, config);
+	iface_station_macaddr_require(phy, config);
 
 	return true;
 }
@@ -1206,9 +1472,13 @@ function iface_config_remove(name, old_config)
 	if (pending)
 		pending.abort();
 
+	apsta_cancel(name, true);
 	delete hostapd.data.apsta_freq[name];
 	hostapd.remove_iface(name);
-	return iface_remove(old_config);
+	iface_remove(old_config);
+	if (hostapd.data.station_macaddr[name] &&
+	    (hostapd.interfaces[name] || !iface_station_macaddr_sync(name, null)))
+		die(`Could not retire station MAC addresses on phy ${name}\n`);
 }
 
 // No fallback to a PHY restart, which would take the other BSSes down.
@@ -1247,11 +1517,13 @@ function mld_link_bss_remove(phy, name)
 	splice(config.bss, idx, 1);
 	bss_remove(phy, bss, bss_config);
 	iface_macaddr_prune(phy, config);
+	iface_station_macaddr_require(phy, config);
 }
 
 function iface_set_config(name, config)
 {
 	let old_config = hostapd.data.config[name];
+	apsta_cancel(name, true);
 
 	if (!config) {
 		delete hostapd.data.config[name];
@@ -1262,13 +1534,16 @@ function iface_set_config(name, config)
 
 	let phy = config.phy;
 	let phydev = phy_open(phy, config.radio_idx);
-	if (!phydev) {
+	if (!phydev && length(config.bss)) {
 		hostapd.printf(`Failed to open phy ${phy}`);
+		if (config.station_phy)
+			die(`Could not open channel-following AP phy ${phy}\n`);
 		return false;
 	}
 
 	config.orig_bss = [ ...config.bss ];
-	iface_check_mld(phydev, name, config);
+	// Hot-unplug can remove the phy before its empty configuration arrives.
+	iface_check_mld(phydev ?? { phy }, name, config);
 	if (!length(config.bss)) {
 		iface_macaddr_prune(name, config);
 		return iface_config_remove(name, old_config);
@@ -1349,6 +1624,10 @@ function iface_load_config(phy, radio, filename)
 
 		if (val[0] == "#channel_follow") {
 			config.radio.channel_follow = int(val[1]) == 1;
+			continue;
+		}
+		if (val[0] == '#station_phy') {
+			config.station_phy = val[1];
 			continue;
 		}
 
@@ -1796,6 +2075,9 @@ let main_obj = {
 			up: true,
 			frequency: 0,
 			sec_chan_offset: 0,
+			chandef: {},
+			transition_token: '',
+			station_state: '',
 			csa: true,
 			csa_count: 0,
 			no_link: true,
@@ -1812,6 +2094,42 @@ let main_obj = {
 			let iface = hostapd.interfaces[phy];
 			if (!iface)
 				return 0;
+
+			let tx = hostapd.data.apsta_pending[phy];
+			if (tx && req.args.transition_token == tx.token) {
+				if (tx.phase == 'resuming' && tx.follow &&
+				    req.args.station_state == 'COMPLETED' && req.args.chandef) {
+					if (!iface.channel_status(req.args.chandef)?.matches)
+						apsta_fail(tx, 'STA resumed on a different channel');
+					else {
+						delete hostapd.data.apsta_pending[phy];
+						tx.timer.cancel();
+					}
+				}
+				return 0;
+			}
+			if (config.station_phy) {
+				if (!req.args.up) {
+					if (req.args.station_state == 'DISCONNECTED')
+						delete hostapd.data.apsta_freq[phy];
+					if (req.args.station_state == 'AUTHENTICATING') {
+						apsta_cancel(phy, true);
+						iface.stop();
+					} else if (!iface.channel_status()?.beaconing) {
+						apsta_follow(phy, config, iface, null, false);
+					}
+					return 0;
+				}
+				if (req.args.frequency) {
+					if (!req.args.chandef)
+						return libubus.STATUS_INVALID_ARGUMENT;
+					hostapd.data.apsta_freq[phy] = req.args.frequency;
+					return apsta_follow(phy, config, iface, req.args.chandef,
+						true, req.args.csa ? req.args.csa_count : null)
+						? 0 : libubus.STATUS_UNKNOWN_ERROR;
+				}
+				return 0;
+			}
 
 			if (!req.args.up) {
 				delete hostapd.data.apsta_freq[phy];
@@ -2065,10 +2383,11 @@ let main_obj = {
 				if (!config || !config.bss)
 					continue;
 
-				let is_pending = !!hostapd.data.pending_config[phy_name];
+				let is_pending = !!hostapd.data.pending_config[phy_name] ||
+					!!hostapd.data.apsta_pending[phy_name];
 				let iface = hostapd.interfaces[phy_name];
 				let state = iface?.state();
-				let is_running = iface && state == "ENABLED" && !is_pending;
+				let is_running = iface && iface.channel_status()?.beaconing && !is_pending;
 
 				for (let bss in config.bss) {
 					let ifname = bss.ifname;
@@ -2127,6 +2446,15 @@ let main_obj = {
 hostapd.data.ubus = ubus;
 hostapd.data.obj = ubus.publish("hostapd", main_obj);
 
+hostapd.data.wpas_watch = ubus.subscriber(() => 0, () => {
+	let lost = values(hostapd.data.apsta_pending);
+	uloop.timer(0, () => {
+		for (let tx in lost)
+			apsta_fail(tx, 'STA owner disconnected');
+	});
+}, [ 'wpa_supplicant' ]);
+hostapd.data.wpas_watch.subscribe('wpa_supplicant');
+
 
 let auth_obj = {};
 hostapd.data.auth_obj = ubus.publish("hostapd-auth", auth_obj);
@@ -2142,6 +2470,19 @@ function bss_event(type, name, data) {
 }
 
 return {
+	iface_state: function(phy, iface, state, channel_changed) {
+		let tx = hostapd.data.apsta_pending[phy];
+		if (channel_changed && hostapd.data.config[phy]?.station_phy &&
+		    hostapd.interfaces[phy] == iface && iface.channel_status()?.beaconing &&
+		    !iface.update_beacons()) {
+			hostapd.printf(`Failed to refresh AP beacons after shared channel switch on ${phy}`);
+			apsta_cancel(phy, true);
+			iface.stop();
+			return;
+		}
+		if (tx && tx.iface == iface)
+			apsta_check(tx);
+	},
 	shutdown: function() {
 		for (let phy in hostapd.data.config)
 			iface_set_config(phy);
