@@ -78,10 +78,13 @@ _procd_wrapper() {
 
 _procd_ubus_call() {
 	local cmd="$1"
+	local ret
 
 	[ -n "$PROCD_DEBUG" ] && json_dump >&2
 	ubus call service "$cmd" "$(json_dump)"
+	ret=$?
 	json_cleanup
+	return "$ret"
 }
 
 _procd_open_service() {
@@ -108,6 +111,18 @@ _procd_close_service() {
 		_procd_close_data
 	}
 	_procd_ubus_call ${1:-set}
+}
+
+procd_close_service() {
+	local old_cb ret
+
+	# Publication has a transport result; unlike the JSON builders, callers
+	# need that result after the namespace has been restored.
+	json_set_namespace procd old_cb
+	_procd_close_service "$@"
+	ret=$?
+	json_set_namespace "$old_cb"
+	return "$ret"
 }
 
 _procd_add_array_data() {
@@ -688,7 +703,6 @@ uci_load_validate() {
 
 _procd_wrapper \
 	procd_open_service \
-	procd_close_service \
 	procd_add_instance \
 	procd_add_raw_trigger \
 	procd_add_config_trigger \
