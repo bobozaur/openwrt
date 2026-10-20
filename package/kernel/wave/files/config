@@ -9,9 +9,9 @@ CONFIG_LINDRV_GEN6_USE_LEGACY_INT=y
 CONFIG_BUS_PCI_PCIE=y
 CONFIG_EEPROM_SUPPORT=y
 CONFIG_USE_LIBNL_NG=y
-# Native operational counters are also selected by STAT_CNTRS_DEBUG.
-# CONFIG_DEBUG is not set
-# CONFIG_ENABLE_OBJPOOL is not set
+# Native runtime checks, object lifetime accounting and operational counters.
+CONFIG_DEBUG=y
+CONFIG_ENABLE_OBJPOOL=y
 CONFIG_TXMM_HISTORY_LENGTH=0
 CONFIG_TRACER_HISTORY_LENGTH=0
 CONFIG_STAT_CNTRS_DEBUG=y
