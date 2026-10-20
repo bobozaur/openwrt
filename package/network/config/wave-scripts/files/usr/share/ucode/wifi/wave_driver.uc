@@ -117,6 +117,22 @@ function setup(data) {
 		if (+v.config.dpp ||
 		    security.auth_type in [ 'eap2', 'eap192', 'eap-eap2', 'dpp' ])
 			return fail('WAVE_AUTH_UNSUPPORTED');
+		let multi_ap = int(v.config.multi_ap ?? 0);
+		if (multi_ap < 0 || multi_ap > (v.config.mode == 'ap' ? 3 : 1))
+			return fail('WAVE_MULTI_AP_ROLE_UNSUPPORTED');
+		if (v.config.mode == 'ap') {
+			// Backhaul peers declare four-address use during association, before
+			// STA_ADD. Ordinary late WDS and shared VLAN key contexts are separate.
+			if (v.config.dynamic_vlan || v.config.per_sta_vif || length(v.vlans))
+				return fail('WAVE_DYNAMIC_VLAN_UNSUPPORTED');
+			if (v.config.wds && !(multi_ap & 1))
+				return fail('WAVE_LATE_WDS_UNSUPPORTED');
+			if (multi_ap & 1)
+				v.config.wds = true;
+		} else if (multi_ap || v.config.multi_ap_backhaul_sta) {
+			// Create the static four-address interface before associating.
+			v.config.wds = true;
+		}
 		modes[v.config.mode] = true;
 	}
 	if (modes.ap && modes.sta)
