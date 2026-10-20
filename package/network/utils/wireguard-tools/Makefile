@@ -11,7 +11,7 @@ include $(TOPDIR)/rules.mk
 PKG_NAME:=wireguard-tools
 
 PKG_VERSION:=1.0.20260223
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 
 PKG_SOURCE:=wireguard-tools-$(PKG_VERSION).tar.xz
 PKG_SOURCE_URL:=https://git.zx2c4.com/wireguard-tools/snapshot/
@@ -38,7 +38,7 @@ define Package/wireguard-tools
 	  +@BUSYBOX_CONFIG_IP \
 	  +@BUSYBOX_CONFIG_FEATURE_IP_LINK \
 	  +kmod-wireguard +netifd
-  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r3)
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r6)
 endef
 
 define Package/wireguard-tools/description
