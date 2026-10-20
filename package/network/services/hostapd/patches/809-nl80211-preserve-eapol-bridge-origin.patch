@@ -1,0 +1,38 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: retain EAPOL bridge origin
+
+A bridge-bound EAPOL socket must retain the originating interface so the
+existing native receiver selects its actual BSS. Request PACKET_ORIGDEV
+without adding another authentication or bridge forwarding policy.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -9514,6 +9514,7 @@
+ 	char master_ifname[IFNAMSIZ];
+ 	int ifindex, br_ifindex = 0;
+ 	int br_added = 0;
++	int eapol_origdev = 1;
+ 	int err;
+ 
+ 	bss = wpa_driver_nl80211_drv_init(hapd, params->ifname,
+@@ -9597,6 +9598,16 @@
+ 	drv->eapol_sock = socket(PF_PACKET, SOCK_DGRAM, htons(ETH_P_PAE));
+ 	if (drv->eapol_sock < 0) {
+ 		wpa_printf(MSG_ERROR, "nl80211: socket(PF_PACKET, SOCK_DGRAM, ETH_P_PAE) failed: %s",
++			   strerror(errno));
++		goto failed;
++	}
++
++	/* Keep the accepted bridge origin when VLAN receive changes the
++	 * packet device to a VLAN interface before protocol socket delivery. */
++	if (setsockopt(drv->eapol_sock, SOL_PACKET, PACKET_ORIGDEV,
++		       &eapol_origdev, sizeof(eapol_origdev)) < 0) {
++		wpa_printf(MSG_ERROR,
++			   "nl80211: setsockopt(PACKET_ORIGDEV) failed: %s",
+ 			   strerror(errno));
+ 		goto failed;
+ 	}
