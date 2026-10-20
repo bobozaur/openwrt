@@ -167,6 +167,11 @@ load_led() {
 			echo >&2 "Skipping trigger '$trigger' for led '$name' due to missing kernel module"
 			return 1
 		}
+		# Trigger activation may replace a configured positive brightness.
+		# Keep zero before activation: writing it afterward removes the trigger.
+		if [ "$default" = 1 ] && [ "$brightness" -gt 0 ]; then
+			echo "$brightness" > /sys/class/leds/${sysfs}/brightness || return $?
+		fi
 		case "$trigger" in
 		"heartbeat")
 			echo "${inverted}" > "/sys/class/leds/${sysfs}/invert" || return $?
@@ -298,11 +303,15 @@ led_start() {
 				elif [ "$ACTION" = add ] && [ "$DEVICENAME" = "$led" ]; then
 					continue
 				fi
+				# Zero brightness unbinds a trigger, so restore it first.
+				if [ "$brightness" = 0 ] && [ -e "/sys/class/leds/$led/brightness" ]; then
+					echo 0 > "/sys/class/leds/$led/brightness" || return $?
+				fi
 				if [ -e "/sys/class/leds/$led/trigger" ]; then
 					echo "$trigger" > "/sys/class/leds/$led/trigger" || return $?
 				fi
 
-				if [ -e "/sys/class/leds/$led/brightness" ]; then
+				if [ "$brightness" != 0 ] && [ -e "/sys/class/leds/$led/brightness" ]; then
 					echo "$brightness" > "/sys/class/leds/$led/brightness" || return $?
 				fi
 
