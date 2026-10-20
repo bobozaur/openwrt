@@ -14,6 +14,9 @@ import * as fs from 'fs';
 
 global.radio = ARGV[2];
 
+let wave;
+try { wave = require('wifi.wave'); } catch (e) {}
+
 const mesh_param_list = [
 	"mesh_retry_timeout", "mesh_confirm_timeout", "mesh_holding_timeout", "mesh_max_peer_links",
 	"mesh_max_retries", "mesh_ttl", "mesh_element_ttl", "mesh_hwmp_max_preq_retries",
@@ -167,6 +170,16 @@ function config_add_mesh_params(config, data) {
 function setup() {
 	let data = json(ARGV[3]);
 
+	// WAVE uses the same nl80211/hostapd configuration model, with paired
+	// AP and station wiphys for one physical radio.
+	if (wave?.matches(data.config)) {
+		if (data.data?.phy && !data.data.wave)
+			reset_config(data.data.phy, data.data.radio);
+		return require('wifi.wave_driver').setup(data);
+	}
+	if (data.data?.wave)
+		require('wifi.wave_driver').teardown(data);
+
 	data.phy = find_phy(data.config, true);
 	if (!data.phy) {
 		log('Bug: PHY is undefined for device');
@@ -316,6 +329,8 @@ function setup() {
 
 function teardown() {
 	let data = json(ARGV[3]);
+	if (data.data?.wave)
+		return require('wifi.wave_driver').teardown(data);
 
 	if (ARGV[2] == "#mlo")
 		return 0;
