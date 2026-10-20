@@ -185,7 +185,8 @@ function setup(data) {
 				return fail('WAVE_MASTER_CONFIG_FAILED');
 			master_mac = lc(v.config.macaddr);
 		}
-		netifd.set_vif(name, v.config.ifname);
+		// The bridge owns bridged WAVE forwarding.
+		netifd.set_vif(name, v.config.ifname, { bridge_forwarding: mode == 'ap' });
 		if (mode == 'sta' && type(supplicant.generate(supplicant_data, sta_data, v)) != 'object')
 			return 1;
 	}
