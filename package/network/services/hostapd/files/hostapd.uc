@@ -24,6 +24,7 @@ hostapd.data.apsta_sequence = 0;
 hostapd.data.file_fields = {
 	vlan_file: true,
 	wpa_psk_file: true,
+	wpa_psk_file_static: true,
 	sae_password_file: true,
 	rxkh_file: true,
 	accept_mac_file: true,
@@ -734,10 +735,12 @@ function find_array_idx(arr, key, val)
 
 function bss_reload_psk(bss, config, old_config)
 {
-	if (is_equal(old_config.hash.wpa_psk_file, config.hash.wpa_psk_file))
+	if (is_equal(old_config.hash.wpa_psk_file, config.hash.wpa_psk_file) &&
+	    is_equal(old_config.hash.wpa_psk_file_static, config.hash.wpa_psk_file_static))
 		return;
 
 	old_config.hash.wpa_psk_file = config.hash.wpa_psk_file;
+	old_config.hash.wpa_psk_file_static = config.hash.wpa_psk_file_static;
 	if (!is_equal(old_config, config))
 		return;
 
@@ -825,6 +828,7 @@ function bss_remove_file_fields(config)
 	for (let key in config.hash)
 		new_cfg.hash[key] = config.hash[key];
 	delete new_cfg.hash.wpa_psk_file;
+	delete new_cfg.hash.wpa_psk_file_static;
 	delete new_cfg.hash.sae_password_file;
 	delete new_cfg.hash.vlan_file;
 
