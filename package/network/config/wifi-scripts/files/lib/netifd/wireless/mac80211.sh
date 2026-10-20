@@ -1011,7 +1011,11 @@ wpa_supplicant_set_config() {
 	ret="$?"
 	[ "$ret" != 0 -o -z "$supplicant_res" ] && wireless_setup_vif_failed WPA_SUPPLICANT_FAILED
 
-	wireless_add_process "$(jsonfilter -s "$supplicant_res" -l 1 -e @.pid)" "/usr/sbin/wpa_supplicant" 1 1
+	# Empty configuration removes a previous STA without making an AP-only
+	# radio depend on the shared supplicant process.
+	if [ -n "$wpa_supp_init" ]; then
+		wireless_add_process "$(jsonfilter -s "$supplicant_res" -l 1 -e @.pid)" "/usr/sbin/wpa_supplicant" 1 1
+	fi
 
 }
 
