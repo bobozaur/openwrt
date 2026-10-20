@@ -1,0 +1,1181 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wave: bind four-address ports to native peer lifetimes
+
+Restore standard four-address and Multi-AP admission, AP_VLAN ownership
+and peer replication through native station and netdev lifetimes.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+---
+--- a/wireless/driver/linux/cfg80211.c
++++ b/wireless/driver/linux/cfg80211.c
+@@ -391,6 +391,8 @@
+   MTLK_ASSERT(NULL != cfg80211);
+   if (!wave_radio_control_ready_get(cfg80211->radio))
+     return ERR_PTR(-EBUSY);
++  if (iftype == NL80211_IFTYPE_AP_VLAN)
++    return wave_df_ap_vlan_add(wiphy, name, params);
+   if (iftype != NL80211_IFTYPE_AP)
+     return ERR_PTR(-EOPNOTSUPP);
+   mbss_cfg.added_vap_name = name;
+@@ -432,6 +434,8 @@
+ {
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   MTLK_ASSERT(NULL != cfg80211);
++  if (wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return wave_df_ap_vlan_del(wdev);
+   return wave_radio_virtual_interface_del(cfg80211->radio, wdev->netdev);
+ }
+ 
+@@ -457,6 +461,9 @@
+   enum nl80211_iftype iftype,
+   struct vif_params *params)
+ {
++  if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN ||
++      iftype == NL80211_IFTYPE_AP_VLAN)
++    return -EOPNOTSUPP;
+   return wave_radio_virtual_interface_change(ndev, iftype);
+ }
+ 
+@@ -788,6 +795,9 @@
+ {
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   MTLK_ASSERT(NULL != cfg80211);
++  if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN &&
++      !mtlk_df_user_from_ndev(ndev))
++    return -ENOENT;
+   return wave_radio_sta_get(cfg80211->radio, ndev, mac, sinfo);
+ }
+ 
+@@ -848,6 +858,8 @@
+ {
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   MTLK_ASSERT(NULL != cfg80211);
++  if (wdev->iftype == NL80211_IFTYPE_AP_VLAN)
++    return -EOPNOTSUPP;
+   return wave_radio_mgmt_tx(cfg80211->radio, wdev->netdev, chan, offchan, wait, buf, len, no_cck, dont_wait_for_ack, cookie);
+ }
+ 
+@@ -1458,6 +1470,9 @@
+ {
+   wv_cfg80211_t *cfg80211 = wiphy_priv(wiphy);
+   MTLK_ASSERT(NULL != cfg80211);
++  if (ndev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN &&
++      !mtlk_df_user_from_ndev(ndev))
++    return -ENOENT;
+   return wave_radio_station_dump(cfg80211->radio, ndev, idx, mac, st_info);
+ }
+ 
+@@ -2021,6 +2036,10 @@
+     WIPHY_BSS_PARAM_BASIC_RATES | WIPHY_BSS_PARAM_AP_ISOLATE |
+     WIPHY_BSS_PARAM_HT_OPMODE;
+   wiphy->interface_modes = BIT(NL80211_IFTYPE_AP);
++#if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
++  wiphy->interface_modes |= BIT(NL80211_IFTYPE_AP_VLAN);
++  wiphy->software_iftypes |= BIT(NL80211_IFTYPE_AP_VLAN);
++#endif
+   wv_cfg80211_sysfs_init(wiphy);
+ 
+   hw_get_fw_version(hw_handle, wiphy->fw_version, sizeof(wiphy->fw_version));
+@@ -2122,6 +2141,9 @@
+ #endif
+     );
+ 
++#if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
++  wiphy->flags |= WIPHY_FLAG_4ADDR_AP;
++#endif
+   /* FIXCFG80211: Unset TMP or TBD */
+   wiphy->flags &= ~(WIPHY_FLAG_CONTROL_PORT_PROTOCOL |
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
+@@ -2131,7 +2153,8 @@
+                     WIPHY_FLAG_NETNS_OK |
+                     WIPHY_FLAG_PS_ON_BY_DEFAULT);
+ 
+-  /* AP creation applies its MAC before registration. */
++  /* AP creation applies its MAC before registration; AP_VLAN uses it to
++   * select the active parent on this wiphy. */
+   wiphy->features = (NL80211_FEATURE_MAC_ON_CREATE |
+                      NL80211_FEATURE_SK_TX_STATUS |
+                      NL80211_FEATURE_AP_MODE_CHAN_WIDTH_CHANGE |
+@@ -2172,6 +2195,11 @@
+     return;
+   }
+ 
++  rtnl_lock();
++  wiphy_lock(cfg80211->wiphy);
++  wave_df_ap_vlan_del_unbound(cfg80211->wiphy);
++  wiphy_unlock(cfg80211->wiphy);
++  rtnl_unlock();
+   /* unregister hardware */
+   wiphy_unregister(cfg80211->wiphy);
+ 
+--- a/wireless/driver/linux/core.c
++++ b/wireless/driver/linux/core.c
+@@ -1221,10 +1221,20 @@
+   bridge_mode = MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_BRIDGE_MODE);
+ 
+   if (mtlk_vap_is_ap(vap_handle)) {
+-    /* Linux already selected this bridge port's unicast egress. */
++    /* Linux already selected this bridge port's unicast egress. A four-address
++     * peer can contain both Ethernet hosts; its SID is not a split horizon. */
+     bridge_unicast_return = nbuf->skb_iif == nbuf->dev->ifindex &&
+       netif_is_bridge_port(nbuf->dev) &&
+       !mtlk_osal_eth_is_multicast(ether_header->h_dest);
++    if (nbuf->dev->ieee80211_ptr->iftype == NL80211_IFTYPE_AP_VLAN) {
++      if (nbuf->skb_iif == nbuf->dev->ifindex && !bridge_unicast_return)
++        goto tx_error;
++      sta = wave_df_ap_vlan_tx_sta(nbuf->dev);
++      if (!sta)
++        goto tx_error;
++      nbuf_flags = MTLK_NBUFF_UNICAST;
++      goto send_tx_data;
++    }
+      /* AP mode interface */
+     if (MESH_MODE_BACKHAUL_AP == MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_MESH_MODE)) {
+       /* MultiAP: backhaul AP always has ONLY one station and always transmits frames
+@@ -1284,6 +1294,8 @@
+     }
+ 
+     if (sta) {
++      if (rcu_access_pointer(sta->ap_vlan))
++        goto tx_error;
+       /* Bridge unicast, including multicast-to-unicast copies, follows the
+        * selected Ethernet destination. Keep native split horizon otherwise. */
+       if (sta == src_sta && !bridge_unicast_return) {
+@@ -1428,6 +1440,10 @@
+           dst_sta = mtlk_hstdb_find_sta(&nic->slow_ctx->hstdb, ether_header->h_dest);
+         }
+ 
++        if (dst_sta && rcu_access_pointer(dst_sta->ap_vlan)) {
++          mtlk_sta_decref(dst_sta);
++          dst_sta = NULL;
++        }
+         if (dst_sta != NULL) {
+           if (dst_sta != src_sta) {
+             nbuf_flags |= MTLK_NBUFF_FORWARD;
+@@ -1813,6 +1829,9 @@
+   if (__LIKELY(sta)) {
+     mtlk_pckt_filter_e filter = mtlk_sta_get_packets_filter(sta);
+ 
++    if (mtlk_vap_is_ap(nic->vap_handle) &&
++        !wave_df_ap_vlan_prepare_tx(sta, data->nbuf))
++      goto tx_skip;
+     if (filter == MTLK_PCKT_FLTR_DISCARD_ALL ||
+         (filter == MTLK_PCKT_FLTR_ALLOW_802_1X && ether_header->h_proto != htons(ETH_P_PAE))) {
+       mtlk_sta_on_packet_dropped(sta, MTLK_TX_DISCARDED_DROP_ALL_FILTER);
+@@ -8338,6 +8357,11 @@
+     ELOG_D("Invalid priority: %u", qos);
+   nic->pstats.sta_session_rx_packets++;
+ 
++  if (wave_df_ap_vlan_rx(src_sta, nbuf)) {
++    CPU_STAT_END_TRACK(CPU_STAT_ID_RX_HW);
++    goto end;
++  }
++
+   /* In Backhaul AP mode only one STA can be connected (IRE), so we do not need to update hostdb */
+   if (MESH_MODE_BACKHAUL_AP != MTLK_CORE_HOT_PATH_PDB_GET_INT(nic, CORE_DB_CORE_MESH_MODE))
+   {
+@@ -9776,6 +9800,10 @@
+   /* notify Traffic Analyzer about new STA */
+   mtlk_ta_on_connect(mtlk_vap_get_ta(core->vap_handle), sta);
+ 
++  if (mtlk_vap_is_ap(core->vap_handle) && core->dgaf_disabled)
++  {
++  }
++
+   if (!mtlk_vap_is_ap(core->vap_handle)) {
+     bss_data_t bss_found;
+     if (mtlk_cache_find_bss_by_bssid(&core->slow_ctx->cache, addr, &bss_found, NULL) == 0) {
+@@ -9849,6 +9877,7 @@
+   }
+   info = &request->peer;
+   if (mtlk_vap_is_ap(core->vap_handle)) {
++    core_cfg_apply_assoc_four_addr(core, request);
+     if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(core->vap_handle)))
+       res = MTLK_ERR_NOT_READY;
+   } else {
+--- a/wireless/driver/linux/core.h
++++ b/wireless/driver/linux/core.h
+@@ -603,6 +603,8 @@
+   /* MBSS instance ID  - it is assigned by the hypervisor and should be used when communicating with HAL*/
+   mtlk_vap_handle_t   vap_handle;
+ 
++  // reliable multicast context
++
+   int net_state; // FIXME perhaps make it atomic if it even matters... see the next comment
+ 
+   mtlk_osal_spinlock_t net_state_lock; // FIXME get rid of this, it's not used consistently for all accessess anyway
+--- a/wireless/driver/linux/core_config.c
++++ b/wireless/driver/linux/core_config.c
+@@ -2156,6 +2156,20 @@
+   return MTLK_ERR_OK;
+ }
+ 
++void
++core_cfg_apply_assoc_four_addr(mtlk_core_t *core,
++                               struct wave_peer_connect_request *request)
++{
++  /* The request carries peer declarations, not a policy decision made before
++   * entering the master serializer. STATIC/LIST/WDS-WPA are applied by the
++   * native station owner immediately after this association-time decision. */
++  if ((MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_4ADDR_MODE) == MTLK_CORE_4ADDR_DYNAMIC &&
++       request->four_addr) ||
++      (request->multi_ap_backhaul_sta &&
++       wave_df_multi_ap_backhaul(mtlk_df_get_user(mtlk_vap_get_df(core->vap_handle)))))
++    request->peer.WDS_client_type = FOUR_ADDRESSES_STATION;
++}
++
+ 
+ static int
+ _mtlk_core_store_four_addr_mode (mtlk_core_t *core, const uint32 four_addr_mode)
+--- a/wireless/driver/linux/core_config.h
++++ b/wireless/driver/linux/core_config.h
+@@ -96,6 +96,9 @@
+ /* Native AP/STA frontend; submits the target queue on the master serializer. */
+ int wave_core_set_txq_params(mtlk_df_t *df, const struct mtlk_txq_params *params);
+ 
++struct wave_peer_connect_request;
++void core_cfg_apply_assoc_four_addr(mtlk_core_t *core,
++                                    struct wave_peer_connect_request *request);
+ 
+ int __MTLK_IFUNC core_cfg_set_four_addr_cfg (mtlk_handle_t hcore, const void *data, uint32 data_size);
+ int __MTLK_IFUNC core_cfg_get_four_addr_cfg (mtlk_handle_t hcore, const void *data, uint32 data_size);
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -1378,6 +1378,9 @@
+     }
+   }
+ 
++  if (ieee80211_vif_to_wdev(vif)->use_4addr)
++    info->WDS_client_type = FOUR_ADDRESSES_STATION;
++
+   if (sta->deflink.he_cap.has_he) {
+     const struct ieee80211_sta_he_cap *he = &sta->deflink.he_cap;
+     wv_mac80211_t *mac80211 = __wv_ieee80211_hw_get_mac80211(hw);
+@@ -2369,7 +2372,6 @@
+   hw->wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
+   /* Both role wiphys configure one physical radio power ceiling. */
+   hw->wiphy->features &= ~NL80211_FEATURE_VIF_TXPOWER;
+-  hw->wiphy->flags &= ~(WIPHY_FLAG_4ADDR_AP | WIPHY_FLAG_4ADDR_STATION);
+   wv_cfg80211_sysfs_init(hw->wiphy);
+ 
+   hw->wiphy->mgmt_stypes = wv_mgmt_stypes;
+--- a/wireless/driver/linux/mac80211.h
++++ b/wireless/driver/linux/mac80211.h
+@@ -21,6 +21,8 @@
+   sta_info peer;
+   struct wave_sta_bss_parameters bss; /* Used only by a station VAP. */
+   /* Validated AP association declarations; policy is applied on the master. */
++  bool four_addr;
++  bool multi_ap_backhaul_sta;
+ };
+ 
+ 
+--- a/wireless/driver/linux/mcast.c
++++ b/wireless/driver/linux/mcast.c
+@@ -128,6 +128,8 @@
+ mtlk_mc_transmit (mtlk_core_t* nic, mtlk_core_handle_tx_data_t *tx_data, uint32 nbuf_flags, int bridge_mode, sta_entry *src_sta)
+ {
+   int res = MTLK_ERR_OK;
++  const sta_entry *sta = NULL;
++  mtlk_stadb_iterator_t iter;
+ 
+ #ifdef MTLK_DEBUG_IPERF_PAYLOAD_TX
+   debug_ooo_analyze_packet(FALSE, tx_data->nbuf, 0);
+@@ -136,6 +138,67 @@
+   /* analyze and adjust packet's priority */
+   qos_adjust_priority(nic->vap_handle, nic->dscp_table, tx_data->nbuf);
+ 
++  /* Four-address peers cannot consume the BSS's three-address group frames.
++   * Replicate according to peer state, independently of legacy bridge mode. */
++  if (mtlk_vap_is_ap(nic->vap_handle) &&
++      (nbuf_flags & (MTLK_NBUFF_BROADCAST | MTLK_NBUFF_MULTICAST)) &&
++      (BR_MODE_WDS == bridge_mode ||
++       mtlk_stadb_get_four_addr_sta_cnt(&nic->slow_ctx->stadb)))
++  {
++    bool send_group = true;
++    mtlk_core_handle_tx_data_t clone_data = {0};
++
++    /* copy rx_if's into cloned buffer tx_data */
++    clone_data.rx_if = tx_data->rx_if;
++    clone_data.rx_subif = tx_data->rx_subif;
++
++    /* Each copy targets the peer SID. Preserve an ordinary BSS group copy only
++     * for ordinary receivers, and never send a peer copy back to its source. */
++    sta = mtlk_stadb_iterate_first(&nic->slow_ctx->stadb, &iter);
++    if (sta) {
++      /* If the referenced snapshot could not be allocated, leave the ordinary
++       * group path available. Only a complete snapshot can rule out receivers. */
++      send_group = false;
++      for (; sta; sta = mtlk_stadb_iterate_next(&iter)) {
++        if (sta == src_sta || rcu_access_pointer(sta->ap_vlan))
++          continue;
++        if (!sta->peer_ap && !mtlk_sta_is_4addr(sta)) {
++          send_group = true;
++          continue;
++        }
++        clone_data.dst_sta = (sta_entry *)sta;
++
++        clone_data.nbuf = mtlk_df_nbuf_clone_no_priv(tx_data->nbuf);
++
++        if (!clone_data.nbuf) {
++          mtlk_sta_on_packet_dropped(clone_data.dst_sta, MTLK_TX_DISCARDED_DRV_NO_RESOURCES);
++          /* One failed recipient must not hide later ordinary/group peers. */
++          continue;
++        }
++        /* Adjust cloned packet's priority */
++        mtlk_df_nbuf_set_priority(clone_data.nbuf, mtlk_df_nbuf_get_priority(tx_data->nbuf));
++
++        mtlk_sta_incref(clone_data.dst_sta);
++
++        ILOG3_Y("Broadcast packet sending to 4addr sta %Y", mtlk_sta_get_addr(clone_data.dst_sta));
++        res = _mtlk_do_send_data_to_sta(nic, &clone_data, nbuf_flags);
++        if (clone_data.msg) {
++          mtlk_hw_release_msg_to_send(mtlk_vap_get_hwapi(nic->vap_handle), clone_data.msg);
++          clone_data.msg = NULL;
++        }
++      }
++      mtlk_stadb_iterate_done(&iter);
++    } /* End of "for each 4addr client" */
++
++    /* Count receivers, not clones: the source is not a group destination. */
++    if (!send_group) {
++      /* drop original buffer*/
++      mtlk_df_nbuf_free(tx_data->nbuf);
++      return MTLK_ERR_OK;
++    }
++
++  } /* End of broadcasting over WDS */
++
+   res = _mtlk_do_send_data_to_sta(nic, tx_data, nbuf_flags);
+   return res;
+ }
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -227,6 +227,8 @@
+   struct net_device *ndev;
+   BOOL               ndev_registered;
+   struct wave_tx_queue tx_queue;
++  struct list_head ap_vlans; /* RTNL and owning wiphy lock */
++  spinlock_t ap_vlan_lock;
+   struct gro_cells   rx_gro;
+   spinlock_t         rx_gro_lock;
+   bool               rx_gro_accepting;
+@@ -258,6 +260,7 @@
+ 
+   spinlock_t assoc_lock;
+   struct wave_assoc_metadata assoc_metadata[16];
++  bool multi_ap_backhaul_bss; /* protected by assoc_lock */
+ 
+   int corrupted_packets_counter;
+ 
+@@ -736,6 +739,134 @@
+ }
+ EXPORT_SYMBOL(_mtlk_df_user_linux_start_tx);
+ 
++/* AP_VLAN owns a Linux port, never a firmware VAP. The first member is NULL
++ * until first open selects the parent for cfg80211 station/key operations.
++ * ap_vlan_lock protects both sides of the binding and the station retirement
++ * flag. RX additionally uses RCU through the network-stack handoff.
++ */
++struct wave_ap_vlan {
++  mtlk_df_user_t *parent;
++  struct net_device *parent_ndev;
++  struct wireless_dev wdev;
++  struct list_head node;
++  struct wave_tx_queue tx_queue;
++  sta_entry *sta;
++};
++
++static int wave_ap_vlan_open(struct net_device *ndev)
++{
++  struct wave_ap_vlan *vlan = netdev_priv(ndev);
++  struct wiphy *wiphy = vlan->wdev.wiphy;
++  struct wireless_dev *iter;
++  mtlk_df_user_t *parent = NULL;
++  struct net_device *parent_ndev;
++  mtlk_vap_handle_t vap;
++  int err = 0;
++
++  ASSERT_RTNL();
++  wiphy_lock(wiphy);
++  /* Standard hostapd assigns the BSS MAC after NEW_INTERFACE and before UP.
++   * Resolve that final address here, without guessing from the child name. */
++  list_for_each_entry(iter, &wiphy->wdev_list, list) {
++    mtlk_df_user_t *candidate;
++    mtlk_core_t *core;
++
++    if (iter->iftype != NL80211_IFTYPE_AP || !iter->netdev ||
++        !netif_running(iter->netdev) ||
++        !ether_addr_equal(iter->netdev->dev_addr, ndev->dev_addr))
++      continue;
++    candidate = mtlk_df_user_from_ndev(iter->netdev);
++    core = mtlk_vap_get_core(mtlk_df_get_vap_handle(candidate->df));
++    if (!READ_ONCE(core->slow_ctx->ap_started))
++      continue;
++    if (parent) {
++      err = -EINVAL;
++      goto out;
++    }
++    parent = candidate;
++  }
++  if (!parent || (vlan->parent && vlan->parent != parent)) {
++    err = -ENOLINK;
++    goto out;
++  }
++  parent_ndev = parent->ndev;
++  /* Registration/upper attachment already consumed these reservations.
++   * Do not change them, or the administrator's MTU, during first open. */
++  if (ndev->needed_headroom < parent_ndev->needed_headroom ||
++      ndev->needed_tailroom < parent_ndev->needed_tailroom ||
++      ndev->mtu < parent_ndev->min_mtu ||
++      (parent_ndev->max_mtu && ndev->mtu > parent_ndev->max_mtu)) {
++    err = -EINVAL;
++    goto out;
++  }
++  if (!vlan->parent) {
++    ndev->min_mtu = parent_ndev->min_mtu;
++    ndev->max_mtu = parent_ndev->max_mtu;
++    dev_hold(parent_ndev);
++    WRITE_ONCE(vlan->parent_ndev, parent_ndev);
++    WRITE_ONCE(vlan->parent, parent);
++    list_add_tail(&vlan->node, &parent->ap_vlans);
++  }
++  vap = mtlk_df_get_vap_handle(parent->df);
++  wave_hw_tx_queue_start(mtlk_vap_get_hw(vap), &vlan->tx_queue);
++out:
++  wiphy_unlock(wiphy);
++  return err;
++}
++
++static int wave_ap_vlan_stop(struct net_device *ndev)
++{
++  struct wave_ap_vlan *vlan = netdev_priv(ndev);
++  mtlk_vap_handle_t vap;
++
++  if (!vlan->parent)
++    return 0;
++  vap = mtlk_df_get_vap_handle(vlan->parent->df);
++  wave_hw_tx_queue_stop(mtlk_vap_get_hw(vap), &vlan->tx_queue);
++  return 0;
++}
++
++static int wave_ap_vlan_iflink(const struct net_device *ndev)
++{
++  const struct wave_ap_vlan *vlan = netdev_priv(ndev);
++  struct net_device *parent = READ_ONCE(vlan->parent_ndev);
++
++  return parent ? parent->ifindex : ndev->ifindex;
++}
++
++static int wave_ap_vlan_set_mac(struct net_device *ndev, void *addr)
++{
++  struct wave_ap_vlan *vlan = netdev_priv(ndev);
++
++  ASSERT_RTNL();
++  /* Once selected, the BSS owns this child's bindings until deletion.
++   * A same-address ioctl is handled by netif_set_mac_address itself. */
++  if (vlan->parent)
++    return -EBUSY;
++  return eth_mac_addr(ndev, addr);
++}
++
++static const struct net_device_ops wave_ap_vlan_ops = {
++  .ndo_open = wave_ap_vlan_open,
++  .ndo_stop = wave_ap_vlan_stop,
++  .ndo_start_xmit = _mtlk_df_user_linux_start_tx,
++  .ndo_get_iflink = wave_ap_vlan_iflink,
++  .ndo_set_mac_address = wave_ap_vlan_set_mac,
++  .ndo_validate_addr = eth_validate_addr,
++};
++
++static void wave_ap_vlan_destructor(struct net_device *ndev)
++{
++  struct wave_ap_vlan *vlan = netdev_priv(ndev);
++
++  if (vlan->parent_ndev)
++    dev_put(vlan->parent_ndev);
++}
++
++/* netifd enables bridge hairpin for non-isolated WAVE APs. Every bridged
++ * frame is handed to that owner; an explicit hairpin-off choice is never
++ * bypassed by driver-local forwarding, VLAN learning or a second querier.
++ */
+ bool wave_df_intra_bss_forwarding(mtlk_df_user_t *df_user)
+ {
+ #if !MTLK_USE_DIRECTCONNECT_DP_API && !MTLK_USE_PUMA6_UDMA
+@@ -745,6 +876,339 @@
+ #endif
+ }
+ 
++/* A bridged parent has already passed VLAN and source policy. Remaining
++ * group frames use BSS flooding rather than the native VLAN-blind cache.
++ * Standalone RX shortcuts use their native membership owner. Bridged
++ * forwarding remains entirely subject to Linux VLAN/source/port policy.
++ */
++
++struct wireless_dev *wave_df_ap_vlan_add(struct wiphy *wiphy, const char *name,
++                                         struct vif_params *params)
++{
++  struct wireless_dev *iter;
++  struct wave_ap_vlan *vlan;
++  struct net_device *ndev;
++  u8 address[ETH_ALEN];
++  unsigned int headroom = 0, tailroom = 0;
++  int err;
++
++  ASSERT_RTNL();
++  lockdep_assert_wiphy(wiphy);
++#if MTLK_USE_DIRECTCONNECT_DP_API || MTLK_USE_PUMA6_UDMA
++  return ERR_PTR(-EOPNOTSUPP);
++#endif
++  /* Four-address children have exactly one receiver. Ordinary dynamic-VLAN
++   * AP ports need a separate multi-station contract, not this peer binding.
++   */
++  if (params->use_4addr != 1)
++    return ERR_PTR(-EOPNOTSUPP);
++  ether_addr_copy(address, params->macaddr);
++  list_for_each_entry(iter, &wiphy->wdev_list, list) {
++    if (iter->iftype != NL80211_IFTYPE_AP || !iter->netdev)
++      continue;
++    /* A default address is only a seed. No BSS reference is selected until
++     * the normal DOWN MAC assignment and subsequent open have completed. */
++    if (is_zero_ether_addr(address))
++      ether_addr_copy(address, iter->netdev->dev_addr);
++    headroom = max_t(unsigned int, headroom, iter->netdev->needed_headroom);
++    tailroom = max_t(unsigned int, tailroom, iter->netdev->needed_tailroom);
++  }
++  if (!is_valid_ether_addr(address))
++    return ERR_PTR(-EADDRNOTAVAIL);
++  ndev = alloc_netdev(sizeof(*vlan), name, NET_NAME_USER, ether_setup);
++  if (!ndev)
++    return ERR_PTR(-ENOMEM);
++  vlan = netdev_priv(ndev);
++  vlan->wdev.wiphy = wiphy;
++  vlan->wdev.iftype = NL80211_IFTYPE_AP_VLAN;
++  vlan->wdev.use_4addr = true;
++  vlan->wdev.netdev = ndev;
++  INIT_LIST_HEAD(&vlan->node);
++  INIT_LIST_HEAD(&vlan->tx_queue.node);
++  vlan->tx_queue.ndev = ndev;
++  dev_net_set(ndev, wiphy_net(wiphy));
++  ndev->ieee80211_ptr = &vlan->wdev;
++  ndev->netdev_ops = &wave_ap_vlan_ops;
++  ndev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
++  ndev->needed_headroom = headroom;
++  ndev->needed_tailroom = tailroom;
++  eth_hw_addr_set(ndev, address);
++  SET_NETDEV_DEV(ndev, wiphy_dev(wiphy));
++  netif_carrier_off(ndev);
++  err = cfg80211_register_netdevice(ndev);
++  if (err) {
++    free_netdev(ndev);
++    return ERR_PTR(err);
++  }
++  ndev->needs_free_netdev = true;
++  ndev->priv_destructor = wave_ap_vlan_destructor;
++  return &vlan->wdev;
++}
++
++/* Called at the station database's removal boundary, before its final refs.
++ * A station found concurrently by cfg80211 cannot be rebound after this point.
++ */
++void wave_df_ap_vlan_sta_drop(sta_entry *sta)
++{
++  mtlk_df_user_t *parent = mtlk_df_get_user(mtlk_vap_get_df(sta->vap_handle));
++  struct net_device *ndev;
++  struct wave_ap_vlan *vlan;
++  bool put = false;
++
++  spin_lock_bh(&parent->ap_vlan_lock);
++  sta->ap_vlan_retiring = true;
++  ndev = rcu_dereference_protected(sta->ap_vlan,
++                                  lockdep_is_held(&parent->ap_vlan_lock));
++  if (ndev) {
++    vlan = netdev_priv(ndev);
++    RCU_INIT_POINTER(sta->ap_vlan, NULL);
++    vlan->sta = NULL;
++    netif_carrier_off(ndev);
++    put = true;
++  }
++  spin_unlock_bh(&parent->ap_vlan_lock);
++  if (put)
++    mtlk_sta_decref(sta);
++}
++
++struct wave_ap_vlan_binding {
++  mtlk_df_user_t *parent;
++  struct wave_ap_vlan *vlan;
++  sta_entry *sta;
++  uint16 sid;
++  uint32 sid_order;
++  int result;
++};
++
++/* The radio master owns SID lifetime while the Linux port is rebound.
++ * In-flight descriptors retain their original parent ownership. */
++static void wave_ap_vlan_bind_owned(mtlk_handle_t handle)
++{
++  struct wave_ap_vlan_binding *binding = HANDLE_T_PTR(struct wave_ap_vlan_binding, handle);
++  mtlk_df_user_t *parent = binding->parent;
++  struct wave_ap_vlan *vlan = binding->vlan, *old_vlan;
++  sta_entry *sta = binding->sta;
++  mtlk_core_t *core = mtlk_vap_get_core(sta->vap_handle);
++  struct net_device *old_ndev;
++  bool old_ref = false;
++  sta_entry *sid_sta;
++
++  sid_sta = mtlk_stadb_find_sid(&core->slow_ctx->stadb, binding->sid);
++  if (sid_sta != sta || sta->info.sid_order != binding->sid_order) {
++    if (sid_sta)
++      mtlk_sta_decref(sid_sta);
++    binding->result = -ENOENT;
++    return;
++  }
++  mtlk_sta_decref(sid_sta);
++  if (vlan && (mtlk_core_get_net_state(core) != NET_STATE_CONNECTED ||
++               mtlk_sta_get_packets_filter(sta) == MTLK_PCKT_FLTR_DISCARD_ALL ||
++               !wave_hw_mmb_ready(mtlk_vap_get_hw(core->vap_handle)))) {
++    binding->result = -ENETDOWN;
++    return;
++  }
++  spin_lock_bh(&parent->ap_vlan_lock);
++  if (sta->ap_vlan_retiring || (vlan && vlan->sta && vlan->sta != sta)) {
++    binding->result = sta->ap_vlan_retiring ? -ENOENT : -EBUSY;
++    spin_unlock_bh(&parent->ap_vlan_lock);
++    return;
++  }
++  old_ndev = rcu_dereference_protected(sta->ap_vlan,
++                                      lockdep_is_held(&parent->ap_vlan_lock));
++  if ((vlan && old_ndev == vlan->wdev.netdev) ||
++      (!vlan && !old_ndev)) {
++    spin_unlock_bh(&parent->ap_vlan_lock);
++    binding->result = 0;
++    return;
++  }
++  if (old_ndev) {
++    old_vlan = netdev_priv(old_ndev);
++    old_vlan->sta = NULL;
++    netif_carrier_off(old_ndev);
++    old_ref = true;
++  }
++  if (vlan) {
++    mtlk_sta_incref(sta);
++    vlan->sta = sta;
++    rcu_assign_pointer(sta->ap_vlan, vlan->wdev.netdev);
++    netif_carrier_on(vlan->wdev.netdev);
++  } else {
++    RCU_INIT_POINTER(sta->ap_vlan, NULL);
++  }
++  spin_unlock_bh(&parent->ap_vlan_lock);
++  if (old_ref)
++    mtlk_sta_decref(sta);
++  binding->result = 0;
++}
++
++static int wave_ap_vlan_submit_binding(mtlk_df_user_t *parent,
++                                       struct wave_ap_vlan *vlan, sta_entry *sta)
++{
++  mtlk_core_t *master = mtlk_vap_manager_get_master_core(mtlk_vap_get_manager(sta->vap_handle));
++  struct wave_ap_vlan_binding binding = {
++    .parent = parent, .vlan = vlan, .sta = sta,
++    .sid = sta->info.sid, .sid_order = sta->info.sid_order, .result = -EIO,
++  };
++  mtlk_command_t command;
++  int res;
++
++  /* SET_STATION holds the wiphy lock, not RTNL. Queued Linux-port traffic
++   * chooses its referenced peer at dequeue and native submission rechecks
++   * that binding. The blocked command joins completion even on timeout.
++   */
++  res = mtlk_command_init(&command, wave_ap_vlan_bind_owned, HANDLE_T(&binding), MTLK_SLID);
++  if (res == MTLK_ERR_OK) {
++    res = mtlk_core_execute_hw_command(master, &command, 2000);
++    mtlk_command_cleanup(&command);
++  }
++  synchronize_net();
++  return res == MTLK_ERR_OK ? binding.result : _mtlk_df_mtlk_to_linux_error_code(res);
++}
++
++int wave_df_ap_vlan_bind(struct net_device *parent_ndev, const u8 *mac,
++                        struct net_device *ndev)
++{
++  mtlk_df_user_t *parent = mtlk_df_user_from_ndev(parent_ndev);
++  mtlk_core_t *core = mtlk_vap_get_core(mtlk_df_get_vap_handle(parent->df));
++  struct wave_ap_vlan *vlan = NULL;
++  sta_entry *sta;
++  int res;
++
++  lockdep_assert_wiphy(parent_ndev->ieee80211_ptr->wiphy);
++  if (parent_ndev->ieee80211_ptr->iftype != NL80211_IFTYPE_AP)
++    return -EINVAL;
++  if (ndev != parent_ndev) {
++    if (ndev->netdev_ops != &wave_ap_vlan_ops)
++      return -EINVAL;
++    vlan = netdev_priv(ndev);
++    if (vlan->parent != parent)
++      return -EINVAL;
++  }
++  sta = mtlk_stadb_find_sta(&core->slow_ctx->stadb, mac);
++  if (!sta)
++    return -ENOENT;
++  if (vlan && !mtlk_sta_is_4addr(sta)) {
++    mtlk_sta_decref(sta);
++    return -EOPNOTSUPP;
++  }
++
++  res = wave_ap_vlan_submit_binding(parent, vlan, sta);
++  mtlk_sta_decref(sta);
++  return res;
++}
++
++sta_entry *wave_df_ap_vlan_tx_sta(struct net_device *ndev)
++{
++  struct wave_ap_vlan *vlan = netdev_priv(ndev);
++  sta_entry *sta;
++
++  if (!vlan->parent)
++    return NULL;
++  spin_lock_bh(&vlan->parent->ap_vlan_lock);
++  sta = vlan->sta;
++  if (sta)
++    mtlk_sta_incref(sta);
++  spin_unlock_bh(&vlan->parent->ap_vlan_lock);
++  return sta;
++}
++
++static bool wave_df_ap_vlan_tx_allowed(sta_entry *sta, struct net_device *ndev)
++{
++  mtlk_df_user_t *parent = mtlk_df_get_user(mtlk_vap_get_df(sta->vap_handle));
++  struct net_device *bound;
++  bool allowed;
++
++  spin_lock_bh(&parent->ap_vlan_lock);
++  bound = rcu_dereference_protected(sta->ap_vlan,
++                                    lockdep_is_held(&parent->ap_vlan_lock));
++  allowed = !sta->ap_vlan_retiring &&
++            (bound ? bound == ndev : ndev == parent->ndev);
++  spin_unlock_bh(&parent->ap_vlan_lock);
++  return allowed;
++}
++
++bool wave_df_ap_vlan_prepare_tx(sta_entry *sta, mtlk_nbuf_t *nbuf)
++{
++  struct net_device *parent = mtlk_df_user_get_ndev(
++    mtlk_df_get_user(mtlk_vap_get_df(sta->vap_handle)));
++  struct net_device *origin = nbuf->dev ?: parent;
++
++  if (!wave_df_ap_vlan_tx_allowed(sta, origin))
++    return false;
++  /* DMA may outlive child removal. Only the existing parent VAP lifetime
++   * owns hardware-submitted skbs; unregister drains child qdiscs and RX.
++   */
++  nbuf->dev = parent;
++  return true;
++}
++
++int wave_df_ap_vlan_del(struct wireless_dev *wdev)
++{
++  struct wave_ap_vlan *vlan = netdev_priv(wdev->netdev);
++  mtlk_df_user_t *parent = vlan->parent;
++  sta_entry *sta;
++
++  ASSERT_RTNL();
++  lockdep_assert_wiphy(wdev->wiphy);
++  dev_deactivate(wdev->netdev);
++  if (!parent)
++    goto unregister;
++  spin_lock_bh(&parent->ap_vlan_lock);
++  sta = vlan->sta;
++  if (sta)
++    mtlk_sta_incref(sta);
++  spin_unlock_bh(&parent->ap_vlan_lock);
++  if (sta) {
++    wave_ap_vlan_submit_binding(parent, NULL, sta);
++    mtlk_sta_decref(sta);
++  }
++  /* Teardown must finish even if the master no longer accepts commands.
++   * Such a failed transition leaves native membership admission closed.
++   */
++  spin_lock_bh(&parent->ap_vlan_lock);
++  sta = vlan->sta;
++  if (sta) {
++    RCU_INIT_POINTER(sta->ap_vlan, NULL);
++    vlan->sta = NULL;
++  }
++  spin_unlock_bh(&parent->ap_vlan_lock);
++  if (sta)
++    mtlk_sta_decref(sta);
++  list_del_init(&vlan->node);
++  synchronize_net();
++unregister:
++  cfg80211_unregister_netdevice(wdev->netdev);
++  return 0;
++}
++
++static void wave_df_ap_vlan_del_all(mtlk_df_user_t *parent)
++{
++  struct wave_ap_vlan *vlan, *next;
++
++  list_for_each_entry_safe(vlan, next, &parent->ap_vlans, node)
++    wave_df_ap_vlan_del(&vlan->wdev);
++}
++
++void wave_df_ap_vlan_del_unbound(struct wiphy *wiphy)
++{
++  struct wireless_dev *wdev, *next;
++
++  ASSERT_RTNL();
++  lockdep_assert_wiphy(wiphy);
++  /* Parent teardown already removed attached children. Never-opened ports
++   * belong only to the wiphy and must also leave before it unregisters. */
++  list_for_each_entry_safe(wdev, next, &wiphy->wdev_list, list) {
++    struct wave_ap_vlan *vlan;
++
++    if (wdev->iftype != NL80211_IFTYPE_AP_VLAN)
++      continue;
++    vlan = netdev_priv(wdev->netdev);
++    if (!vlan->parent)
++      wave_df_ap_vlan_del(wdev);
++  }
++}
++
++
+ 
+ /********************************************************************
+  * DirectConnect DP supporting functionality BEGIN
+@@ -1785,9 +2249,19 @@
+ {
+   mtlk_hw_t *hw;
+   mtlk_df_user_t* df_user =  mtlk_df_user_from_ndev(ndev);
++  struct wave_ap_vlan *vlan, *next;
+ 
+   MTLK_CHECK_DF_USER(df_user);
+ 
++  /* Like mac80211, close dependent ports from ndo_stop under RTNL, before
++   * the parent's locked cfg80211 deletion callback. Their close notifiers
++   * acquire the wiphy mutex; unregistering an UP child there would recurse.
++   * Close only the ports; existing BSS/STA owners retire their bindings.
++   */
++  ASSERT_RTNL();
++  list_for_each_entry_safe(vlan, next, &df_user->ap_vlans, node)
++    dev_close(vlan->wdev.netdev);
++
+   ILOG0_SS("%s, %s: stop the interface", current->comm, mtlk_df_user_get_name(df_user));
+   wave_df_tx_queue_stop(df_user);
+ 
+@@ -1816,6 +2290,7 @@
+       wave_hw_mmb_quiesce(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df_user->df)));
+     }
+   }
++  wave_df_multi_ap_backhaul_set(df_user, false);
+   wave_df_assoc_clear(df_user);
+ 
+   if (df_user->hs20_enabled)
+@@ -5418,6 +5893,7 @@
+ {
+   ASSERT_RTNL();
+   wave_df_notifications_stop_locked(df_user);
++  wave_df_ap_vlan_del_all(df_user);
+   if (df_user->ndev_registered) {
+     df_user->ndev_registered = false;
+     cfg80211_unregister_netdevice(df_user->ndev);
+@@ -5616,6 +6092,35 @@
+  * Keep RCU until netif_rx: child deletion then waits before unregistering and
+  * draining the network backlog. No skb queued to hardware retains a child.
+  */
++bool wave_df_ap_vlan_rx(sta_entry *sta, mtlk_nbuf_t *nbuf)
++{
++  struct net_device *ndev;
++  mtlk_core_t *core = mtlk_vap_get_core(sta->vap_handle);
++  bool handled = false;
++  const struct ethhdr *eth = (const struct ethhdr *)nbuf->data;
++  uint32 flags;
++
++  rcu_read_lock();
++  ndev = rcu_dereference(sta->ap_vlan);
++  if (ndev) {
++    handled = true;
++    if (!netif_running(ndev) || mtlk_core_is_looped_packet(core, nbuf) ||
++        mtlk_core_get_net_state(core) != NET_STATE_CONNECTED) {
++      dev_core_stats_rx_dropped_inc(ndev);
++      mtlk_df_nbuf_free(nbuf);
++    } else {
++      flags = is_broadcast_ether_addr(eth->h_dest) ? MTLK_NBUFF_BROADCAST :
++              is_multicast_ether_addr(eth->h_dest) ? MTLK_NBUFF_MULTICAST :
++              MTLK_NBUFF_UNICAST;
++      mtlk_sta_on_packet_indicated(sta, nbuf, flags);
++      dev_sw_netstats_rx_add(ndev, nbuf->len);
++      wave_df_indicate_rx_data(mtlk_vap_get_df(sta->vap_handle), nbuf, ndev);
++    }
++  }
++  rcu_read_unlock();
++  return handled;
++}
++
+ BOOL __MTLK_IFUNC mtlk_df_ui_check_is_mc_group_member(mtlk_df_t *df,
+                                                   const uint8* group_addr)
+ {
+@@ -9455,6 +9960,26 @@
+   spin_unlock_irqrestore(&df_user->assoc_lock, flags);
+ }
+ 
++void wave_df_multi_ap_backhaul_set(mtlk_df_user_t *df_user, bool backhaul)
++{
++  unsigned long flags;
++
++  spin_lock_irqsave(&df_user->assoc_lock, flags);
++  df_user->multi_ap_backhaul_bss = backhaul;
++  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
++}
++
++bool wave_df_multi_ap_backhaul(mtlk_df_user_t *df_user)
++{
++  unsigned long flags;
++  bool backhaul;
++
++  spin_lock_irqsave(&df_user->assoc_lock, flags);
++  backhaul = df_user->multi_ap_backhaul_bss;
++  spin_unlock_irqrestore(&df_user->assoc_lock, flags);
++  return backhaul;
++}
++
+ static void wave_df_channel_notify_work(struct wiphy *wiphy,
+                                        struct wiphy_work *work)
+ {
+@@ -9525,6 +10050,7 @@
+ {
+   lockdep_assert_wiphy(df_user->ndev->ieee80211_ptr->wiphy);
+   df_user->ap_stop_pending = false;
++  wave_df_multi_ap_backhaul_set(df_user, false);
+   wave_df_assoc_clear(df_user);
+ }
+ 
+@@ -9626,6 +10152,8 @@
+   }
+   memset (df_user, 0, sizeof(mtlk_df_user_t));
+   INIT_LIST_HEAD(&df_user->tx_queue.node);
++  INIT_LIST_HEAD(&df_user->ap_vlans);
++  spin_lock_init(&df_user->ap_vlan_lock);
+   spin_lock_init(&df_user->rx_gro_lock);
+   spin_lock_init(&df_user->assoc_lock);
+   spin_lock_init(&df_user->channel_notify_lock);
+--- a/wireless/driver/linux/mtlk_df_user_priv.h
++++ b/wireless/driver/linux/mtlk_df_user_priv.h
+@@ -707,6 +707,8 @@
+   u8 vendor;
+   u8 opmode;
+   bool opmode_valid;
++  bool four_addr;
++  bool multi_ap_backhaul_sta;
+   bool pbac;
+   unsigned long expires;
+ };
+@@ -718,7 +720,23 @@
+ bool wave_df_assoc_get(mtlk_df_user_t *df_user, const u8 *mac,
+                        struct wave_assoc_metadata *metadata);
+ void wave_df_assoc_clear(mtlk_df_user_t *df_user);
++/* Accepted AP setup Association Response IEs own the local BSS role. A peer
++ * declaration cannot enable it; flushing stations does not replace it. */
++void wave_df_multi_ap_backhaul_set(mtlk_df_user_t *df_user, bool backhaul);
++bool wave_df_multi_ap_backhaul(mtlk_df_user_t *df_user);
++
++struct _sta_entry;
++struct wireless_dev *wave_df_ap_vlan_add(struct wiphy *wiphy, const char *name,
++                                         struct vif_params *params);
++int wave_df_ap_vlan_del(struct wireless_dev *wdev);
++void wave_df_ap_vlan_del_unbound(struct wiphy *wiphy);
++int wave_df_ap_vlan_bind(struct net_device *parent, const u8 *mac,
++                        struct net_device *vlan);
++void wave_df_ap_vlan_sta_drop(struct _sta_entry *sta);
++struct _sta_entry *wave_df_ap_vlan_tx_sta(struct net_device *ndev);
++bool wave_df_ap_vlan_rx(struct _sta_entry *sta, mtlk_nbuf_t *nbuf);
+ bool wave_df_intra_bss_forwarding(mtlk_df_user_t *df_user);
++bool wave_df_ap_vlan_prepare_tx(struct _sta_entry *sta, mtlk_nbuf_t *nbuf);
+ 
+ void wave_df_tx_queue_start(mtlk_df_user_t *df_user);
+ void wave_df_tx_queue_stop(mtlk_df_user_t *df_user);
+--- a/wireless/driver/linux/wave_radio.c
++++ b/wireless/driver/linux/wave_radio.c
+@@ -1983,6 +1983,54 @@
+   return _wave_radio_tx_power(radio, WAVE_TX_POWER_MAC, limit, NULL);
+ }
+ 
++#define WAVE_MULTI_AP_EXTENSION    6
++#define WAVE_MULTI_AP_BACKHAUL_BSS BIT(6)
++#define WAVE_MULTI_AP_BACKHAUL_STA BIT(7)
++
++/* Select the Multi-AP IE itself: a later WFA IE may have a different type.
++ * Only one complete extension declaration can authorize a local/peer role. */
++static bool wave_multi_ap_role(const u8 *ies, size_t len, u8 role)
++{
++  bool found = false, extension = false, backhaul = false;
++
++  if (!ies)
++    return false;
++  while (len) {
++    const u8 *attr;
++    size_t size, left;
++
++    if (len < 2 || ies[1] > len - 2)
++      return false;
++    size = ies[1] + 2;
++    if (ies[0] == WLAN_EID_VENDOR_SPECIFIC && ies[1] >= 4 &&
++        ies[2] == ((WLAN_OUI_WFA >> 16) & 0xff) &&
++        ies[3] == ((WLAN_OUI_WFA >> 8) & 0xff) &&
++        ies[4] == (WLAN_OUI_WFA & 0xff) &&
++        ies[5] == WLAN_OUI_TYPE_WFA_MULTI_AP) {
++      if (found)
++        return false;
++      found = true;
++      attr = ies + 6;
++      left = ies[1] - 4;
++      while (left) {
++        if (left < 2 || attr[1] > left - 2)
++          return false;
++        if (attr[0] == WAVE_MULTI_AP_EXTENSION) {
++          if (extension || attr[1] != 1)
++            return false;
++          extension = true;
++          backhaul = !!(attr[2] & role);
++        }
++        left -= attr[1] + 2;
++        attr += attr[1] + 2;
++      }
++    }
++    ies += size;
++    len -= size;
++  }
++  return found && extension && backhaul;
++}
++
+ int wave_radio_beacon_change(
+   wave_radio_t *radio,
+   struct net_device *ndev,
+@@ -2016,6 +2064,14 @@
+ 
+   res = _mtlk_df_user_invoke_core(master_df, WAVE_CORE_REQ_SET_BEACON, &clpb, &beacon_data, sizeof(beacon_data));
+   res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_SET_BEACON, TRUE);
++  /* Userspace MLME supplies its local Association Response IEs during AP
++   * setup, before ADD_STA. Omission preserves the accepted template's role;
++   * a successful explicit replacement, including an empty one, replaces it.
++   * Beacon contents and received peer declarations do not own this policy. */
++  if (res == MTLK_ERR_OK && beacon->assocresp_ies)
++    wave_df_multi_ap_backhaul_set(df_user,
++      wave_multi_ap_role(beacon->assocresp_ies, beacon->assocresp_ies_len,
++                         WAVE_MULTI_AP_BACKHAUL_BSS));
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+ 
+@@ -2103,6 +2159,8 @@
+   ILOG1_SSD("%s: Invoked from %s (%i)", ndev->name, current->comm, current->pid);
+   MTLK_CHECK_DF_USER(df_user);
+ 
++  /* A new BSS cannot inherit the previous response template's local role. */
++  wave_df_multi_ap_backhaul_set(df_user, false);
+   res = _wave_radio_abort_and_prevent_scan(radio);
+   if (res != MTLK_ERR_OK)
+     goto finish;
+@@ -2203,6 +2261,7 @@
+   if (beacon_accepted && (linux_error || res != MTLK_ERR_OK)) {
+     int stop_res;
+ 
++    wave_df_multi_ap_backhaul_set(df_user, false);
+     wave_df_assoc_clear(df_user);
+     clpb = NULL;
+     stop_res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user),
+@@ -2257,6 +2316,7 @@
+   }
+   if (res == MTLK_ERR_OK) {
+     wave_df_assoc_clear(df_user);
++    wave_df_multi_ap_backhaul_set(df_user, false);
+   }
+ 
+ finish:
+@@ -2334,6 +2394,18 @@
+     metadata.vendor = 1;
+   else if (elems.vendor_w101)
+     metadata.vendor = 2;
++  /* The parser validated the complete IE; its preceding byte is its length.
++   * Check the bytes needed by each vendor extension before dereferencing. */
++  if (elems.vendor_intel && elems.vendor_intel[-1] >= 5 &&
++      elems.vendor_intel[3] == WLAN_EID_INTEL_VENDOR_TYPE_4ADDR_MODE &&
++      elems.vendor_intel[4] == WLAN_EID_INTEL_VENDOR_4ADDR_MODE_STA)
++    metadata.four_addr = true;
++  if (elems.vendor_brcm && elems.vendor_brcm[-1] >= 7 &&
++      elems.vendor_brcm[3] == WLAN_EID_BRCM_VENDOR_VERSION_2 &&
++      (elems.vendor_brcm[6] & WLAN_EID_BRCM_VENDOR_DWDS_CAPABLE))
++    metadata.four_addr = true;
++  metadata.multi_ap_backhaul_sta =
++    wave_multi_ap_role(buf + offset, len - offset, WAVE_MULTI_AP_BACKHAUL_STA);
+   if (elems.opmode_notif) {
+     metadata.opmode = *elems.opmode_notif;
+     metadata.opmode_valid = true;
+@@ -2431,6 +2503,10 @@
+     return MTLK_ERR_NOT_READY;
+   info->bss_coex_20_40 = metadata.coexistence;
+   info->vendor = metadata.vendor;
++  /* Peer declarations do not authorize a mode by themselves. Evaluate
++   * the current local policy only when the master admits STA_ADD. */
++  request->four_addr = metadata.four_addr;
++  request->multi_ap_backhaul_sta = metadata.multi_ap_backhaul_sta;
+   if (params->link_sta_params.opmode_notif_used || metadata.opmode_valid) {
+     info->opmode_notif = params->link_sta_params.opmode_notif_used ?
+                          params->link_sta_params.opmode_notif : metadata.opmode;
+@@ -2578,6 +2654,15 @@
+   res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user), WAVE_CORE_REQ_AP_CONNECT_STA, &clpb, &request, sizeof(request));
+   res = _mtlk_df_user_process_core_retval(res, clpb, WAVE_CORE_REQ_AP_CONNECT_STA, TRUE);
+ 
++  if (res == MTLK_ERR_OK && params->vlan) {
++    int vlan_res = wave_df_ap_vlan_bind(ndev, mac, params->vlan);
++
++    if (vlan_res) {
++      /* An unsuccessful NEW_STATION must not leave an unbound peer alive. */
++      wave_radio_sta_del(radio, ndev, mac);
++      return vlan_res;
++    }
++  }
+ finish:
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+@@ -2614,7 +2699,7 @@
+   if (!(params->sta_flags_mask & BIT(NL80211_STA_FLAG_AUTHORIZED))){
+     ILOG2_SD("%s: Only authorizing/unauthorizing is supporting, change_flags:0x%x", ndev->name, params->sta_flags_mask);
+     res = MTLK_ERR_OK;
+-    goto finish;
++    goto bind_vlan;
+   }
+ 
+   MTLK_CFG_SET_ITEM_BY_FUNC_VOID(&t_authorizing, sta_addr, mtlk_osal_copy_eth_addresses, (t_authorizing.sta_addr.au8Addr, mac));
+@@ -2624,6 +2709,9 @@
+   res = _mtlk_df_user_invoke_core(mtlk_df_user_get_df(df_user), WAVE_CORE_REQ_AUTHORIZING_STA, &clpb, &t_authorizing, sizeof(t_authorizing));
+   res = _mtlk_df_user_process_core_retval_void(res, clpb, WAVE_CORE_REQ_AUTHORIZING_STA, TRUE);
+ 
++bind_vlan:
++  if (res == MTLK_ERR_OK && params->vlan)
++    return wave_df_ap_vlan_bind(ndev, mac, params->vlan);
+ finish:
+   return _mtlk_df_mtlk_to_linux_error_code(res);
+ }
+--- a/wireless/driver/shared/stadb.c
++++ b/wireless/driver/shared/stadb.c
+@@ -1148,6 +1148,7 @@
+   --stadb->sid_hash_cnt;
+   mtlk_hash_remove_sid(&stadb->sid_hash, &sta->hentry_sid);
+ 
++  wave_df_ap_vlan_sta_drop(sta);
+ 
+   if (mtlk_sta_is_4addr(sta))
+     mtlk_osal_atomic_dec(&stadb->four_addr_sta_cnt);
+--- a/wireless/driver/shared/stadb.h
++++ b/wireless/driver/shared/stadb.h
+@@ -276,6 +276,8 @@
+                         _mtlk_hash_sid_keycmp);
+ 
+ struct _sta_entry {
++  struct net_device __rcu *ap_vlan; /* Parent df_user ap_vlan_lock and RCU */
++  bool ap_vlan_retiring; /* Same lock; prevents binding a removed incarnation. */
+   MTLK_HASH_ENTRY_T(ieee_addr) hentry;
+   MTLK_HASH_ENTRY_T(sid)       hentry_sid;
+   mtlk_atomic_t                ref_cnt;
