@@ -268,12 +268,14 @@ void wpas_ucode_ctrl_event(struct wpa_supplicant *wpa_s, const char *str, size_t
 }
 
 void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
-			     const struct wps_credential *cred)
+			     const struct wps_credential *cred,
+			     struct wpa_ssid *network)
 {
 #ifdef CONFIG_WPS
+	static const char * const fields[] = { "proto", "key_mgmt", "pairwise" };
 	uc_value_t *val;
-	char *ifname, *encryption, *ssid, *key;
-	size_t ifname_len;
+	const char *encryption;
+	size_t i;
 
 	if (!cred)
 		return;
@@ -304,6 +306,15 @@ void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
 		return;
 	}
 
+	/* External processing bypasses the native profile validator. A 64-byte
+	 * PSK must still be hexadecimal before publishing credential material. */
+	if (!network && cred->auth_type != WPS_AUTH_OPEN &&
+	    cred->key_len == 2 * PMK_LEN) {
+		for (i = 0; i < cred->key_len; i++)
+			if (hex2num(cred->key[i]) < 0)
+				return;
+	}
+
 	val = wpa_ucode_registry_get(iface_registry, wpa_s->ucode.idx);
 	if (!val)
 		return;
@@ -320,6 +331,20 @@ void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
 	ucv_object_add(val, "encryption", ucv_string_new(encryption));
 	ucv_object_add(val, "ssid", ucv_string_new_length(cred->ssid, cred->ssid_len));
 	ucv_object_add(val, "key", ucv_string_new_length(cred->key, cred->key_len));
+	/* A processed notification describes the final native security policy,
+	 * including cipher workarounds and optional SAE. It does not claim that
+	 * a consumer has persisted these credentials to UCI. */
+	ucv_object_add(val, "processed", ucv_boolean_new(network != NULL));
+	if (network) {
+		ucv_object_add(val, "network_id", ucv_int64_new(network->id));
+		for (i = 0; i < ARRAY_SIZE(fields); i++) {
+			char *value = wpa_config_get_no_key(network, fields[i]);
+
+			if (value)
+				ucv_object_add(val, fields[i], ucv_string_new(value));
+			os_free(value);
+		}
+	}
 
 	ucv_put(wpa_ucode_call(3));
 #endif /* CONFIG_WPS */
