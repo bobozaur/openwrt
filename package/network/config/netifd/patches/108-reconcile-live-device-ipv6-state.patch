@@ -1,0 +1,557 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: reconcile live device IPv6 family changes
+
+A live disable_ipv6 change does not restart a dual-stack interface. Notify
+L3 subscribers and reconcile IPv6 addresses, routes, neighbors, delegated
+prefixes and installed policy rules while retaining IPv4. Preserve desired
+netifd-owned state for re-enable, but require protocols to publish fresh
+external IPv6 snapshots. Aliases mirror the underlying effective setting.
+
+Keep effective-family admission separate from the IP-settings lifetime.
+Protocol setup must install addresses before IFPEV_UP enables configured
+routes through their connected gateways; routes and neighbors still require
+enabled IP settings. Apply the family check to the shared address callback
+so a protocol update cannot reintroduce disabled IPv6.
+
+Use the retained policy identity and published prefix assignment ownership
+from the preceding changes, and publish only active prefix state.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/alias.c
++++ b/alias.c
+@@ -89,6 +89,12 @@ static void alias_device_cb(struct devic
+ 	struct alias_device *alias;
+ 
+ 	alias = container_of(dep, struct alias_device, dep);
++	/* An alias has no independent sysctl state. Mirror its current owner
++	 * before publishing presence or a live IPv6-family change. */
++	if (ev == DEV_EVENT_ADD || ev == DEV_EVENT_UP || ev == DEV_EVENT_IPV6_CHANGE) {
++		alias->dev.orig_settings.ipv6 = device_ipv6_enabled(dep->dev);
++		alias->dev.orig_settings.valid_flags |= DEV_OPT_IPV6;
++	}
+ 	switch (ev) {
+ 	case DEV_EVENT_ADD:
+ 		device_set_present(&alias->dev, true);
+--- a/device.c
++++ b/device.c
+@@ -268,6 +268,17 @@ struct device_type simple_device_type =
+ 	.free = simple_device_free,
+ };
+ 
++bool
++device_ipv6_enabled(const struct device *dev)
++{
++	if (dev->settings.flags & DEV_OPT_IPV6)
++		return dev->settings.ipv6;
++	if (dev->orig_settings.valid_flags & DEV_OPT_IPV6)
++		return dev->orig_settings.ipv6;
++
++	return true;
++}
++
+ void
+ device_merge_settings(struct device *dev, struct device_settings *n)
+ {
+@@ -694,6 +705,7 @@ const char *device_event_name(enum devic
+ 		[DEV_EVENT_LINK_DOWN] = "link_down",
+ 		[DEV_EVENT_TOPO_CHANGE] = "topo_change",
+ 		[DEV_EVENT_VLAN_UPDATE] = "vlan_update",
++		[DEV_EVENT_IPV6_CHANGE] = "ipv6_change",
+ 	};
+ 
+ 	if (ev >= ARRAY_SIZE(event_names) || !event_names[ev])
+@@ -1294,6 +1306,7 @@ device_set_config(struct device *dev, st
+ 	unsigned long diff[2] = {};
+ 	uint64_t apply_mask = 0;
+ 	enum dev_change_type ret = DEV_CONFIG_APPLIED;
++	bool ipv6 = device_ipv6_enabled(dev);
+ 	bool has_old;
+ 
+ 	if (type != dev->type)
+@@ -1358,8 +1371,11 @@ device_set_config(struct device *dev, st
+ 			return DEV_CONFIG_RECREATE;
+ 	}
+ 
+-	if (ret == DEV_CONFIG_APPLIED && apply_mask && dev->active)
++	if (ret == DEV_CONFIG_APPLIED && apply_mask && dev->active) {
+ 		device_apply_live_settings(dev, apply_mask);
++		if (ipv6 != device_ipv6_enabled(dev))
++			device_broadcast_event(dev, DEV_EVENT_IPV6_CHANGE);
++	}
+ 
+ 	return ret;
+ }
+--- a/device.h
++++ b/device.h
+@@ -206,6 +206,9 @@ enum device_event {
+ 	/* the vlan list of the device was updated */
+ 	DEV_EVENT_VLAN_UPDATE,
+ 
++	/* the effective IPv6 setting changed without a device restart */
++	DEV_EVENT_IPV6_CHANGE,
++
+ 	__DEV_EVENT_MAX
+ };
+ 
+@@ -393,6 +396,7 @@ struct device_type *device_type_get(cons
+ struct device *device_create(const char *name, struct device_type *type,
+ 			     struct blob_attr *config);
+ void device_merge_settings(struct device *dev, struct device_settings *n);
++bool device_ipv6_enabled(const struct device *dev);
+ void device_init_settings(struct device *dev, struct blob_attr **tb);
+ /*
+  * Parse device-attr blob into tb_dev, seed dev->settings, and invoke the
+--- a/interface-ip.c
++++ b/interface-ip.c
+@@ -203,6 +203,21 @@ static int set_ip_lo_policy(bool add, bo
+ 	return (add) ? system_add_iprule(&rule) : system_del_iprule(&rule);
+ }
+ 
++static bool
++interface_ip_family_enabled(struct interface_ip_settings *ip, enum device_addr_flags flags)
++{
++	struct device *dev = ip->iface->l3_dev.dev;
++
++	return (flags & DEVADDR_FAMILY) != DEVADDR_INET6 ||
++		!dev || device_ipv6_enabled(dev);
++}
++
++static bool
++interface_ip_enabled(struct interface_ip_settings *ip, enum device_addr_flags flags)
++{
++	return ip->enabled && interface_ip_family_enabled(ip, flags);
++}
++
+ static void interface_ip_set_policy_rules(struct interface *iface, bool enabled)
+ {
+ 	struct interface_ip_policy *policy = &iface->policy_rules;
+@@ -210,32 +225,33 @@ static void interface_ip_set_policy_rule
+ 	struct iprule rule = {
+ 		.flags = IPRULE_INET6 | IPRULE_IN | IPRULE_ACTION | IPRULE_PRIORITY,
+ 	};
++	bool ipv6;
+ 
+-	if (policy->enabled == enabled)
++	if (enabled && !dev)
+ 		return;
+ 
+-	if (enabled) {
+-		if (!dev)
+-			return;
+-		policy->ipv6 = dev->settings.ipv6;
++	ipv6 = enabled && device_ipv6_enabled(dev);
++	if (enabled && !policy->enabled) {
+ 		policy->ifindex = dev->ifindex;
+ 		policy->ip4table = iface->ip4table;
+ 		policy->ip6table = iface->ip6table;
+ 		strcpy(policy->ifname, dev->ifname);
+ 	}
+ 
+-	if (policy->ipv6) {
+-		set_ip_lo_policy(enabled, true, policy);
++	if (policy->ipv6 != ipv6) {
++		set_ip_lo_policy(ipv6, true, policy);
+ 		rule.priority = IPRULE_PRIORITY_REJECT + policy->ifindex;
+ 		strcpy(rule.in_dev, policy->ifname);
+ 		system_resolve_iprule_action("failed_policy", &rule.action);
+-		if (enabled)
++		if (ipv6)
+ 			system_add_iprule(&rule);
+ 		else
+ 			system_del_iprule(&rule);
+ 	}
+-	set_ip_lo_policy(enabled, false, policy);
++	if (policy->enabled != enabled)
++		set_ip_lo_policy(enabled, false, policy);
+ 	policy->enabled = enabled;
++	policy->ipv6 = ipv6;
+ }
+ 
+ static bool
+@@ -778,7 +794,8 @@ interface_update_proto_addr(struct vlist
+ 	if (a_new && a_old) {
+ 		keep = true;
+ 
+-		if (a_old->flags != a_new->flags || a_old->failed)
++		if (a_old->flags != a_new->flags || a_old->failed ||
++		    a_old->enabled != interface_ip_family_enabled(ip, a_new->flags))
+ 			keep = false;
+ 
+ 		if (a_old->valid_until != a_new->valid_until ||
+@@ -857,10 +874,14 @@ interface_update_proto_addr(struct vlist
+ 	if (node_new) {
+ 		bool v6 = (a_new->flags & DEVADDR_FAMILY) == DEVADDR_INET6;
+ 
+-		a_new->enabled = true;
++		/* Protocol setup installs addresses before IFPEV_UP enables
++		 * configured routes through their connected gateways. Only the
++		 * effective family setting can suppress this early publication.
++		 */
++		a_new->enabled = interface_ip_family_enabled(ip, a_new->flags);
+ 		a_new->policy_table = (v6) ? iface->ip6table : iface->ip4table;
+ 
+-		if (!keep || replace) {
++		if (a_new->enabled && (!keep || replace)) {
+ 			if (!(a_new->flags & DEVADDR_EXTERNAL)) {
+ 				if (system_add_address(dev, a_new))
+ 					a_new->failed = true;
+@@ -903,7 +924,7 @@ enable_route(struct interface_ip_setting
+ 	if (ip->no_defaultroute && !route->mask)
+ 		return false;
+ 
+-	return ip->enabled;
++	return interface_ip_enabled(ip, route->flags);
+ }
+ 
+ static void
+@@ -925,7 +946,8 @@ interface_update_proto_neighbor(struct v
+ 	if (node_old && node_new) {
+ 		keep = (!memcmp(neighbor_old->macaddr, neighbor_new->macaddr, sizeof(neighbor_old->macaddr)) &&
+ 			(neighbor_old->proxy == neighbor_new->proxy) &&
+-			(neighbor_old->router == neighbor_new->router));
++			(neighbor_old->router == neighbor_new->router) &&
++			(neighbor_old->enabled == interface_ip_enabled(ip, neighbor_new->flags)));
+ 	}
+ 
+ 	if (node_old) {
+@@ -936,11 +958,10 @@ interface_update_proto_neighbor(struct v
+ 	}
+ 
+ 	if (node_new) {
+-		if (!keep && ip->enabled)
++		neighbor_new->enabled = interface_ip_enabled(ip, neighbor_new->flags);
++		if (!keep && neighbor_new->enabled)
+ 			if (system_add_neighbor(dev, neighbor_new))
+ 				neighbor_new->failed = true;
+-
+-		neighbor_new->enabled = ip->enabled;
+ 	}
+ }
+ 
+@@ -965,7 +986,8 @@ __interface_update_route(struct interfac
+ 	if (node_old && node_new)
+ 		keep = !memcmp(&route_old->nexthop, &route_new->nexthop, sizeof(route_old->nexthop)) &&
+ 			(route_old->mtu == route_new->mtu) && (route_old->type == route_new->type) &&
+-			(route_old->proto == route_new->proto) && !route_old->failed;
++			(route_old->proto == route_new->proto) && !route_old->failed &&
++			(route_old->enabled == enable_route(ip, route_new));
+ 
+ 	if (node_old) {
+ 		if (!(route_old->flags & DEVADDR_EXTERNAL) && route_old->enabled && !keep)
+@@ -1109,6 +1131,28 @@ interface_prefix_address_in_use(const st
+ }
+ 
+ static void
++interface_prefix_set_enabled(struct device_prefix *prefix, bool enabled)
++{
++	struct device_route route = {
++		.flags = DEVADDR_INET6,
++		.metric = INT32_MAX,
++		.mask = prefix->length,
++		.addr.in6 = prefix->addr,
++	};
++
++	if (prefix->enabled == enabled)
++		return;
++
++	/* The retained prefix owns this null route, including while it has no
++	 * downlink assignment. IPv6 disable must retire that ownership too. */
++	if (enabled)
++		system_add_route(NULL, &route);
++	else
++		system_del_route(NULL, &route);
++	prefix->enabled = enabled;
++}
++
++static void
+ interface_set_prefix_address(struct device_prefix_assignment *assignment,
+ 		const struct device_prefix *prefix, struct interface *iface, bool add)
+ {
+@@ -1117,6 +1161,9 @@ interface_set_prefix_address(struct devi
+ 		return;
+ 
+ 	struct device *l3_downlink = iface->l3_dev.dev;
++	bool ipv6 = device_ipv6_enabled(l3_downlink);
++
++	add = add && prefix->enabled && ipv6;
+ 
+ 	struct device_addr addr;
+ 	struct device_route route;
+@@ -1136,7 +1183,7 @@ interface_set_prefix_address(struct devi
+ 	if (!add && assignment->enabled) {
+ 		time_t now = system_get_rtime();
+ 
+-		if (addr.valid_until && addr.valid_until - 1 <= now) {
++		if (!ipv6 || (addr.valid_until && addr.valid_until - 1 <= now)) {
+ 			addr.valid_until = 0;
+ 			addr.preferred_until = 0;
+ 		} else {
+@@ -1472,13 +1519,6 @@ interface_update_prefix(struct vlist_tre
+ 	if (tree && (!node_new || !node_old))
+ 		ip->iface->updated |= IUF_PREFIX;
+ 
+-	struct device_route route;
+-	memset(&route, 0, sizeof(route));
+-	route.flags = DEVADDR_INET6;
+-	route.metric = INT32_MAX;
+-	route.mask = (node_new) ? prefix_new->length : prefix_old->length;
+-	route.addr.in6 = (node_new) ? prefix_new->addr : prefix_old->addr;
+-
+ 	struct device_prefix_assignment *c;
+ 	struct interface *iface;
+ 	bool new_valid = node_new && !(prefix_new->valid_until && prefix_new->valid_until - 1 <= system_get_rtime());
+@@ -1493,6 +1533,15 @@ interface_update_prefix(struct vlist_tre
+ 	if (node_new && (!prefix_new->iface || !prefix_new->iface->proto_ip.no_delegation))
+ 		list_add(&prefix_new->head, &prefixes);
+ 
++	if (node_new) {
++		if (node_old)
++			prefix_new->enabled = prefix_old->enabled;
++		interface_prefix_set_enabled(prefix_new, !prefix_new->iface ||
++			interface_ip_enabled(&prefix_new->iface->proto_ip, DEVADDR_INET6));
++	} else {
++		interface_prefix_set_enabled(prefix_old, false);
++	}
++
+ 	if (node_old && node_new) {
+ 		/* Move assignments and refresh addresses to update valid times */
+ 		list_for_each_entry(c, &prefix_new->assignments, head)
+@@ -1503,15 +1552,10 @@ interface_update_prefix(struct vlist_tre
+ 				prefix_new->valid_until != prefix_old->valid_until)
+ 			ip->iface->updated |= IUF_PREFIX;
+ 	} else if (node_new) {
+-		/* Set null-route to avoid routing loops */
+-		system_add_route(NULL, &route);
+-
+ 		if (!prefix_new->iface || !prefix_new->iface->proto_ip.no_delegation)
+ 			interface_update_prefix_assignments(prefix_new, new_valid);
+ 	} else if (node_old) {
+-		/* Remove null-route */
+ 		interface_update_prefix_assignments(prefix_old, false);
+-		system_del_route(NULL, &route);
+ 	}
+ 
+ 	if (node_old) {
+@@ -1818,15 +1862,16 @@ interface_ip_set_route_enabled(struct in
+ {
+ 	struct device *dev = ip->iface->l3_dev.dev;
+ 
+-	if (route->flags & DEVADDR_EXTERNAL)
+-		return;
+-
+ 	if (!enable_route(ip, route))
+ 		enabled = false;
+ 
+ 	if (route->enabled == enabled)
+ 		return;
+ 
++	route->enabled = enabled;
++	if (route->flags & DEVADDR_EXTERNAL)
++		return;
++
+ 	if (enabled) {
+ 		interface_set_route_info(ip->iface, route);
+ 
+@@ -1834,8 +1879,6 @@ interface_ip_set_route_enabled(struct in
+ 			route->failed = true;
+ 	} else
+ 		system_del_route(dev, route);
+-
+-	route->enabled = enabled;
+ }
+ 
+ void interface_ip_set_enabled(struct interface_ip_settings *ip, bool enabled)
+@@ -1857,15 +1900,24 @@ void interface_ip_set_enabled(struct int
+ 
+ 	vlist_for_each_element(&ip->addr, addr, node) {
+ 		bool v6 = ((addr->flags & DEVADDR_FAMILY) == DEVADDR_INET6) ? true : false;
++		bool active = interface_ip_enabled(ip, addr->flags);
+ 
+-		if (addr->flags & DEVADDR_EXTERNAL)
++		if (addr->enabled == active)
+ 			continue;
+ 
+-		if (addr->enabled == enabled)
++		if (addr->flags & DEVADDR_EXTERNAL) {
++			/* The protocol owns the address, but netifd owns its policy
++			 * rules and whether it is published as an active address. */
++			if (active)
++				addr->policy_table = v6 ? iface->ip6table : iface->ip4table;
++			if (addr->policy_table)
++				interface_add_addr_rules(addr, active);
++			addr->enabled = active;
+ 			continue;
++		}
+ 
+-		if (enabled) {
+-			system_add_address(dev, addr);
++		if (active) {
++			addr->failed = !!system_add_address(dev, addr);
+ 
+ 			addr->policy_table = (v6) ? iface->ip6table : iface->ip4table;
+ 			if (iface->metric || addr->policy_table)
+@@ -1913,7 +1965,7 @@ void interface_ip_set_enabled(struct int
+ 			if (addr->policy_table)
+ 				interface_add_addr_rules(addr, false);
+ 		}
+-		addr->enabled = enabled;
++		addr->enabled = active;
+ 	}
+ 
+ 	vlist_for_each_element(&ip->route, route, node)
+@@ -1923,28 +1975,68 @@ void interface_ip_set_enabled(struct int
+ 			interface_ip_set_route_enabled(ip, route, enabled);
+ 
+ 	vlist_for_each_element(&ip->neighbor, neighbor, node) {
+-		if (neighbor->enabled == enabled)
++		bool active = interface_ip_enabled(ip, neighbor->flags);
++
++		if (neighbor->enabled == active)
+ 			continue;
+ 
+-		if (enabled) {
++		if (active) {
+ 			if(system_add_neighbor(dev, neighbor))
+ 				neighbor->failed = true;
+ 		} else
+ 			system_del_neighbor(dev, neighbor);
+ 
+-		neighbor->enabled = enabled;
++		neighbor->enabled = active;
+ 	}
+ 
+ 	struct device_prefix *c;
+ 	struct device_prefix_assignment *a;
++	struct interface *downlink;
++
++	vlist_for_each_element(&ip->prefix, c, node)
++		interface_prefix_set_enabled(c, interface_ip_enabled(ip, DEVADDR_INET6));
++
+ 	list_for_each_entry(c, &prefixes, head)
+-		list_for_each_entry(a, &c->assignments, head)
++		list_for_each_entry(a, &c->assignments, head) {
+ 			if (!strcmp(a->name, ip->iface->name))
+ 				interface_set_prefix_address(a, c, ip->iface, enabled);
++			else if (c->iface == iface &&
++				 (downlink = vlist_find(&interfaces, a->name, downlink, node)))
++				interface_set_prefix_address(a, c, downlink,
++					downlink->config_ip.enabled || downlink->proto_ip.enabled);
++		}
+ 
+ 	interface_ip_set_policy_rules(iface, enabled);
+ }
+ 
++static void
++interface_ip_invalidate_external_v6(struct interface_ip_settings *ip)
++{
++	struct device_addr *addr, *addr_tmp;
++	struct device_route *route, *route_tmp;
++	const unsigned int mask = DEVADDR_FAMILY | DEVADDR_EXTERNAL;
++	const unsigned int flags = DEVADDR_INET6 | DEVADDR_EXTERNAL;
++
++	/* disable_ipv6 removes external kernel state too. The protocol must
++	 * announce a fresh snapshot; netifd cannot recreate those addresses or
++	 * claim that a cached external route survived a family transition. */
++	vlist_for_each_element_safe(&ip->addr, addr, node, addr_tmp)
++		if ((addr->flags & mask) == flags)
++			vlist_delete(&ip->addr, &addr->node);
++	vlist_for_each_element_safe(&ip->route, route, node, route_tmp)
++		if ((route->flags & mask) == flags)
++			vlist_delete(&ip->route, &route->node);
++}
++
++void
++interface_ip_update_ipv6(struct interface *iface)
++{
++	interface_ip_invalidate_external_v6(&iface->config_ip);
++	interface_ip_invalidate_external_v6(&iface->proto_ip);
++	interface_ip_set_enabled(&iface->config_ip, iface->config_ip.enabled);
++	interface_ip_set_enabled(&iface->proto_ip, iface->proto_ip.enabled);
++}
++
+ void
+ interface_ip_update_start(struct interface_ip_settings *ip)
+ {
+--- a/interface-ip.h
++++ b/interface-ip.h
+@@ -76,6 +76,7 @@ struct device_prefix {
+ 	struct list_head head;
+ 	struct list_head assignments;
+ 	struct interface *iface;
++	bool enabled;
+ 	time_t valid_until;
+ 	time_t preferred_until;
+ 
+@@ -185,6 +186,7 @@ void interface_ip_update_start(struct in
+ void interface_ip_update_complete(struct interface_ip_settings *ip);
+ void interface_ip_flush(struct interface_ip_settings *ip);
+ void interface_ip_set_enabled(struct interface_ip_settings *ip, bool enabled);
++void interface_ip_update_ipv6(struct interface *iface);
+ void interface_ip_update_metric(struct interface_ip_settings *ip, int metric);
+ 
+ struct interface *interface_ip_add_target_route(union if_addr *addr, bool v6, struct interface *iface,
+--- a/interface.c
++++ b/interface.c
+@@ -532,6 +532,33 @@ interface_l3_dev_cb(struct device_user *
+ 	struct interface *iface;
+ 
+ 	iface = container_of(dep, struct interface, l3_dev);
++	if (ev == DEV_EVENT_IPV6_CHANGE) {
++		struct device_prefix *prefix;
++		struct device_prefix_assignment *assignment;
++		struct interface *downlink;
++
++		/* Keep desired IP state and IPv4 active while reconciling the
++		 * effective IPv6 family, including delegated downlink addresses. */
++		interface_ip_update_ipv6(iface);
++		iface->updated |= IUF_ADDRESS | IUF_ROUTE | IUF_PREFIX;
++		if (iface->state == IFS_UP)
++			interface_event(iface, IFEV_UPDATE);
++
++		list_for_each_entry(prefix, &prefixes, head) {
++			if (prefix->iface != iface)
++				continue;
++			list_for_each_entry(assignment, &prefix->assignments, head) {
++				downlink = vlist_find(&interfaces, assignment->name, downlink, node);
++				if (!downlink || downlink == iface)
++					continue;
++				downlink->updated |= IUF_ADDRESS | IUF_ROUTE | IUF_PREFIX;
++				if (downlink->state == IFS_UP)
++					interface_event(downlink, IFEV_UPDATE);
++			}
++		}
++		return;
++	}
++
+ 	if (iface->l3_dev.dev == iface->main_dev.dev)
+ 		return;
+ 
+--- a/ubus.c
++++ b/ubus.c
+@@ -692,6 +692,9 @@ interface_ip_dump_prefix_list(struct int
+ 
+ 	time_t now = system_get_rtime();
+ 	vlist_for_each_element(&ip->prefix, prefix, node) {
++		if (!prefix->enabled)
++			continue;
++
+ 		a = blobmsg_open_table(&b, NULL);
+ 
+ 		buf = blobmsg_alloc_string_buffer(&b, "address", buflen);
+@@ -746,8 +749,14 @@ interface_ip_dump_prefix_assignment_list
+ 	const int buflen = INET6_ADDRSTRLEN;
+ 	time_t now = system_get_rtime();
+ 
++	if (iface->l3_dev.dev && !device_ipv6_enabled(iface->l3_dev.dev))
++		return;
++
+ 	struct device_prefix *prefix;
+ 	list_for_each_entry(prefix, &prefixes, head) {
++		if (!prefix->enabled)
++			continue;
++
+ 		struct device_prefix_assignment *assign;
+ 		list_for_each_entry(assign, &prefix->assignments, head) {
+ 			if (strcmp(assign->name, iface->name))
