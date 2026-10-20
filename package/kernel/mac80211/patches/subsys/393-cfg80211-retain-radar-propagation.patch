@@ -1,0 +1,167 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] cfg80211: retain and serialize radar propagation
+
+The single saved radar chandef can be overwritten before its work runs.
+Retain affected radar subchannels as atomic pending bits until the existing
+worker consumes them. Work keeps RTNL lifetime protection and takes one peer
+wiphy lock at a time for DFS state and CAC cancellation, matching completion
+serialization without nesting the source wiphy mutex.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -188,6 +188,7 @@
+  * @orig_mpwr: internal use
+  * @dfs_state: current state of this channel. Only relevant if radar is required
+  *	on this channel.
++ * @dfs_radar_pending: internal atomic bit recording pending radar propagation.
+  * @dfs_state_entered: timestamp (jiffies) when the dfs state was entered.
+  * @dfs_state_last_available: timestamp (jiffies) of the last time when the
+  *	channel was available.
+@@ -209,6 +210,7 @@
+ 	u32 orig_flags;
+ 	int orig_mag, orig_mpwr;
+ 	enum nl80211_dfs_state dfs_state;
++	unsigned long dfs_radar_pending;
+ 	unsigned long dfs_state_entered;
+ 	unsigned long dfs_state_last_available;
+ 	unsigned int dfs_cac_ms;
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -864,6 +864,21 @@
+ }
+ EXPORT_SYMBOL(cfg80211_chandef_compatible);
+ 
++/* A second radar report must not replace a first report whose propagation
++ * work has not run yet. Record every affected subchannel without allocation. */
++void cfg80211_queue_radar_propagation(struct cfg80211_registered_device *rdev,
++                                    const struct cfg80211_chan_def *chandef)
++{
++	struct ieee80211_channel *c;
++
++	for_each_subchan(chandef, freq, cf) {
++		c = ieee80211_get_channel_khz(&rdev->wiphy, freq);
++		if (c && (c->flags & IEEE80211_CHAN_RADAR))
++			set_bit(0, &c->dfs_radar_pending);
++	}
++	queue_work(cfg80211_wq, &rdev->propagate_radar_detect_wk);
++}
++
+ void cfg80211_set_dfs_state(struct wiphy *wiphy,
+ 			    const struct cfg80211_chan_def *chandef,
+ 			    enum nl80211_dfs_state dfs_state)
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -499,16 +499,30 @@
+ static void cfg80211_propagate_radar_detect_wk(struct work_struct *work)
+ {
+ 	struct cfg80211_registered_device *rdev;
++	struct ieee80211_supported_band *sband;
++	struct cfg80211_chan_def chandef = {};
++	int band, i;
+ 
+ 	rdev = container_of(work, struct cfg80211_registered_device,
+ 			    propagate_radar_detect_wk);
+-
+ 	rtnl_lock();
+-
+-	regulatory_propagate_dfs_state(&rdev->wiphy, &rdev->radar_chandef,
+-				       NL80211_DFS_UNAVAILABLE,
+-				       NL80211_RADAR_DETECTED);
+-
++	for (band = 0; band < NUM_NL80211_BANDS; band++) {
++		sband = rdev->wiphy.bands[band];
++		if (!sband)
++			continue;
++		for (i = 0; i < sband->n_channels; i++) {
++			struct ieee80211_channel *chan = &sband->channels[i];
++
++			/* An event after this exchange sets the bit and queues the
++			 * same native work again, including for an earlier channel. */
++			if (!test_and_clear_bit(0, &chan->dfs_radar_pending))
++				continue;
++			cfg80211_chandef_create(&chandef, chan, NL80211_CHAN_NO_HT);
++			regulatory_propagate_dfs_state(&rdev->wiphy, &chandef,
++						      NL80211_DFS_UNAVAILABLE,
++						      NL80211_RADAR_DETECTED);
++		}
++	}
+ 	rtnl_unlock();
+ }
+ 
+@@ -1038,6 +1052,7 @@
+ 			sband->channels[i].orig_mpwr =
+ 				sband->channels[i].max_power;
+ 			sband->channels[i].band = band;
++			sband->channels[i].dfs_radar_pending = 0;
+ 
+ 			if (WARN_ON(sband->channels[i].freq_offset >= 1000))
+ 				return -EINVAL;
+--- a/net/wireless/core.h
++++ b/net/wireless/core.h
+@@ -105,7 +105,6 @@
+ 	struct wiphy_work sched_scan_stop_wk;
+ 	struct work_struct sched_scan_res_wk;
+ 
+-	struct cfg80211_chan_def radar_chandef;
+ 	struct work_struct propagate_radar_detect_wk;
+ 
+ 	struct cfg80211_chan_def cac_done_chandef;
+@@ -481,6 +480,8 @@
+ #define NL80211_BSS_USE_FOR_ALL	(NL80211_BSS_USE_FOR_NORMAL | \
+ 				 NL80211_BSS_USE_FOR_MLD_LINK)
+ 
++void cfg80211_queue_radar_propagation(struct cfg80211_registered_device *rdev,
++				      const struct cfg80211_chan_def *chandef);
+ void cfg80211_set_dfs_state(struct wiphy *wiphy,
+ 			    const struct cfg80211_chan_def *chandef,
+ 			    enum nl80211_dfs_state dfs_state);
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -1176,8 +1176,7 @@
+ 
+ 	nl80211_radar_notify(rdev, chandef, NL80211_RADAR_DETECTED, NULL, gfp);
+ 
+-	memcpy(&rdev->radar_chandef, chandef, sizeof(struct cfg80211_chan_def));
+-	queue_work(cfg80211_wq, &rdev->propagate_radar_detect_wk);
++	cfg80211_queue_radar_propagation(rdev, chandef);
+ }
+ EXPORT_SYMBOL(__cfg80211_radar_event);
+ 
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -12027,10 +12027,9 @@
+ 
+ 	cfg80211_sched_dfs_chan_update(rdev);
+ 
+-	rdev->radar_chandef = chandef;
+ 
+ 	/* Propagate this notification to other radios as well */
+-	queue_work(cfg80211_wq, &rdev->propagate_radar_detect_wk);
++	cfg80211_queue_radar_propagation(rdev, &chandef);
+ 
+ 	return 0;
+ }
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@ -4219,7 +4219,7 @@
+ 	struct wireless_dev *wdev;
+ 	unsigned int link_id;
+ 
+-	guard(wiphy)(&rdev->wiphy);
++	lockdep_assert_wiphy(&rdev->wiphy);
+ 
+ 	/* If we finished CAC or received radar, we should end any
+ 	 * CAC running on the same channels.
+@@ -4270,6 +4270,8 @@
+ 					   chandef->chan->center_freq))
+ 			continue;
+ 
++		/* Serialize peer NOP and CAC cancellation with native CAC completion. */
++		guard(wiphy)(&rdev->wiphy);
+ 		cfg80211_set_dfs_state(&rdev->wiphy, chandef, dfs_state);
+ 
+ 		if (event == NL80211_RADAR_DETECTED ||
