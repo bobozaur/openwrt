@@ -1,0 +1,21 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: match the scan timeout to its native BSS owner
+
+A shared driver can have several BSS scan links. Match the timeout context
+before aborting so another interface's scan is not selected.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/src/drivers/driver_nl80211_scan.c
++++ b/src/drivers/driver_nl80211_scan.c
+@@ -164,7 +164,7 @@
+ #endif /* CONFIG_DRIVER_NL80211_QCA */
+ 
+ 	for (bss = drv->first_bss; bss; bss = bss->next) {
+-		if (bss->scan_link)
++		if (bss->scan_link && bss->ctx == timeout_ctx)
+ 			break;
+ 	}
+ 
