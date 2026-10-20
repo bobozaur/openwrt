@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+. /lib/functions/uci-defaults.sh
+. /lib/functions/system.sh
+. /lib/functions/ax50.sh
+
+board_config_update
+
+case "$(board_name)" in
+tplink,archer-ax50-v1)
+	ucidef_set_interfaces_lan_wan "lan1 lan2 lan3 lan4" "wan"
+	if mac=$(ax50_factory_mac); then
+		ucidef_set_interface_macaddr "lan" "$mac"
+		ucidef_set_interface_macaddr "wan" "$(macaddr_add "$mac" 1)"
+		ucidef_set_label_macaddr "$mac"
+	else
+		logger -t ax50 'Factory MAC address unavailable'
+	fi
+	;;
+esac
+
+board_config_flush

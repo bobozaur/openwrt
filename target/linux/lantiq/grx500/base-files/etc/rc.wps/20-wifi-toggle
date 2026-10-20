@@ -1,0 +1,11 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+. /lib/functions.sh
+
+[ "$(board_name)" = "tplink,archer-ax50-v1" ] || exit 1
+[ "$ACTION" = "released" ] && [ "${SEEN:-0}" -ge 2 ] || exit 1
+
+# The shared WPS/Wi-Fi key toggles the radios after a two-second hold.
+/etc/rc.button/rfkill
+exit 0

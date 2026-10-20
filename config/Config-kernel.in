@@ -1563,7 +1563,7 @@ config KERNEL_SQUASHFS_XATTR
 #
 choice
 	prompt "Compiler optimization level"
-	default KERNEL_CC_OPTIMIZE_FOR_SIZE if SMALL_FLASH
+	default KERNEL_CC_OPTIMIZE_FOR_SIZE if SMALL_FLASH || TARGET_lantiq_grx500
 
 config KERNEL_CC_OPTIMIZE_FOR_PERFORMANCE
 	bool "Optimize for performance"
