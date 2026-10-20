@@ -1105,6 +1105,11 @@
 				"enum": [ "on", "off", "0", "1", "sae", "sae-pk", "wpa3", "owe" ]
 			}
 		},
+		"wmm": {
+			"description": "Wireless Multimedia QoS. Required for high-throughput modes.",
+			"type": "boolean",
+			"default": true
+		},
 		"uapsd": {
 			"type": "alias",
 			"default": "uapsd_advertisement_enabled"
