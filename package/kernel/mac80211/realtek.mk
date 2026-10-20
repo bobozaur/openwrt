@@ -215,6 +215,17 @@ define KernelPackage/rtl8xxxu/description
 endef
 
 define KernelPackage/rtw88/config
+	config PACKAGE_RTW88_USB_SW_CRYPTO
+		bool "Use software cryptography for rtw88 USB devices"
+		depends on PACKAGE_kmod-rtw88-usb
+		default n
+		help
+		  Keep USB encryption keys in mac80211 for the module lifetime.
+		  This avoids hardware key-generation ambiguity during replacement.
+		  Applies to every attached rtw88 USB adapter and disables firmware
+		  WoWLAN for them. PCI and SDIO policy is unchanged. Select only
+		  for a deployment qualified with software cryptography.
+
 	config PACKAGE_RTW88_DEBUG
 		bool "Realtek wireless debugging (rtw88)"
 		depends on PACKAGE_kmod-rtw88
@@ -236,6 +247,7 @@ define KernelPackage/rtw88
   DEPENDS+= +kmod-mac80211
   FILES:=$(PKG_BUILD_DIR)/drivers/net/wireless/realtek/rtw88/rtw88_core.ko
   AUTOLOAD:=$(call AutoProbe,rtw88_core)
+  MODPARAMS:=$(if $(CONFIG_PACKAGE_RTW88_USB_SW_CRYPTO),usb_sw_crypto=1)
   HIDDEN:=1
 endef
 
