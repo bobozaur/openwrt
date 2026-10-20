@@ -55,7 +55,7 @@ esac
 mkdir -p /lib/firmware
 stage=$(mktemp -d /lib/firmware/.wave600-import.XXXXXX)
 while read -r _hash file; do
-	unsquashfs -cat -processors 1 -o 286889 "$image" "lib/firmware/$file" > "$stage/$file"
+	unsquashfs -cat -processors 1 -mem 8M -o 286889 "$image" "lib/firmware/$file" > "$stage/$file"
 done < "$manifest"
 (cd "$stage" && sha256sum -c "$manifest")
 chmod 0644 "$stage"/*.bin
