@@ -1,0 +1,64 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wifi: rtw88: serialize reserved-page debugfs access
+
+Serialize the native reserved-page reader and range selector through the
+existing register/firmware mutex. Validate the selected range before it
+can allocate or read. This fixes an existing debug interface; it adds no
+new diagnostic surface.
+
+Not submitted upstream.
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/drivers/net/wireless/realtek/rtw88/debug.c
++++ b/drivers/net/wireless/realtek/rtw88/debug.c
+@@ -309,18 +309,23 @@
+ 	struct rtw_debugfs_priv *debugfs_priv = m->private;
+ 	struct rtw_dev *rtwdev = debugfs_priv->rtwdev;
+ 	u16 page_size = rtwdev->chip->page_size;
+-	u32 buf_size = debugfs_priv->rsvd_page.page_num * page_size;
+-	u32 offset = debugfs_priv->rsvd_page.page_offset * page_size;
++	u32 buf_size, offset;
+ 	u8 *buf;
+ 	int i;
+ 	int ret;
+ 
++	mutex_lock(&rtwdev->mutex);
++	buf_size = debugfs_priv->rsvd_page.page_num * page_size;
++	offset = debugfs_priv->rsvd_page.page_offset * page_size;
+ 	buf = vzalloc(buf_size);
+-	if (!buf)
++	if (!buf) {
++		mutex_unlock(&rtwdev->mutex);
+ 		return -ENOMEM;
++	}
+ 
+ 	ret = rtw_fw_dump_fifo(rtwdev, RTW_FW_FIFO_SEL_RSVD_PAGE, offset,
+ 			       buf_size, (u32 *)buf);
++	mutex_unlock(&rtwdev->mutex);
+ 	if (ret) {
+ 		rtw_err(rtwdev, "failed to dump rsvd page\n");
+ 		vfree(buf);
+@@ -353,15 +358,22 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	num = sscanf(tmp, "%d %d", &offset, &page_num);
++	num = sscanf(tmp, "%u %u", &offset, &page_num);
+ 
+ 	if (num != 2) {
+ 		rtw_warn(rtwdev, "invalid arguments\n");
+ 		return -EINVAL;
+ 	}
+ 
++	mutex_lock(&rtwdev->mutex);
++	if (!page_num || offset >= rtwdev->fifo.rsvd_pg_num ||
++	    page_num > rtwdev->fifo.rsvd_pg_num - offset) {
++		mutex_unlock(&rtwdev->mutex);
++		return -EINVAL;
++	}
+ 	debugfs_priv->rsvd_page.page_offset = offset;
+ 	debugfs_priv->rsvd_page.page_num = page_num;
++	mutex_unlock(&rtwdev->mutex);
+ 
+ 	return count;
+ }
