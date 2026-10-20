@@ -1,0 +1,33 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] net: add GRX500 Ethernet build support
+
+Register the shared GRX500 Ethernet DMA owner. The LAN and WAN
+DMA pairs retain separate NAPI and interrupt owners.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -108,3 +108,6 @@
+ obj-$(CONFIG_NET_VENDOR_SYNOPSYS) += synopsys/
+ obj-$(CONFIG_NET_VENDOR_PENSANDO) += pensando/
+ obj-$(CONFIG_OA_TC6) += oa_tc6.o
++
++obj-$(CONFIG_NET_GRX500) += grx500_eth.o
++grx500_eth-objs := lantiq_grx500.o
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -205,3 +205,11 @@
+ source "drivers/net/ethernet/xircom/Kconfig"
+ 
+ endif # ETHERNET
++
++config NET_GRX500
++	tristate "Lantiq GRX500 Ethernet DMA"
++	depends on MACH_GRX500 && NETDEVICES && ETHERNET && OF && NET_DSA && INET
++	select PHYLIB
++	select OF_MDIO
++	select FW_LOADER
++	depends on RESET_CONTROLLER
