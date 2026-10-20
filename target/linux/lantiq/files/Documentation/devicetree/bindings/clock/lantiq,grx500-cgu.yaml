@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/clock/lantiq,grx500-cgu.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Lantiq GRX500 clock generation unit
+
+maintainers:
+  - OpenWrt Development List <openwrt-devel@lists.openwrt.org>
+
+description: |
+  CPU and FPI clocks, USB and PCIe gates, and the shared PCIe reference PLL.
+  Clock indices are defined in dt-bindings/clock/lantiq,grx500-cgu.h.
+
+properties:
+  compatible:
+    items:
+      - const: lantiq,grx500-cgu
+      - const: syscon
+  reg:
+    maxItems: 1
+  native-endian: true
+  '#clock-cells':
+    const: 1
+
+required:
+  - compatible
+  - reg
+  - native-endian
+  - '#clock-cells'
+
+additionalProperties: false
