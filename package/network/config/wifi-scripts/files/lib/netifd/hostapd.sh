@@ -335,7 +335,7 @@ hostapd_common_add_bss_config() {
 	config_add_int multi_ap
 
 	config_add_boolean wps_pushbutton wps_label ext_registrar wps_pbc_in_m1
-	config_add_int wps_ap_setup_locked wps_independent
+	config_add_int wps_ap_setup_locked wps_independent wps_state
 	config_add_string wps_device_type wps_device_name wps_manufacturer wps_pin uuid
 	config_add_string multi_ap_backhaul_ssid multi_ap_backhaul_key
 
@@ -555,7 +555,7 @@ hostapd_set_bss_options() {
 
 	wireless_vif_parse_encryption
 
-	local bss_conf bss_md5sum ft_key rxkhs
+	local bss_conf bss_md5sum ft_key rxkhs wps_state
 	local wep_rekey wpa_group_rekey wpa_pair_rekey wpa_master_rekey wpa_key_mgmt
 
 	json_get_vars \
@@ -563,7 +563,7 @@ hostapd_set_bss_options() {
 		wpa_disable_eapol_key_retries tdls_prohibit \
 		maxassoc max_inactivity disassoc_low_ack isolate auth_cache \
 		wps_pushbutton wps_label ext_registrar wps_pbc_in_m1 wps_ap_setup_locked \
-		wps_independent wps_device_type wps_device_name wps_manufacturer wps_pin uuid \
+		wps_independent wps_state wps_device_type wps_device_name wps_manufacturer wps_pin uuid \
 		macfilter ssid utf8_ssid wmm uapsd hidden short_preamble rsn_preauth \
 		iapp_interface eapol_version dynamic_vlan ieee80211w nasid \
 		acct_secret acct_port acct_interval \
@@ -841,8 +841,14 @@ hostapd_set_bss_options() {
 		set_default wps_manufacturer "www.openwrt.org"
 		set_default wps_independent 1
 
-		wps_state=2
-		[ -n "$wps_not_configured" ] && wps_state=1
+		case "$wps_state" in
+			"")
+				wps_state=2
+				[ -n "$wps_not_configured" ] && wps_state=1
+				;;
+			0|1|2) ;;
+			*) return 1 ;;
+		esac
 
 		[ "$ext_registrar" -gt 0 -a -n "$network_bridge" ] && append bss_conf "upnp_iface=$network_bridge" "$N"
 
@@ -1674,7 +1680,9 @@ wpa_supplicant_add_network() {
 	}
 
 	if [ "$key_mgmt" = "WPS" ]; then
-		echo "wps_cred_processing=1" >> "$_config"
+		# The native supplicant selects the connected credential; rpcd performs
+		# conditional persistence using the interface's original UCI snapshot.
+		echo "wps_cred_processing=0" >> "$_config"
 	else
 		cat >> "$_config" <<EOF
 network={
