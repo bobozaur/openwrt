@@ -2065,6 +2065,12 @@ hostapd_bss_transition_request(struct ubus_context *ctx, struct ubus_object *obj
 	if (tb[BSS_TR_DIALOG_TOKEN])
 		dialog_token = blobmsg_get_u32(tb[BSS_TR_DIALOG_TOKEN]);
 
+	/* A BTM request token is a nonzero octet. Check before narrowing the
+	 * ubus integer; zero is discarded by compliant stations without reply.
+	 */
+	if (!dialog_token || dialog_token > 255)
+		return UBUS_STATUS_INVALID_ARGUMENT;
+
 	da_imminent = !!(tb[BSS_TR_DA_IMMINENT] && blobmsg_get_bool(tb[BSS_TR_DA_IMMINENT]));
 	abridged = !!(tb[BSS_TR_ABRIDGED] && blobmsg_get_bool(tb[BSS_TR_ABRIDGED]));
 
@@ -2119,7 +2125,8 @@ hostapd_bss_update_airtime(struct ubus_context *ctx, struct ubus_object *obj,
 	struct blob_attr *tb[__UPDATE_AIRTIME_MAX];
 	struct sta_info *sta = NULL;
 	u8 addr[ETH_ALEN];
-	int weight;
+	unsigned int old_weight;
+	int weight, ret;
 
 	blobmsg_parse(airtime_policy, __UPDATE_AIRTIME_MAX, tb, blob_data(msg), blob_len(msg));
 
@@ -2143,8 +2150,14 @@ hostapd_bss_update_airtime(struct ubus_context *ctx, struct ubus_object *obj,
 	if (!sta)
 		return UBUS_STATUS_NOT_FOUND;
 
+	old_weight = sta->dyn_airtime_weight;
 	sta->dyn_airtime_weight = weight;
-	airtime_policy_new_sta(hapd, sta);
+	ret = airtime_policy_new_sta(hapd, sta);
+	if (ret) {
+		sta->dyn_airtime_weight = old_weight;
+		return ret == -EOPNOTSUPP ? UBUS_STATUS_NOT_SUPPORTED :
+			UBUS_STATUS_UNKNOWN_ERROR;
+	}
 
 	return 0;
 }
