@@ -1,0 +1,79 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] mac80211: support opt-in hardware key replacement
+
+Some firmware key tables replace an occupied slot atomically and cannot
+install a second key before retiring the first. Let those drivers opt in to
+SET-before-DISABLE replacement while preserving the existing fallback and
+tailroom accounting. This flag does not establish RX key-generation identity.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/include/net/mac80211.h
++++ b/include/net/mac80211.h
+@@ -3074,6 +3074,13 @@
+  * @IEEE80211_HW_SUPPORTS_NDP_BLOCKACK: HW can transmit/receive S1G NDP
+  *	BlockAck frames.
+  *
++ * @IEEE80211_HW_KEY_REPLACE_IN_PLACE: Installing a key over an occupied
++ *	hardware slot replaces its previous contents. On rekey, try SET_KEY before
++ *	removing the old key; after a successful hardware install, do not issue
++ *	DISABLE_KEY for the replaced key. On failure, revoke the old key normally.
++ *	This does not imply support for Extended Key ID or replacing PTK0 without
++ *	RX generation synchronization.
++ *
+  * @NUM_IEEE80211_HW_FLAGS: number of hardware flags, used for sizing arrays
+  */
+ enum ieee80211_hw_flags {
+@@ -3135,6 +3142,7 @@
+ 	IEEE80211_HW_HANDLES_QUIET_CSA,
+ 	IEEE80211_HW_STRICT,
+ 	IEEE80211_HW_SUPPORTS_NDP_BLOCKACK,
++	IEEE80211_HW_KEY_REPLACE_IN_PLACE,
+ 
+ 	/* keep last, obviously */
+ 	NUM_IEEE80211_HW_FLAGS
+--- a/net/mac80211/key.c
++++ b/net/mac80211/key.c
+@@ -505,10 +505,27 @@
+ 
+ 	if (old) {
+ 		if (old->flags & KEY_FLAG_UPLOADED_TO_HARDWARE) {
+-			ieee80211_key_disable_hw_accel(old);
+-
+-			if (new)
++			if (new && ieee80211_hw_check(&sdata->local->hw,
++						       KEY_REPLACE_IN_PLACE)) {
+ 				ret = ieee80211_key_enable_hw_accel(new);
++				if (!ret && (new->flags & KEY_FLAG_UPLOADED_TO_HARDWARE)) {
++					if (!(old->conf.flags &
++					      (IEEE80211_KEY_FLAG_GENERATE_MMIC |
++					       IEEE80211_KEY_FLAG_PUT_MIC_SPACE |
++					       IEEE80211_KEY_FLAG_RESERVE_TAILROOM)))
++						increment_tailroom_need_count(sdata);
++					old->flags &= ~KEY_FLAG_UPLOADED_TO_HARDWARE;
++				} else {
++					/* Software fallback cannot replace an active HW slot. */
++					ieee80211_key_disable_hw_accel(old);
++					if (!ret)
++						ret = -EOPNOTSUPP;
++				}
++			} else {
++				ieee80211_key_disable_hw_accel(old);
++				if (new)
++					ret = ieee80211_key_enable_hw_accel(new);
++			}
+ 		}
+ 	} else {
+ 		if (!new->local->wowlan) {
+--- a/net/mac80211/debugfs.c
++++ b/net/mac80211/debugfs.c
+@@ -483,6 +483,7 @@
+ 	FLAG(HANDLES_QUIET_CSA),
+ 	FLAG(STRICT),
+ 	FLAG(SUPPORTS_NDP_BLOCKACK),
++	FLAG(KEY_REPLACE_IN_PLACE),
+ #undef FLAG
+ };
+ 
