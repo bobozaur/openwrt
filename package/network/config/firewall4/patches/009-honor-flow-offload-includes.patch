@@ -1,0 +1,30 @@
+From 2207f85415bce5483ca726818e2f8650bd31ce0d Mon Sep 17 00:00:00 2001
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Date: Tue, 20 Oct 2026 12:18:04 +0300
+Subject: [PATCH] ruleset: honor includes in the flow offload chain
+
+Expose native chain-prepend and chain-append hooks to policies that must
+process traffic before flow installation. No DHCP policy dependency.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+ root/usr/share/firewall4/templates/ruleset.uc | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/root/usr/share/firewall4/templates/ruleset.uc b/root/usr/share/firewall4/templates/ruleset.uc
+index 83a25fc..21615d9 100644
+--- a/root/usr/share/firewall4/templates/ruleset.uc
++++ b/root/usr/share/firewall4/templates/ruleset.uc
+@@ -153,7 +153,9 @@ table inet fw4 {
+ 
+ {% if (length(flowtable_devices)): %}
+ 	chain flow_offload {
++{% fw4.includes('chain-prepend', 'flow_offload') %}
+ 		meta l4proto { tcp, udp } flow offload @ft;
++{% fw4.includes('chain-append', 'flow_offload') %}
+ 	}
+ 
+ {% endif %}
+-- 
+2.43.0
+
