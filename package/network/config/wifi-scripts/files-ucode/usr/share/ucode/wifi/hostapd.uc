@@ -600,6 +600,8 @@ export function setup(data) {
 		append('\n#frequency', data.config.frequency);
 	if (data.channel_follow)
 		append('\n#channel_follow', 1);
+	if (data.station_phy)
+		append('\n#station_phy', data.station_phy);
 
 	let has_ap;
 	for (let k, interface in data.interfaces) {
