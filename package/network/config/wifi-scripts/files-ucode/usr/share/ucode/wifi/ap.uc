@@ -172,7 +172,7 @@ function iface_setup(config) {
 
 	append('bssid', config.macaddr);
 	config.ssid2 = config.ssid;
-	config.wmm_enabled = 1;
+	config.wmm_enabled = +(config.wmm ?? true);
 	append_string_vars(config, [ 'ssid2' ]);
 
 	/* vendor_elements is a single concatenated hex blob, not one per line */
