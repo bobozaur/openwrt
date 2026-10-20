@@ -134,6 +134,17 @@ struct grx500_flow_mac {
 	u16 users;
 };
 
+enum grx500_flow_rx_reject {
+	GF_RX_DESCRIPTOR,
+	GF_RX_IP_HEADER,
+	GF_RX_TRANSPORT,
+	GF_RX_TUPLE,
+	GF_RX_MAC,
+	GF_RX_MTU,
+	GF_RX_ALLOC,
+	GF_RX_REJECT_COUNT,
+};
+
 struct grx500_flow {
 	struct device *dev;
 	void __iomem *gsw;
@@ -159,6 +170,10 @@ struct grx500_flow {
 	struct u64_stats_sync return_sync;
 	u64_stats_t returns, return_bytes, stale_returns, invalid_returns, tx_rejected;
 	atomic64_t table_failures, capacity_fallbacks;
+	atomic64_t rx_examined, rx_candidates, rx_unmarked_nat;
+	atomic64_t rx_validated;
+	spinlock_t rx_reject_lock;
+	u64 rx_rejects[GF_RX_REJECT_COUNT];
 	u64 add_requests, add_accepted, add_rejected;
 	unsigned int active;
 	bool stopping, faulted, software_ingress;
@@ -180,7 +195,16 @@ const char grx500_flow_stats_names[GRX500_FLOW_STATS_COUNT][ETH_GSTRING_LEN] = {
 	"pae_stale_returns", "pae_invalid_returns", "pae_table_failures",
 	"pae_capacity_fallbacks",
 	"pae_add_requests", "pae_add_accepted", "pae_add_rejected",
-	"pae_tx_rejected",
+	"pae_rx_examined", "pae_rx_candidates", "pae_rx_unmarked_nat",
+	"pae_rx_validated", "pae_tx_rejected",
+	"pae_rx_reject_descriptor",
+	"pae_rx_reject_ip_header",
+	"pae_rx_reject_transport",
+	"pae_rx_reject_tuple",
+	"pae_rx_reject_mac",
+	"pae_rx_reject_mtu",
+	"pae_rx_reject_alloc",
+	"pae_mac_cap14",
 	"pae_mac_smac_capacity",
 	"pae_mac_dmac_capacity",
 	"pae_mac_smac_limit",
@@ -194,7 +218,8 @@ const char grx500_flow_stats_names[GRX500_FLOW_STATS_COUNT][ETH_GSTRING_LEN] = {
  */
 void grx500_flow_get_stats(struct grx500_flow *f, u64 *data)
 {
-	unsigned int start, i, index = 11;
+	unsigned long flags;
+	unsigned int start, i, index = 15 + GF_RX_REJECT_COUNT;
 	u64 macs = 0, references = 0;
 
 	memset(data, 0, sizeof(*data) * GRX500_FLOW_STATS_COUNT);
@@ -208,17 +233,25 @@ void grx500_flow_get_stats(struct grx500_flow *f, u64 *data)
 		data[2] = u64_stats_read(&f->return_bytes);
 		data[3] = u64_stats_read(&f->stale_returns);
 		data[4] = u64_stats_read(&f->invalid_returns);
-		data[10] = u64_stats_read(&f->tx_rejected);
+		data[14] = u64_stats_read(&f->tx_rejected);
 	} while (u64_stats_fetch_retry(&f->return_sync, start));
 	data[5] = atomic64_read(&f->table_failures);
 	data[6] = atomic64_read(&f->capacity_fallbacks);
 	data[7] = f->add_requests;
 	data[8] = f->add_accepted;
 	data[9] = f->add_rejected;
+	data[10] = atomic64_read(&f->rx_examined);
+	data[11] = atomic64_read(&f->rx_candidates);
+	data[12] = atomic64_read(&f->rx_unmarked_nat);
+	data[13] = atomic64_read(&f->rx_validated);
+	spin_lock_irqsave(&f->rx_reject_lock, flags);
+	memcpy(data + 15, f->rx_rejects, sizeof(f->rx_rejects));
+	spin_unlock_irqrestore(&f->rx_reject_lock, flags);
 	for (i = 1; i < GF_MAC_ENTRIES; i++) {
 		macs += !!f->macs[i].users;
 		references += f->macs[i].users;
 	}
+	data[index++] = f->mac_capabilities;
 	data[index++] = f->source_mac_capacity;
 	data[index++] = f->dest_mac_capacity;
 	data[index++] = f->source_mac_limit;
@@ -1741,6 +1774,19 @@ int grx500_flow_setup_tc(struct grx500_flow *f, enum tc_setup_type type,
 	return ret;
 }
 
+static void gf_rx_reject(struct grx500_flow *f,
+			enum grx500_flow_rx_reject stage)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&f->rx_reject_lock, flags);
+	f->rx_rejects[stage]++;
+	spin_unlock_irqrestore(&f->rx_reject_lock, flags);
+	u64_stats_update_begin(&f->return_sync);
+	u64_stats_inc(&f->invalid_returns);
+	u64_stats_update_end(&f->return_sync);
+}
+
 bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 			u32 dw0, u32 dw1, const u8 *frame, unsigned int len)
 {
@@ -1748,6 +1794,7 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	struct grx500_flow_path *path;
 	struct grx500_flow_tuple tuple;
 	struct ethhdr eth;
+	enum grx500_flow_rx_reject rejection = GF_RX_DESCRIPTOR;
 	union {
 		struct iphdr v4;
 		struct ipv6hdr v6;
@@ -1765,13 +1812,22 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	bool ipv6;
 	int ret;
 
-	if (((dw1 >> 8) & 15) != GF_RETURN_EP && ((dw1 >> 4) & 15) != GF_RETURN_MARK)
+	if (f)
+		atomic64_inc(&f->rx_examined);
+	if (((dw1 >> 8) & 15) != GF_RETURN_EP && ((dw1 >> 4) & 15) != GF_RETURN_MARK) {
+		/* Native RX DW1 bit18 is the NAT result flag. It does not by
+		 * itself establish a trusted completed-return identity.
+		 */
+		if (f && (dw1 & BIT(18)))
+			atomic64_inc(&f->rx_unmarked_nat);
 		return false;
+	}
 	/* A marked but malformed/stale return can never re-enter IP receive:
 	 * its header may already have been translated and TTL decremented.
 	 */
 	if (!f)
 		return true;
+	atomic64_inc(&f->rx_candidates);
 	if (((dw1 >> 8) & 15) != GF_RETURN_EP || ((dw1 >> 4) & 15) != GF_RETURN_MARK ||
 	    (dw1 & BIT(19)) || len < GF_PMAC_LEN + ETH_HLEN)
 		goto invalid;
@@ -1780,6 +1836,7 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	 * header before inspecting fields, including the IPv4 checksum words.
 	 */
 	memcpy(&eth, frame + GF_PMAC_LEN, sizeof(eth));
+	rejection = GF_RX_IP_HEADER;
 	packet = frame + GF_PMAC_LEN + ETH_HLEN;
 	available = len - GF_PMAC_LEN - ETH_HLEN;
 	if (eth.h_proto == htons(ETH_P_IP)) {
@@ -1814,6 +1871,7 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	if (iplen < iphlen || iplen > available)
 		goto invalid;
 	l4len = iplen - iphlen;
+	rejection = GF_RX_TRANSPORT;
 	if (protocol == IPPROTO_UDP) {
 		if (l4len < sizeof(transport.udp))
 			goto invalid;
@@ -1851,6 +1909,7 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	    !(gf_ingress_ports(f, path->ingress) & BIT(source)) ||
 	    !netif_running(path->ingress) || !netif_running(path->egress))
 		goto stale;
+	rejection = GF_RX_TUPLE;
 	if (entry->ipv6 != ipv6 || entry->protocol != protocol ||
 	    entry->after.sport != tuple.sport || entry->after.dport != tuple.dport)
 		goto invalid_locked;
@@ -1861,11 +1920,15 @@ bool grx500_flow_receive(struct grx500_flow *f, struct napi_struct *napi,
 	} else if (entry->after.src != tuple.src || entry->after.dst != tuple.dst) {
 		goto invalid_locked;
 	}
+	rejection = GF_RX_MAC;
 	if (!ether_addr_equal(entry->source_mac, eth.h_source) ||
 	    !ether_addr_equal(entry->dest_mac, eth.h_dest))
 		goto invalid_locked;
+	rejection = GF_RX_MTU;
 	if (iplen > min_t(unsigned int, path->mtu, READ_ONCE(path->egress->mtu)))
 		goto invalid_locked;
+	atomic64_inc(&f->rx_validated);
+	rejection = GF_RX_ALLOC;
 	skb = napi_alloc_skb(napi, ETH_HLEN + iplen);
 	if (!skb)
 		goto invalid_locked;
@@ -1902,11 +1965,11 @@ stale:
 	rcu_read_unlock();
 	return true;
 invalid_locked:
+	gf_rx_reject(f, rejection);
 	rcu_read_unlock();
+	return true;
 invalid:
-	u64_stats_update_begin(&f->return_sync);
-	u64_stats_inc(&f->invalid_returns);
-	u64_stats_update_end(&f->return_sync);
+	gf_rx_reject(f, rejection);
 	return true;
 }
 
@@ -1935,6 +1998,7 @@ struct grx500_flow *grx500_flow_create(struct device *dev, void __iomem *gsw,
 	f->software_ingress = true;
 	mutex_init(&f->lock);
 	u64_stats_init(&f->return_sync);
+	spin_lock_init(&f->rx_reject_lock);
 	INIT_LIST_HEAD(&f->entries);
 	INIT_LIST_HEAD(&f->blocks);
 	INIT_WORK(&f->invalidate_work, gf_invalidate_work);
