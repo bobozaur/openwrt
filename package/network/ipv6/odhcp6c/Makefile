@@ -29,7 +29,7 @@ define Package/odhcp6c
   CATEGORY:=Network
   TITLE:=Embedded DHCPv6-client for OpenWrt
   DEPENDS:=@IPV6 +libubox +libubus +netifd
-  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r6)
 endef
 
 define Package/odhcp6c/conffiles

@@ -38,7 +38,7 @@ define Package/wireguard-tools
 	  +@BUSYBOX_CONFIG_IP \
 	  +@BUSYBOX_CONFIG_FEATURE_IP_LINK \
 	  +kmod-wireguard +netifd
-  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r6)
 endef
 
 define Package/wireguard-tools/description

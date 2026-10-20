@@ -30,7 +30,9 @@ function reset_phy(phy) {
 	return !!ap && !!sta;
 }
 
-// Reserve the persistent firmware master's address while the STA role is active.
+// A STA-only radio still has a persistent firmware AP master. Its address
+// belongs to a separate netifd group until both role configurations retire.
+// Mixed mode is covered by hostapd's actual AP-address mirror instead.
 function master_macaddr_sync(group, phy, address) {
 	let list = {};
 	if (address)
@@ -205,7 +207,8 @@ function setup(data) {
 				return fail('WAVE_MASTER_CONFIG_FAILED');
 			master_mac = lc(v.config.macaddr);
 		}
-		// The bridge owns bridged WAVE forwarding.
+		// The Linux bridge owns all bridged data forwarding for WAVE, including
+		// same-BSS traffic when multicast conversion is disabled.
 		netifd.set_vif(name, v.config.ifname, { bridge_forwarding: mode == 'ap' });
 		if (mode == 'sta' && type(supplicant.generate(supplicant_data, sta_data, v)) != 'object')
 			return 1;
@@ -218,6 +221,8 @@ function setup(data) {
 		if (!supplicant.setup(supplicant_data, sta_data))
 			return setup_failed(owner, 'WAVE_SUPPLICANT_FAILED');
 	}
+	// Native hostapd publishes every actual AP BSSID into the station scope
+	// before channel-follow callbacks can resume the deferred station.
 	if (modes.ap && !hostapd.setup(ap_data))
 		return setup_failed(owner, 'WAVE_HOSTAPD_FAILED');
 	if (modes.sta && !supplicant.start(sta_data))

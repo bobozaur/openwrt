@@ -183,7 +183,7 @@ define Package/hostapd/Default
   TITLE:=IEEE 802.1x Authenticator
   URL:=https://w1.fi/hostapd/
   DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r3))
   USERID:=network=101:network=101
   PROVIDES:=hostapd
   CONFLICTS:=$(HOSTAPD_PROVIDERS)
@@ -289,7 +289,7 @@ define Package/wpad/Default
   SUBMENU:=WirelessAPD
   TITLE:=IEEE 802.1x Auth/Supplicant
   DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r3))
   USERID:=network=101:network=101
   URL:=https://w1.fi/
   PROVIDES:=hostapd wpa-supplicant
@@ -434,7 +434,7 @@ define Package/wpa-supplicant/Default
   TITLE:=WPA Supplicant
   URL:=https://w1.fi/wpa_supplicant/
   DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r3))
   USERID:=network=101:network=101
   PROVIDES:=wpa-supplicant
   CONFLICTS:=$(SUPPLICANT_PROVIDERS)
