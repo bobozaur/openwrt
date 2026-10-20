@@ -209,12 +209,13 @@ function setup(data) {
 		if (owner.macaddr_group &&
 		    !master_macaddr_sync(owner.macaddr_group, sta_data.phy, master_mac))
 			return setup_failed(owner, 'WAVE_MAC_RESERVATION_FAILED');
-		supplicant.setup(supplicant_data, sta_data);
+		if (!supplicant.setup(supplicant_data, sta_data))
+			return setup_failed(owner, 'WAVE_SUPPLICANT_FAILED');
 	}
-	if (modes.ap)
-		hostapd.setup(ap_data);
-	if (modes.sta)
-		supplicant.start(sta_data);
+	if (modes.ap && !hostapd.setup(ap_data))
+		return setup_failed(owner, 'WAVE_HOSTAPD_FAILED');
+	if (modes.sta && !supplicant.start(sta_data))
+		return setup_failed(owner, 'WAVE_SUPPLICANT_FAILED');
 
 	netifd.set_up();
 	return 0;
