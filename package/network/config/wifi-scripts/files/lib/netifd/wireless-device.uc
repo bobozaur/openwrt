@@ -61,6 +61,8 @@ function handle_link(dev, data, up)
 		isolate: !!config.bridge_isolate,
 		wireless: true,
 		wireless_ap: ap,
+		// Driver capability, separate from the administrator's M2U policy.
+		wireless_bridge_forwarding: ap && !!data.bridge_forwarding,
 	};
 
 	if (ap && config.multicast_to_unicast != null)
