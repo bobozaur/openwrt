@@ -1896,6 +1896,16 @@ static int grx500_register_port(struct platform_device *pdev,
 	ret = register_netdev(netdev);
 	if (ret)
 		goto disconnect_phy;
+	/* Registration resolves names such as eth%d before the native NAPI
+	 * thread is created. Each independently serviced DMA pair then has its
+	 * real napi/<netdev>-<id> owner for ordinary packet steering. ready is
+	 * still false, so neither interface can start polling during publication.
+	 */
+	ret = dev_set_threaded(netdev, NETDEV_NAPI_THREADED_ENABLED);
+	if (ret) {
+		unregister_netdev(netdev);
+		goto disconnect_phy;
+	}
 	board->netdev[port] = netdev;
 	netdev_info(netdev, "DMA%u IRQs RX=%d TX=%d\n",
 		    port ? 1 : 2, eth->rx_irq, eth->tx_irq);
