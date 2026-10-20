@@ -4,6 +4,6 @@
 
 / {
 	chosen {
-		bootargs = "console=ttyLTQ0,115200 earlycon panic=5 ubi.mtd=system_sw,2048 ubifs.default_version=4 thread_backlog_napi ax50_initial_install=1";
+		bootargs = "console=ttyLTQ0,115200 earlycon panic=5 ubi.mtd=system_sw,2048 ubifs.default_version=4 thread_backlog_napi boot_timeout=120 ax50_initial_install=1";
 	};
 };
