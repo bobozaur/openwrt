@@ -142,15 +142,16 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	}
 --- a/src/ap/wps_hostapd.c
 +++ b/src/ap/wps_hostapd.c
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,8 @@
  #include "utils/includes.h"
++#include <fcntl.h>
  #include <sys/file.h>
  #include <sys/stat.h>
 +#include <limits.h>
  
  #include "utils/common.h"
  #include "utils/eloop.h"
-@@ -16,6 +17,10 @@
+@@ -16,6 +18,10 @@
  #include "common/wpa_ctrl.h"
  #include "common/ieee802_11_defs.h"
  #include "common/ieee802_11_common.h"
@@ -161,7 +162,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #include "eapol_auth/eapol_auth_sm.h"
  #include "eapol_auth/eapol_auth_sm_i.h"
  #include "wps/wps.h"
-@@ -28,6 +33,7 @@
+@@ -28,6 +34,7 @@
  #include "ap_drv_ops.h"
  #include "beacon.h"
  #include "sta_info.h"
@@ -169,7 +170,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #include "wps_hostapd.h"
  #include "ucode.h"
  
-@@ -107,6 +113,30 @@
+@@ -107,6 +114,30 @@
  		return -1;
  	}
  	return 0;
@@ -200,7 +201,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  
-@@ -169,6 +199,14 @@
+@@ -169,6 +200,14 @@
  		goto out;
  	operation = "sync";
  	if (os_fdatasync(f))
@@ -215,7 +216,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		goto out;
  	operation = "owner check";
  	if (hostapd_wps_psk_file_matches(path, &st))
-@@ -1264,14 +1302,41 @@
+@@ -1264,14 +1303,41 @@
  }
  
  
@@ -259,7 +260,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		hostapd_wps_clear_ies(hapd, 0);
  		return 0;
  	}
-@@ -1413,12 +1478,12 @@
+@@ -1413,12 +1479,12 @@
  	} else if (conf->ssid.wpa_passphrase) {
  		wps->network_key = (u8 *) os_strdup(conf->ssid.wpa_passphrase);
  		wps->network_key_len = os_strlen(conf->ssid.wpa_passphrase);
@@ -274,7 +275,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		wps->network_key_len = 2 * PMK_LEN;
  #ifdef CONFIG_WEP
  	} else if (conf->ssid.wep.keys_set && conf->ssid.wep.key[0]) {
-@@ -1431,8 +1496,8 @@
+@@ -1431,8 +1497,8 @@
  #endif /* CONFIG_WEP */
  	}
  
@@ -285,7 +286,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		wps->psk_set = 1;
  	}
  
-@@ -1522,7 +1587,13 @@
+@@ -1522,7 +1588,13 @@
  	wps->upc = hapd->conf->upc;
  #endif /* CONFIG_WPS_UPNP */
  
@@ -300,7 +301,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #ifdef CONFIG_P2P
  	if ((hapd->conf->p2p & P2P_ENABLED) &&
-@@ -1641,13 +1712,76 @@
+@@ -1641,13 +1713,76 @@
  }
  
  
@@ -379,7 +380,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	wps_registrar_update_psk_policy(wps->registrar,
  		conf->ssid.wpa_psk_file != NULL,
-@@ -1676,12 +1810,12 @@
+@@ -1676,12 +1811,12 @@
  		if (!wps->network_key)
  			return;
  		wps->network_key_len = os_strlen(conf->ssid.wpa_passphrase);
@@ -394,7 +395,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		wps->network_key_len = 2 * PMK_LEN;
  #ifdef CONFIG_WEP
  	} else if (conf->ssid.wep.keys_set && conf->ssid.wep.key[0]) {
-@@ -1694,8 +1828,8 @@
+@@ -1694,8 +1829,8 @@
  #endif /* CONFIG_WEP */
  	}
  
