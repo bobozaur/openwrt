@@ -1,0 +1,26 @@
+{
+  "component": "omcproxy",
+  "upstream": "https://git.openwrt.org/project/omcproxy.git",
+  "base": "3abb601ab77f5e914a3203e5d0c8ae7fb1579bae",
+  "bundle": "native/omcproxy.bundle",
+  "sha256": "02effa2d2cbb8385c74496c7f6dcfdd2d9313f512b850bf1b6c755a0ee55a3ed",
+  "bytes": 3251,
+  "retained_branch": "contribution",
+  "refs": {
+    "refs/heads/contribution": "c9036a5eb5a15f063953981facd21884c78e0194",
+    "refs/heads/master": "3abb601ab77f5e914a3203e5d0c8ae7fb1579bae",
+    "refs/heads/topic/group-route-refresh": "1590ab92289e5548ea362734cbe04a2b01add44d",
+    "refs/heads/topic/retained-downlinks": "ef0789b570e2b54a3863380c7ada497e01da466d",
+    "refs/heads/topic/scope-before-replay": "143ed2ceecd37ea5fd64c7e5cec5fa5d75a73815",
+    "refs/tags/archive/20261020-consolidation/master": "3abb601ab77f5e914a3203e5d0c8ae7fb1579bae",
+    "refs/tags/archive/20261020-consolidation/topic/group-route-refresh": "1590ab92289e5548ea362734cbe04a2b01add44d",
+    "refs/tags/archive/20261020-consolidation/topic/retained-downlinks": "ef0789b570e2b54a3863380c7ada497e01da466d",
+    "refs/tags/archive/20261020-consolidation/topic/scope-before-replay": "143ed2ceecd37ea5fd64c7e5cec5fa5d75a73815"
+  },
+  "public_base_refs": {
+    "refs/heads/master": "3abb601ab77f5e914a3203e5d0c8ae7fb1579bae",
+    "refs/tags/archive/20261020-consolidation/master": "3abb601ab77f5e914a3203e5d0c8ae7fb1579bae"
+  },
+  "bundle_refs_exact": true,
+  "verify_exit": 0
+}

@@ -1,0 +1,22 @@
+{
+  "component": "procd",
+  "upstream": "https://git.openwrt.org/project/procd.git",
+  "base": "5aef7c33b01455157c1373a14e2a3fa47d024c6c",
+  "bundle": "native/procd.bundle",
+  "sha256": "e4de9c6edc21796df70f44162fce2f34c10056a1fcf0fcc83145f45ba097b0ea",
+  "bytes": 3428,
+  "retained_branch": "contribution",
+  "refs": {
+    "refs/heads/contribution": "261a74d4367972ec559403eab587971016a9698c",
+    "refs/heads/master": "5aef7c33b01455157c1373a14e2a3fa47d024c6c",
+    "refs/heads/topic/startup-policy": "312fa10f198a6eb64778f462a1bb21a9f6f8b0b7",
+    "refs/tags/archive/20261020-consolidation/master": "5aef7c33b01455157c1373a14e2a3fa47d024c6c",
+    "refs/tags/archive/20261020-consolidation/topic/startup-policy": "312fa10f198a6eb64778f462a1bb21a9f6f8b0b7"
+  },
+  "public_base_refs": {
+    "refs/heads/master": "5aef7c33b01455157c1373a14e2a3fa47d024c6c",
+    "refs/tags/archive/20261020-consolidation/master": "5aef7c33b01455157c1373a14e2a3fa47d024c6c"
+  },
+  "bundle_refs_exact": true,
+  "verify_exit": 0
+}

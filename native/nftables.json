@@ -1,0 +1,22 @@
+{
+  "component": "nftables",
+  "upstream": "https://git.netfilter.org/nftables.git",
+  "base": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
+  "bundle": "native/nftables.bundle",
+  "sha256": "b32cb83bae7762c9e343991eb44afe2f9b7f3b328cd5bcfdd860fc5c7cb122f6",
+  "bytes": 5151,
+  "retained_branch": "contribution",
+  "refs": {
+    "refs/heads/contribution": "37b9c8c08630fbe4cfdc428729ea400585d23978",
+    "refs/heads/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
+    "refs/heads/topic/scalar-map-operands": "d27e4087d978bd8479e2125b475e39afbaa93f4f",
+    "refs/tags/archive/20261020-consolidation/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
+    "refs/tags/archive/20261020-consolidation/topic/scalar-map-operands": "d27e4087d978bd8479e2125b475e39afbaa93f4f"
+  },
+  "public_base_refs": {
+    "refs/heads/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
+    "refs/tags/archive/20261020-consolidation/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd"
+  },
+  "bundle_refs_exact": true,
+  "verify_exit": 0
+}

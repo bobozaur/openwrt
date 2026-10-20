@@ -1,0 +1,30 @@
+{
+  "component": "fstools",
+  "upstream": "https://git.openwrt.org/project/fstools.git",
+  "base": "907cf4496eb58c93daf3c9c65ce32eec6e6546e3",
+  "bundle": "native/fstools.bundle",
+  "sha256": "82d1d201562205c2254fab49c46b70492b0297779ef8a9c8b7fdf8f3cde7b5b4",
+  "bytes": 5816,
+  "retained_branch": "contribution",
+  "refs": {
+    "refs/heads/backport/selected-overlay-extensions": "77e49e8cab6d9ba93f15ab96a3b68b3fc5ca5509",
+    "refs/heads/backport/selected-overlay-reset": "62ff83d32e1fbe36096780e1ea8f6934a5dfae3c",
+    "refs/heads/contribution": "65266fa0ff775798488c0d439a8fc5b91d8fe098",
+    "refs/heads/master": "907cf4496eb58c93daf3c9c65ce32eec6e6546e3",
+    "refs/heads/topic/hfs-checker": "225fc3d6a42a46b6d54fb047ef009cfe7fbe2847",
+    "refs/heads/topic/selected-overlay-extensions": "3a17fc2fdac86f65d0faaa7202180cd835a33b9e",
+    "refs/heads/topic/selected-overlay-reset": "b37d1c5a1e1b6f4a838a389c636c2115b67012b1",
+    "refs/tags/archive/20261020-consolidation/backport/selected-overlay-extensions": "77e49e8cab6d9ba93f15ab96a3b68b3fc5ca5509",
+    "refs/tags/archive/20261020-consolidation/backport/selected-overlay-reset": "62ff83d32e1fbe36096780e1ea8f6934a5dfae3c",
+    "refs/tags/archive/20261020-consolidation/master": "907cf4496eb58c93daf3c9c65ce32eec6e6546e3",
+    "refs/tags/archive/20261020-consolidation/topic/hfs-checker": "225fc3d6a42a46b6d54fb047ef009cfe7fbe2847",
+    "refs/tags/archive/20261020-consolidation/topic/selected-overlay-extensions": "3a17fc2fdac86f65d0faaa7202180cd835a33b9e",
+    "refs/tags/archive/20261020-consolidation/topic/selected-overlay-reset": "b37d1c5a1e1b6f4a838a389c636c2115b67012b1"
+  },
+  "public_base_refs": {
+    "refs/heads/master": "907cf4496eb58c93daf3c9c65ce32eec6e6546e3",
+    "refs/tags/archive/20261020-consolidation/master": "907cf4496eb58c93daf3c9c65ce32eec6e6546e3"
+  },
+  "bundle_refs_exact": true,
+  "verify_exit": 0
+}
