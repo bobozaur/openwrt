@@ -23,6 +23,9 @@ PKG_SOURCE:=backports-$(PKG_SOURCE_VERSION).tar.zst
 PKG_BUILD_DIR:=$(KERNEL_BUILD_DIR)/$(if $(BUILD_VARIANT),$(PKG_NAME)-$(BUILD_VARIANT)/)backports-$(PKG_SOURCE_VERSION)
 PKG_BUILD_PARALLEL:=1
 
+# Backports resolves Kbuild dependencies in its own tree.
+PKG_FILE_DEPENDS:=$(LINUX_DIR)/include/generated/autoconf.h
+
 PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
 
 PKG_DRIVERS = \
