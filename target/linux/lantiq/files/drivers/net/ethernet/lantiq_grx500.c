@@ -63,6 +63,7 @@
 #define MAC_CTRL0_FCON_OFF BIT(6)
 #define SDMA_PCTRL(p)	((0xbc0 + 6 * (p)) * 4)
 #define SDMA_PCTRL_FCEN	BIT(1)
+#define GRX500_PAUSE_REGS_COUNT 46
 #define PHY_FW_ADDR(i)	(GSW_TOP + 0x228 + (i) * 0x10)
 #define PCE_TABLE_CTRL	(0x44f * 4)
 #define PCE_TABLE_ADDR	(0x44e * 4)
@@ -822,6 +823,52 @@ static int grx500_wan_set_pauseparam(struct net_device *netdev,
 	return 0;
 }
 
+static int grx500_wan_get_regs_len(struct net_device *netdev)
+{
+	return GRX500_PAUSE_REGS_COUNT * sizeof(u32);
+}
+
+static void grx500_wan_get_regs(struct net_device *netdev,
+				struct ethtool_regs *regs, void *data)
+{
+	struct grx500_eth *eth = netdev_priv(netdev);
+	u32 *values = data;
+	unsigned int bank, port, mac, reg;
+	void __iomem *base;
+
+	/* Version 2: native-endian u32 words, GSW-L then GSW-R. Each bank
+	 * starts with SDMA_FCTHR1..4, followed by physical ports 2..5 (L) or
+	 * 15 (R). Each port contributes MAC_CTRL0, MAC_PSTAT, PHY_ADDR,
+	 * MDIO_STAT, SDMA_PCTRL, SDMA_PFCTHR8, SDMA_PFCTHR9, in that order.
+	 * The original 43 words are followed by the attached WAN PHY's BMCR,
+	 * ADVERTISE and LPA. Each PHY word contains a 16-bit register value or
+	 * a negative signed 32-bit errno. No latch-low BMSR read is performed.
+	 * These are non-atomic snapshots; link/configuration changes can occur
+	 * between reads. PHY reads use the existing phylib and MDIO bus locks.
+	 */
+	regs->version = 2;
+	for (bank = 0; bank < ARRAY_SIZE(eth->board->gsw); bank++) {
+		base = eth->board->gsw[bank];
+		for (reg = 0xb41; reg <= 0xb44; reg++)
+			*values++ = __raw_readl(base + reg * 4);
+		for (port = bank ? 15 : 2; port <= (bank ? 15 : 5); port++) {
+			mac = bank ? 0 : port - 1;
+			*values++ = __raw_readl(base + MAC_CTRL0 + mac * 12 * 4);
+			*values++ = __raw_readl(base + (0x900 + mac * 12) * 4);
+			*values++ = __raw_readl(base + PHY_ADDR(mac));
+			*values++ = __raw_readl(base + PHY_ADDR(mac) + 4);
+			*values++ = __raw_readl(base + SDMA_PCTRL(port));
+			*values++ = __raw_readl(base + (0xb80 + port * 2) * 4);
+			*values++ = __raw_readl(base + (0xb81 + port * 2) * 4);
+		}
+	}
+	mutex_lock(&eth->phydev->lock);
+	*values++ = phy_read(eth->phydev, MII_BMCR);
+	*values++ = phy_read(eth->phydev, MII_ADVERTISE);
+	*values++ = phy_read(eth->phydev, MII_LPA);
+	mutex_unlock(&eth->phydev->lock);
+}
+
 static int grx500_rmon_read32(struct grx500_eth *eth, u8 table, u8 offset,
 			    u32 *value)
 {
@@ -983,6 +1030,8 @@ static const struct ethtool_ops grx500_wan_ethtool_ops = {
 	.nway_reset = phy_ethtool_nway_reset,
 	.get_pauseparam = grx500_wan_get_pauseparam,
 	.set_pauseparam = grx500_wan_set_pauseparam,
+	.get_regs_len = grx500_wan_get_regs_len,
+	.get_regs = grx500_wan_get_regs,
 	.get_strings = grx500_wan_get_strings,
 	.get_sset_count = grx500_wan_get_sset_count,
 	.get_ethtool_stats = grx500_wan_get_ethtool_stats,
