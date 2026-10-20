@@ -11,6 +11,7 @@ failure defaults. Driver-supplied station/link/TID statistics remain valid;
 other drivers retain their existing defaults. Do not carry management-only
 removed-link retry/failure counters into an aggregate data total.
 
+The enum-tail insertion is independent of the optional in-place rekey flag.
 Apply after the driver-counter removal snapshot changes. Preserve filled
 station, link and per-TID values when a link is removed; suppress only the
 software retry/failure fallback for hardware without DATA TX status. Keep
@@ -36,13 +37,12 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
   * @IEEE80211_HW_CONNECTION_MONITOR:
   *	The hardware performs its own connection monitoring, including
   *	periodic keep-alives to the AP and probing the AP on beacon loss.
-@@ -3143,6 +3150,7 @@
- 	IEEE80211_HW_STRICT,
- 	IEEE80211_HW_SUPPORTS_NDP_BLOCKACK,
- 	IEEE80211_HW_KEY_REPLACE_IN_PLACE,
-+	IEEE80211_HW_NO_DATA_TX_STATUS,
+@@ -3146,3 +3153,5 @@
  
- 	/* keep last, obviously */
+-	/* keep last, obviously */
++	IEEE80211_HW_NO_DATA_TX_STATUS,
++
++	/* keep last, obviously */
  	NUM_IEEE80211_HW_FLAGS
 --- a/net/mac80211/debugfs.c
 +++ b/net/mac80211/debugfs.c
