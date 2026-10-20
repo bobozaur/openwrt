@@ -80,6 +80,10 @@ let proto = {
 		return proto_notify(msg);
 	},
 
+	clear_host_dependencies: function() {
+		return proto_notify({ action: 8 });
+	},
+
 	setup_failed: function() {
 		return proto_notify({ action: 7 });
 	},
