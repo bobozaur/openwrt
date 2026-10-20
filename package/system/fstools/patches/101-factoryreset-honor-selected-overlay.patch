@@ -1,0 +1,56 @@
+From b37d1c5a1e1b6f4a838a389c636c2115b67012b1 Mon Sep 17 00:00:00 2001
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Date: Tue, 20 Oct 2026 12:11:17 +0300
+Subject: [PATCH] factoryreset: honor the selected overlay name
+
+mount_root start and done already select fstools_overlay_name from the
+kernel command line. Use that same selection for factory reset so a
+device with separate named bank overlays resets its active writable
+volume. Keep rootfs_data as the default for existing devices.
+
+Follow-up to 207d8feaf2a6 (mount_root: honor fstools_overlay_name in done).
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+ factoryreset.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/factoryreset.c b/factoryreset.c
+index 0985b3a..d88a3d3 100644
+--- a/factoryreset.c
++++ b/factoryreset.c
+@@ -31,6 +31,7 @@
+ 
+ #include "libfstools/libfstools.h"
+ #include "libfstools/volume.h"
++#include "libfstools/common.h"
+ 
+ static int jffs2_mark(struct volume *v);
+ 
+@@ -103,6 +104,8 @@ static int jffs2_mark(struct volume *v)
+ int main(int argc, char **argv)
+ {
+ 	struct volume *v;
++	char dataparam[64];
++	char *dataname = "rootfs_data";
+ 	int ch, yes = 0, reset = 0, keep = 0;
+ 
+ 	if (!strcmp(basename(argv[0]), "jffs2reset"))
+@@ -136,9 +139,12 @@ int main(int argc, char **argv)
+ 		return -1;
+ 	}
+ 
+-	v = volume_find("rootfs_data");
++	if (get_var_from_file("/proc/cmdline", "fstools_overlay_name", dataparam, sizeof(dataparam)))
++		dataname = dataparam;
++
++	v = volume_find(dataname);
+ 	if (!v) {
+-		ULOG_ERR("MTD partition 'rootfs_data' not found\n");
++		ULOG_ERR("Overlay volume '%s' not found\n", dataname);
+ 		return -1;
+ 	}
+ 
+-- 
+2.43.0
+
