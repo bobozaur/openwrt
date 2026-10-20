@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/net/lantiq,grx500-ethernet.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Lantiq GRX500 Ethernet DMA and switch integration
+
+maintainers:
+  - OpenWrt Development List <openwrt-devel@lists.openwrt.org>
+
+description: |
+  Owns the LAN and WAN switch register windows, two DMA pairs and five GPHYs.
+  The LAN Ethernet child is the DSA CPU conduit; the WAN child is an ordinary
+  Ethernet interface. Each child owns its MDIO bus. The switch child shares
+  its parent's LAN switch resource. The driver loads the 64-KiB executable
+  GPHY body through the firmware loader; OEM containers are decoded by userspace.
+
+properties:
+  compatible:
+    const: lantiq,grx500-ethernet
+  reg:
+    minItems: 6
+    maxItems: 6
+  reg-names:
+    items:
+      - const: switch
+      - const: rx-dma
+      - const: tx-dma
+      - const: wan-switch
+      - const: wan-rx-dma
+      - const: wan-tx-dma
+  interrupts:
+    maxItems: 4
+  interrupt-names:
+    items:
+      - const: rx
+      - const: tx
+      - const: wan-rx
+      - const: wan-tx
+  resets:
+    description: LAN GPHYs 0 through 3, then the WAN GPHY
+    minItems: 5
+    maxItems: 5
+
+  "#address-cells":
+    const: 1
+  "#size-cells":
+    const: 0
+
+  ethernet@0:
+    type: object
+    properties:
+      reg:
+        const: 0
+      mdio:
+        $ref: mdio.yaml#
+        unevaluatedProperties: false
+    required:
+      - reg
+      - mdio
+    additionalProperties: false
+
+  ethernet@1:
+    $ref: ethernet-controller.yaml#
+    properties:
+      reg:
+        const: 1
+      label: true
+      mdio:
+        $ref: mdio.yaml#
+        unevaluatedProperties: false
+    required:
+      - reg
+      - phy-mode
+      - phy-handle
+      - mdio
+    unevaluatedProperties: false
+
+  switch:
+    $ref: dsa/lantiq,grx500-switch.yaml#
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - interrupts
+  - interrupt-names
+  - resets
+  - "#address-cells"
+  - "#size-cells"
+  - ethernet@0
+  - ethernet@1
+  - switch
+
+additionalProperties: false
