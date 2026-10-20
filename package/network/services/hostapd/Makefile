@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=hostapd
-PKG_RELEASE:=4
+PKG_RELEASE:=7
 
 PKG_SOURCE_URL:=https://w1.fi/hostap.git
 PKG_SOURCE_PROTO:=git
@@ -37,6 +37,16 @@ EAPOL_TEST_PROVIDERS:=eapol-test eapol-test-openssl eapol-test-wolfssl
 
 SUPPLICANT_PROVIDERS:=
 HOSTAPD_PROVIDERS:=
+
+# These providers compile WPS and install the native enrollment consumer.
+# Basic/mini providers, common support files and command-line tools do not.
+WPS_PROVIDERS:= \
+	hostapd hostapd-openssl hostapd-wolfssl hostapd-mbedtls \
+	wpad wpad-openssl wpad-wolfssl wpad-mbedtls \
+	wpad-mesh-openssl wpad-mesh-wolfssl wpad-mesh-mbedtls \
+	wpa-supplicant wpa-supplicant-openssl wpa-supplicant-wolfssl wpa-supplicant-mbedtls \
+	wpa-supplicant-p2p \
+	wpa-supplicant-mesh-openssl wpa-supplicant-mesh-wolfssl wpa-supplicant-mesh-mbedtls
 
 LOCAL_TYPE=$(strip \
 		$(if $(findstring wpad,$(BUILD_VARIANT)),wpad, \
@@ -172,8 +182,8 @@ define Package/hostapd/Default
   SUBMENU:=WirelessAPD
   TITLE:=IEEE 802.1x Authenticator
   URL:=https://w1.fi/hostapd/
-  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))
+  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
   USERID:=network=101:network=101
   PROVIDES:=hostapd
   CONFLICTS:=$(HOSTAPD_PROVIDERS)
@@ -278,8 +288,8 @@ define Package/wpad/Default
   CATEGORY:=Network
   SUBMENU:=WirelessAPD
   TITLE:=IEEE 802.1x Auth/Supplicant
-  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))
+  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
   USERID:=network=101:network=101
   URL:=https://w1.fi/
   PROVIDES:=hostapd wpa-supplicant
@@ -423,8 +433,8 @@ define Package/wpa-supplicant/Default
   SUBMENU:=WirelessAPD
   TITLE:=WPA Supplicant
   URL:=https://w1.fi/wpa_supplicant/
-  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))
+  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
   USERID:=network=101:network=101
   PROVIDES:=wpa-supplicant
   CONFLICTS:=$(SUPPLICANT_PROVIDERS)

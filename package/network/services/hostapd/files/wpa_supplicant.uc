@@ -19,6 +19,245 @@ wpas.data.config = {};
 wpas.data.iface_phy = {};
 wpas.data.iface_ubus = {};
 wpas.data.dpp_hooks = {};
+wpas.data.config_generation = 0;
+wpas.data.enrollment = {};
+wpas.data.enrollment_results = {};
+
+function enrollment_result(owner, phase)
+{
+	let binding = owner.config.uci;
+	if (!binding)
+		return;
+	let key = binding.section;
+	let previous = wpas.data.enrollment_results[key];
+	previous?.expiry?.cancel();
+	// This is a bounded result of an enrollment operation, not a connection
+	// state cache. Keep it through the config reload caused by persistence;
+	// current connection state is always queried from the native interface.
+	let result = { phase, device: binding.device };
+	wpas.data.enrollment_results[key] = result;
+	result.expiry = uloop.timer(120000, () => {
+		if (wpas.data.enrollment_results[key] == result)
+			delete wpas.data.enrollment_results[key];
+	});
+}
+
+function enrollment_forget(ifname, status)
+{
+	let entry = wpas.data.enrollment[ifname];
+	if (!entry)
+		return;
+	entry.expiry?.cancel();
+	entry.retry?.cancel();
+	delete wpas.data.enrollment[ifname];
+	if (status) {
+		enrollment_result(entry.owner, status);
+		wpas.printf(`WPS persistence on ${ifname}: ${status}`);
+		ubus.event('wps_persistence', { ifname, status });
+	}
+}
+
+function enrollment_owner(ifname, iface)
+{
+	let phy = wpas.data.config[wpas.data.iface_phy[ifname]];
+	let owner = phy?.data[ifname];
+	if (!owner || owner.config.mode != 'sta' || !owner.config.uci ||
+	    wpas.interfaces[ifname] != iface)
+		return null;
+	let uci = owner.config.uci;
+	if (type(uci.section) != 'string' || !length(uci.section) ||
+	    type(uci.device) != 'string' || !length(uci.device))
+		return null;
+	// The transaction owns one complete persistent radio/iface snapshot.
+	// Preserve section identity for status even when a multi-radio or partial
+	// configuration cannot safely enroll into that transaction.
+	let devices = uci.expected?.device;
+	let persistent = type(uci.expected) == 'object' &&
+		type(uci.expected_device) == 'object' &&
+		uci.expected['.type'] == 'wifi-iface' &&
+		uci.expected_device['.type'] == 'wifi-device' && uci.expected.mode == 'sta' &&
+		((type(devices) == 'string' && devices == uci.device) ||
+		 (type(devices) == 'array' && length(devices) == 1 &&
+		  type(devices[0]) == 'string' && devices[0] == uci.device));
+	return { phy, owner, persistent };
+}
+
+function enrollment_values(cred, status)
+{
+	if (!cred.ssid || index(cred.ssid, '\x00') >= 0 ||
+	    index(cred.key, '\x00') >= 0 || cred.ieee80211w < 0 || cred.ieee80211w > 2)
+		return null;
+	let key_mgmt = split(cred.key_mgmt ?? '', ' ');
+	let proto = split(cred.proto ?? '', ' ');
+	let pairwise = split(cred.pairwise ?? '', ' ');
+	// WPS AES profiles may be expanded by the native driver to several optional
+	// ciphers. UCI can represent the cipher actually negotiated, even when it
+	// cannot express that entire optional set in one encryption value.
+	let cipher = {
+		'TKIP': 'tkip', 'CCMP': 'ccmp', 'GCMP': 'gcmp',
+		'CCMP-256': 'ccmp256', 'GCMP-256': 'gcmp256',
+	}[status.pairwise_cipher];
+	let encryption;
+	if (length(key_mgmt) == 1 && key_mgmt[0] == 'NONE') {
+		encryption = 'none';
+	} else {
+		if (!length(key_mgmt) || length(filter(key_mgmt, (v) => v != 'WPA-PSK' && v != 'SAE')) ||
+		    !cipher || index(pairwise, status.pairwise_cipher) < 0)
+			return null;
+		if (index(key_mgmt, 'SAE') >= 0) {
+			if (cipher == 'tkip')
+				return null;
+			encryption = index(key_mgmt, 'WPA-PSK') >= 0 ? 'sae-mixed' : 'sae';
+		} else if (index(proto, 'RSN') >= 0) {
+			encryption = index(proto, 'WPA') >= 0 ? 'psk-mixed' : 'psk2';
+		} else if (index(proto, 'WPA') >= 0) {
+			encryption = 'psk';
+		} else {
+			return null;
+		}
+		encryption += '+' + cipher;
+	}
+	return { ssid: cred.ssid, encryption, key: encryption == 'none' ? null : cred.key,
+		ieee80211w: sprintf('%d', cred.ieee80211w), sae_password: null };
+}
+
+function enrollment_persist(ifname, iface)
+{
+	let entry = wpas.data.enrollment[ifname];
+	if (!entry)
+		return;
+	if (entry.expiry.remaining() <= 0) {
+		enrollment_forget(ifname, entry.publication_unconfirmed ? 'unconfirmed' : 'expired');
+		return;
+	}
+	let binding = enrollment_owner(ifname, iface);
+	let status = iface.status();
+	if (!binding?.persistent || entry.iface != iface || entry.owner != binding.owner ||
+	    entry.generation != binding.phy.generation || status.wps_run != entry.run) {
+		enrollment_forget(ifname, entry.publication_unconfirmed ? 'unconfirmed' : 'cancelled');
+		return;
+	}
+	if (status.state != 'COMPLETED' || !status.wps_success || !status.wps_selected ||
+	    status.network_wps_run != entry.run)
+		return;
+	let cred = entry.candidates[sprintf('%d', status.network_id)];
+	if (!cred)
+		return;
+	let values = enrollment_values(cred, status);
+	if (!values) {
+		enrollment_forget(ifname, 'unrepresentable credential');
+		return;
+	}
+	let request = { ...entry.owner.config.uci, values };
+	delete entry.confirmation;
+	let result = ubus.call('uci', 'wireless_enroll', request);
+	let error = ubus.error(true);
+	if (wpas.data.enrollment[ifname] != entry)
+		return;
+	if (result?.status == 'saved' || result?.status == 'conflict') {
+		enrollment_forget(ifname, result.status);
+		return;
+	}
+	if (!result?.status && (error == null || index([
+	    libubus.STATUS_TIMEOUT, libubus.STATUS_CONNECTION_FAILED,
+	    libubus.STATUS_UNKNOWN_ERROR ], error) >= 0)) {
+		// A committed publication can lose its reply before config.change
+		// replaces this owner. Retain only an already-desired confirmation:
+		// its two transaction alternatives must both equal the desired state.
+		let expected = { ...request.expected };
+		for (let name, value in values)
+			if (value === null)
+				delete expected[name];
+			else
+				expected[name] = value;
+		entry.publication_unconfirmed = true;
+		entry.confirmation = { ...request, expected };
+	}
+	// Pending edits/Apply retain their owner. Retry only while this exact
+	// selected connection and configuration incarnation remain eligible.
+	enrollment_result(entry.owner, 'waiting');
+	entry.retry?.cancel();
+	entry.retry = uloop.timer(2000, () => enrollment_persist(ifname, iface));
+}
+
+function enrollment_reconcile(old_if, new_if, generation)
+{
+	if (!old_if)
+		return;
+	let ifname = old_if.config.iface;
+	let entry = wpas.data.enrollment[ifname];
+	let request = entry?.confirmation;
+	if (!request || entry.owner != old_if || entry.generation != generation ||
+	    wpas.interfaces[ifname] != entry.iface ||
+	    old_if.cancelled_wps_run == entry.run || entry.iface.status()?.wps_run != entry.run)
+		return;
+	if (entry.expiry.remaining() <= 0) {
+		enrollment_forget(ifname, 'unconfirmed');
+		return;
+	}
+	if (new_if) {
+		let binding = new_if.config.uci;
+		if (new_if.config.mode != 'sta' || binding?.section != request.section ||
+		    binding?.device != request.device ||
+		    !is_equal(binding.expected, request.expected) ||
+		    !is_equal(binding.expected_device, request.expected_device))
+			return;
+	}
+	// Reconcile the old operation before retiring its resource, including a
+	// stop-first reload. No candidate, writer or new expiry crosses generations.
+	// This request can only re-sync already-published values; runtime equality
+	// is never a durable saved acknowledgment and unsaved disk cannot be changed.
+	entry.retry?.cancel();
+	delete entry.confirmation;
+	let result = ubus.call('uci', 'wireless_enroll', request);
+	if (wpas.data.enrollment[ifname] != entry)
+		return;
+	enrollment_forget(ifname, result?.status == 'saved' ? 'saved' :
+		result?.status == 'conflict' ? 'conflict' : 'unconfirmed');
+}
+
+function enrollment_candidate(ifname, iface, cred)
+{
+	if (!cred.processed || !cred.wps_run || cred.network_id == null)
+		return;
+	let binding = enrollment_owner(ifname, iface);
+	if (!binding?.persistent || binding.owner.cancelled_wps_run == cred.wps_run)
+		return;
+	let entry = wpas.data.enrollment[ifname];
+	if (entry && (entry.iface != iface || entry.owner != binding.owner ||
+	             entry.generation != binding.phy.generation || entry.run != cred.wps_run)) {
+		enrollment_forget(ifname);
+		entry = null;
+	}
+	if (!entry) {
+		entry = wpas.data.enrollment[ifname] = {
+			iface, owner: binding.owner, generation: binding.phy.generation,
+			run: cred.wps_run, candidates: {},
+		};
+		entry.expiry = uloop.timer(120000, () => enrollment_forget(ifname,
+			entry.publication_unconfirmed ? 'unconfirmed' : 'expired'));
+	}
+	enrollment_result(entry.owner, 'connecting');
+	entry.candidates[sprintf('%d', cred.network_id)] = cred;
+}
+
+// Internal radio serialization keeps the native interface, accepted profiles
+// and exact enrollment owner. Netdev down releases the driver's station role.
+function iface_pause(owner)
+{
+	let ifname = owner.config.iface;
+	let iface = wpas.interfaces[ifname];
+	if (!owner.running || !iface)
+		return true;
+	if (owner.paused == iface)
+		return true;
+	owner.paused = iface;
+	if (wdev_set_up(ifname, false)) {
+		delete owner.paused;
+		return false;
+	}
+	return true;
+}
 
 function iface_stop(iface)
 {
@@ -27,9 +266,12 @@ function iface_stop(iface)
 	if (!iface.running)
 		return;
 
+	enrollment_forget(ifname, wpas.data.enrollment[ifname]?.publication_unconfirmed ?
+		'unconfirmed' : 'cancelled');
 	delete wpas.data.iface_phy[ifname];
 	wpas.remove_iface(ifname);
 	wdev_remove(ifname);
+	delete iface.paused;
 	iface.running = false;
 }
 
@@ -57,8 +299,17 @@ function iface_start(phydev, iface)
 {
 	let phy = phydev.name;
 
-	if (iface.running)
-		return;
+	if (iface.running && wpas.interfaces[iface.config.iface]) {
+		if (!iface.paused)
+			return true;
+		let native = wpas.interfaces[iface.config.iface];
+		if (iface.paused != native || native.status().state != 'INTERFACE_DISABLED' ||
+		    wdev_set_up(iface.config.iface, true))
+			return false;
+		delete iface.paused;
+		return true;
+	}
+	iface.running = false;
 
 	let ifname = iface.config.iface;
 	let macaddr = phy_macaddr_get(phydev, ifname, iface.macaddr, {
@@ -66,7 +317,7 @@ function iface_start(phydev, iface)
 		macaddr: iface.config.macaddr,
 	});
 	if (!macaddr)
-		return;
+		return false;
 
 	iface.macaddr = macaddr;
 	let wdev_config = { ...iface.config, macaddr };
@@ -75,19 +326,30 @@ function iface_start(phydev, iface)
 	let ret = phydev.wdev_add(ifname, wdev_config);
 	if (ret) {
 		wpas.printf(`Failed to create device ${ifname}: ${ret}`);
-		return;
+		delete wpas.data.iface_phy[ifname];
+		return false;
 	}
 
 	ret = wdev_set_up(ifname, true);
 	if (ret) {
 		wpas.printf(`Failed to bring up device ${ifname}: ${ret}`);
+		delete wpas.data.iface_phy[ifname];
 		wdev_remove(ifname);
-		return;
+		return false;
 	}
 
 	wpas.data.iface_phy[ifname] = phy;
-	wpas.add_iface(iface.config);
+	if (wpas.add_iface(iface.config) < 0 || !wpas.interfaces[ifname]) {
+		wpas.printf(`Failed to start supplicant interface ${ifname}`);
+		delete wpas.data.iface_phy[ifname];
+		wdev_remove(ifname);
+		return false;
+	}
+	let transition = wpas.data.config[phydev.name]?.transition;
+	if (transition?.phase == 'resuming' && transition.frequency > 0)
+		wpas.interfaces[ifname].config('freq_list', [ transition.frequency ]);
 	iface.running = true;
+	return true;
 }
 
 // a change of these lines needs no new netdev
@@ -146,13 +408,23 @@ function iface_network_apply(ifname, old_data, new_data, freq_list)
 	return true;
 }
 
-function iface_cb(new_if, old_if)
+function iface_cb(new_if, old_if, generation)
 {
+	enrollment_reconcile(old_if, new_if, generation);
+	// A new configuration incarnation retires a paused old resource directly;
+	// never bring the old profile up briefly while applying its replacement.
+	if (old_if?.paused) {
+		iface_stop(old_if);
+		if (new_if)
+			new_if.macaddr = old_if.macaddr;
+		return;
+	}
 	if (old_if && new_if)
 		new_if.macaddr = old_if.macaddr;
 
 	if (old_if && new_if && is_equal(old_if.config, new_if.config)) {
 		new_if.running = old_if.running;
+		new_if.macaddr = old_if.macaddr;
 		return;
 	}
 
@@ -194,7 +466,7 @@ function phy_dev_open(phy_name)
 function start_pending(phy_name)
 {
 	let phy = wpas.data.config[phy_name];
-	if (!phy || !phy.data)
+	if (!phy || !phy.data || phy.transition?.phase == 'paused')
 		return;
 
 	let phydev = phy_dev_open(phy_name);
@@ -503,7 +775,84 @@ function mld_bss_allowed(data, bss) {
 	return index(data.freq_list, bss.freq) >= 0;
 }
 
-function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_base, config_list)
+function phy_transition_finish(phy, resume, force)
+{
+	let transition = phy.transition;
+	if (!transition)
+		return true;
+	resume ??= true;
+	transition.request?.reply(null, libubus.STATUS_UNKNOWN_ERROR);
+	delete transition.request;
+	if (resume && !force) {
+		for (let ifname in transition.freq_list) {
+			let iface = wpas.interfaces[ifname];
+			if (iface && phy.data[ifname]?.paused == iface &&
+			    iface.status().state != 'INTERFACE_DISABLED') {
+				// A queued DOWN notification is ignored if the netdev is
+				// already UP. Keep the existing lease until DOWN is observed.
+				transition.finishing = true;
+				return true;
+			}
+		}
+	}
+	transition.lease?.cancel();
+	delete phy.transition;
+	let success = true;
+	for (let ifname, freqs in transition.freq_list) {
+		let iface = wpas.interfaces[ifname];
+		if (!iface)
+			continue;
+		iface.config('freq_list', freqs);
+		let owner = phy.data[ifname];
+		if (!resume || owner?.paused != iface)
+			continue;
+		if (wdev_set_up(ifname, true)) {
+			wpas.printf(`Failed to resume station ${ifname}`);
+			success = false;
+		} else {
+			delete owner.paused;
+		}
+	}
+	return success;
+}
+
+function phy_transition_ready(phy)
+{
+	let transition = phy.transition;
+	if (!transition || transition.phase != 'paused')
+		return;
+	if (transition.finishing) {
+		phy_transition_finish(phy);
+		return;
+	}
+	if (!transition.request)
+		return;
+	for (let ifname in transition.freq_list) {
+		let iface = wpas.interfaces[ifname];
+		if (phy.data[ifname]?.paused &&
+		    (phy.data[ifname].paused != iface ||
+		     iface.status().state != 'INTERFACE_DISABLED'))
+			return;
+	}
+	transition.request.reply({ generation: phy.generation, token: transition.token });
+	delete transition.request;
+}
+
+function phy_transition_lease(name, phy, milliseconds)
+{
+	let transition = phy.transition;
+	if (transition.lease)
+		transition.lease.cancel();
+	transition.lease = uloop.timer(milliseconds, () => {
+		if (phy.transition != transition)
+			return;
+		wpas.printf(`AP/STA transition on ${name} expired; restoring station operation`);
+		phy_transition_finish(phy, true, true);
+		start_pending(name);
+	});
+}
+
+function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_base, config_list, ap_phy)
 {
 	let phy = wpas.data.config[config_name];
 
@@ -517,6 +866,10 @@ function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_ba
 	}
 
 	phy.radio = radio;
+	phy_transition_finish(phy, false);
+	let previous_generation = phy.generation;
+	phy.generation = ++wpas.data.config_generation;
+	phy.ap_phy = ap_phy;
 	phy.num_global_macaddr = num_global_macaddr;
 	phy.macaddr_base = macaddr_base;
 
@@ -529,7 +882,7 @@ function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_ba
 			push(values, [ config.iface, prepare_config(config) ]);
 
 	mld_update_phy(phy, mlo_ifaces);
-	phy.update(values);
+	phy.update(values, previous_generation);
 
 	macaddr_sync_defer(ubus, "wpa_supplicant", config_name, macaddr_keep(keys(phy.data)));
 }
@@ -717,6 +1070,101 @@ function dpp_rx_via_channel(ifname, method, data, no_reply)
 }
 
 let main_obj = {
+	phy_transition: {
+		args: { phy: '', owner: '', token: '', replaces: '', action: '', frequency: 0, lease_ms: 0 },
+		call: function(req) {
+			let phy = wpas.data.config[req.args.phy];
+			if (!phy || !req.args.token || phy.ap_phy != req.args.owner)
+				return libubus.STATUS_NOT_FOUND;
+			let transition = phy.transition;
+			if (req.args.action == 'pause') {
+				if (transition && transition.token != req.args.token &&
+				    transition.token != req.args.replaces)
+					return libubus.STATUS_PERMISSION_DENIED;
+				if (transition?.token == req.args.token) {
+					if (transition.request || transition.finishing)
+						return libubus.STATUS_PERMISSION_DENIED;
+					return { generation: phy.generation, token: transition.token };
+				}
+				let previous_freqs = transition?.freq_list;
+				// Transfer only the same native paused resources, without UP.
+				phy_transition_finish(phy, false);
+				transition = phy.transition = {
+					token: req.args.token, owner: req.args.owner,
+					generation: phy.generation, phase: 'paused', freq_list: {},
+				};
+				phy_transition_lease(req.args.phy, phy, 30000);
+				for (let ifname, entry in phy.data) {
+					let iface = wpas.interfaces[ifname];
+					let previous = previous_freqs && index(keys(previous_freqs), ifname) >= 0;
+					transition.freq_list[ifname] = previous ? previous_freqs[ifname] :
+						(iface ? iface.config('freq_list') : null);
+					if (!iface_pause(entry)) {
+						phy_transition_finish(phy);
+						start_pending(req.args.phy);
+						return libubus.STATUS_UNKNOWN_ERROR;
+					}
+				}
+				req.defer();
+				transition.request = req;
+				phy_transition_ready(phy);
+				return;
+			}
+			if (!transition && req.args.action == 'cancel') {
+				// A previous UP failure retains its exact native owner. The
+				// ordinary start path can restore that resource without re-add.
+				for (let ifname, entry in phy.data)
+					if (entry.paused) {
+						start_pending(req.args.phy);
+						break;
+					}
+				for (let ifname, entry in phy.data)
+					if (entry.paused)
+						return libubus.STATUS_UNKNOWN_ERROR;
+				return 0;
+			}
+			if (!transition || transition.token != req.args.token ||
+			    transition.generation != phy.generation)
+				return libubus.STATUS_NOT_FOUND;
+			if (req.args.action == 'cancel') {
+				let restored = phy_transition_finish(phy);
+				start_pending(req.args.phy);
+				return restored ? 0 : libubus.STATUS_UNKNOWN_ERROR;
+			}
+			if (req.args.action == 'renew') {
+				if (req.args.lease_ms <= 0)
+					return libubus.STATUS_INVALID_ARGUMENT;
+				phy_transition_lease(req.args.phy, phy, req.args.lease_ms);
+				return 0;
+			}
+			if (req.args.action != 'resume' || req.args.frequency < 0)
+				return libubus.STATUS_INVALID_ARGUMENT;
+			if (transition.request || transition.finishing)
+				return libubus.STATUS_PERMISSION_DENIED;
+			transition.phase = 'resuming';
+			transition.frequency = req.args.frequency;
+			if (!transition.frequency) {
+				if (!phy_transition_finish(phy))
+					return libubus.STATUS_UNKNOWN_ERROR;
+			} else {
+				phy_transition_lease(req.args.phy, phy, 35000);
+				for (let ifname, entry in phy.data) {
+					let iface = wpas.interfaces[ifname];
+					if (!iface || entry.paused != iface)
+						continue;
+					if (!iface.config('freq_list', [ transition.frequency ]) ||
+					    wdev_set_up(ifname, true))
+						return libubus.STATUS_UNKNOWN_ERROR;
+					delete entry.paused;
+				}
+			}
+			start_pending(req.args.phy);
+			for (let ifname in phy.data)
+				if (!wpas.interfaces[ifname])
+					return libubus.STATUS_UNKNOWN_ERROR;
+			return 0;
+		}
+	},
 	phy_set_state: {
 		args: {
 			phy: "",
@@ -731,6 +1179,8 @@ let main_obj = {
 			let phy = wpas.data.config[name];
 			if (!phy)
 				return libubus.STATUS_NOT_FOUND;
+			if (phy.transition)
+				return libubus.STATUS_PERMISSION_DENIED;
 
 			let radio_mask = phy.radio != null ? (1 << phy.radio) : 0;
 			if (req.args.stop) {
@@ -867,6 +1317,7 @@ let main_obj = {
 			radio: 0,
 			num_global_macaddr: 0,
 			macaddr_base: "",
+			ap_phy: '',
 			config: [],
 			defer: true,
 		},
@@ -877,10 +1328,16 @@ let main_obj = {
 
 			wpas.printf(`Set new config for phy ${phy}`);
 			if (req.args.config)
-				set_config(phy, req.args.phy, req.args.radio, req.args.num_global_macaddr, req.args.macaddr_base, req.args.config);
+				set_config(phy, req.args.phy, req.args.radio, req.args.num_global_macaddr, req.args.macaddr_base, req.args.config, req.args.ap_phy);
 
-			if (!req.args.defer)
-				uloop.timer(100, () => start_pending(phy));
+			if (!req.args.defer) {
+				let owner = wpas.data.config[phy];
+				let generation = owner?.generation;
+				uloop.timer(100, () => {
+					if (wpas.data.config[phy] == owner && owner?.generation == generation)
+						start_pending(phy);
+				});
+			}
 
 			return {
 				pid: wpas.getpid()
@@ -1020,6 +1477,23 @@ let main_obj = {
 
 wpas.data.ubus = ubus;
 wpas.data.obj = ubus.publish("wpa_supplicant", main_obj);
+
+wpas.data.hostapd_watch = ubus.subscriber(() => 0, () => {
+	// A vanished AP owner cannot retain a station pause or frequency pin.
+	let lost = [];
+	for (let name, phy in wpas.data.config)
+		if (phy.transition)
+			push(lost, { name, phy, transition: phy.transition });
+	uloop.timer(0, () => {
+		for (let entry in lost) {
+			if (entry.phy.transition != entry.transition)
+				continue;
+			phy_transition_finish(entry.phy);
+			start_pending(entry.name);
+		}
+	});
+}, [ 'hostapd' ]);
+wpas.data.hostapd_watch.subscribe('hostapd');
 wpas.udebug_set("wpa_supplicant", wpas.data.ubus);
 
 function iface_event(type, name, data) {
@@ -1038,7 +1512,7 @@ function iface_hostapd_notify(ifname, iface, state)
 {
 	let status = iface.status();
 	let ubus = wpas.data.ubus;
-	let msg = {};
+	let msg = { station_state: state };
 
 	let mld = wpas.data.mld[ifname];
 	switch (state) {
@@ -1056,6 +1530,8 @@ function iface_hostapd_notify(ifname, iface, state)
 		if (!mld) {
 			msg.frequency = status.frequency;
 			msg.sec_chan_offset = status.sec_chan_offset;
+			if (status.chandef)
+				msg.chandef = status.chandef;
 		}
 		break;
 	default:
@@ -1068,7 +1544,15 @@ function iface_hostapd_notify(ifname, iface, state)
 			wpas.printf(`no PHY for ifname ${ifname}`);
 			return;
 		}
+		let phy = wpas.data.config[msg.phy];
+		msg.phy = phy?.ap_phy ?? msg.phy;
+		let transition = phy?.transition;
+		if (transition)
+			msg.transition_token = transition.token;
 		ubus.call("hostapd", "apsta_state", msg);
+		if (state == 'COMPLETED' && transition && phy.transition == transition &&
+		    transition.phase == 'resuming')
+			phy_transition_finish(phy);
 		return;
 	}
 
@@ -1109,6 +1593,8 @@ function iface_channel_switch(ifname, iface, info)
 		frequency: info.frequency,
 		sec_chan_offset: info.sec_chan_offset,
 	};
+	if (info.chandef)
+		msg.chandef = info.chandef;
 
 	let mld = wpas.data.mld[ifname];
 	if (mld) {
@@ -1124,6 +1610,10 @@ function iface_channel_switch(ifname, iface, info)
 			wpas.printf(`no PHY for ifname ${ifname}`);
 			return;
 		}
+		let phy = wpas.data.config[msg.phy];
+		msg.phy = phy?.ap_phy ?? msg.phy;
+		if (phy?.transition)
+			msg.transition_token = phy.transition.token;
 	}
 
 	ubus.call("hostapd", "apsta_state", msg);
@@ -1176,26 +1666,78 @@ function iface_ubus_add(ifname)
 		},
 		wps_start: {
 			args: {
-				multi_ap: true
+				multi_ap: true,
+				section: '',
+				// uHTTPd supplies the authenticated transport session. Its ACL
+				// check owns authorization; this method owns section identity.
+				ubus_rpc_session: '',
 			},
 			call: (req) => {
 				let iface = wpas.interfaces[ifname];
 				if (!iface)
 					return libubus.STATUS_NOT_FOUND;
 
-				iface.ctrl(`WPS_PBC multi_ap=${+req.args.multi_ap}`);
-				return 0;
+				let binding = enrollment_owner(ifname, iface);
+				if (req.args.section != null && req.args.section != binding?.owner.config.uci.section)
+					return libubus.STATUS_NOT_FOUND;
+				if (req.args.section != null && !binding?.persistent)
+					return libubus.STATUS_NOT_SUPPORTED;
+				enrollment_forget(ifname);
+				let multi_ap = req.args.multi_ap ?? binding?.owner.config.wps_multi_ap ?? false;
+				let result = iface.ctrl(`WPS_PBC multi_ap=${+multi_ap}`);
+				if (binding && result && match(result, /^OK\n?$/))
+					enrollment_result(binding.owner, 'active');
+				return result && match(result, /^OK\n?$/) ? 0 : libubus.STATUS_INVALID_ARGUMENT;
+			},
+		},
+		wps_status: {
+			args: { section: '', ubus_rpc_session: '' },
+			call: (req) => {
+				let iface = wpas.interfaces[ifname];
+				if (!iface)
+					return libubus.STATUS_NOT_FOUND;
+				let binding = enrollment_owner(ifname, iface);
+				if (req.args.section != null && req.args.section != binding?.owner.config.uci.section)
+					return libubus.STATUS_NOT_FOUND;
+				let result = wpas.data.enrollment_results[binding?.owner.config.uci.section];
+				if (result?.device != binding?.owner.config.uci.device)
+					result = null;
+				return { state: iface.status().state,
+					phase: result?.phase ?? 'idle',
+					persistent: !!binding?.persistent };
 			},
 		},
 		wps_cancel: {
-			args: {},
+			args: { section: '', ubus_rpc_session: '' },
 			call: (req) => {
 				let iface = wpas.interfaces[ifname];
 				if (!iface)
 					return libubus.STATUS_NOT_FOUND;
 
-				iface.ctrl("WPS_CANCEL");
-				return 0;
+				let binding = enrollment_owner(ifname, iface);
+				if (req.args.section != null && req.args.section != binding?.owner.config.uci.section)
+					return libubus.STATUS_NOT_FOUND;
+				let state = iface.status();
+				// Persistence reloads the saved profile into a new native network,
+				// so its WPS run tags no longer identify the established connection.
+				// Cancel may withdraw a selected candidate waiting to be saved, but
+				// must not disconnect any completed non-WPS profile or replace a
+				// terminal saved result on a late/repeated request.
+				if (state.state == 'COMPLETED' && state.wps_selected) {
+					if (wpas.data.enrollment[ifname]) {
+						if (binding)
+							binding.owner.cancelled_wps_run = state.wps_run;
+						enrollment_forget(ifname, 'cancelled');
+					}
+					return 0;
+				}
+				enrollment_forget(ifname);
+				if (binding) {
+					binding.owner.cancelled_wps_run = state.wps_run;
+					enrollment_result(binding.owner, 'cancelled');
+				}
+				let result = iface.ctrl("WPS_CANCEL");
+				return result && match(result, /^OK\n?$/) ? 0 : libubus.STATUS_INVALID_ARGUMENT;
 			},
 		},
 		control: {
@@ -1223,6 +1765,13 @@ return {
 		wpas.data.ubus.disconnect();
 	},
 	bss_allowed: function(ifname, bss) {
+		let phy = wpas.data.config[wpas.data.iface_phy[ifname]];
+		let transition = phy?.transition;
+		if (transition?.phase == 'paused')
+			return false;
+		if (transition?.phase == 'resuming' && transition.frequency > 0 &&
+		    bss.freq != transition.frequency)
+			return false;
 		let mld = wpas.data.mld[ifname];
 		if (!mld)
 			return true;
@@ -1234,12 +1783,24 @@ return {
 		iface_event("add", name);
 	},
 	iface_remove: function(name, obj) {
+		enrollment_forget(name, wpas.data.enrollment[name]?.publication_unconfirmed ?
+			'unconfirmed' : 'cancelled');
 		iface_event("remove", name);
 		iface_ubus_remove(name);
 		delete wpas.data.dpp_hooks[name];
 	},
 	ctrl_event: function(name, iface, ev) {
 		iface_ubus_notify(name, ev);
+		if (match(ev, /^WPS-(CANCEL|FAIL|TIMEOUT|OVERLAP-DETECTED)/)) {
+			let binding = enrollment_owner(name, iface);
+			if (binding) {
+				binding.owner.cancelled_wps_run = iface.status().wps_run;
+				let result = wpas.data.enrollment_results[binding.owner.config.uci.section];
+				if (wpas.data.enrollment[name] || result?.phase in [ 'active', 'connecting', 'waiting' ])
+					enrollment_result(binding.owner, 'cancelled');
+			}
+			enrollment_forget(name, 'cancelled');
+		}
 
 		// The set of links of an associated MLD can change without a state
 		// transition, which would leave the AP side following a link that no
@@ -1258,6 +1819,10 @@ return {
 		event_data.name = ifname;
 		iface_event("state", ifname, event_data);
 		try {
+			let transition_phy = wpas.data.config[wpas.data.iface_phy[ifname]];
+			if (state == 'INTERFACE_DISABLED' && transition_phy)
+				phy_transition_ready(transition_phy);
+			enrollment_persist(ifname, iface);
 			iface_hostapd_notify(ifname, iface, state);
 
 			if (state != "COMPLETED")
@@ -1289,6 +1854,7 @@ return {
 			iface_channel_switch(ifname, iface, info);
 	},
 	wps_credentials: function(ifname, iface, cred) {
+		enrollment_candidate(ifname, iface, cred);
 		cred.ifname = ifname;
 		ubus.event("wps_credentials", cred);
 	},
