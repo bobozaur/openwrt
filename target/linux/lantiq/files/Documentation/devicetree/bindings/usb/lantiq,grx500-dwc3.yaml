@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/usb/lantiq,grx500-dwc3.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Lantiq GRX500 DWC3 integration
+
+maintainers:
+  - OpenWrt Development List <openwrt-devel@lists.openwrt.org>
+
+description: |
+  The wrapper sequences the clock, reset, PHY and VBUS before populating its
+  DWC3 child. Parent and child describe the same register aperture; only the
+  child owns the live core resource. The wrapper accesses it during startup
+  before registering the child and removes the child before powering down.
+
+properties:
+  compatible:
+    const: lantiq,grx500-dwc3
+  reg:
+    maxItems: 1
+  reg-names:
+    const: core
+  clocks:
+    maxItems: 1
+  resets:
+    maxItems: 1
+  vbus-gpios:
+    description: External VBUS power switch
+    maxItems: 1
+  lantiq,port:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    enum: [0, 1]
+    description: SoC USB controller index
+  lantiq,rcu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Reset and endian configuration syscon
+  '#address-cells':
+    const: 1
+  '#size-cells':
+    const: 1
+  ranges: true
+  dma-ranges:
+    maxItems: 1
+
+patternProperties:
+  '^usb@[0-9a-f]+$':
+    $ref: snps,dwc3.yaml#
+    unevaluatedProperties: false
+
+required:
+  - compatible
+  - reg
+  - reg-names
+  - clocks
+  - resets
+  - vbus-gpios
+  - lantiq,port
+  - lantiq,rcu
+  - '#address-cells'
+  - '#size-cells'
+  - ranges
+  - dma-ranges
+
+additionalProperties: false
