@@ -3,6 +3,7 @@ import * as ubus from "ubus";
 import * as uloop from "uloop";
 import { is_equal } from "./utils.uc";
 import { access, lsdir } from "fs";
+import { find_phy } from "wifi.utils";
 
 const wds_sta_re = /^(.+)\.sta[0-9]+$/;
 
@@ -430,10 +431,33 @@ function start()
 
 function retry_setup()
 {
-	if (this.delete)
+	if (this.delete || !this.autostart)
 		return;
 
-	if (this.state != "down" || !this.autostart)
+	if (this.state == "up") {
+		let config = this.data.config;
+		let previous = this.handler_data[this.name]?.phy;
+
+		if (config.disabled || config.type != "mac80211" || !previous ||
+		    access("/sys/class/ieee80211/" + previous))
+			return;
+
+		let current = find_phy(config, true);
+		if (!current || !access("/sys/class/ieee80211/" + current))
+			return;
+
+		/*
+		 * PHY removal withdraws netdev links without necessarily changing
+		 * our setup state. Keep the old handler data for teardown so its
+		 * hostapd/supplicant owners retire before setup uses the new PHY.
+		 */
+		this.dbg("retry after PHY " + previous + " was replaced by " + current);
+		wdev_reset(this);
+		this.teardown();
+		return;
+	}
+
+	if (this.state != "down")
 		return;
 
 	this.start();

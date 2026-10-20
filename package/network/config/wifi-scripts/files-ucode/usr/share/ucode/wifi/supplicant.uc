@@ -371,24 +371,30 @@ export function generate(config_list, data, interface) {
 export function setup(config, data) {
 	if (!global.ubus.list('wpa_supplicant'))
 		system('ubus wait_for wpa_supplicant');
-	let ret = global.ubus.call('wpa_supplicant', 'config_set', {
+	let request = {
 		phy: data.phy,
 		radio: data.config.radio,
 		config,
 		defer: true,
 		num_global_macaddr: data.config.num_global_macaddr,
 		macaddr_base: data.config.macaddr_base ?? "",
-	});
+	};
+	let ret = global.ubus.call('wpa_supplicant', 'config_set', request);
 
-	if (ret)
-		netifd.add_process('/usr/sbin/wpa_supplicant', ret.pid, true, true);
+	if (ret) {
+		// Empty configuration retires an old STA owner; it does not make
+		// an AP-only radio depend on the shared supplicant process.
+		if (length(config))
+			netifd.add_process('/usr/sbin/wpa_supplicant', ret.pid, true, true);
+	}
 	else
 		netifd.setup_failed('SUPPLICANT_START_FAILED');
+	return !!ret;
 };
 
 
 export function start(data) {
-	global.ubus.call('wpa_supplicant', 'config_set', {
+	return !!global.ubus.call('wpa_supplicant', 'config_set', {
 		phy: data.phy,
 		radio: data.config.radio,
 		num_global_macaddr: data.config.num_global_macaddr,
