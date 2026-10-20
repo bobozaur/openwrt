@@ -6,7 +6,7 @@
 #include <linux/ethtool.h>
 
 struct grx500_flow;
-#define GRX500_FLOW_STATS_COUNT 17
+#define GRX500_FLOW_STATS_COUNT 29
 extern const char grx500_flow_stats_names[GRX500_FLOW_STATS_COUNT][ETH_GSTRING_LEN];
 
 struct grx500_flow *grx500_flow_create(struct device *dev, void __iomem *gsw,
