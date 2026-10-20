@@ -348,6 +348,8 @@ export function generate(config_list, data, interface) {
 
 	let config = {
 		mode: interface.config.mode,
+		uci: interface.uci,
+		wps_multi_ap: !!interface.config.multi_ap_backhaul_sta,
 		ctrl: interface.config.ctrl_interface,
 		iface: interface.config.ifname,
 		config: file_name,
