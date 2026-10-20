@@ -1,17 +1,23 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 
-set -eu
+set -e
 
 usage() {
-	cat <<'EOF'
+	cat <<'HELP'
 Usage: wave600-firmware-import [STOCK.zip|STOCK.bin]
+       wave600-firmware-import --migrate
 
 Import the original Archer AX50 V1 1.1.2 Build 20251022 radio firmware.
 Without a file argument, download the pinned official release over HTTPS.
-Imported files are preserved by normal sysupgrade backups. Reboot afterwards
-to initialize the radios. A factory reset requires importing the files again.
-EOF
+A complete installed cohort is reused without downloading or writing it again.
+The dedicated firmware volume survives sysupgrade and factory reset. Reboot
+following the first import to initialize the radios.
+
+--migrate moves an already imported, verified cohort into the firmware volume
+without downloading anything. Package installation and early boot do this
+migration automatically. User settings are never copied to the volume.
+HELP
 }
 
 case "${1:-}" in
@@ -20,50 +26,178 @@ esac
 [ "$#" -le 1 ] || { usage >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo 'Run as root to install firmware.' >&2; exit 1; }
 
+. /lib/functions/system.sh
+. /lib/upgrade/nand.sh
+[ "$(board_name)" = tplink,archer-ax50-v1 ] || {
+	echo 'This importer requires an Archer AX50 V1.' >&2
+	exit 1
+}
+
 manifest=/usr/share/wave600-firmware-importer/SHA256SUMS
+store=/mnt/wave600_firmware
+volume_name=wave600_firmware
 url='https://static.tp-link.com/upload/firmware/2025/202511/20251121/Archer%20AX50_V1_251022.zip'
 archive_hash=755156fc9897092189f551107fd05adff92439cd8039837b559d0002e8cf918f
 image_hash=cf887d15c65108ed6bfcd9bd26d5dcde93dc2a6544cf6795260ff57d60f07119
-
-work=$(mktemp -d /tmp/wave600-import.XXXXXX)
+work=
 stage=
+
+# S09 runs before S10boot creates /var/lock. flock releases ownership on exit
+# or power loss, including interrupted first imports.
+exec 9>/tmp/wave600-firmware.lock
+flock -x 9
+ubidev=$(nand_find_ubi system_sw)
+[ -n "$ubidev" ] || { echo 'Cannot find the system_sw UBI device.' >&2; exit 1; }
+volume=$(nand_find_volume "$ubidev" "$volume_name")
+
+check_cohort() {
+	local hash file
+	[ -d "$1" ] && [ ! -L "$1" ] || return 1
+	while read -r hash file; do
+		[ -f "$1/$file" ] && [ ! -L "$1/$file" ] || return 1
+	done < "$manifest"
+	(cd "$1" && sha256sum -c "$manifest") >/dev/null 2>&1
+}
+
+mounted_store() {
+	awk -v dir="$store" -v name="$ubidev:$volume_name" -v dev="/dev/$volume" '
+		$2 == dir {count++; if (($1 == name || $1 == dev) && $3 == "ubifs") matched++}
+		END {exit count == 1 && matched == 1 ? 0 : 1}' /proc/mounts
+}
+
+mount_store() {
+	local mode="$1"
+	if [ "$mode" = rw ]; then
+		[ "$(cat "/sys/class/ubi/$volume/type")" = dynamic ] &&
+		[ "$(cat "/sys/class/ubi/$volume/reserved_ebs")" = 32 ] &&
+		[ "$(cat "/sys/class/ubi/$volume/usable_eb_size")" = 126976 ] || return 1
+	fi
+	mkdir -p "$store" || return 1
+	if mounted_store; then
+		awk -v dir="$store" -v mode="$mode" '$2 == dir && $4 ~ "(^|,)" mode "(,|$)" {found=1}
+			END {exit found ? 0 : 1}' /proc/mounts && return 0
+		mount -o "remount,$mode" "$store"
+	else
+		# Refuse an unrelated mount at the package-owned mountpoint.
+		awk -v dir="$store" '$2 == dir {found=1} END {exit found ? 1 : 0}' /proc/mounts || return 1
+		mount -t ubifs -o "$mode,nosuid,nodev,noexec" "$ubidev:$volume_name" "$store"
+	fi
+}
+
 cleanup() {
-	rm -rf "$work"
-	[ -z "$stage" ] || rm -rf "$stage"
+	local result="$?" failed=0
+	trap - EXIT HUP INT TERM
+	set +e
+	[ -z "$work" ] || rm -rf "$work" || failed=1
+	[ -z "$stage" ] || rm -rf "$stage" || failed=1
+	if mounted_store && awk -v dir="$store" '$2 == dir && $4 ~ /(^|,)rw(,|$)/ {found=1}
+		END {exit found ? 0 : 1}' /proc/mounts; then
+		sync || failed=1
+		mount -o remount,ro "$store" || failed=1
+	fi
+	[ "$result" != 0 ] || result="$failed"
+	exit "$result"
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-if [ "$#" -eq 0 ]; then
-	input=$work/stock.zip
-	uclient-fetch -O "$input" "$url"
-else
-	input=$1
+remove_legacy_files() {
+	local hash file actual
+	# The persistent cohort was checked first. Delete only matching regular
+	# files; the baked updates/ links take precedence in the firmware loader.
+	while read -r hash file; do
+		[ -f "/lib/firmware/$file" ] && [ ! -L "/lib/firmware/$file" ] || continue
+		actual=$(sha256sum < "/lib/firmware/$file")
+		[ "${actual%% *}" != "$hash" ] || rm -f "/lib/firmware/$file"
+	done < "$manifest"
+}
+
+if [ -n "$volume" ]; then
+	# An interrupted creation may leave an empty volume which UBIFS can only
+	# initialize on the later writable mount. Never recreate or erase it.
+	if mount_store ro; then
+		if check_cohort "$store/firmware"; then
+			remove_legacy_files
+			echo 'WAVE600 firmware is already installed in the reset-preserved volume.'
+			exit 0
+		fi
+		[ ! -e "$store/firmware" ] || {
+			# Do not leave rejected bytes reachable through the firmware
+			# loader's updates/ links. A busy mount can be detached without
+			# erasing its data; existing readers must close their own files.
+			umount "$store" || umount -l "$store" || {
+				echo 'Cannot withdraw rejected WAVE600 firmware; release users of the store and unmount it before loading radios.' >&2
+				exit 1
+			}
+			echo 'The published WAVE600 firmware cohort failed verification; store unmounted.' >&2
+			exit 1
+		}
+	fi
 fi
 
-# Identify the supported input once before handing it to either extractor.
-hash=$(sha256sum < "$input")
-case "${hash%% *}" in
-	"$archive_hash")
-		image=$work/stock.bin
-		unzip -p "$input" '*.bin' > "$image"
-		;;
-	"$image_hash") image=$input ;;
-	*) echo 'Input is not the supported Archer AX50 V1 1.1.2 Build 20251022 release.' >&2; exit 1 ;;
-esac
+if [ "${1:-}" = --migrate ]; then
+	# Restored firmware from old sysupgrade backups is still regular files in
+	# /lib/firmware. Never create a volume or fetch data without a valid cohort.
+	check_cohort /lib/firmware || exit 0
+	legacy=1
+else
+	legacy=0
+	work=$(mktemp -d /tmp/wave600-import.XXXXXX)
+	if [ "$#" -eq 0 ]; then
+		input=$work/stock.zip
+		uclient-fetch -O "$input" "$url"
+	else
+		input=$1
+	fi
 
-mkdir -p /lib/firmware
-stage=$(mktemp -d /lib/firmware/.wave600-import.XXXXXX)
+	# Identify the supported input once before handing it to either extractor.
+	hash=$(sha256sum < "$input")
+	case "${hash%% *}" in
+		"$archive_hash")
+			image=$work/stock.bin
+			unzip -p "$input" '*.bin' > "$image"
+			;;
+		"$image_hash") image=$input ;;
+		*) echo 'Input is not the supported Archer AX50 V1 1.1.2 Build 20251022 release.' >&2; exit 1 ;;
+	esac
+fi
+
+if [ -z "$volume" ]; then
+	# Allocate only this named volume from free space; existing volumes and
+	# their IDs, including the fallback and calibration, are never changed.
+	[ "$(cat "/sys/class/ubi/$ubidev/avail_eraseblocks")" -ge 32 ] || {
+		echo 'The firmware store requires 32 free UBI eraseblocks.' >&2
+		exit 1
+	}
+	ubimkvol "/dev/$ubidev" -N "$volume_name" -t dynamic -s 4063232
+	volume=$(nand_find_volume "$ubidev" "$volume_name")
+	[ -n "$volume" ]
+fi
+mount_store rw
+[ ! -e "$store/firmware" ] || {
+	echo 'Refusing to replace a published WAVE600 firmware cohort.' >&2
+	exit 1
+}
+# One fixed cohort fits the volume. Reclaim only unpublished staging left by
+# an interrupted invocation before copying another complete cohort.
+stage=$store/.staging
+rm -rf "$stage"
+mkdir "$stage"
 while read -r _hash file; do
-	unsquashfs -cat -processors 1 -mem 8M -o 286889 "$image" "lib/firmware/$file" > "$stage/$file"
+	if [ "$legacy" = 1 ]; then
+		cp "/lib/firmware/$file" "$stage/$file"
+	else
+		unsquashfs -cat -processors 1 -mem 8M -o 286889 "$image" "lib/firmware/$file" > "$stage/$file"
+	fi
 done < "$manifest"
-(cd "$stage" && sha256sum -c "$manifest")
+check_cohort "$stage"
 chmod 0644 "$stage"/*.bin
+# Persist file contents before the atomic directory publication. Readers use
+# only firmware/, so an interrupted staging copy never exposes a partial set.
+sync
+mv "$stage" "$store/firmware"
+stage=
+sync
+remove_legacy_files
 
-# Stage on the destination filesystem so readers only see complete files.
-# Every accepted input supplies the same pinned cohort.
-while read -r _hash file; do
-	mv -f "$stage/$file" "/lib/firmware/$file"
-done < "$manifest"
-
-echo 'WAVE600 firmware imported. Reboot to initialize the radios.'
+echo 'WAVE600 firmware imported into the reset-preserved volume. Reboot to initialize the radios.'
