@@ -20,8 +20,8 @@ include $(INCLUDE_DIR)/package.mk
 define Package/wifi-scripts
   SECTION:=utils
   CATEGORY:=Base system
-  DEPENDS:=+netifd +ucode +ucode-mod-nl80211 +ucode-mod-rtnl +ucode-mod-ubus +ucode-mod-uci +ucode-mod-digest
-  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)
+  DEPENDS:=+netifd +ucode +ucode-mod-nl80211 +ucode-mod-rtnl +ucode-mod-ubus +ucode-mod-uci +ucode-mod-digest +WIFI_SCRIPTS_UCODE:hostapd-common
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)$(if $(CONFIG_WIFI_SCRIPTS_UCODE),$(comma) hostapd-common (>=2026.08.07~831364bf-r7))
   TITLE:=Wi-Fi configuration scripts
   PKGARCH:=all
 endef
