@@ -1,0 +1,29 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] clk: add GRX500 CGU build support
+
+Register the GRX500 clock gates and shared PCIe PLL provider against the
+native-endian CGU syscon.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -168,3 +168,5 @@
+ obj-y					+= xilinx/
+ obj-$(CONFIG_ARCH_ZYNQ)			+= zynq/
+ obj-$(CONFIG_COMMON_CLK_ZYNQMP)         += zynqmp/
++
++obj-$(CONFIG_CLK_GRX500) += clk-grx500.o
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -584,3 +584,8 @@
+ 	  Kunit test for the clk-fractional-divider type.
+ 
+ endif
++
++config CLK_GRX500
++	bool "Lantiq GRX500 clock controller"
++	depends on MACH_GRX500 && COMMON_CLK && OF
++	select MFD_SYSCON
