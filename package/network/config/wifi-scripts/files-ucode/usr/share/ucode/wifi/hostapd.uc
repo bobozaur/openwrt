@@ -630,8 +630,13 @@ export function setup(data) {
 		system('ubus wait_for hostapd');
 	let ret = global.ubus.call('hostapd', 'config_set', msg);
 
-	if (ret)
-		netifd.add_process('/usr/sbin/hostapd', ret.pid, true, true);
+	if (ret) {
+		// A cleanup request for an absent AP must not attach a STA-only
+		// radio to the lifecycle of the shared hostapd process.
+		if (has_ap)
+			netifd.add_process('/usr/sbin/hostapd', ret.pid, true, true);
+	}
 	else
 		netifd.setup_failed('HOSTAPD_START_FAILED');
+	return !!ret;
 };
