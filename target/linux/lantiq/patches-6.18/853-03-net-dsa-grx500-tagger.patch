@@ -1,0 +1,27 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] net: dsa: add GRX500 PMAC tagger build support
+
+Register the eight-byte GRX500 PMAC tagger for the GSWIP3 switch.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/net/dsa/Makefile
++++ b/net/dsa/Makefile
+@@ -42,3 +42,5 @@
+ 
+ # for tracing framework to find trace.h
+ CFLAGS_trace.o := -I$(src)
++
++obj-$(CONFIG_NET_DSA_TAG_GRX500) += tag_grx500.o
+--- a/net/dsa/Kconfig
++++ b/net/dsa/Kconfig
+@@ -191,3 +191,7 @@
+ 	  Arrow SpeedChips XRS700x switches that use a single byte tag trailer.
+ 
+ endif
++
++config NET_DSA_TAG_GRX500
++	tristate "Lantiq GRX500 eight-byte PMAC tag"
++	depends on NET_DSA
