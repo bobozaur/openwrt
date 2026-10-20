@@ -30,26 +30,25 @@ ax50_running_bank() {
 ax50_check_volume() {
 	local dir="/sys/class/ubi/ubi0_$1"
 	[ "$(cat "$dir/name")" = "$2" ] &&
-	[ "$(cat "$dir/type")" = dynamic ] || return 1
-	# Fixed geometry is needed only when admitting the recorded OEM layout.
-	[ -z "$3" ] || {
-		[ "$(cat "$dir/reserved_ebs")" = "$3" ] &&
-		[ "$(cat "$dir/usable_eb_size")" = 126976 ]
-	}
-}
-
-ax50_check_ubi() {
-	[ "$(cat /sys/class/ubi/ubi0/mtd_num)" = 5 ] &&
-	[ "$(cat /sys/class/mtd/mtd5/name)" = system_sw ]
+	[ "$(cat "$dir/reserved_ebs")" = "$3" ] &&
+	[ "$(cat "$dir/usable_eb_size")" = 126976 ] &&
+	[ "$(cat "$dir/type")" = dynamic ]
 }
 
 ax50_check_core_layout() {
-	ax50_check_ubi &&
+	[ "$(cat /sys/class/ubi/ubi0/mtd_num)" = 5 ] &&
+	[ "$(cat /sys/class/mtd/mtd5/name)" = system_sw ] &&
 	ax50_check_volume 0 kernelA 25 &&
 	ax50_check_volume 1 rootfsA 215 &&
 	ax50_check_volume 2 kernelB 25 &&
 	ax50_check_volume 3 rootfsB 207 &&
 	ax50_check_volume 4 data_vol 166
+}
+
+ax50_check_layout() {
+	ax50_check_core_layout &&
+	ax50_check_volume 6 ax50_overlayA 128 &&
+	ax50_check_volume 7 ax50_overlayB 128
 }
 
 ax50_check_initial_layout() {
@@ -68,8 +67,8 @@ ax50_check_initial_layout() {
 }
 
 ax50_check_lower_root() {
-	local bank="$1" root dev
-	ax50_check_ubi || return 1
+	local bank root dev
+	bank=$(ax50_running_bank) || return 1
 	case "$bank" in A) root=1 ;; B) root=3 ;; esac
 	[ "$(cat "/sys/class/ubi/ubi0_$root/name")" = "rootfs$bank" ] || return 1
 	dev=$(cat "/sys/class/block/ubiblock0_$root/dev") && [ -n "$dev" ] || return 1
@@ -81,10 +80,10 @@ ax50_check_lower_root() {
 }
 
 ax50_check_running_root() {
-	local bank="$1" overlay
-	ax50_check_lower_root "$bank" || return 1
+	local bank overlay
+	ax50_check_lower_root || return 1
+	bank=$(ax50_running_bank) || return 1
 	case "$bank" in A) overlay=6 ;; B) overlay=7 ;; esac
-	ax50_check_volume "$overlay" "ax50_overlay$bank" || return 1
 	awk -v name="ubi0:ax50_overlay$bank" -v dev="/dev/ubi0_$overlay" '
 		$2 == "/" && $3 == "overlay" && $4 ~ /(^|,)rw(,|$)/ &&
 			$4 ~ /(^|,)upperdir=\/overlay\/upper(,|$)/ {root++}

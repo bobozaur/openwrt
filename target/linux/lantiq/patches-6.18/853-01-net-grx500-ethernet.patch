@@ -1,7 +1,7 @@
 From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 Subject: [PATCH] net: add GRX500 Ethernet build support
 
-Register the shared GRX500 Ethernet DMA owner. The LAN and WAN
+Register the shared GRX500 Ethernet DMA and flow owner. The LAN and WAN
 DMA pairs retain separate NAPI and interrupt owners.
 
 Upstream-Status: Pending
@@ -16,7 +16,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  obj-$(CONFIG_OA_TC6) += oa_tc6.o
 +
 +obj-$(CONFIG_NET_GRX500) += grx500_eth.o
-+grx500_eth-objs := lantiq_grx500.o
++grx500_eth-objs := lantiq_grx500.o lantiq_grx500_flow.o
 --- a/drivers/net/ethernet/Kconfig
 +++ b/drivers/net/ethernet/Kconfig
 @@ -205,3 +205,11 @@

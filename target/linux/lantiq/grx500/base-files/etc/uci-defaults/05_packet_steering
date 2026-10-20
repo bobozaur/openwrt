@@ -1,0 +1,10 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+# Both Ethernet interfaces share a controller. Use both Linux cores for RX.
+uci -q get network.globals.packet_steering >/dev/null || {
+	uci set network.globals.packet_steering=2
+	uci commit network
+}
+
+exit 0

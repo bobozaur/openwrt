@@ -14,7 +14,7 @@ tplink,archer-ax50-v1)
 		ucidef_set_interface_macaddr "wan" "$(macaddr_add "$mac" 1)"
 		ucidef_set_label_macaddr "$mac"
 	else
-		logger -t ax50 'Factory MAC address unavailable'
+		logger -t ax50 'Factory identity unavailable; boot cannot be confirmed'
 	fi
 	;;
 esac
