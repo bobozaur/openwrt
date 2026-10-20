@@ -348,7 +348,7 @@ function iface_auth_type(config, band, eht) {
 	append_vars(config, [
 		'sae_require_mfp', 'sae_password_file', 'sae_pwe', 'sae_groups', 'sae_track_password', 'time_advertisement', 'time_zone',
 		'wpa_group_rekey', 'wpa_ptk_rekey', 'wpa_gmk_rekey', 'wpa_strict_rekey',
-		'macaddr_acl', 'wpa_psk_radius', 'wpa_psk', 'wpa_passphrase', 'wpa_psk_file',
+		'macaddr_acl', 'wpa_psk_radius', 'wpa_psk', 'wpa_passphrase', 'wpa_psk_file', 'wpa_psk_file_static',
 		'eapol_version', 'dynamic_vlan', 'radius_request_cui', 'eap_reauth_period',
 		'radius_das_client', 'radius_das_port', 'owe_groups', 'owe_ptk_workaround', 'own_ip_addr', 'dynamic_own_ip_addr',
 		'wpa_disable_eapol_key_retries', 'auth_algs', 'wpa', 'wpa_pairwise',
@@ -473,13 +473,11 @@ function iface_vlan(interface, config, vlans) {
 	]);
 }
 
-/* hostapd uses only the last wpa_psk_file line, and the hostapd service
- * hashes one file per option, so the user's file is copied */
+/* SAE combines its configured and generated rows in one runtime input.
+ * Static WPA rows use a separate read-only input: the configured primary
+ * PSK file remains the native WPS read/append owner across regeneration.
+ */
 function station_file_write(config, option, path, lines) {
-	// An empty generated PSK file changes WPS to per-device key ownership.
-	if (option == 'wpa_psk_file' && !config[option] && !length(lines))
-		return;
-
 	const user_entries = config[option] ? fs.readfile(config[option]) : null;
 
 	if (config[option] && user_entries == null)
@@ -506,7 +504,8 @@ function iface_wpa_stations(config, stas) {
 			push(lines, (sta.config.vid ? `vlanid=${sta.config.vid} ` : '') + `${mac} ${sta.config.key}`);
 	}
 
-	station_file_write(config, 'wpa_psk_file', `/var/run/hostapd-${config.ifname}.psk`, lines);
+	if (length(lines))
+		station_file_write(config, 'wpa_psk_file_static', `/var/run/hostapd-${config.ifname}.psk-static`, lines);
 }
 
 function iface_sae_stations(config, stas) {
