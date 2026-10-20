@@ -1,0 +1,274 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] odhcpd: retain withdrawn PD identity until its original expiry
+
+Keep a previously bound, withdrawn prefix delegation as revocation authority
+until its original expiry without reserving allocation space or retaining
+routes. Renew/Rebind revoke old client hints without refreshing that state.
+Tentative offers and failed or unencodable replacements cannot consume it;
+a committed replacement or Release supersedes it.
+
+Keep retirement in the existing lease owner and state publication. Omit
+retired allocation fields and route exports, retain the Reconfigure key,
+and preserve ordinary NA allocation and address lifetimes.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/src/dhcpv6-ia.c
++++ b/src/dhcpv6-ia.c
+@@ -289,7 +289,7 @@ struct in6_addr in6_from_prefix_and_iid(
+ static void __apply_lease(struct dhcpv6_lease *a,
+ 		struct odhcpd_ipaddr *addrs, ssize_t addr_len, bool add)
+ {
+-	if (a->flags & OAF_DHCPV6_NA)
++	if (a->retiring || (a->flags & OAF_DHCPV6_NA))
+ 		return;
+ 
+ 	for (ssize_t i = 0; i < addr_len; ++i) {
+@@ -356,7 +356,7 @@ static bool assign_pd(struct interface *
+ 	uint32_t current = 1, asize = (uint32_t)((1ULL << (64 - assign->length)) - 1);
+ 	if (assign->assigned_subnet_id) {
+ 		list_for_each_entry(c, &iface->ia_assignments, head) {
+-			if (c->flags & OAF_DHCPV6_NA)
++			if (c->retiring || (c->flags & OAF_DHCPV6_NA))
+ 				continue;
+ 
+ 			if (assign->assigned_subnet_id >= current && assign->assigned_subnet_id + asize < c->assigned_subnet_id) {
+@@ -375,7 +375,7 @@ static bool assign_pd(struct interface *
+ 	/* Fallback to a variable assignment */
+ 	current = 1;
+ 	list_for_each_entry(c, &iface->ia_assignments, head) {
+-		if (c->flags & OAF_DHCPV6_NA)
++		if (c->retiring || (c->flags & OAF_DHCPV6_NA))
+ 			continue;
+ 
+ 		current = (current + asize) & (~asize);
+@@ -478,8 +478,8 @@ static void handle_addrlist_change(struc
+ 	time_t now = odhcpd_time();
+ 
+ 	list_for_each_entry(c, &iface->ia_assignments, head) {
+-		if ((c->flags & OAF_DHCPV6_PD) && !(iface->ra_flags & ND_RA_FLAG_MANAGED)
+-		    && (c->bound))
++		/* The old route belongs to the old prefix, including managed mode. */
++		if ((c->flags & OAF_DHCPV6_PD) && c->bound)
+ 			__apply_lease(c, info->addrs_old.addrs,
+ 					info->addrs_old.len, false);
+ 	}
+@@ -487,7 +487,7 @@ static void handle_addrlist_change(struc
+ 	set_border_assignment_size(iface, border);
+ 
+ 	list_for_each_entry_safe(c, d, &iface->ia_assignments, head) {
+-		if (c->duid_len == 0 ||
++		if (c->duid_len == 0 || c->retiring ||
+ 	            !(c->flags & OAF_DHCPV6_PD)	||
+ 		    (!INFINITE_VALID(c->valid_until) && c->valid_until < now))
+ 			continue;
+@@ -513,8 +513,19 @@ static void handle_addrlist_change(struc
+ 	while (!list_empty(&reassign)) {
+ 		c = list_first_entry(&reassign, struct dhcpv6_lease, head);
+ 		list_del_init(&c->head);
+-		if (!assign_pd(iface, c))
+-			dhcpv6_free_lease(c);
++		if (!assign_pd(iface, c)) {
++			if (c->bound) {
++				/* Routes were removed against addrs_old above. Keep the
++				 * original expiry/key, but never reserve a slot or revive
++				 * this binding when upstream prefixes return.
++				 */
++				c->bound = false;
++				c->retiring = true;
++				list_add_tail(&c->head, &border->head);
++			} else {
++				dhcpv6_free_lease(c);
++			}
++		}
+ 	}
+ 
+ 	statefiles_write();
+@@ -1112,8 +1123,10 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *bu
+ 			}
+ 		}
+ 
+-		/* Find an existing assignment */
+-		struct dhcpv6_lease *c, *a = NULL;
++		/* Select the identity before touching routes/timers. A tentative
++		 * replacement is not a grant and cannot supersede PD retirement.
++		 */
++		struct dhcpv6_lease *c, *a = NULL, *offer = NULL, *retired = NULL;
+ 		list_for_each_entry(c, &iface->ia_assignments, head) {
+ 			/* If we're looking for a PD, is this a PD? */
+ 			if (is_pd && !(c->flags & OAF_DHCPV6_PD))
+@@ -1172,18 +1185,32 @@ ssize_t dhcpv6_ia_handle_IAs(uint8_t *bu
+ 				continue;
+ 			}
+ 
+-			/* We have a match */
+-			a = c;
++			if (c->retiring)
++				retired = c;
++			else if (c->bound)
++				a = c;
++			else
++				offer = c;
++		}
++
++		if (!a) {
++			if (retired && (hdr->msg_type == DHCPV6_MSG_RENEW ||
++					    hdr->msg_type == DHCPV6_MSG_REBIND ||
++					    hdr->msg_type == DHCPV6_MSG_RELEASE))
++				a = retired;
++			else
++				a = offer;
++		}
+ 
+-			/* Reset state */
++		if (a) {
+ 			if (a->bound)
+ 				apply_lease(a, false);
+-
+ 			stop_reconf(a);
+-			break;
+ 		}
+ 
+-		if (lease_cfg && a && a->lease_cfg != lease_cfg) {
++		if (lease_cfg && a && !a->retiring && a->lease_cfg != lease_cfg) {
++			if (offer == a)
++				offer = NULL;
+ 			dhcpv6_free_lease(a);
+ 			a = NULL;
+ 		}
+@@ -1193,6 +1220,15 @@ proceed:
+ 		uint16_t status = DHCPV6_STATUS_OK;
+ 		bool assigned = false;
+ 
++		if (a && a->retiring && (hdr->msg_type == DHCPV6_MSG_RENEW ||
++					 hdr->msg_type == DHCPV6_MSG_REBIND)) {
++			/* Revoke the client's old prefixes without positive grants,
++			 * timer refresh, or the normal Rebind route-install tail.
++			 */
++			ia_response_len = build_ia(buf, buflen, status, ia, NULL, iface, false);
++			goto ia_response;
++		}
++
+ 		switch (hdr->msg_type) {
+ 		case DHCPV6_MSG_SOLICIT:
+ 		case DHCPV6_MSG_REQUEST:
+@@ -1226,6 +1262,8 @@ proceed:
+ 
+ 						if (first_key_valid)
+ 							memcpy(a->key, first_key, sizeof(a->key));
++						else if (retired)
++							memcpy(a->key, retired->key, sizeof(a->key));
+ 						else
+ 							odhcpd_urandom(a->key, sizeof(a->key));
+ 
+@@ -1256,7 +1294,9 @@ proceed:
+ 			if (!assigned || iface->addr6_len == 0) {
+ 				/* Set error status */
+ 				status = is_pd ? DHCPV6_STATUS_NOPREFIXAVAIL : DHCPV6_STATUS_NOADDRSAVAIL;
+-			} else if (hdr->msg_type == DHCPV6_MSG_REQUEST && !dhcpv6_ia_on_link(ia, a, iface)) {
++				assigned = false;
++			} else if (hdr->msg_type == DHCPV6_MSG_REQUEST && is_na &&
++				   !dhcpv6_ia_on_link(ia, a, iface)) {
+ 				/* Send NOTONLINK status for the IA */
+ 				status = DHCPV6_STATUS_NOTONLINK;
+ 				assigned = false;
+@@ -1301,6 +1341,13 @@ proceed:
+ 				buf, buflen, status, ia, a, iface,
+ 				hdr->msg_type == DHCPV6_MSG_SOLICIT && !rapid_commit);
+ 
++			if (retired && !ia_response_len) {
++				/* An unencodable replacement cannot consume retirement. */
++				dhcpv6_free_lease(a);
++				a = NULL;
++				break;
++			}
++
+ 			/* Was only a solicitation: mark binding for removal in 60 seconds */
+ 			if (assigned) {
+ 				switch (hdr->msg_type) {
+@@ -1328,6 +1375,10 @@ proceed:
+ 					a->accept_fr_nonce = accept_reconf;
+ 					a->bound = true;
+ 					apply_lease(a, true);
++					if (!status && retired) {
++						dhcpv6_free_lease(retired);
++						retired = NULL;
++					}
+ 					break;
+ 
+ 				default:
+@@ -1363,6 +1414,10 @@ proceed:
+ 			case DHCPV6_MSG_RELEASE:
+ 				/* Immediately expire the lease */
+ 				a->valid_until = now - 1;
++				if (retired && retired != a)
++					dhcpv6_free_lease(retired);
++				if (offer && offer != a)
++					dhcpv6_free_lease(offer);
+ 				break;
+ 
+ 			case DHCPV6_MSG_DECLINE:
+@@ -1409,6 +1464,7 @@ proceed:
+ 			apply_lease(a, true);
+ 		}
+ 
++ia_response:
+ 		if (ia_response_len > buflen)
+ 			ia_response_len = buflen;
+ 
+--- a/src/odhcpd.c
++++ b/src/odhcpd.c
+@@ -671,6 +671,9 @@ void odhcpd_enum_addr6(struct interface
+ 	struct odhcpd_ipaddr *addrs = iface->addr6;
+ 	size_t m = get_preferred_addr(addrs, iface->addr6_len);
+ 
++	if (lease->retiring)
++		return;
++
+ 	for (size_t i = 0; i < iface->addr6_len; ++i) {
+ 		struct in6_addr addr;
+ 		uint32_t preferred_lt, valid_lt;
+--- a/src/odhcpd.h
++++ b/src/odhcpd.h
+@@ -300,6 +300,10 @@ struct dhcpv6_lease {
+ 
+ 	unsigned int flags;
+ 	bool bound;				// the lease has been accepted by the client
++	/* A withdrawn PD retains revocation authority until its original expiry.
++	 * It owns no allocation or routes and may coexist with a tentative offer.
++	 */
++	bool retiring;
+ 	uint32_t leasetime;
+ 	char *hostname;
+ 	bool hostname_valid;			// is the hostname one or more valid DNS labels?
+--- a/src/ubus.c
++++ b/src/ubus.c
+@@ -145,14 +145,18 @@ static int handle_dhcpv6_leases(_o_unuse
+ 			blobmsg_add_u32(&b, "iaid", ntohl(a->iaid));
+ 			blobmsg_add_string(&b, "hostname", (a->hostname) ? a->hostname : "");
+ 			blobmsg_add_u8(&b, "accept-reconf", a->accept_fr_nonce);
+-			if (a->flags & OAF_DHCPV6_NA)
+-				blobmsg_add_u64(&b, "assigned", a->assigned_host_id);
+-			else
+-				blobmsg_add_u32(&b, "assigned", a->assigned_subnet_id);
++			if (!a->retiring) {
++				if (a->flags & OAF_DHCPV6_NA)
++					blobmsg_add_u64(&b, "assigned", a->assigned_host_id);
++				else
++					blobmsg_add_u32(&b, "assigned", a->assigned_subnet_id);
++			}
+ 
+ 			m = blobmsg_open_array(&b, "flags");
+ 			if (a->bound)
+ 				blobmsg_add_string(&b, NULL, "bound");
++			if (a->retiring)
++				blobmsg_add_string(&b, NULL, "retiring");
+ 
+ 			if (a->lease_cfg)
+ 				blobmsg_add_string(&b, NULL, "static");
+@@ -521,4 +525,3 @@ int ubus_init(void)
+ 
+ 	return 0;
+ }
+-
