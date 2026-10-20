@@ -152,6 +152,7 @@ ppp_generic_setup() {
 		${localip:+$localip:} \
 		${lcp_failure:+lcp-echo-interval $lcp_interval lcp-echo-failure $lcp_failure $lcp_adaptive} \
 		${ipv6:++ipv6} \
+		${NETIFD_PROTO_TOKEN:+set NETIFD_PROTO_TOKEN=$NETIFD_PROTO_TOKEN} \
 		${autoipv6:+set AUTOIPV6=1} \
 		${reqprefix:+set REQPREFIX=$reqprefix} \
 		${norelease:+set NORELEASE=1} \
