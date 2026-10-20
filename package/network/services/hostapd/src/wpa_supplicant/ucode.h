@@ -7,6 +7,7 @@ struct wpa_bss;
 struct wpa_global;
 union wpa_event_data;
 struct wpa_supplicant;
+struct wpa_ssid;
 struct wps_credential;
 
 struct wpas_ucode_bss {
@@ -25,7 +26,8 @@ void wpas_ucode_event(struct wpa_supplicant *wpa_s, int event, union wpa_event_d
 void wpas_ucode_ctrl_event(struct wpa_supplicant *wpa_s, const char *str, size_t len);
 bool wpas_ucode_bss_allowed(struct wpa_supplicant *wpa_s, struct wpa_bss *bss);
 void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
-			     const struct wps_credential *cred);
+			     const struct wps_credential *cred,
+			     struct wpa_ssid *network);
 int wpas_ucode_wps_m8_rx(struct wpa_supplicant *wpa_s,
 			  const u8 *data, size_t data_len);
 #ifdef CONFIG_DPP
@@ -83,7 +85,9 @@ static inline bool wpas_ucode_bss_allowed(struct wpa_supplicant *wpa_s, struct w
 	return true;
 }
 
-static inline void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s, const struct wps_credential *cred)
+static inline void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
+					 const struct wps_credential *cred,
+					 struct wpa_ssid *network)
 {
 }
 

@@ -28,7 +28,7 @@ Initiate an 802.11v transition request.
 | validity_period | int32 | no | validity of the BSS Transition Candiate List |
 | neighbors | array | no | BSS Transition Candidate List |
 | abridged | bool | no | prefer APs in the BSS Transition Candidate List |
-| dialog_token | int32 | no | identifier for the request/report transaction |
+| dialog_token | int32 | no | request/report identifier, 1–255; defaults to 1 when omitted |
 | mbo_reason | int32 | no | MBO Transition Reason Code Attribute |
 | cell_pref | int32 | no | MBO Cellular Data Connection Preference Attribute |
 | reassoc_delay | int32 | no | MBO Re-association retry delay |
@@ -418,3 +418,62 @@ Start WPS Push Button Configuration.
 
 ### example
 `ubus call hostapd.wl5-fb wps_start`
+
+
+# UBUS methods - wpa_supplicant
+
+The following methods use the per-interface object `wpa_supplicant.<ifname>`.
+An optional `section` string fences the request against a replacement UCI
+interface; a mismatch returns Not Found. HTTP callers remain subject to the
+transport's read/write ACLs.
+
+## wps_start
+Start native push-button enrollment. Optional `multi_ap` overrides the
+interface's configured backhaul-station intent. Supplying `section` additionally
+requires a complete persistent client configuration assigned to one radio.
+Success acknowledges the native start command, not association or credential
+persistence.
+
+## wps_status
+Return current native connection `state`, bounded enrollment-result `phase` and
+`persistent` eligibility. Phases include `idle`, `active`, `connecting`, `waiting`,
+`saved`, `unconfirmed`, `conflict`, `cancelled`, `expired` and
+`unrepresentable credential`. `saved` confirms durable credential publication;
+`unconfirmed` retains an ambiguous publication outcome. This result is separate
+from current connection state and survives the resulting configuration reload.
+
+## wps_cancel
+Cancel an unfinished native handshake or withdraw pending credential persistence.
+For an established non-WPS profile, cancellation preserves the connection and
+a terminal saved result. Closing a UI status view does not invoke cancellation.
+
+
+# UBUS events - wpa_supplicant
+
+## wps_credentials
+Notify consumers of received WPS credentials and whether the supplicant accepted
+its native network profile. This event does not acknowledge association or UCI
+persistence.
+
+### payload
+
+| Name | Type | Presence | Description |
+|---|---|---|---|
+| ifname | string | always | supplicant interface name |
+| ssid | string | always | received SSID |
+| encryption | string | always | received authentication summary: `psk`, `psk2` or `none`; use the native profile fields below for its accepted security policy |
+| key | string | always | received network key; may be empty for open credentials |
+| processed | bool | always | whether the native network profile was accepted |
+| network_id | integer | processed only | accepted native network identifier |
+| wps_run | integer | processed only | WPS run associated with that network |
+| ieee80211w | integer | processed only | effective native profile PMF policy |
+| proto, key_mgmt, pairwise | string | processed only, when available | serialized native profile fields after security adjustments |
+
+With `processed=true`, native profile acceptance and security adjustments have
+completed. If native configuration-file writing is enabled and compiled in,
+that write has also succeeded. Consumers must preserve the accepted profile's
+security policy when implementing persistence.
+
+With `wps_cred_processing=1`, credentials are handed to an external handler:
+`processed=false` and the native profile fields are absent. This is an external
+processing notification, not a rejection status.

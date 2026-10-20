@@ -5,7 +5,7 @@
 			"methods": [ "event" ]
 		},
 		"wpa_supplicant": {
-			"methods": [ "phy_set_state", "phy_status" ]
+			"methods": [ "phy_set_state", "phy_status", "phy_transition" ]
 		},
 		"hostapd": {
 			"methods": [ "apsta_state" ]
@@ -15,9 +15,13 @@
 		},
 		"udebug": {
 			"methods": [ "get_config" ]
+		},
+		"uci": {
+			"methods": [ "wireless_enroll" ]
 		}
 	},
-	"subscribe": [ "udebug" ],
+	"subscribe": [ "udebug", "hostapd", "wpa_supplicant" ],
+	"listen": [ "ubus.object.add" ],
 	"publish": [ "hostapd", "hostapd.*", "wpa_supplicant", "wpa_supplicant.*", "hostapd-auth" ],
-	"send": [ "bss.*", "wps_credentials" ]
+	"send": [ "bss.*", "wps_credentials", "wps_persistence" ]
 }
