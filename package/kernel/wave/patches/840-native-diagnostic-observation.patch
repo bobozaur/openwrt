@@ -1,0 +1,212 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wave: retain extended native diagnostic observation
+
+Retain the fatal dump before terminal reset and expose TX-pool totals.
+The package diagnostic configuration also enables native debug and TSF access.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+---
+--- a/wireless/driver/linux/mtlk_df_user.c
++++ b/wireless/driver/linux/mtlk_df_user.c
+@@ -6431,6 +6431,7 @@
+   mtlk_df_user_t *df_user = mtlk_df_get_user(df);
+   mtlk_core_ui_get_stadb_status_req_t get_stadb_status_req;
+   unsigned long sta_cnt = 0;
++  struct wave_tx_stats tx;
+ 
+   /* Get Core general information from DF buffer and don't call Core */
+ 
+@@ -6493,6 +6494,13 @@
+ 
+   _mtlk_df_ui_print_driver_stats(s, &df_user->slow_ctx->core_general_stats);
+ 
++  if (wave_hw_get_tx_stats(mtlk_vap_get_hw(mtlk_df_get_vap_handle(df)), &tx)) {
++    mtlk_aux_seq_printf(s, "\nShared TX descriptor statistics\n\n");
++    mtlk_aux_seq_printf(s, "%10u TX MSDUs free\n", tx.free_desc);
++    mtlk_aux_seq_printf(s, "%10u TX MSDUs usage peak\n", tx.used_peak);
++    mtlk_aux_seq_printf(s, "%10u TX confirmations consumed\n", tx.completed_cfm);
++  }
++
+ #if MTLK_USE_DIRECTCONNECT_DP_API
+   _mtlk_df_ui_print_litepath(s, df_user);
+   _mtlk_df_ui_print_dcdp_stats(s, df_user);
+--- a/wireless/driver/shared/fw_recovery.c
++++ b/wireless/driver/shared/fw_recovery.c
+@@ -128,6 +128,12 @@
+   MTLK_DECLARE_INIT_STATUS;                                         /* container for initialization steps */
+ } wave_rcvry_task_ctx_t;
+ 
++enum wave_fatal_dump_state {
++  WAVE_FATAL_DUMP_NONE,
++  WAVE_FATAL_DUMP_PENDING,
++  WAVE_FATAL_DUMP_ATTEMPTED
++};
++
+ /* per card instance */
+ typedef struct {
+   void                    *mmb_base;
+@@ -140,6 +146,8 @@
+   int                     nof_files_done;
+   uint8                   card_idx;                      /* internal index of PCI-card */
+   wave_rcvry_task_ctx_t   rcvry_ctx;                     /* context for Recovery task */
++  atomic_t                fatal_dump_state;            /* current firmware lifetime */
++  int                     fatal_dump_result;           /* protected by dump mutex */
+ } wave_rcvry_card_cfg_t;
+ 
+ 
+@@ -915,7 +923,7 @@
+   rcvry_ctx->cfg.rcvry_fast_cnt = 5;
+   rcvry_ctx->cfg.rcvry_full_cnt = 3;
+   rcvry_ctx->cfg.fail_timer_value = 60 * MTLK_OSAL_MSEC_IN_SEC;
+-  rcvry_ctx->cfg.fw_dump = 0;
++  rcvry_ctx->cfg.fw_dump = 1;
+ 
+   rcvry_ctx->signature = RCVRY_SIGN;
+   return res;
+@@ -2083,10 +2091,16 @@
+ {
+   wave_rcvry_nl_ctx_t *pnl_ctx = &wave_rcvry.nl_ctx;
+   uint8 card_idx = pcard->card_idx;
++  BOOL fatal = atomic_read(&pcard->fatal_dump_state) != WAVE_FATAL_DUMP_NONE;
+   unsigned long flags;
+   int res = MTLK_ERR_NOT_READY;
+ 
+   lockdep_assert_held(&wave_rcvry_dump_mutex);
++  if (atomic_read(&pcard->fatal_dump_state) == WAVE_FATAL_DUMP_ATTEMPTED)
++    return pcard->fatal_dump_result;
++  if (fatal)
++    atomic_set(&pcard->fatal_dump_state, WAVE_FATAL_DUMP_ATTEMPTED);
++
+   if (!pnl_ctx->nl_inited || pnl_ctx->dump_poisoned[card_idx])
+     goto out;
+ 
+@@ -2113,6 +2127,8 @@
+   if (res != MTLK_ERR_OK)
+     pnl_ctx->dump_poisoned[card_idx] = TRUE;
+ out:
++  if (fatal)
++    pcard->fatal_dump_result = res;
+   ILOG0_DD("CID-%02x: FW dump evacuation finished: res=%d", card_idx, res);
+   return res;
+ }
+@@ -2134,6 +2150,41 @@
+   return res;
+ }
+ 
++/* The terminal owner has closed admission and joined IRQ/tasklet/DMA work,
++ * but has not reset firmware or released its mappings. Preserve the native
++ * fatal dump contract before that irreversible boundary. */
++void wave_rcvry_dump_before_reset (mtlk_hw_t *hw_ctx)
++{
++  wave_rcvry_card_cfg_t *pcard = _rcvry_card_hw_ctx_get(hw_ctx);
++
++  /* The caller owns this card's lifetime. Ordinary stop and nonfatal lost
++   * acknowledgements must not wait behind another card's dump. */
++  if (!pcard || atomic_read(&pcard->fatal_dump_state) == WAVE_FATAL_DUMP_NONE)
++    return;
++  if (atomic_read(&pcard->fatal_dump_state) == WAVE_FATAL_DUMP_PENDING &&
++      !READ_ONCE(pcard->rcvry_ctx.cfg.fw_dump))
++    return;
++  mutex_lock(&wave_rcvry_dump_mutex);
++  _rcvry_dump_locked(pcard);
++  mutex_unlock(&wave_rcvry_dump_mutex);
++}
++
++/* All actual firmware starts pass here while the CPUs are still in reset.
++ * The old evacuation has finished before a new fatal generation is admitted.
++ * Do not clear the transport poison: a late native reply can outlive reset. */
++void wave_rcvry_firmware_start (mtlk_hw_t *hw_ctx)
++{
++  wave_rcvry_card_cfg_t *pcard;
++
++  mutex_lock(&wave_rcvry_dump_mutex);
++  pcard = _rcvry_card_hw_ctx_get(hw_ctx);
++  if (pcard) {
++    atomic_set(&pcard->fatal_dump_state, WAVE_FATAL_DUMP_NONE);
++    pcard->fatal_dump_result = MTLK_ERR_NOT_READY;
++  }
++  mutex_unlock(&wave_rcvry_dump_mutex);
++}
++
+ int wave_rcvry_nl_send_msg_complete_rcvry_req (const uint8 card_idx)
+ {
+   wave_rcvry_nl_ctx_t *pnl_ctx = &wave_rcvry.nl_ctx;
+@@ -2429,6 +2480,9 @@
+   if (!pcard)
+     return;
+ 
++  /* Latch before terminating waiters can enter terminal quiesce. */
++  atomic_cmpxchg(&pcard->fatal_dump_state, WAVE_FATAL_DUMP_NONE,
++                 WAVE_FATAL_DUMP_PENDING);
+   _rcvry_mac_fatal_pending_set(pcard, TRUE);
+   _rcvry_process_mac_fatal(pcard, data);
+ }
+--- a/wireless/driver/shared/fw_recovery.h
++++ b/wireless/driver/shared/fw_recovery.h
+@@ -83,6 +83,8 @@
+ 
+ void wave_rcvry_nl_process_rxmsg(uint8 subcmd_id, uint8 card_idx);
+ int wave_rcvry_nl_process_msg_dump_evac(const uint8 card_idx);
++void wave_rcvry_dump_before_reset(mtlk_hw_t *hw_ctx);
++void wave_rcvry_firmware_start(mtlk_hw_t *hw_ctx);
+ int wave_rcvry_nl_send_msg_complete_rcvry_req(const uint8 card_idx);
+ int wave_rcvry_process_msg_complete_rcvry(const void *mmb_base);
+ int wave_rcvry_nl_send_msg_mac_error_evt(const uint8 card_idx, const uint8 error_type);
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -4171,6 +4171,7 @@
+   if (READ_ONCE(hw->quiescing))
+     return;
+ 
++  wave_rcvry_firmware_start(hw);
+   mtlk_ccr_disable_interrupts(hw->ccr, MTLK_IRQ_ALL);
+   mtlk_ccr_clear_interrupts_if_pending(hw->ccr, (uint32) -1);
+   mtlk_ccr_switch_to_iram_boot(hw->ccr);
+@@ -7197,6 +7198,22 @@
+          READ_ONCE(hw->state) == MTLK_HW_STATE_READY;
+ }
+ 
++/* The General proc owner keeps the data pool alive until its readers drain.
++ * These are ordinary pool totals, not a hardware/register snapshot. */
++bool wave_hw_get_tx_stats(mtlk_hw_t *hw, struct wave_tx_stats *stats)
++{
++  if (!wave_hw_mmb_ready(hw))
++    return false;
++
++  mtlk_osal_lock_acquire(&hw->tx.bdr_data.lock);
++  stats->free_desc = hw->tx.nof_free_bds;
++  stats->used_peak = hw->tx.max_used_bds;
++  mtlk_osal_lock_release(&hw->tx.bdr_data.lock);
++  /* Native software completion total; no device register access. */
++  stats->completed_cfm = READ_ONCE(hw->tx.ring.regs.int_OUT_cntr);
++  return true;
++}
++
+ /* Terminal for this probe. Only a fresh PCI probe may restart the card. */
+ static void wave_hw_mmb_quiesce_locked(mtlk_hw_t *hw)
+ {
+@@ -7229,6 +7246,7 @@
+   mtlk_osal_timer_cancel_sync(&hw->recover_timer);
+ #endif
+   wave_mmb_drv_drain_dma(mtlk_ccr_get_device(hw->ccr));
++  wave_rcvry_dump_before_reset(hw);
+   _mtlk_mmb_cleanup_reset_mac(hw);
+   mtlk_ccr_reset_mac(hw->ccr);
+ }
+--- a/wireless/driver/shared/hw_mmb.h
++++ b/wireless/driver/shared/hw_mmb.h
+@@ -236,4 +236,12 @@
+ bool wave_hw_mmb_ready(mtlk_hw_t *hw);
+ 
++/* Lock-protected operational data-pool totals. */
++struct wave_tx_stats {
++  u32 free_desc;
++  u32 used_peak;
++  u32 completed_cfm;
++};
++bool wave_hw_get_tx_stats(mtlk_hw_t *hw, struct wave_tx_stats *stats);
++
+ /* An active native data netdev participates in the shared descriptor pool.
+  * The pool lock protects membership and stop/wake against completion. Control
