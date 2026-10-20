@@ -13,6 +13,12 @@ struct grx500_switch_pdata {
 	 * service starts in conduit ndo_open, before a DSA user admits traffic.
 	 */
 	u8 cpu_rx_channel;
+	/* Blocking DSA policy changes retire PAE returns before mutation.
+	 * Lock order is RTNL / DSA PCE lock -> Ethernet flow owner.
+	 */
+	void *flow_owner;
+	void (*invalidate_flows)(void *owner);
+	void (*software_flow_ingress)(void *owner, bool software);
 };
 
 #endif
