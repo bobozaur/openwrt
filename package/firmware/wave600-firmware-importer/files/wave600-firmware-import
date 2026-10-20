@@ -1,0 +1,69 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+
+set -eu
+
+usage() {
+	cat <<'EOF'
+Usage: wave600-firmware-import [STOCK.zip|STOCK.bin]
+
+Import the original Archer AX50 V1 1.1.2 Build 20251022 radio firmware.
+Without a file argument, download the pinned official release over HTTPS.
+Imported files are preserved by normal sysupgrade backups. Reboot afterwards
+to initialize the radios. A factory reset requires importing the files again.
+EOF
+}
+
+case "${1:-}" in
+	-h|--help) usage; exit 0 ;;
+esac
+[ "$#" -le 1 ] || { usage >&2; exit 1; }
+[ "$(id -u)" -eq 0 ] || { echo 'Run as root to install firmware.' >&2; exit 1; }
+
+manifest=/usr/share/wave600-firmware-importer/SHA256SUMS
+url='https://static.tp-link.com/upload/firmware/2025/202511/20251121/Archer%20AX50_V1_251022.zip'
+archive_hash=755156fc9897092189f551107fd05adff92439cd8039837b559d0002e8cf918f
+image_hash=cf887d15c65108ed6bfcd9bd26d5dcde93dc2a6544cf6795260ff57d60f07119
+
+work=$(mktemp -d /tmp/wave600-import.XXXXXX)
+stage=
+cleanup() {
+	rm -rf "$work"
+	[ -z "$stage" ] || rm -rf "$stage"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+
+if [ "$#" -eq 0 ]; then
+	input=$work/stock.zip
+	uclient-fetch -O "$input" "$url"
+else
+	input=$1
+fi
+
+# Identify the supported input once before handing it to either extractor.
+hash=$(sha256sum < "$input")
+case "${hash%% *}" in
+	"$archive_hash")
+		image=$work/stock.bin
+		unzip -p "$input" '*.bin' > "$image"
+		;;
+	"$image_hash") image=$input ;;
+	*) echo 'Input is not the supported Archer AX50 V1 1.1.2 Build 20251022 release.' >&2; exit 1 ;;
+esac
+
+mkdir -p /lib/firmware
+stage=$(mktemp -d /lib/firmware/.wave600-import.XXXXXX)
+while read -r _hash file; do
+	unsquashfs -cat -processors 1 -o 286889 "$image" "lib/firmware/$file" > "$stage/$file"
+done < "$manifest"
+(cd "$stage" && sha256sum -c "$manifest")
+chmod 0644 "$stage"/*.bin
+
+# Stage on the destination filesystem so readers only see complete files.
+# Every accepted input supplies the same pinned cohort.
+while read -r _hash file; do
+	mv -f "$stage/$file" "/lib/firmware/$file"
+done < "$manifest"
+
+echo 'WAVE600 firmware imported. Reboot to initialize the radios.'
