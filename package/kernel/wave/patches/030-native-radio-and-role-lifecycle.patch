@@ -3973,7 +3973,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    wv_iface_inf = (struct wv_vif_priv*)vif->drv_priv;
    WAVE_WV_CHECK_PTR_RES(wv_iface_inf);
-@@ -1998,6 +2153,12 @@
+@@ -1998,6 +2153,37 @@
      return _mtlk_df_mtlk_to_linux_error_code(MTLK_ERR_VALUE);
    }
  
@@ -3982,6 +3982,31 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +   * master serializer instead of relying on another channel notification. */
 +  if (!cfg80211_chandef_valid(&hw->conf.chandef))
 +    return -EINVAL;
++
++  if (wv_iface_inf->stop_pending)
++    return -EBUSY;
++  if (wv_iface_inf->vap_stopped) {
++    struct mtlk_sta_bss_change_parameters bss = {0};
++
++    /* Key revocation retires the firmware VAP. Restore both ADD_VAP and
++     * SET_BSS before scanning: activation alone cannot transmit probes. */
++    res = wv_sta_bss_params(hw, &vif->bss_conf, wv_iface_inf->vap_index,
++                            &bss.params);
++    if (res != MTLK_ERR_OK)
++      return _mtlk_df_mtlk_to_linux_error_code(res);
++    res = wv_activate_vif(wv_iface_inf->df_user);
++    if (res != MTLK_ERR_OK)
++      return _mtlk_df_mtlk_to_linux_error_code(res);
++    bss.core = mtlk_vap_get_core(mtlk_df_get_vap_handle(
++                  mtlk_df_user_get_df(wv_iface_inf->df_user)));
++    res = _mtlk_df_user_invoke_core(master_df,
++              WAVE_RADIO_REQ_STA_CHANGE_BSS, &clpb, &bss, sizeof(bss));
++    res = _mtlk_df_user_process_core_retval(res, clpb,
++              WAVE_RADIO_REQ_STA_CHANGE_BSS, TRUE);
++    wv_iface_inf->vap_stopped = !wv_iface_inf->is_initialized;
++    if (res != MTLK_ERR_OK)
++      return _mtlk_df_mtlk_to_linux_error_code(res);
++  }
 +
    /* scan request is too big to put on the stack */
    if (!(sr = mtlk_osal_mem_alloc(sizeof(*sr), MTLK_MEM_TAG_CFG80211))) {
