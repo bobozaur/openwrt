@@ -160,6 +160,9 @@ struct grx500_rmon_stats {
 
 struct grx500_switch {
 	struct dsa_switch ds;
+	void *flow_owner;
+	void (*invalidate_flows)(void *owner);
+	void (*software_flow_ingress)(void *owner, bool software);
 	void __iomem *base;
 	/* All ports share the BM table command and result registers. */
 	struct mutex bm_lock;
@@ -665,6 +668,10 @@ static int grx500_software(struct grx500_switch *sw, const char *reason)
 	int port, ret;
 
 	lockdep_assert_held(&sw->pce_lock);
+	if (sw->software_flow_ingress)
+		sw->software_flow_ingress(sw->flow_owner, true);
+	if (sw->invalidate_flows)
+		sw->invalidate_flows(sw->flow_owner);
 	grx500_pause_lan(sw);
 	/* Keep ports stopped if the command engine cannot restore isolation.
 	 * A later phylink event must not reopen a partially configured switch.
@@ -694,6 +701,10 @@ static int grx500_reconfigure(struct grx500_switch *sw)
 	int port, ret;
 
 	lockdep_assert_held(&sw->pce_lock);
+	if (sw->software_flow_ingress)
+		sw->software_flow_ingress(sw->flow_owner, true);
+	if (sw->invalidate_flows)
+		sw->invalidate_flows(sw->flow_owner);
 	if (sw->failed)
 		return -EIO;
 	if (sw->software)
@@ -727,6 +738,8 @@ static int grx500_reconfigure(struct grx500_switch *sw)
 			goto fallback;
 	}
 	grx500_resume_lan(sw);
+	if (sw->software_flow_ingress)
+		sw->software_flow_ingress(sw->flow_owner, false);
 	return 0;
 
 fallback:
@@ -878,6 +891,8 @@ static void grx500_stp_state_set(struct dsa_switch *ds, int port, u8 state)
 	struct grx500_switch *sw = ds->priv;
 
 	mutex_lock(&sw->pce_lock);
+	if (sw->invalidate_flows)
+		sw->invalidate_flows(sw->flow_owner);
 	sw->ports[port].stp = state;
 	grx500_port_config(sw, port);
 	mutex_unlock(&sw->pce_lock);
@@ -950,6 +965,8 @@ static int grx500_bridge_flags(struct dsa_switch *ds, int port,
 	int ret = 0;
 
 	mutex_lock(&sw->pce_lock);
+	if (sw->invalidate_flows)
+		sw->invalidate_flows(sw->flow_owner);
 	if (flags.mask & BR_LEARNING)
 		sw->ports[port].learning = !!(flags.val & BR_LEARNING);
 	if (!grx500_port_offloaded(sw, port))
@@ -974,6 +991,8 @@ static int grx500_vlan_filtering(struct dsa_switch *ds, int port, bool enabled,
 	int ret = 0;
 
 	mutex_lock(&sw->pce_lock);
+	if (sw->invalidate_flows)
+		sw->invalidate_flows(sw->flow_owner);
 	if (grx500_port_offloaded(sw, port) && enabled)
 		ret = grx500_software(sw, "bridge VLAN mode changed");
 	mutex_unlock(&sw->pce_lock);
@@ -1242,6 +1261,8 @@ static int grx500_setup(struct dsa_switch *ds)
 	for (port = 0; port < ds->num_ports; port++)
 		grx500_update(sw, BM_PCFG(port), BM_PCFG_CNTEN, BM_PCFG_CNTEN);
 out:
+	if (!ret && sw->software_flow_ingress)
+		sw->software_flow_ingress(sw->flow_owner, false);
 	mutex_unlock(&sw->pce_lock);
 	if (ret)
 		return ret;
@@ -1255,6 +1276,10 @@ static void grx500_teardown(struct dsa_switch *ds)
 
 	unregister_switchdev_blocking_notifier(&sw->switchdev_nb);
 	mutex_lock(&sw->pce_lock);
+	if (sw->software_flow_ingress)
+		sw->software_flow_ingress(sw->flow_owner, true);
+	if (sw->invalidate_flows)
+		sw->invalidate_flows(sw->flow_owner);
 	sw->failed = true;
 	for (port = 0; port < ds->num_ports; port++)
 		grx500_port_gate(sw, port, false);
@@ -1313,6 +1338,8 @@ static void grx500_mac_link_down(struct phylink_config *config, unsigned int mod
 
 	mutex_lock(&sw->pce_lock);
 	grx500_port_set_pause(sw, dp->index, false, false);
+	if (sw->invalidate_flows)
+		sw->invalidate_flows(sw->flow_owner);
 	sw->ports[dp->index].link = false;
 	grx500_port_gate(sw, dp->index, false);
 	mutex_unlock(&sw->pce_lock);
@@ -1394,6 +1421,9 @@ static int grx500_switch_probe(struct platform_device *pdev)
 	sw->ageing_time = 300000;
 	sw->switchdev_nb.notifier_call = grx500_switchdev_event;
 	sw->base = data->base;
+	sw->flow_owner = data->flow_owner;
+	sw->invalidate_flows = data->invalidate_flows;
+	sw->software_flow_ingress = data->software_flow_ingress;
 	sw->cpu_rx_channel = data->cpu_rx_channel;
 	sw->ds.dev = &pdev->dev;
 	sw->ds.num_ports = GRX500_NUM_PORTS;
