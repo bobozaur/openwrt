@@ -1,0 +1,28 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] omcproxy: invalidate cached routes for a changed group
+
+A membership or source-filter change updates downstream group state, but
+previously cached upstream source routes still contain the old output set.
+Expire only that group's cached sources after updating the client, using
+the upstream MRIB and its native exact-group flush operation. Unrelated
+groups and multicast interface ownership remain unchanged.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/src/proxy.c
++++ b/src/proxy.c
+@@ -92,8 +92,12 @@ static void proxy_trigger(struct querier
+ 		bool include, const struct in6_addr *sources, size_t len)
+ {
+ 	struct proxy_downlink *iface = container_of(user, struct proxy_downlink, iface);
+-	if (proxy_match_scope(iface->flags, group))
++	struct proxy *proxy = container_of(user->user.querier, struct proxy, querier);
++	if (proxy_match_scope(iface->flags, group)) {
+ 		client_set(&iface->client, group, include, sources, len);
++		/* Recompute this group's cached sources against the updated downlinks. */
++		mrib_flush(&proxy->mrib, group, 128, NULL);
++	}
+ }
+ 
+ // Remove proxy with given name
