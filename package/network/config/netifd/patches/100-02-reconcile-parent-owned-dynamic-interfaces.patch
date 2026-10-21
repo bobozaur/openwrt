@@ -1,0 +1,393 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: reconcile parent-owned dynamic interface sets
+
+Publish dynamic children as the desired set of one exact parent, using the
+setup-generation token from the preceding change. An omitted child field
+leaves that set alone; an empty array retires it. Prepare all names and
+configurations before mutation, reject static or foreign-owned names, and
+retain legacy add_dynamic callers.
+
+Own children through the native interface/vlist lifecycle. Retire them on
+parent link loss, teardown or destruction; detach parent pointers before
+callbacks can observe a dying owner. A rejected child set must not suppress
+a valid parent lease, and redefined children cancel pending old removal.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/interface.c
++++ b/interface.c
+@@ -354,7 +354,8 @@ __interface_set_down(struct interface *i
+ 	case IFS_SETUP:
+ 		uloop_timeout_cancel(&iface->carrier_loss_timer);
+ 		iface->state = IFS_TEARDOWN;
+-		if (iface->dynamic)
++		if (iface->dynamic && !iface->dynamic_parent &&
++		    iface->config_state == IFC_NORMAL)
+ 			__set_config_state(iface, IFC_REMOVE);
+ 
+ 		if (state == IFS_UP)
+@@ -402,7 +403,8 @@ interface_check_state(struct interface *
+ 		if (!iface->enabled || !link_state) {
+ 			uloop_timeout_cancel(&iface->carrier_loss_timer);
+ 			iface->state = IFS_TEARDOWN;
+-			if (iface->dynamic)
++			if (iface->dynamic && !iface->dynamic_parent &&
++			    iface->config_state == IFC_NORMAL)
+ 				__set_config_state(iface, IFC_REMOVE);
+ 
+ 			interface_proto_event(iface->proto, PROTO_CMD_TEARDOWN, false);
+@@ -766,9 +768,39 @@ interface_cleanup_state(struct interface
+ }
+ 
+ static void
++interface_set_dynamic_parent(struct interface *iface, struct interface *parent)
++{
++	list_del_init(&iface->dynamic_list);
++	iface->dynamic_parent = parent;
++	if (parent)
++		list_add_tail(&iface->dynamic_list, &parent->dynamic_children);
++}
++
++void
++interface_remove_dynamic_children(struct interface *parent)
++{
++	struct interface *child, *tmp;
++
++	list_for_each_entry_safe(child, tmp, &parent->dynamic_children, dynamic_list)
++		set_config_state(child, IFC_REMOVE);
++}
++
++static void
+ interface_cleanup(struct interface *iface)
+ {
+ 	struct interface_user *dep, *tmp;
++	struct interface *child, *child_tmp;
++	LIST_HEAD(children);
++
++	/* Detach all children before callbacks can observe a dying parent. */
++	list_splice_init(&iface->dynamic_children, &children);
++	list_for_each_entry(child, &children, dynamic_list)
++		child->dynamic_parent = NULL;
++	list_for_each_entry_safe(child, child_tmp, &children, dynamic_list) {
++		list_del_init(&child->dynamic_list);
++		set_config_state(child, IFC_REMOVE);
++	}
++	interface_set_dynamic_parent(iface, NULL);
+ 
+ 	uloop_timeout_cancel(&iface->remove_timer);
+ 	uloop_timeout_cancel(&iface->carrier_loss_timer);
+@@ -938,7 +970,11 @@ interface_alloc(const char *name, struct
+ 	bool force_link = false;
+ 
+ 	iface = calloc_a(sizeof(*iface), &iface_name, strlen(name) + 1);
++	if (!iface)
++		return NULL;
+ 	iface->name = strcpy(iface_name, name);
++	INIT_LIST_HEAD(&iface->dynamic_list);
++	INIT_LIST_HEAD(&iface->dynamic_children);
+ 	INIT_LIST_HEAD(&iface->errors);
+ 	INIT_LIST_HEAD(&iface->users);
+ 	INIT_LIST_HEAD(&iface->hotplug_list);
+@@ -1077,7 +1113,6 @@ static bool __interface_add(struct inter
+ {
+ 	struct blob_attr *tb[IFACE_ATTR_MAX];
+ 	struct blob_attr *cur;
+-	char *name = NULL;
+ 
+ 	blobmsg_parse_attr(iface_attrs, IFACE_ATTR_MAX, tb, config);
+ 
+@@ -1095,26 +1130,10 @@ static bool __interface_add(struct inter
+ 			iface->device = blobmsg_data(cur);
+ 	}
+ 
+-	if (iface->dynamic) {
+-		name = strdup(iface->name);
+-
+-		if (!name)
+-			return false;
+-	}
+-
+ 	iface->config = config;
+ 	iface->tags = tb[IFACE_ATTR_TAGS];
+ 	vlist_add(&interfaces, &iface->node, iface->name);
+ 
+-	if (name) {
+-		iface = vlist_find(&interfaces, name, iface, node);
+-		free(name);
+-
+-		/* Don't delete dynamic interface on reload */
+-		if (iface)
+-			iface->node.version = -1;
+-	}
+-
+ 	return true;
+ }
+ 
+@@ -1531,7 +1550,8 @@ static void
+ interface_change_config(struct interface *if_old, struct interface *if_new)
+ {
+ 	struct blob_attr *old_config = if_old->config;
+-	bool reload = false, reload_ip = false, update_prefix_delegation = false;
++	bool reload = if_old->config_state == IFC_REMOVE;
++	bool reload_ip = false, update_prefix_delegation = false;
+ 
+ 	/*
+ 	 * The interface is being redefined: cancel a pending deferred removal,
+@@ -1539,6 +1559,10 @@ interface_change_config(struct interface
+ 	 */
+ 	if (if_old->config_state == IFC_REMOVE)
+ 		__set_config_state(if_old, IFC_NORMAL);
++	uloop_timeout_cancel(&if_old->remove_timer);
++	if_old->remove_timer.cb = NULL;
++	if_old->remove_pending = false;
++	interface_set_dynamic_parent(if_old, if_new->dynamic_parent);
+ 
+ #define FIELD_CHANGED_STR(field)					\
+ 		((!!if_old->field != !!if_new->field) ||		\
+@@ -1672,12 +1696,19 @@ interface_update(struct vlist_tree *tree
+ 
+ 	if (node_old && node_new) {
+ 		D(INTERFACE, "Update interface '%s'", if_new->name);
++		/* vlist_add has already copied the incoming node's version. */
++		if (if_new->dynamic)
++			if_old->node.version = -1;
+ 		interface_change_config(if_old, if_new);
+ 	} else if (node_old) {
+ 		D(INTERFACE, "Remove interface '%s'", if_old->name);
+ 		set_config_state(if_old, IFC_REMOVE);
+ 	} else if (node_new) {
+ 		D(INTERFACE, "Create interface '%s'", if_new->name);
++		/* Don't delete dynamic interfaces on a configuration reload. */
++		if (if_new->dynamic)
++			if_new->node.version = -1;
++		interface_set_dynamic_parent(if_new, if_new->dynamic_parent);
+ 		interface_event(if_new, IFEV_CREATE);
+ 		proto_init_interface(if_new, if_new->config);
+ 		interface_claim_device(if_new);
+--- a/interface.h
++++ b/interface.h
+@@ -127,6 +127,11 @@ struct interface {
+ 	bool renew;
+ 	bool remove_pending;
+ 
++	/* Dynamic interfaces published by this exact parent interface. */
++	struct interface *dynamic_parent;
++	struct list_head dynamic_list;
++	struct list_head dynamic_children;
++
+ 	unsigned int carrier_loss_delay;
+ 	struct uloop_timeout carrier_loss_timer;
+ 
+@@ -192,6 +197,7 @@ void interface_free(struct interface *if
+ 
+ bool interface_add(struct interface *iface, struct blob_attr *config);
+ bool interface_add_alias(struct interface *iface, struct blob_attr *config);
++void interface_remove_dynamic_children(struct interface *parent);
+ 
+ void interface_set_proto_state(struct interface *iface, struct interface_proto_state *state);
+ 
+--- a/proto-ext.c
++++ b/proto-ext.c
+@@ -232,6 +232,7 @@ proto_ext_free(struct interface_proto_st
+ 	struct proto_ext_state *state;
+ 
+ 	state = container_of(proto, struct proto_ext_state, proto);
++	interface_remove_dynamic_children(proto->iface);
+ 	uloop_timeout_cancel(&state->teardown_timeout);
+ 	uloop_timeout_cancel(&state->checkup_timeout);
+ 	proto_ext_clear_host_dep(state);
+@@ -320,6 +321,7 @@ enum {
+ 	NOTIFY_DNS_SEARCH,
+ 	NOTIFY_NEIGHBORS,
+ 	NOTIFY_NEIGHBORS6,
++	NOTIFY_CHILDREN,
+ 	NOTIFY_TOKEN,
+ 	__NOTIFY_LAST
+ };
+@@ -344,9 +346,115 @@ static const struct blobmsg_policy notif
+ 	[NOTIFY_DNS_SEARCH] = { .name = "dns_search", .type = BLOBMSG_TYPE_ARRAY },
+ 	[NOTIFY_NEIGHBORS]= {.name = "neighbor", .type = BLOBMSG_TYPE_ARRAY},
+ 	[NOTIFY_NEIGHBORS6]= {.name = "neighbor6", .type = BLOBMSG_TYPE_ARRAY},
++	[NOTIFY_CHILDREN] = { .name = "dynamic-children", .type = BLOBMSG_TYPE_UNSPEC },
+ 	[NOTIFY_TOKEN] = { .name = "proto-token", .type = BLOBMSG_TYPE_UNSPEC },
+ };
+ 
++static void
++proto_ext_free_children(struct interface **children, int n)
++{
++	int i;
++
++	for (i = 0; i < n; i++)
++		if (children[i])
++			interface_free(children[i]);
++	free(children);
++}
++
++/* Prepare the entire desired set before changing parent or child state. */
++static int
++proto_ext_prepare_children(struct proto_ext_state *state, struct blob_attr *attr,
++			   struct interface ***result, int *count)
++{
++	static const struct blobmsg_policy policy[] = {
++		{ .name = "name", .type = BLOBMSG_TYPE_STRING },
++		{ .name = "proto", .type = BLOBMSG_TYPE_STRING },
++	};
++	struct blob_attr *cur, *tb[ARRAY_SIZE(policy)], *config;
++	struct interface **children, *old, *child;
++	const char *name, *proto;
++	size_t rem;
++	int n, i = 0, j, ret = UBUS_STATUS_INVALID_ARGUMENT;
++
++	if (blobmsg_type(attr) != BLOBMSG_TYPE_ARRAY ||
++	    (n = blobmsg_check_array(attr, BLOBMSG_TYPE_TABLE)) < 0)
++		return ret;
++
++	children = calloc(n ? n : 1, sizeof(*children));
++	if (!children)
++		return UBUS_STATUS_UNKNOWN_ERROR;
++
++	blobmsg_for_each_attr(cur, attr, rem) {
++		blobmsg_parse_attr(policy, ARRAY_SIZE(policy), tb, cur);
++		if (!tb[0] || !tb[1])
++			goto error;
++		name = blobmsg_get_string(tb[0]);
++		proto = blobmsg_get_string(tb[1]);
++		if (!name[0] || !proto[0] ||
++		    strspn(name, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-") != strlen(name) ||
++		    !strcmp(name, state->proto.iface->name))
++			goto error;
++		for (j = 0; j < i; j++)
++			if (!strcmp(name, children[j]->name))
++				goto error;
++
++		old = vlist_find(&interfaces, name, old, node);
++		if (old && old->dynamic_parent != state->proto.iface) {
++			ret = UBUS_STATUS_PERMISSION_DENIED;
++			goto error;
++		}
++
++		config = blob_memdup(cur);
++		if (!config) {
++			ret = UBUS_STATUS_UNKNOWN_ERROR;
++			goto error;
++		}
++		child = interface_alloc(name, config, true);
++		if (!child) {
++			free(config);
++			ret = UBUS_STATUS_UNKNOWN_ERROR;
++			goto error;
++		}
++		children[i++] = child;
++		child->config = config;
++		if (strcmp(child->proto_handler->name, proto))
++			goto error;
++		child->dynamic_parent = state->proto.iface;
++	}
++
++	*result = children;
++	*count = n;
++	return 0;
++
++error:
++	proto_ext_free_children(children, i);
++	return ret;
++}
++
++static int
++proto_ext_update_children(struct proto_ext_state *state,
++			  struct interface **children, int n)
++{
++	struct interface *old, *tmp, *child;
++	int i;
++
++	list_for_each_entry_safe(old, tmp, &state->proto.iface->dynamic_children, dynamic_list) {
++		for (i = 0; i < n; i++)
++			if (!strcmp(old->name, children[i]->name))
++				break;
++		if (i == n)
++			vlist_delete(&interfaces, &old->node);
++	}
++
++	for (i = 0; i < n; i++) {
++		child = children[i];
++		if (!interface_add(child, child->config))
++			return UBUS_STATUS_UNKNOWN_ERROR;
++		children[i] = NULL;
++	}
++	return 0;
++}
++
+ static int
+ proto_ext_update_link(struct proto_ext_state *state, struct blob_attr *data, struct blob_attr **tb)
+ {
+@@ -367,6 +475,7 @@ proto_ext_update_link(struct proto_ext_s
+ 
+ 	up = blobmsg_get_bool(tb[NOTIFY_LINK_UP]);
+ 	if (!up) {
++		interface_remove_dynamic_children(iface);
+ 		state->proto.proto_event(&state->proto, IFPEV_LINK_LOST);
+ 		return 0;
+ 	}
+@@ -636,6 +745,8 @@ proto_ext_notify(struct interface_proto_
+ {
+ 	struct proto_ext_state *state;
+ 	struct blob_attr *tb[__NOTIFY_LAST];
++	struct interface **children = NULL;
++	int n = 0, ret, child_error = 0;
+ 
+ 	state = container_of(proto, struct proto_ext_state, proto);
+ 
+@@ -646,10 +757,23 @@ proto_ext_notify(struct interface_proto_
+ 	    (blobmsg_type(tb[NOTIFY_TOKEN]) != BLOBMSG_TYPE_STRING ||
+ 	     !state->token[0] || strcmp(blobmsg_get_string(tb[NOTIFY_TOKEN]), state->token)))
+ 		return UBUS_STATUS_PERMISSION_DENIED;
++	if (tb[NOTIFY_CHILDREN]) {
++		if (!tb[NOTIFY_TOKEN] || state->sm == S_TEARDOWN || state->sm == S_SETUP_ABORT)
++			return UBUS_STATUS_PERMISSION_DENIED;
++		if (blobmsg_get_u32(tb[NOTIFY_ACTION]) != 0 || !tb[NOTIFY_LINK_UP] ||
++		    !blobmsg_get_bool(tb[NOTIFY_LINK_UP]))
++			return UBUS_STATUS_INVALID_ARGUMENT;
++		child_error = proto_ext_prepare_children(state, tb[NOTIFY_CHILDREN], &children, &n);
++	}
+ 
+ 	switch(blobmsg_get_u32(tb[NOTIFY_ACTION])) {
+ 	case 0:
+-		return proto_ext_update_link(state, attr, tb);
++		ret = proto_ext_update_link(state, attr, tb);
++		if (!ret && children && state->sm == S_IDLE)
++			ret = proto_ext_update_children(state, children, n);
++		proto_ext_free_children(children, n);
++		/* A rejected child set must not suppress a valid parent lease. */
++		return ret ? ret : child_error;
+ 	case 1:
+ 		return proto_ext_run_command(state, tb);
+ 	case 2:
+@@ -799,6 +923,7 @@ proto_ext_run(struct proto_ext_state *st
+ 		state->restart_pending = false;
+ 		action = "restart";
+ 	} else {
++		interface_remove_dynamic_children(proto->iface);
+ 		switch (state->sm) {
+ 		case S_SETUP:
+ 			if (state->script_task.uloop.pending) {
+--- a/scripts/netifd-proto.sh
++++ b/scripts/netifd-proto.sh
+@@ -112,6 +112,17 @@ proto_close_data() {
+ 	proto_close_nested
+ }
+ 
++# Link-up desired set for this exact parent: omit to keep, empty to retire.
++# Requires the current setup token; static and foreign names are not replaceable.
++proto_add_dynamic_children() {
++	proto_close_nested
++	json_add_array "dynamic-children"
++}
++
++proto_close_dynamic_children() {
++	json_close_array
++}
++
+ proto_add_dns_server() {
+ 	local address="$1"
+ 
