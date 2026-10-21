@@ -3,7 +3,7 @@
 . /lib/functions/ax50.sh
 
 REQUIRE_IMAGE_METADATA=1
-RAMFS_COPY_BIN='mktemp'
+RAMFS_COPY_BIN='sha256sum head mktemp'
 
 AX50_IMAGE_DIR=sysupgrade-tplink_archer-ax50-v1
 
@@ -67,6 +67,17 @@ ax50_volume_unmounted() {
 	fi
 }
 
+ax50_write_volume() {
+	local file="$1" id="$2" size capacity expected actual
+	size=$(wc -c < "$file")
+	capacity=$(( $(cat "/sys/class/ubi/ubi0_$id/reserved_ebs") * 126976 ))
+	[ "$size" -gt 0 ] && [ "$size" -le "$capacity" ] || return 1
+	expected=$(sha256sum "$file" | cut -d ' ' -f 1)
+	ubiupdatevol "/dev/ubi0_$id" "$file" || return 1
+	actual=$(head -c "$size" "/dev/ubi0_$id" | sha256sum | cut -d ' ' -f 1)
+	[ "$actual" = "$expected" ]
+}
+
 ax50_initial_remove_overlay() {
 	local id="$1" name="$2" dev="$3"
 	# Only a successful creation in this invocation grants removal ownership.
@@ -116,7 +127,7 @@ ax50_initial_install_cleanup() {
 }
 
 ax50_initial_install() {
-	local dir id created_a=0 created_b=0 dev_a= dev_b= selection_attempted=0
+	local dir id preserved created_a=0 created_b=0 dev_a= dev_b= selection_attempted=0
 	ax50_is_initial_install && [ "$(board_name)" = tplink,archer-ax50-v1 ] &&
 		[ -z "$UPGRADE_BACKUP" ] && ax50_check_initial_layout &&
 		ax50_check_initial_bootenv || return 1
@@ -130,6 +141,9 @@ ax50_initial_install() {
 		trap 'exit 1' HUP INT TERM
 		tar -xOf "$1" "$AX50_IMAGE_DIR/root" > "$dir/root"
 		tar -xOf "$1" "$AX50_IMAGE_DIR/kernelB" > "$dir/kernel"
+		# Hash whole logical volumes, not just their image prefixes. No copy
+		# of fallback A or shared factory data is staged or written to NAND.
+		preserved=$(sha256sum /dev/ubi0_0 /dev/ubi0_1 /dev/ubi0_4)
 		ubimkvol /dev/ubi0 -n 6 -N ax50_overlayA -t dynamic -s 16252928
 		created_a=1
 		dev_a=$(cat /sys/class/ubi/ubi0_6/dev)
@@ -141,8 +155,8 @@ ax50_initial_install() {
 		if [ -e /sys/class/block/ubiblock0_3 ]; then
 			ubiblock -r /dev/ubi0_3
 		fi
-		ubiupdatevol /dev/ubi0_3 "$dir/root"
-		ubiupdatevol /dev/ubi0_2 "$dir/kernel"
+		ax50_write_volume "$dir/root" 3
+		ax50_write_volume "$dir/kernel" 2
 		# The new B overlay has no OEM configuration to import. Its first
 		# native UBIFS mount creates only this explicitly allocated filesystem.
 		mkdir "$dir/overlay"
@@ -151,6 +165,7 @@ ax50_initial_install() {
 		umount "$dir/overlay"
 		ax50_check_layout
 		ax50_check_initial_bootenv
+		[ "$(sha256sum /dev/ubi0_0 /dev/ubi0_1 /dev/ubi0_4)" = "$preserved" ]
 		# A lost acknowledgement may still have selected B. Retain both new
 		# overlays after this point, even when fw_setenv/readback fails.
 		selection_attempted=1
@@ -189,8 +204,8 @@ platform_do_upgrade() {
 		if [ -e "/sys/class/block/ubiblock0_$root" ]; then
 			ubiblock -r "/dev/ubi0_$root"
 		fi
-		ubiupdatevol "/dev/ubi0_$root" "$dir/root"
-		ubiupdatevol "/dev/ubi0_$kernel" "$dir/kernel"
+		ax50_write_volume "$dir/root" "$root"
+		ax50_write_volume "$dir/kernel" "$kernel"
 		# Empty only the inactive standard overlay. Mounting creates UBIFS on
 		# this already allocated volume; shared UBI and OEM data are untouched.
 		ubiupdatevol -t "/dev/ubi0_$overlay"
