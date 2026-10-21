@@ -1304,7 +1304,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    MTLK_CLPB_END;
  }
-@@ -3889,26 +3957,153 @@
+@@ -3889,26 +3957,157 @@
    MTLK_CLPB_END;
  }
  
@@ -1358,6 +1358,10 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +
 +  mtlk_vap_set_stopped(vap);
 +  synchronize_net();
++  /* Terminal removal can skip firmware disconnect and leave host peers.
++   * Join their timers before freeing the core and its station database. */
++  clean_all_sta_on_disconnect(mtlk_vap_get_core(vap));
++  mtlk_stadb_stop(&mtlk_vap_get_core(vap)->slow_ctx->stadb);
 +  mtlk_vap_stop(vap);
 +  mtlk_vap_delete(vap);
 +}
@@ -1646,12 +1650,14 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      /* set bss */
      return _mtlk_core_set_bss_internal(core, &bss_parameters);
-@@ -7020,6 +7233,8 @@
+@@ -7020,6 +7233,10 @@
    }
  
    ILOG0_DD("CID-%04x: Deleting VAP#%d", mtlk_vap_get_oid(core->vap_handle), vap_index);
 +  mtlk_vap_set_stopped(vap_handle);
 +  synchronize_net();
++  clean_all_sta_on_disconnect(mtlk_vap_get_core(vap_handle));
++  mtlk_stadb_stop(&mtlk_vap_get_core(vap_handle)->slow_ctx->stadb);
    mtlk_vap_stop(vap_handle);
    mtlk_vap_delete(vap_handle);
    res = MTLK_ERR_OK;
