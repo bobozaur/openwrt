@@ -1,0 +1,102 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netifd: retain routes owned by another prefix assignment
+
+A delegated-prefix length change can create a new assignment in the same
+subnet while its predecessor is still installed. With random interface IDs,
+both addresses can be enabled before the old prefix is retired. Native route
+creation replaces the identical connected route, so deleting the old route
+also removes the surviving assignment's route.
+
+Retain the route while another enabled assignment owns its kernel identity:
+masked destination, device, effective table and metric. Assignment routes
+have no source selector or gateway and share the static protocol. Retire
+old address policies and deprecate the old address normally; do not replay
+surviving policies. The last assignment still removes the connected route.
+Use the kernel default IPv6 metric explicitly so a metric-zero deletion
+cannot select a different metric route.
+
+This route handoff defect predates the exact-address ownership check.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/interface-ip.c
++++ b/interface-ip.c
+@@ -21,6 +21,8 @@
+ #include <limits.h>
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
++#include <linux/rtnetlink.h>
++#include <linux/ipv6_route.h>
+ 
+ #include "netifd.h"
+ #include "device.h"
+@@ -1152,6 +1154,43 @@
+ 	prefix->enabled = enabled;
+ }
+ 
++/* Assignment routes have no gateway or source selector and use the static
++ * protocol. Their remaining kernel identity is target, device, table and metric.
++ * A second IID in the same assigned subnet replaces, rather than adds, a route.
++ */
++static bool
++interface_prefix_route_in_use(const struct device_prefix_assignment *assignment,
++		const struct device *dev, const struct device_route *route)
++{
++	struct device_prefix *prefix;
++	struct device_prefix_assignment *other;
++	struct interface *iface;
++
++	list_for_each_entry(prefix, &prefixes, head)
++		list_for_each_entry(other, &prefix->assignments, head) {
++			union if_addr addr = { .in6 = other->addr };
++			unsigned int mask = other->length < 64 ? 64 : other->length;
++
++			if (other == assignment || !other->enabled || mask != route->mask)
++				continue;
++
++			iface = vlist_find(&interfaces, other->name, iface, node);
++			if (!iface || !iface->l3_dev.dev ||
++			    iface->l3_dev.dev->ifindex != dev->ifindex ||
++			    (iface->ip6table ? iface->ip6table : RT_TABLE_MAIN) !=
++			    (route->table ? route->table : RT_TABLE_MAIN) ||
++			    (iface->metric > 0 ? iface->metric : IP6_RT_PRIO_USER) !=
++			    route->metric)
++				continue;
++
++			clear_if_addr(&addr, mask);
++			if (IN6_ARE_ADDR_EQUAL(&addr.in6, &route->addr.in6))
++				return true;
++		}
++
++	return false;
++}
++
+ static void
+ interface_set_prefix_address(struct device_prefix_assignment *assignment,
+ 		const struct device_prefix *prefix, struct interface *iface, bool add)
+@@ -1209,8 +1248,12 @@
+ 
+ 		clear_if_addr(&route.addr, route.mask);
+ 		interface_set_route_info(iface, &route);
+-
+-		system_del_route(l3_downlink, &route);
++		/* IPv6 add defaults to 1024; delete metric 0 would be a wildcard. */
++		if (route.metric <= 0)
++			route.metric = IP6_RT_PRIO_USER;
++
++		if (!interface_prefix_route_in_use(assignment, l3_downlink, &route))
++			system_del_route(l3_downlink, &route);
+ 		if (!interface_prefix_address_in_use(assignment, l3_downlink)) {
+ 			if (addr.valid_until)
+ 				system_add_address(l3_downlink, &addr);
+@@ -1255,6 +1298,9 @@
+ 
+ 		clear_if_addr(&route.addr, route.mask);
+ 		interface_set_route_info(iface, &route);
++		/* IPv6 add defaults to 1024; delete metric 0 would be a wildcard. */
++		if (route.metric <= 0)
++			route.metric = IP6_RT_PRIO_USER;
+ 
+ 		system_add_route(l3_downlink, &route);
+ 

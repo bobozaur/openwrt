@@ -1,0 +1,59 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] odhcpd: revoke stale prefixes in DHCPv6 Replies
+
+Request and rapid-commit Replies must explicitly revoke stale client
+prefixes instead of omitting them. Retain Advertise hint semantics, and
+validate address suboptions against their enclosing IA type before comparing
+or emitting zero-lifetime replies. This preserves the existing lease owner
+and RFC 9096 stale-configuration signaling.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/src/dhcpv6-ia.c
++++ b/src/dhcpv6-ia.c
+@@ -571,7 +571,7 @@ static void valid_until_cb(struct uloop_
+ 
+ static size_t build_ia(uint8_t *buf, size_t buflen, uint16_t status,
+ 		const struct dhcpv6_ia_hdr *ia, struct dhcpv6_lease *a,
+-		struct interface *iface, bool request)
++		struct interface *iface, bool advertise)
+ {
+ 	struct dhcpv6_ia_hdr o_ia = {
+ 		.type = ia->type,
+@@ -744,7 +744,8 @@ static size_t build_ia(uint8_t *buf, siz
+ 			o_ia.t2 = htonl(1);
+ 	}
+ 
+-	if (!request) {
++	/* Replies must revoke stale hints; Advertise must omit them (RFC 9096). */
++	if (!advertise) {
+ 		uint8_t *odata, *end = ((uint8_t*)ia) + htons(ia->len) + DHCPV6_OPT_HDR_SIZE;
+ 		uint16_t otype, olen;
+ 
+@@ -753,9 +754,14 @@ static size_t build_ia(uint8_t *buf, siz
+ 			struct dhcpv6_ia_addr *ia_a = (struct dhcpv6_ia_addr *)&odata[-DHCPV6_OPT_HDR_SIZE];
+ 			bool found = false;
+ 
+-			if ((otype != DHCPV6_OPT_IA_PREFIX || olen < sizeof(*ia_p) - DHCPV6_OPT_HDR_SIZE) &&
+-					(otype != DHCPV6_OPT_IA_ADDR || olen < sizeof(*ia_a) - DHCPV6_OPT_HDR_SIZE))
++			if (ia->type == htons(DHCPV6_OPT_IA_PD)) {
++				if (otype != DHCPV6_OPT_IA_PREFIX ||
++				    olen < sizeof(*ia_p) - DHCPV6_OPT_HDR_SIZE || ia_p->prefix_len > 128)
++					continue;
++			} else if (otype != DHCPV6_OPT_IA_ADDR ||
++				   olen < sizeof(*ia_a) - DHCPV6_OPT_HDR_SIZE) {
+ 				continue;
++			}
+ 
+ 			if (a) {
+ 				struct odhcpd_ipaddr *addrs = iface->addr6;
+@@ -1293,7 +1299,7 @@ proceed:
+ 
+ 			ia_response_len = build_ia(
+ 				buf, buflen, status, ia, a, iface,
+-				hdr->msg_type != DHCPV6_MSG_REBIND);
++				hdr->msg_type == DHCPV6_MSG_SOLICIT && !rapid_commit);
+ 
+ 			/* Was only a solicitation: mark binding for removal in 60 seconds */
+ 			if (assigned) {
