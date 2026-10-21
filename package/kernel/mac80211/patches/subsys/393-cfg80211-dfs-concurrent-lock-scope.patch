@@ -1,0 +1,32 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] cfg80211: assert the wiphy lock only for concurrent DFS lookup
+
+The ordinary channel-availability path can reject concurrent DFS from static
+feature, channel and interface attributes without walking interface state.
+Require the wiphy lock where the concurrent BSS lookup actually needs it,
+so callers without concurrent DFS keep their existing lockless query path.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -966,8 +966,6 @@
+ 	struct wireless_dev *wdev;
+ 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+ 
+-	lockdep_assert_held(&rdev->wiphy.mtx);
+-
+ 	if (!wiphy_ext_feature_isset(&rdev->wiphy,
+ 				     NL80211_EXT_FEATURE_DFS_CONCURRENT) ||
+ 	    !(chan->flags & IEEE80211_CHAN_DFS_CONCURRENT))
+@@ -976,6 +974,8 @@
+ 	/* only valid for P2P GO */
+ 	if (iftype != NL80211_IFTYPE_P2P_GO)
+ 		return false;
++
++	lockdep_assert_held(&rdev->wiphy.mtx);
+ 
+ 	/*
+ 	 * Allow only if there's a concurrent BSS
