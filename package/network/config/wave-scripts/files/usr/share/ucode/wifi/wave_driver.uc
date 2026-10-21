@@ -113,11 +113,10 @@ function setup(data) {
 			return fail('WAVE_MODE_UNSUPPORTED');
 		let security = { ...v.config };
 		iface.parse_encryption(security, config);
-		// Reject requested PMF before native generators can choose a fallback.
-		if (+v.config.ieee80211w > 0 || +v.config.dpp ||
-		    security.auth_type in [ 'sae', 'psk-sae', 'psk-sae-compat',
-			'eap2', 'eap192', 'eap-eap2', 'owe', 'dpp' ])
-			return fail('WAVE_PMF_UNSUPPORTED');
+		// PMF, SAE and OWE use the native management transport and userspace AKMs.
+		if (+v.config.dpp ||
+		    security.auth_type in [ 'eap2', 'eap192', 'eap-eap2', 'dpp' ])
+			return fail('WAVE_AUTH_UNSUPPORTED');
 		modes[v.config.mode] = true;
 	}
 	if (modes.ap && modes.sta)
