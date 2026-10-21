@@ -5,7 +5,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=wave
 PKG_VERSION:=6.0.8.87.7
-PKG_RELEASE:=14
+PKG_RELEASE:=15
 PKG_SOURCE_VERSION:=06.00.08.00.87.00.07.d24084bd3447
 WAVE_SOURCE_BASE:=lq-wave-300-$(PKG_SOURCE_VERSION)
 PKG_SOURCE:=ax50v1_GPL_3.tar.gz
@@ -22,7 +22,8 @@ PKG_BUILD_PARALLEL:=0
 # The selected driver and RF C sources refer to the module-root dual license.
 # This describes the built module, not other contents of the vendor SDK.
 PKG_LICENSE:=GPL-2.0-only BSD-2-Clause
-PKG_LICENSE_FILES:=LICENSE wireless/driver/rflib/AGREEMENT
+PKG_LICENSE_FILES:=LICENSE wireless/driver/rflib/AGREEMENT \
+	wireless/shared_mbss_mac/Statistics/Wave600/LICENSE
 
 STAMP_CONFIGURED_DEPENDS:=$(STAGING_DIR)/usr/include/mac80211-backport/backport/autoconf.h
 
@@ -41,9 +42,10 @@ endef
 
 define KernelPackage/wave/description
  Intel WAVE600 driver using the standard cfg80211/mac80211 backports API.
- Builds the driver and RF library from TP-Link's pinned Archer AX50 v1 source
- release. Import matching stock radio firmware separately with
- wave600-firmware-importer before initializing the radios.
+ Builds the driver and RF library from TP-Link's pinned Archer AX50 v1 source,
+ adapted to the coherent WRX600 A0 interface used by NETGEAR RAX40 V1 1.0.6.106.
+ Import that radio firmware with the AX50 PSD using wave600-firmware-importer
+ before initializing the radios.
 endef
 
 define Build/Prepare
