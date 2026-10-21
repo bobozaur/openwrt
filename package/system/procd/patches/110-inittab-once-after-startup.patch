@@ -1,0 +1,40 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] support inittab once actions after successful startup
+
+Run non-respawning actions only after the entire sysinit queue completes. This
+provides a normal init boundary for board boot-success hooks without an extra
+daemon or assumptions about rc.d numbering.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/inittab.c
++++ b/inittab.c
+@@ -241,8 +241,19 @@
+ 		fork_worker(a);
+ }
+ 
++static void once(struct init_action *a)
++{
++	a->respawn = -1;
++	a->proc.cb = child_exit;
++	fork_worker(a);
++}
++
+ static struct init_handler handlers[] = {
+ 	{
++		.name = "once",
++		.cb = once,
++		.multi = 1,
++	}, {
+ 		.name = "sysinit",
+ 		.cb = runrc,
+ 	}, {
+--- a/state.c
++++ b/state.c
+@@ -168,4 +168,5 @@
+ 		LOG("- init complete -\n");
++		procd_inittab_run("once");
+ 		procd_inittab_run("respawnlate");
+ 		procd_inittab_run("askconsolelate");
+ 		break;
