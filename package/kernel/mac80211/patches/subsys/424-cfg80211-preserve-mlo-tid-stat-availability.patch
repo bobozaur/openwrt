@@ -1,0 +1,73 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] cfg80211: preserve per-TID availability in MLO station totals
+
+The station and link netlink encoders honor cfg80211_tid_stats.filled, but
+the MLO aggregation helper unconditionally sums and marks every RX/TX
+field, including unavailable retry and failure counts. It also dereferences
+a missing per-link per-TID array when the station array is present.
+
+Check the link pointer and each field's native filled bit before adding it
+to station totals. Preserve the existing first-entry aggregation scope and
+all values from correctly filled links. An omitted counter stays omitted;
+a supplied zero remains a valid zero. No new counter or reporting API is
+introduced.
+
+Not submitted upstream.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -8458,22 +8458,36 @@
+ 		}
+ 		init++;
+ 
+-		/* pertid stats accumulate for rx/tx fields */
+-		if (sinfo->pertid) {
+-			sinfo->pertid->rx_msdu +=
+-				link_sinfo->pertid->rx_msdu;
+-			sinfo->pertid->tx_msdu +=
+-				link_sinfo->pertid->tx_msdu;
+-			sinfo->pertid->tx_msdu_retries +=
+-				link_sinfo->pertid->tx_msdu_retries;
+-			sinfo->pertid->tx_msdu_failed +=
+-				link_sinfo->pertid->tx_msdu_failed;
+-
+-			sinfo->pertid->filled |=
+-				BIT(NL80211_TID_STATS_RX_MSDU) |
+-				BIT(NL80211_TID_STATS_TX_MSDU) |
+-				BIT(NL80211_TID_STATS_TX_MSDU_RETRIES) |
+-				BIT(NL80211_TID_STATS_TX_MSDU_FAILED);
++		/* Aggregate only values supplied by this link. */
++		if (sinfo->pertid && link_sinfo->pertid) {
++			if (link_sinfo->pertid->filled &
++			    BIT(NL80211_TID_STATS_RX_MSDU)) {
++				sinfo->pertid->rx_msdu +=
++					link_sinfo->pertid->rx_msdu;
++				sinfo->pertid->filled |=
++					BIT(NL80211_TID_STATS_RX_MSDU);
++			}
++			if (link_sinfo->pertid->filled &
++			    BIT(NL80211_TID_STATS_TX_MSDU)) {
++				sinfo->pertid->tx_msdu +=
++					link_sinfo->pertid->tx_msdu;
++				sinfo->pertid->filled |=
++					BIT(NL80211_TID_STATS_TX_MSDU);
++			}
++			if (link_sinfo->pertid->filled &
++			    BIT(NL80211_TID_STATS_TX_MSDU_RETRIES)) {
++				sinfo->pertid->tx_msdu_retries +=
++					link_sinfo->pertid->tx_msdu_retries;
++				sinfo->pertid->filled |=
++					BIT(NL80211_TID_STATS_TX_MSDU_RETRIES);
++			}
++			if (link_sinfo->pertid->filled &
++			    BIT(NL80211_TID_STATS_TX_MSDU_FAILED)) {
++				sinfo->pertid->tx_msdu_failed +=
++					link_sinfo->pertid->tx_msdu_failed;
++				sinfo->pertid->filled |=
++					BIT(NL80211_TID_STATS_TX_MSDU_FAILED);
++			}
+ 		}
+ 	}
+ 

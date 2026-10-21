@@ -164,15 +164,18 @@ function iface_setup(config) {
 	else
 		append('bss', config.ifname);
 
-	if (config.multicast_to_unicast || config.proxy_arp)
-		config.ap_isolate = 1;
+	/* A bridge must apply snooping/proxy policy before intra-BSS delivery.
+	 * Without that owner, preserve native forwarding unless isolation was
+	 * explicitly requested. Emit both states for configuration replacements. */
+	config.ap_isolate = +(!!config.ap_isolate ||
+		(!!config.network_bridge && (config.multicast_to_unicast || config.proxy_arp)));
 
 	if (config.proxy_arp)
 		set_default(config, 'na_mcast_to_ucast', true);
 
 	append('bssid', config.macaddr);
 	config.ssid2 = config.ssid;
-	config.wmm_enabled = 1;
+	config.wmm_enabled = +(config.wmm ?? true);
 	append_string_vars(config, [ 'ssid2' ]);
 
 	/* vendor_elements is a single concatenated hex blob, not one per line */
@@ -271,7 +274,7 @@ function iface_auth_type(config, band, eht) {
 	switch(config.auth_type) {
 	case 'none':
 	case 'owe':
-		config.wps_state = 1;
+		set_default(config, 'wps_state', 1);
 
 		append_string_vars(config, [ 'owe_transition_ssid' ]);
 		append_vars(config, [
@@ -302,10 +305,9 @@ function iface_auth_type(config, band, eht) {
 			config.wpa_passphrase = config.key;
 		}
 
-		if (config.auth_type in [ 'psk', 'psk-sae', 'psk-sae-compat' ] && band != '6g') {
-			set_default(config, 'wpa_psk_file', `/var/run/hostapd-${config.ifname}.psk`);
+		if (config.wpa_psk_file &&
+		    config.auth_type in [ 'psk', 'psk-sae', 'psk-sae-compat' ] && band != '6g')
 			touch_file(config.wpa_psk_file);
-		}
 
 		if (config.auth_type in [ 'sae', 'psk-sae', 'psk-sae-compat' ] || config.rsno2_sae) {
 			set_default(config, 'sae_password_file', `/var/run/hostapd-${config.ifname}.sae`);
@@ -349,7 +351,7 @@ function iface_auth_type(config, band, eht) {
 	append_vars(config, [
 		'sae_require_mfp', 'sae_password_file', 'sae_pwe', 'sae_groups', 'sae_track_password', 'time_advertisement', 'time_zone',
 		'wpa_group_rekey', 'wpa_ptk_rekey', 'wpa_gmk_rekey', 'wpa_strict_rekey',
-		'macaddr_acl', 'wpa_psk_radius', 'wpa_psk', 'wpa_passphrase', 'wpa_psk_file',
+		'macaddr_acl', 'wpa_psk_radius', 'wpa_psk', 'wpa_passphrase', 'wpa_psk_file', 'wpa_psk_file_static',
 		'eapol_version', 'dynamic_vlan', 'radius_request_cui', 'eap_reauth_period',
 		'radius_das_client', 'radius_das_port', 'owe_groups', 'owe_ptk_workaround', 'own_ip_addr', 'dynamic_own_ip_addr',
 		'wpa_disable_eapol_key_retries', 'auth_algs', 'wpa', 'wpa_pairwise',
@@ -474,8 +476,10 @@ function iface_vlan(interface, config, vlans) {
 	]);
 }
 
-/* hostapd uses only the last wpa_psk_file line, and the hostapd service
- * hashes one file per option, so the user's file is copied */
+/* SAE combines its configured and generated rows in one runtime input.
+ * Static WPA rows use a separate read-only input: the configured primary
+ * PSK file remains the native WPS read/append owner across regeneration.
+ */
 function station_file_write(config, option, path, lines) {
 	const user_entries = config[option] ? fs.readfile(config[option]) : null;
 
@@ -503,7 +507,8 @@ function iface_wpa_stations(config, stas) {
 			push(lines, (sta.config.vid ? `vlanid=${sta.config.vid} ` : '') + `${mac} ${sta.config.key}`);
 	}
 
-	station_file_write(config, 'wpa_psk_file', `/var/run/hostapd-${config.ifname}.psk`, lines);
+	if (length(lines))
+		station_file_write(config, 'wpa_psk_file_static', `/var/run/hostapd-${config.ifname}.psk-static`, lines);
 }
 
 function iface_sae_stations(config, stas) {

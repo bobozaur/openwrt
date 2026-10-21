@@ -254,6 +254,14 @@ function config_init(uci)
 			let vif = {
 				name, config,
 				device: dev_name,
+				// Preserve raw option presence/types before driver normalization.
+				// Service-provided VIFs intentionally have no persistent UCI owner.
+				uci: {
+					section: name,
+					device: dev_name,
+					expected: json(sprintf('%J', data)),
+					expected_device: json(sprintf('%J', sections.device[dev_name])),
+				},
 
 				vlan: [],
 				sta: [],
