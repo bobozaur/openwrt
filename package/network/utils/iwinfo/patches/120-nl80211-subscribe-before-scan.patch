@@ -1,0 +1,208 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: listen for scan completion before triggering
+
+A scan can finish before the trigger acknowledgement reaches userspace.
+Subscribe on a separate socket before sending the command, so neither a
+late subscription nor synchronous acknowledgement handling loses the event.
+Match the interface and bound the event wait without extending it for
+unrelated notifications or interruptions. Release the socket on every exit.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/iwinfo_nl80211.c
++++ b/iwinfo_nl80211.c
+@@ -28,6 +28,8 @@
+ #include <fnmatch.h>
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <poll.h>
++#include <time.h>
+ 
+ #include "iwinfo_nl80211.h"
+ 
+@@ -618,7 +620,7 @@
+ 	return NL_SKIP;
+ }
+ 
+-static int nl80211_subscribe(const char *family, const char *group)
++static int nl80211_subscribe(struct nl_sock *sock, const char *family, const char *group)
+ {
+ 	struct nl80211_group_conveyor cv = { .name = group, .id = -ENOENT };
+ 	struct nl80211_msg_conveyor *req;
+@@ -633,7 +635,7 @@
+ 		if (err)
+ 			return err;
+ 
+-		return nl_socket_add_membership(nls->nl_sock, cv.id);
++		return nl_socket_add_membership(sock, cv.id);
+ 
+ nla_put_failure:
+ 		nl80211_free(req);
+@@ -647,9 +649,18 @@
+ {
+ 	struct nl80211_event_conveyor *cv = arg;
+ 	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
++	struct nlattr **attr = nl80211_parse(msg);
++
++	if (!attr[NL80211_ATTR_IFINDEX] ||
++	    nla_get_u32(attr[NL80211_ATTR_IFINDEX]) != cv->ifindex)
++		return NL_SKIP;
+ 
+-	if (cv->wait[gnlh->cmd / 32] & (1 << (gnlh->cmd % 32)))
++	if (gnlh->cmd == NL80211_CMD_NEW_SCAN_RESULTS ||
++	    gnlh->cmd == NL80211_CMD_SCAN_ABORTED)
++	{
+ 		cv->recv = gnlh->cmd;
++		return NL_STOP;
++	}
+ 
+ 	return NL_SKIP;
+ }
+@@ -659,44 +670,64 @@
+ 	return NL_OK;
+ }
+ 
+-static int __nl80211_wait(const char *family, const char *group, ...)
++static int nl80211_wait(struct nl_sock *sock, unsigned int ifindex)
+ {
+-	struct nl80211_event_conveyor cv = { };
++	struct nl80211_event_conveyor cv = { .ifindex = ifindex };
++	struct pollfd pfd = { .fd = nl_socket_get_fd(sock), .events = POLLIN };
++	struct timespec deadline, now;
+ 	struct nl_cb *cb;
+-	int err = 0;
+-	int cmd;
+-	va_list ap;
++	int err = 0, ret, timeout;
+ 
+-	if (nl80211_subscribe(family, group))
+-		return -ENOENT;
++	if (clock_gettime(CLOCK_MONOTONIC, &deadline))
++		return -errno;
++	deadline.tv_sec += 60;
+ 
+ 	cb = nl_cb_alloc(NL_CB_DEFAULT);
+-
+- 	if (!cb)
++	if (!cb)
+ 		return -ENOMEM;
+ 
+-	nl_cb_err(cb,                  NL_CB_CUSTOM, nl80211_msg_error,      &err);
++	nl_cb_err(cb, NL_CB_CUSTOM, nl80211_msg_error, &err);
+ 	nl_cb_set(cb, NL_CB_SEQ_CHECK, NL_CB_CUSTOM, nl80211_wait_seq_check, NULL);
+-	nl_cb_set(cb, NL_CB_VALID,     NL_CB_CUSTOM, nl80211_wait_cb,        &cv );
+-
+-	va_start(ap, group);
++	nl_cb_set(cb, NL_CB_VALID, NL_CB_CUSTOM, nl80211_wait_cb, &cv);
+ 
+-	for (cmd = va_arg(ap, int); cmd != 0; cmd = va_arg(ap, int))
+-		cv.wait[cmd / 32] |= (1 << (cmd % 32));
++	while (!cv.recv && !err)
++	{
++		if (clock_gettime(CLOCK_MONOTONIC, &now))
++		{
++			err = -errno;
++			break;
++		}
++		timeout = (deadline.tv_sec - now.tv_sec) * 1000 +
++		          (deadline.tv_nsec - now.tv_nsec) / 1000000;
++		if (timeout <= 0)
++		{
++			err = -ETIMEDOUT;
++			break;
++		}
+ 
+-	va_end(ap);
++		ret = poll(&pfd, 1, timeout);
++		if (ret < 0 && errno == EINTR)
++			continue;
++		if (ret <= 0)
++		{
++			err = ret ? -errno : -ETIMEDOUT;
++			break;
++		}
++		if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
++		{
++			err = -EIO;
++			break;
++		}
+ 
+-	while (!cv.recv && !err)
+-		nl_recvmsgs(nls->nl_sock, cb);
++		ret = nl_recvmsgs(sock, cb);
++		if (ret < 0 && ret != -NLE_AGAIN && ret != -NLE_INTR)
++			err = ret;
++	}
+ 
+ 	nl_cb_put(cb);
+-
+ 	return err;
+ }
+ 
+-#define nl80211_wait(family, group, ...) \
+-	__nl80211_wait(family, group, __VA_ARGS__, 0)
+-
+ /* This is linux's ieee80211_freq_khz_to_channel() which is:
+  * SPDX-License-Identifier: GPL-2.0
+  * Copyright 2007-2009 Johannes Berg <johannes@sipsolutions.net>
+@@ -2911,12 +2942,28 @@
+ static int nl80211_get_scanlist_nl(const char *ifname, char *buf, int *len)
+ {
+ 	struct nl80211_scanlist sl = { .e = (struct iwinfo_scanlist_entry *)buf };
++	struct nl_sock *sock = NULL;
++	unsigned int ifindex = if_nametoindex(ifname);
++	int rv = -1;
++
++	if (!ifindex)
++		goto out;
++
++	/* Listen before triggering, on a separate socket: the command socket's
++	 * synchronous ACK handling must not consume a fast scan completion.
++	 */
++	sock = nl_socket_alloc();
++	if (!sock)
++		goto out;
++	if (genl_connect(sock) || nl_socket_set_nonblocking(sock))
++		goto out;
++	if (nl80211_subscribe(sock, "nl80211", "scan"))
++		goto out;
+ 
+ 	if (nl80211_request(ifname, NL80211_CMD_TRIGGER_SCAN, 0, NULL, NULL))
+ 		goto out;
+ 
+-	if (nl80211_wait("nl80211", "scan",
+-	                 NL80211_CMD_NEW_SCAN_RESULTS, NL80211_CMD_SCAN_ABORTED))
++	if (nl80211_wait(sock, ifindex))
+ 		goto out;
+ 
+ 	if (nl80211_request(ifname, NL80211_CMD_GET_SCAN, NLM_F_DUMP,
+@@ -2924,11 +2971,14 @@
+ 		goto out;
+ 
+ 	*len = sl.len * sizeof(struct iwinfo_scanlist_entry);
+-	return 0;
++	rv = 0;
+ 
+ out:
+-	*len = 0;
+-	return -1;
++	if (sock)
++		nl_socket_free(sock);
++	if (rv)
++		*len = 0;
++	return rv;
+ }
+ 
+ static int wpasupp_ssid_decode(const char *in, char *out, int outlen)
+--- a/iwinfo_nl80211.h
++++ b/iwinfo_nl80211.h
+@@ -48,7 +48,7 @@
+ };
+ 
+ struct nl80211_event_conveyor {
+-	uint32_t wait[(NL80211_CMD_MAX / 32) + !!(NL80211_CMD_MAX % 32)];
++	unsigned int ifindex;
+ 	int recv;
+ };
+ 
