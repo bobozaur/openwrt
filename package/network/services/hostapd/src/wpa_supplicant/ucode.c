@@ -3,10 +3,12 @@
 #include "utils/ucode.h"
 #include "utils/base64.h"
 #include "drivers/driver.h"
+#include "common/ieee802_11_common.h"
 #include "ap/hostapd.h"
 #include "common/sae.h"
 #include "rsn_supp/wpa.h"
 #include "wpa_supplicant_i.h"
+#include "driver_i.h"
 #include "wps_supplicant.h"
 #include "ctrl_iface.h"
 #include "config.h"
@@ -134,10 +136,81 @@ void wpas_ucode_update_state(struct wpa_supplicant *wpa_s)
 	ucv_put(wpa_ucode_call(3));
 }
 
+/* A BSS advertises its channel; the driver reports the channel negotiated by
+ * this station. Preserve the latter when another interface follows it. */
+static uc_value_t *
+wpas_ucode_chandef(int freq, enum chan_width width, int cf1, int cf2)
+{
+	enum oper_chan_width oper;
+	enum hostapd_hw_mode mode;
+	int bandwidth, low, primary, sec;
+	u8 channel, op_class, seg0, seg1 = 0;
+	uc_value_t *ret;
+
+	switch (width) {
+	case CHAN_WIDTH_20_NOHT:
+	case CHAN_WIDTH_20:
+		oper = CONF_OPER_CHWIDTH_USE_HT;
+		bandwidth = 20;
+		break;
+	case CHAN_WIDTH_40:
+		oper = CONF_OPER_CHWIDTH_USE_HT;
+		bandwidth = 40;
+		break;
+	case CHAN_WIDTH_80:
+		oper = CONF_OPER_CHWIDTH_80MHZ;
+		bandwidth = 80;
+		break;
+	case CHAN_WIDTH_160:
+		oper = CONF_OPER_CHWIDTH_160MHZ;
+		bandwidth = 160;
+		break;
+	case CHAN_WIDTH_80P80:
+		oper = CONF_OPER_CHWIDTH_80P80MHZ;
+		bandwidth = 80;
+		break;
+	case CHAN_WIDTH_320:
+		oper = CONF_OPER_CHWIDTH_320MHZ;
+		bandwidth = 320;
+		break;
+	default:
+		return NULL;
+	}
+
+	if (!cf1 && bandwidth == 20)
+		cf1 = freq;
+	if (freq <= 0 || cf1 <= 0 || cf2 < 0 ||
+	    (width == CHAN_WIDTH_80P80) != !!cf2)
+		return NULL;
+	low = cf1 - bandwidth / 2 + 10;
+	primary = freq - low;
+	if (primary < 0 || primary >= bandwidth || primary % 20)
+		return NULL;
+	sec = bandwidth == 20 ? 0 : ((primary / 20) & 1 ? -1 : 1);
+	mode = ieee80211_freq_to_channel_ext(freq, sec, oper, &op_class, &channel);
+	if (mode == NUM_HOSTAPD_MODES ||
+	    ieee80211_freq_to_chan(cf1, &seg0) == NUM_HOSTAPD_MODES ||
+	    (cf2 && ieee80211_freq_to_chan(cf2, &seg1) == NUM_HOSTAPD_MODES))
+		return NULL;
+
+	ret = ucv_object_new(vm);
+	ucv_object_add(ret, "frequency", ucv_int64_new(freq));
+	ucv_object_add(ret, "hw_mode", ucv_int64_new(mode));
+	ucv_object_add(ret, "op_class", ucv_int64_new(op_class));
+	ucv_object_add(ret, "channel", ucv_int64_new(channel));
+	ucv_object_add(ret, "sec_channel", ucv_int64_new(sec));
+	ucv_object_add(ret, "oper_chwidth", ucv_int64_new(oper));
+	ucv_object_add(ret, "center_freq1", ucv_int64_new(cf1));
+	ucv_object_add(ret, "center_freq2", ucv_int64_new(cf2));
+	ucv_object_add(ret, "center_seg0_idx", ucv_int64_new(freq < 3000 ? 0 : seg0));
+	ucv_object_add(ret, "center_seg1_idx", ucv_int64_new(seg1));
+	return ret;
+}
+
 void wpas_ucode_event(struct wpa_supplicant *wpa_s, int event, union wpa_event_data *data)
 {
 	const char *state;
-	uc_value_t *val;
+	uc_value_t *val, *chandef;
 
 	if (event != EVENT_CH_SWITCH_STARTED &&
 	    event != EVENT_LINK_CH_SWITCH_STARTED)
@@ -156,6 +229,12 @@ void wpas_ucode_event(struct wpa_supplicant *wpa_s, int event, union wpa_event_d
 	val = ucv_object_new(vm);
 	uc_value_push(ucv_get(val));
 
+	chandef = wpas_ucode_chandef(data->ch_switch.freq,
+		data->ch_switch.ch_width, data->ch_switch.cf1,
+		data->ch_switch.cf2);
+
+	if (chandef)
+		ucv_object_add(val, "chandef", chandef);
 	ucv_object_add(val, "csa_count", ucv_int64_new(data->ch_switch.count));
 	ucv_object_add(val, "frequency", ucv_int64_new(data->ch_switch.freq));
 	ucv_object_add(val, "sec_chan_offset", ucv_int64_new(data->ch_switch.ch_offset));
@@ -189,12 +268,14 @@ void wpas_ucode_ctrl_event(struct wpa_supplicant *wpa_s, const char *str, size_t
 }
 
 void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
-			     const struct wps_credential *cred)
+			     const struct wps_credential *cred,
+			     struct wpa_ssid *network)
 {
 #ifdef CONFIG_WPS
+	static const char * const fields[] = { "proto", "key_mgmt", "pairwise" };
 	uc_value_t *val;
-	char *ifname, *encryption, *ssid, *key;
-	size_t ifname_len;
+	const char *encryption;
+	size_t i;
 
 	if (!cred)
 		return;
@@ -225,6 +306,15 @@ void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
 		return;
 	}
 
+	/* External processing bypasses the native profile validator. A 64-byte
+	 * PSK must still be hexadecimal before publishing credential material. */
+	if (!network && cred->auth_type != WPS_AUTH_OPEN &&
+	    cred->key_len == 2 * PMK_LEN) {
+		for (i = 0; i < cred->key_len; i++)
+			if (hex2num(cred->key[i]) < 0)
+				return;
+	}
+
 	val = wpa_ucode_registry_get(iface_registry, wpa_s->ucode.idx);
 	if (!val)
 		return;
@@ -241,6 +331,20 @@ void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
 	ucv_object_add(val, "encryption", ucv_string_new(encryption));
 	ucv_object_add(val, "ssid", ucv_string_new_length(cred->ssid, cred->ssid_len));
 	ucv_object_add(val, "key", ucv_string_new_length(cred->key, cred->key_len));
+	/* A processed notification describes the final native security policy,
+	 * including cipher workarounds and optional SAE. It does not claim that
+	 * a consumer has persisted these credentials to UCI. */
+	ucv_object_add(val, "processed", ucv_boolean_new(network != NULL));
+	if (network) {
+		ucv_object_add(val, "network_id", ucv_int64_new(network->id));
+		for (i = 0; i < ARRAY_SIZE(fields); i++) {
+			char *value = wpa_config_get_no_key(network, fields[i]);
+
+			if (value)
+				ucv_object_add(val, fields[i], ucv_string_new(value));
+			os_free(value);
+		}
+	}
 
 	ucv_put(wpa_ucode_call(3));
 #endif /* CONFIG_WPS */
@@ -672,6 +776,21 @@ uc_wpas_iface_status(uc_vm_t *vm, size_t nargs)
 	bss = wpa_s->current_bss;
 	if (bss)
 		uc_wpas_iface_status_bss(ret, bss);
+	if (wpa_s->wpa_state == WPA_COMPLETED && !wpa_s->valid_links) {
+		struct wpa_channel_info ci = { 0 };
+		uc_value_t *chandef;
+
+		if (!wpa_drv_channel_info(wpa_s, &ci)) {
+			chandef = wpas_ucode_chandef(ci.frequency, ci.chanwidth,
+						    ci.center_frq1, ci.center_frq2);
+			if (chandef) {
+				ucv_object_add(ret, "chandef", chandef);
+				ucv_object_add(ret, "frequency", ucv_int64_new(ci.frequency));
+				ucv_object_add(ret, "sec_chan_offset",
+					ucv_get(ucv_object_get(chandef, "sec_channel", NULL)));
+			}
+		}
+	}
 
 	if (wpa_s->valid_links) {
 		unsigned int valid_links = wpa_s->valid_links;
@@ -763,10 +882,17 @@ uc_wpas_iface_config(uc_vm_t *vm, size_t nargs)
 			size_t len = ucv_array_length(val);
 			int *freq_list;
 
+			if (ucv_type(val) == UC_NULL) {
+				free(wpa_s->conf->freq_list);
+				wpa_s->conf->freq_list = NULL;
+				return ucv_boolean_new(true);
+			}
 			if (ucv_type(val) != UC_ARRAY)
 				return NULL;
 
 			freq_list = calloc(len + 1, sizeof(*freq_list));
+			if (!freq_list)
+				return NULL;
 			for (size_t i = 0; i < len; i++) {
 				uc_value_t *cur = ucv_array_get(val, i);
 

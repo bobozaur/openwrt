@@ -1,0 +1,43 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] AP: respect the driver single CSA counter capability
+
+A driver advertising one CSA counter cannot apply a second independent
+countdown. Honor its existing capability when preparing a channel switch
+while preserving normal countdown behavior on other drivers.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -4747,6 +4747,7 @@
+ {
+ 	struct hostapd_iface *iface = hapd->iface;
+ 	struct hostapd_freq_params old_freq;
++	struct wpa_driver_capa capa;
+ 	int ret;
+ 	enum oper_chan_width chanwidth;
+ 	u8 chan;
+@@ -4823,6 +4824,21 @@
+ 			   settings->freq_params.he_enabled,
+ 			   settings->freq_params.eht_enabled);
+ 		return -1;
++	}
++
++	/* CSA and Extended CSA use separate countdown bytes. Keep the
++	 * ordinary CSA when the driver can update only one counter, instead
++	 * of building a two-counter template its channel-switch op rejects.
++	 * get_capa returns the driver's existing capability snapshot.
++	 */
++	os_memset(&capa, 0, sizeof(capa));
++	if (hapd->driver->get_capa &&
++	    hapd->driver->get_capa(hapd->drv_priv, &capa) == 0 &&
++	    capa.max_csa_counters == 1) {
++#ifdef CONFIG_TESTING_OPTIONS
++		if (!hapd->iconf->ecsa_ie_only)
++#endif /* CONFIG_TESTING_OPTIONS */
++			iface->cs_oper_class = 0;
+ 	}
+ 
+ 	settings->freq_params.channel = chan;

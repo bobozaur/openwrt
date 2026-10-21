@@ -600,8 +600,11 @@ export function setup(data) {
 		append('\n#frequency', data.config.frequency);
 	if (data.channel_follow)
 		append('\n#channel_follow', 1);
+	if (data.station_phy)
+		append('\n#station_phy', data.station_phy);
 
 	let has_ap;
+	let owners = {};
 	for (let k, interface in data.interfaces) {
 		if (interface.config.mode != 'ap')
 			continue;
@@ -613,6 +616,8 @@ export function setup(data) {
 
 		if (!setup_interface(k, data, interface.config, interface.vlans, interface.stas, phy_features, owe ? 'owe' : null))
 			continue;
+		if (interface.uci)
+			owners[interface.config.ifname] = interface.uci;
 		if (owe)
 			setup_interface(k, data, interface.config, interface.vlans, interface.stas, phy_features, 'owe-transition');
 		has_ap = true;
@@ -624,14 +629,20 @@ export function setup(data) {
 		phy: data.phy,
 		radio: data.config.radio,
 		config: has_ap ? file_name : "",
-		prev_config: file_name + '.prev'
+		prev_config: file_name + '.prev',
+		uci: owners,
 	};
 	if (!global.ubus.list('hostapd'))
 		system('ubus wait_for hostapd');
 	let ret = global.ubus.call('hostapd', 'config_set', msg);
 
-	if (ret)
-		netifd.add_process('/usr/sbin/hostapd', ret.pid, true, true);
+	if (ret) {
+		// A cleanup request for an absent AP must not attach a STA-only
+		// radio to the lifecycle of the shared hostapd process.
+		if (has_ap)
+			netifd.add_process('/usr/sbin/hostapd', ret.pid, true, true);
+	}
 	else
 		netifd.setup_failed('HOSTAPD_START_FAILED');
+	return !!ret;
 };
