@@ -476,7 +476,25 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      switch (nbuf_flags & (MTLK_NBUFF_FORWARD | MTLK_NBUFF_CONSUME))
      {
        case (MTLK_NBUFF_FORWARD | MTLK_NBUFF_CONSUME):
-@@ -1616,8 +1571,8 @@
+@@ -1504,6 +1459,8 @@
+         break;
+ 
+       case 0:
++        if (dst_sta)
++          mtlk_sta_decref(dst_sta);
+         mtlk_df_nbuf_free(nbuf);
+         ILOG3_P("nbuf %p dropped - consumption is disabled", nbuf);
+         return;
+@@ -1524,7 +1481,7 @@
+ 
+       nbuf = nbuf_orig;
+       /* Count rxed data to be forwarded */
+-      mtlk_sta_on_rx_packet_forwarded(src_sta, nbuf);
++      mtlk_sta_on_rx_packet_forwarded(src_sta, nbuf_len);
+       CPU_STAT_END_TRACK(CPU_STAT_ID_TX_FWD);
+     }
+   } /* AP mode */
+@@ -1616,8 +1573,8 @@
  }
  #endif
  
@@ -487,7 +505,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    mtlk_txmm_data_t          *man_entry = NULL;
    mtlk_txmm_msg_t           man_msg;
-@@ -1650,7 +1605,10 @@
+@@ -1650,7 +1607,10 @@
  
    tpcConfig->tpcLoopType = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_TPC_LOOP_TYPE);
  
@@ -499,7 +517,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (result != MTLK_ERR_OK) {
      ELOG_D("CID-%04x: Can't send UM_MAN_SET_TPC_CONFIG_REQ request due to PDB read error", mtlk_vap_get_oid(nic->vap_handle));
      goto FINISH;
-@@ -1670,9 +1628,16 @@
+@@ -1670,9 +1630,16 @@
    result = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
    if (result != MTLK_ERR_OK) {
      ELOG_DD("CID-%04x: Can't send UM_MAN_SET_TPC_CONFIG_REQ request to MAC (err=%d)", mtlk_vap_get_oid(nic->vap_handle), result);
@@ -516,7 +534,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  FINISH:
    if (man_entry) {
      mtlk_txmm_msg_cleanup(&man_msg);
-@@ -1685,25 +1650,15 @@
+@@ -1685,25 +1652,15 @@
  mtlk_reload_tpc_wrapper (struct nic *nic, uint32 channel, psdb_pw_limits_t *pwl)
  {
    int res = MTLK_ERR_PARAMS;
@@ -544,7 +562,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    res = mtlk_reload_tpc(
        (mtlk_hw_band_e)WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_FREQ_BAND_CUR),
-@@ -1716,8 +1671,8 @@
+@@ -1716,8 +1673,8 @@
        mtlk_core_get_eeprom(nic),
        mtlk_eeprom_get_num_antennas(mtlk_core_get_eeprom(nic)));
  
@@ -555,7 +573,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      goto END;
    }
  
-@@ -1752,7 +1707,6 @@
+@@ -1752,7 +1709,6 @@
      struct ethhdr     *ether_header = (struct ethhdr *)nbuf->data;
      mtlk_hw_api_t     *hw_api       = mtlk_vap_get_hwapi(nic->vap_handle);
      uint32             tid          = mtlk_df_nbuf_get_priority(nbuf);
@@ -563,7 +581,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      mtlk_hw_data_req_mirror_t *msg  = NULL;
  
      /* Sanity check */
-@@ -1761,8 +1715,12 @@
+@@ -1761,8 +1717,12 @@
        goto tx_skip;
      }
  
@@ -578,7 +596,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (__UNLIKELY(!msg)) {
        ++nic->pstats.ac_dropped_counter[tid];
        nic->pstats.tx_overruns++;
-@@ -1778,6 +1736,7 @@
+@@ -1778,6 +1738,7 @@
      msg->nbuf       = nbuf;
      msg->size       = mtlk_df_nbuf_get_data_length(nbuf);
      msg->sid        = sta_sid;
@@ -586,7 +604,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      msg->tid        = tid;
      msg->wds        = (uint8)wds;
      msg->mcf        = wds ? 0 : nbuf_flags & (MTLK_NBUFF_MULTICAST | MTLK_NBUFF_BROADCAST);
-@@ -1805,6 +1764,9 @@
+@@ -1805,6 +1766,9 @@
  tx_skip:
      /* release hw message and record error's statistic */
      if (msg) {
@@ -596,7 +614,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        mtlk_hw_release_msg_to_send(hw_api, HW_MSG_PTR(msg));
      }
  
-@@ -1849,7 +1811,10 @@
+@@ -1849,7 +1813,10 @@
    mtlk_dump(5, data->nbuf->data, data->nbuf->len, "nbuf->data received from OS");
  
    if (__LIKELY(sta)) {
@@ -608,7 +626,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        mtlk_sta_on_packet_dropped(sta, MTLK_TX_DISCARDED_DROP_ALL_FILTER);
        nic->pstats.txerr_drop_all_filter++;
        goto tx_skip;
-@@ -1868,17 +1833,6 @@
+@@ -1868,17 +1835,6 @@
    }
    else
    {
@@ -626,7 +644,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (sta) {
        /* Use 4 address for peer APs and 4 address stations */
        if (sta->peer_ap || mtlk_sta_is_4addr(sta)) {
-@@ -1888,11 +1842,15 @@
+@@ -1888,11 +1844,15 @@
        }
        sta_sid = mtlk_sta_get_sid(sta);
      }
@@ -643,7 +661,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      res = __mtlk_core_dcdp_prepare_and_xmit(nic, data, wds, sta_sid, mc_index, nbuf_flags);
    else
  #endif
-@@ -1941,9 +1899,7 @@
+@@ -1941,9 +1901,7 @@
      if (mtlk_osal_eth_is_multicast(ether_header->h_dest)) {
        /* Multicast/broadcast*/
        if (!mtlk_osal_eth_is_broadcast(ether_header->h_dest)) {
@@ -654,7 +672,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
        dev_spec_info->mcf = 1;
      } else {
-@@ -1960,7 +1916,7 @@
+@@ -1960,7 +1918,7 @@
      }
    } else {
      /* STA mode */
@@ -663,7 +681,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      u8 *bssid = wv_ieee80211_peer_ap_address(vif);
      if (bssid) {
        dst_sta = mtlk_stadb_find_sta(&core->slow_ctx->stadb, bssid);
-@@ -1982,30 +1938,6 @@
+@@ -1982,30 +1940,6 @@
  static char test_wps_ie2[] = {0xdd, 7, 0x00, 0x50, 0xf2, 0x04, 7, 8, 9};
  #endif
  
@@ -694,7 +712,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  /*
  +----+-------++-----------------++------------------- -----------------------------------------+
  |     \      ||  Interf. Dis.   ||                   Inerf. Enabled                            |
-@@ -2399,10 +2331,16 @@
+@@ -2399,10 +2333,16 @@
      MTLK_ASSERT(params);
      memset(req, 0, sizeof(*req));
  
@@ -715,7 +733,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      /* Dealing w/ short slot time */
      if (params->use_short_slot_time == -1)
-@@ -2473,7 +2411,7 @@
+@@ -2473,7 +2413,7 @@
        memset(req->u8HE_Mcs_Nss, 0xff, sizeof(req->u8HE_Mcs_Nss));
        wave_pdb_get_binary(param_db_core, PARAM_DB_CORE_HE_MCS_NSS, &req->u8HE_Mcs_Nss, &mcs_len);
        mtlk_dump(1, &req->u8HE_Mcs_Nss, mcs_len, "dump of u8HE_Mcs_Nss:");
@@ -724,7 +742,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
  }
  
-@@ -2490,9 +2428,11 @@
+@@ -2490,9 +2430,11 @@
      struct mtlk_chan_def *current_chandef = __wave_core_chandef_get(master_core);
      wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
  
@@ -739,7 +757,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      /* Dealing w/ short slot time */
      if (params->use_short_slot_time != -1)
-@@ -2520,18 +2460,31 @@
+@@ -2520,18 +2462,31 @@
   * (otherwize there will be a dead-lock) but still the actual FW SET_BSS message should be
   * sent for the relevant core.
   */
@@ -771,7 +789,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      /* prepare msg for the FW */
      if (!(man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(core->vap_handle), &res))) {
        ELOG_DD("CID-%04x: UM_BSS_SET_BSS_REQ init failed, err=%i",
-@@ -2545,23 +2498,32 @@
+@@ -2545,23 +2500,32 @@
      req = (UMI_SET_BSS *) man_entry->payload;
      /* copy input structure and setup vapId */
      *req = *fw_params;
@@ -807,7 +825,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      /* process result */
      if (res != MTLK_ERR_OK)
          ELOG_DD("CID-%04x: UM_BSS_SET_BSS_REQ send failed, err=%i",
-@@ -2574,6 +2536,9 @@
+@@ -2574,6 +2538,9 @@
      if (NULL != man_entry)
        mtlk_txmm_msg_cleanup(&man_msg);
  
@@ -817,7 +835,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    end:
      finish_and_prevent_fw_set_chan(context_core, FALSE);
      return res;
-@@ -2581,7 +2546,8 @@
+@@ -2581,7 +2548,8 @@
  
  /* This function should be called from master serializer context */
  static int
@@ -827,7 +845,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    mtlk_core_t *core = NULL;
    UMI_SET_BSS fw_request;
-@@ -2613,8 +2579,10 @@
+@@ -2613,8 +2581,10 @@
    radio = wave_vap_radio_get(core->vap_handle);
  
    if (core->net_state != NET_STATE_ACTIVATING &&
@@ -839,7 +857,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (mtlk_vap_is_ap(core->vap_handle)) {
      if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(core->vap_handle))) {
-@@ -2623,29 +2591,61 @@
+@@ -2623,29 +2593,61 @@
        goto end;
      }
  
@@ -912,7 +930,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  end:
    return res;
-@@ -2665,7 +2665,7 @@
+@@ -2665,7 +2667,7 @@
  
    params = mtlk_clpb_enum_get_next(clpb, &params_size);
    MTLK_CLPB_TRY(params, params_size)
@@ -921,7 +939,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_CLPB_FINALLY(res)
      return mtlk_clpb_push_res(clpb, res);
    MTLK_CLPB_END;
-@@ -2700,7 +2700,9 @@
+@@ -2700,7 +2702,9 @@
      goto FINISH;
    }
  
@@ -932,7 +950,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    man_entry->id = UM_MAN_STOP_VAP_TRAFFIC_REQ;
    man_entry->payload_size = sizeof(*req);
-@@ -2820,14 +2822,8 @@
+@@ -2820,14 +2824,8 @@
  }
  
  void __MTLK_IFUNC
@@ -949,7 +967,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (subtype == MAN_TYPE_PROBE_RES) {
      if (is_broadcast) {
          _mtlk_core_del_bcast_probe_resp_entry(nic, peer);
-@@ -2837,6 +2833,18 @@
+@@ -2837,6 +2835,18 @@
    }
  }
  
@@ -968,7 +986,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  /* Update counters for BSS reserved queue */
  void __MTLK_IFUNC
  mtlk_core_on_bss_res_queued(mtlk_core_t *nic) {
-@@ -2861,10 +2869,12 @@
+@@ -2861,10 +2871,12 @@
  
    for (;;) {
      dat_uncfm = mtlk_osal_atomic_get(&nic->unconfirmed_data);
@@ -982,7 +1000,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      ILOG4_DDDDDDD("CID-%04x: wait_cnt %3d,  data:%d, bss:%d (sent:%d, confirmed:%d), bss_res_queue:%d",
                  mtlk_vap_get_oid(nic->vap_handle),
-@@ -2901,12 +2911,19 @@
+@@ -2901,12 +2913,19 @@
  
    ILOG2_DS("CID-%04x: net_state=%s", mtlk_vap_get_oid(nic->vap_handle), mtlk_net_state_to_string(nic->net_state));
  
@@ -1005,7 +1023,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (net_state == NET_STATE_CONNECTED) {
      if (nic->vap_in_fw_is_active) {
        res = _mtlk_core_send_stop_vap_traffic(nic);
-@@ -2936,12 +2953,11 @@
+@@ -2936,12 +2955,11 @@
    mtlk_vap_set_stopped(nic->vap_handle);
  
  FINISH:
@@ -1020,7 +1038,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      current_chandef->center_freq1 = 0;
    }
-@@ -3402,26 +3418,10 @@
+@@ -3402,26 +3420,10 @@
    return res;
  }
  
@@ -1047,7 +1065,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (mtlk_vap_is_master(core->vap_handle)) {
      mtlk_core_cfg_init_cca_adapt(core);
      mtlk_core_cfg_init_ire_ctrl(core);
-@@ -3490,15 +3490,30 @@
+@@ -3490,15 +3492,30 @@
    struct mtlk_ap_settings *aps;
    unsigned aps_size;
    int res;
@@ -1078,7 +1096,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        /* save these away for later restores, etc. */
        MTLK_CORE_PDB_SET_BINARY(nic, PARAM_DB_CORE_ESSID, aps->essid, aps->essid_len);
        wave_pdb_set_int(param_db_core, PARAM_DB_CORE_HIDDEN_SSID, aps->hidden_ssid);
-@@ -3560,6 +3575,19 @@
+@@ -3560,6 +3577,19 @@
  
      mtlk_stadb_configure(&nic->slow_ctx->stadb, &sta_db_cfg);
      mtlk_stadb_start(&nic->slow_ctx->stadb);
@@ -1098,7 +1116,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    MTLK_CLPB_FINALLY(res) {
      return mtlk_clpb_push_res(clpb, res);
-@@ -3567,6 +3595,18 @@
+@@ -3567,6 +3597,18 @@
    MTLK_CLPB_END;
  }
  
@@ -1117,7 +1135,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static int
  __mtlk_core_deactivate(mtlk_core_t *running_core, mtlk_core_t *nic)
  {
-@@ -3600,10 +3640,13 @@
+@@ -3600,10 +3642,13 @@
  
    _mtlk_core_poll_stat_stop(nic);
  
@@ -1134,7 +1152,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      mtlk_scan_support_t *ss = mtlk_core_get_scan_support(running_core);
      struct mtlk_chan_def *ccd = __wave_core_chandef_get(nic);
  
-@@ -3611,22 +3654,6 @@
+@@ -3611,22 +3656,6 @@
  
      mtlk_core_cfg_set_block_tx(nic, 0);
  
@@ -1157,7 +1175,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (ss->dfs_debug_params.debug_chan)
        ss->dfs_debug_params.switch_in_progress = FALSE;
  
-@@ -3658,12 +3685,18 @@
+@@ -3658,12 +3687,18 @@
        || (net_state == NET_STATE_HALTED)) /* for cleanup after exception */
    {
      deactivate_res = _mtlk_mbss_deactivate_vap(running_core, nic); /* this will set the net_state */
@@ -1177,7 +1195,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      } else {
        ILOG1_D("CID-%04x: Skip reset security", mtlk_vap_get_oid(nic->vap_handle));
      }
-@@ -3718,6 +3751,13 @@
+@@ -3718,6 +3753,13 @@
    */
    if (MTLK_ERR_OK != deactivate_res)
      res = deactivate_res;
@@ -1191,7 +1209,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return res;
  }
  
-@@ -3730,14 +3770,25 @@
+@@ -3730,14 +3772,25 @@
  _mtlk_core_deactivate (mtlk_handle_t hcore, const void* data, uint32 data_size)
  {
    int res = MTLK_ERR_OK;
@@ -1219,7 +1237,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  /* Set peer AP beacon interval (relevant only for station role interface)
-@@ -3803,13 +3854,23 @@
+@@ -3803,13 +3856,23 @@
    struct mgmt_tx_params *mtp;
    uint32 mtp_size;
    sta_entry *sta = NULL;
@@ -1243,7 +1261,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      dst_addr   = WLAN_GET_ADDR1(mtp->buf);
      frame_ctrl = mtlk_wlan_pkt_get_frame_ctl((uint8 *)mtp->buf);
      subtype    = (frame_ctrl & FRAME_SUBTYPE_MASK) >> FRAME_SUBTYPE_SHIFT;
-@@ -3837,15 +3898,21 @@
+@@ -3837,15 +3900,21 @@
            ILOG2_DY("CID-%04x: Don't send Probe Response to %Y", mtlk_vap_get_oid(core->vap_handle), dst_addr);
            MTLK_CLPB_EXIT(MTLK_ERR_OK); /* FIXME: code to return */
          }
@@ -1266,7 +1284,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        ILOG1_DSDDS("CID-%04x: Send %s frame error: type=%d, res=%d (%s)",
                 mtlk_vap_get_oid(core->vap_handle),
                 (mtp->extra_processing == PROCESS_MANAGEMENT) ? "management" : (mtp->extra_processing == PROCESS_EAPOL) ? "EAPOL" : (mtp->extra_processing == PROCESS_NULL_DATA_PACKET) ? "null data" : "unknown",
-@@ -3857,15 +3924,14 @@
+@@ -3857,15 +3926,14 @@
        if (sta)
          if (PROCESS_EAPOL == mtp->extra_processing)
            mtlk_sta_on_tx_packet_802_1x(sta);            /* Count 802_1x TX packets */
@@ -1286,7 +1304,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    }
    MTLK_CLPB_END;
  }
-@@ -3889,26 +3955,153 @@
+@@ -3889,26 +3957,153 @@
    MTLK_CLPB_END;
  }
  
@@ -1450,7 +1468,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (sta)
    {
      /* If WDS WPS station sent EAPOL not to us, discard. */
-@@ -3918,23 +4111,20 @@
+@@ -3918,23 +4113,20 @@
          return MTLK_ERR_OK;
        }
      }
@@ -1483,7 +1501,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    return MTLK_ERR_OK;
  
-@@ -4109,9 +4299,6 @@
+@@ -4109,9 +4301,6 @@
  
  void mtlk_set_dbg_channel_availability_check_time(mtlk_scan_support_t* obj, int channel_availability_check_time)
  {
@@ -1493,7 +1511,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    obj->dfs_debug_params.cac_time = channel_availability_check_time;
  }
  
-@@ -5123,8 +5310,8 @@
+@@ -5123,8 +5312,8 @@
    return res;
  }
  
@@ -1504,7 +1522,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    mtlk_txmm_msg_t           man_msg;
    mtlk_txmm_data_t          *man_entry = NULL;
-@@ -5160,6 +5347,13 @@
+@@ -5160,6 +5349,13 @@
    return res;
  }
  
@@ -1518,7 +1536,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static int
  _mtlk_core_check_and_set_radio_mode (mtlk_core_t *core, uint32 radio_mode)
  {
-@@ -5278,6 +5472,7 @@
+@@ -5278,6 +5474,7 @@
  
    mu_operation_config = (UMI_HE_MU_OPERATION_CONFIG *)(man_entry->payload);
    mu_operation_config->enableHeMuOperation = he_mu_operation;
@@ -1526,7 +1544,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
  
-@@ -5309,6 +5504,15 @@
+@@ -5309,6 +5506,15 @@
      return MTLK_ERR_PARAMS;
    }
  
@@ -1542,7 +1560,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG2_V("Sending UM_MAN_BF_MODE_CONFIG_REQ");
  
    man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), NULL);
-@@ -5373,8 +5577,16 @@
+@@ -5373,8 +5579,16 @@
  _mtlk_core_store_and_send_fixed_pwr_cfg (mtlk_core_t *core, FixedPower_t *fixed_pwr_params)
  {
    wave_radio_t *radio = wave_vap_radio_get(core->vap_handle);
@@ -1559,7 +1577,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (MTLK_ERR_OK != WAVE_RADIO_PDB_SET_BINARY(radio, PARAM_DB_RADIO_FIXED_PWR, fixed_pwr_params, sizeof(*fixed_pwr_params)))
      ELOG_V("Failed to store Fixed TX management power parameters");
  
-@@ -5452,8 +5664,8 @@
+@@ -5452,8 +5666,8 @@
        MTLK_CFG_CHECK_ITEM_AND_CALL_VOID(master_cfg, acs_update_timeout, WAVE_RADIO_PDB_SET_INT,
                                         (radio, PARAM_DB_RADIO_ACS_UPDATE_TO, master_cfg->acs_update_timeout));
  
@@ -1570,7 +1588,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
        MTLK_CFG_CHECK_ITEM_AND_CALL(master_cfg, mu_operation, mtlk_core_set_mu_operation,
                                    (core, !!master_cfg->mu_operation), res);
-@@ -5849,9 +6061,9 @@
+@@ -5849,9 +6063,9 @@
                                     (hcore, scan_and_calib_cfg->rbm), res);
        MTLK_CFG_CHECK_ITEM_AND_CALL(scan_and_calib_cfg, radar_detect, _mtlk_core_set_radar_detect,
                                     (core, !!scan_and_calib_cfg->radar_detect), res);
@@ -1582,7 +1600,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_CFG_END_CHEK_ITEM_AND_CALL()
    MTLK_CLPB_FINALLY(res)
      return mtlk_clpb_push_res(clpb, res);
-@@ -5886,8 +6098,6 @@
+@@ -5886,8 +6100,6 @@
                              &calib_cw_masks_size), res);
    MTLK_CFG_SET_ITEM(&scan_and_calib_cfg, radar_detect, WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_DFS_RADAR_DETECTION));
    if (mtlk_vap_is_ap(core->vap_handle)){
@@ -1591,7 +1609,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    } /* TODO MAC80211: handle set/get bss scan expire time for sta mode interface - is this required? */
    res = mtlk_clpb_push(clpb, &res, sizeof(res));
    if (MTLK_ERR_OK == res)
-@@ -5935,8 +6145,8 @@
+@@ -5935,8 +6147,8 @@
      MTLK_CFG_START_CHEK_ITEM_AND_CALL()
        MTLK_CFG_CHECK_ITEM_AND_CALL_VOID(tpc_cfg, loop_type, WAVE_RADIO_PDB_SET_INT,
                                (wave_vap_radio_get(core->vap_handle), PARAM_DB_RADIO_TPC_LOOP_TYPE, tpc_cfg->loop_type));
@@ -1602,7 +1620,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_CFG_END_CHEK_ITEM_AND_CALL()
    MTLK_CLPB_FINALLY(res)
      return mtlk_clpb_push_res(clpb, res);
-@@ -6572,7 +6782,7 @@
+@@ -6572,7 +6784,7 @@
      _mtlk_core_fill_set_bss_request(core, &fw_request, params);
  
      /* Process UM_BSS_SET_BSS_REQ */
@@ -1611,7 +1629,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  end:
      return res;
-@@ -6583,6 +6793,7 @@
+@@ -6583,6 +6795,7 @@
  {
      memset(bss_parameters, 0, sizeof(*bss_parameters));
      bss_parameters->use_cts_prot = -1;
@@ -1619,7 +1637,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      bss_parameters->use_short_preamble = -1;
      bss_parameters->use_short_slot_time = -1;
      bss_parameters->ht_opmode = -1;
-@@ -6598,7 +6809,7 @@
+@@ -6598,7 +6811,7 @@
  
      /* reset structure and set protection mode */
      _mtlk_core_reset_bss_params_internal(&bss_parameters);
@@ -1628,7 +1646,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      /* set bss */
      return _mtlk_core_set_bss_internal(core, &bss_parameters);
-@@ -7020,6 +7231,8 @@
+@@ -7020,6 +7233,8 @@
    }
  
    ILOG0_DD("CID-%04x: Deleting VAP#%d", mtlk_vap_get_oid(core->vap_handle), vap_index);
@@ -1637,7 +1655,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_vap_stop(vap_handle);
    mtlk_vap_delete(vap_handle);
    res = MTLK_ERR_OK;
-@@ -7086,6 +7299,8 @@
+@@ -7086,6 +7301,8 @@
        res = mtlk_clpb_push(clpb, &ctx, sizeof(ctx));
        if (MTLK_ERR_OK != res) {
          mtlk_clpb_purge(clpb);
@@ -1646,7 +1664,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
      } else { /* Station mode interface */
        ctx = mtlk_df_get_user(mtlk_vap_get_df(_vap_handle));
-@@ -7093,6 +7308,8 @@
+@@ -7093,6 +7310,8 @@
        res = mtlk_clpb_push(clpb, &ctx, sizeof(ctx));
        if (MTLK_ERR_OK != res) {
          mtlk_clpb_purge(clpb);
@@ -1655,7 +1673,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        }
      }
    }
-@@ -7173,8 +7390,9 @@
+@@ -7173,8 +7392,9 @@
        MTLK_CLPB_EXIT(MTLK_ERR_RETRY);
      }
  
@@ -1667,7 +1685,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_CLPB_FINALLY(res)
      return mtlk_clpb_push_res(clpb, res);
    MTLK_CLPB_END;
-@@ -7757,7 +7975,7 @@
+@@ -7757,7 +7977,7 @@
    if (sta) {
      do {
        WE_GEN_DATAEX_DEVICE_STATUS dataex_dev_status;
@@ -1676,7 +1694,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        dataex_dev_status.u32TxCount    = mtlk_sta_get_stat_cntr_tx_frames(sta);
  
        resp.datalen += sizeof(WE_GEN_DATAEX_DEVICE_STATUS);
-@@ -7946,58 +8164,6 @@
+@@ -7946,58 +8166,6 @@
    return hw_mmb_set_rtlog_cfg(mtlk_vap_get_hw(core->vap_handle), cfg_data, cfg_size);
  }
  
@@ -1735,7 +1753,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  int
  mtlk_core_update_network_mode(mtlk_core_t* nic, uint8 net_mode)
  {
-@@ -8145,6 +8311,16 @@
+@@ -8145,6 +8313,16 @@
      goto end;
    }
  
@@ -1752,7 +1770,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG5_YD("STA %Y found by SID %d", src_sta->info.addr.au8Addr, data->sid);
  
    qos = data->priority;
-@@ -8388,15 +8564,19 @@
+@@ -8388,15 +8566,19 @@
  
    /* check if have enough room in tx queue. Do not send probe response if not */
    if (mtlk_mmb_bss_mgmt_tx_check(core->vap_handle)) {
@@ -1774,7 +1792,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
            mtlk_core_inc_cnt(core, MTLK_CORE_CNT_TX_PROBE_RESP_DROPPED);
        }
    } else {
-@@ -8500,6 +8680,8 @@
+@@ -8500,6 +8682,8 @@
    cpd.switch_type = ST_NORMAL;
    cpd.block_tx_pre = FALSE;
    cpd.block_tx_post = FALSE; /* TRUE means waiting for radars */
@@ -1783,7 +1801,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    cpd.radar_required = FALSE; /* we have a station up so we don't need radar checks */
  
    _mtlk_df_user_invoke_core_async(master_df,
-@@ -8522,7 +8704,7 @@
+@@ -8522,7 +8706,7 @@
    mtlk_core_t         *cur_core;
    mtlk_vap_manager_t  *vap_mng;
    mtlk_vap_handle_t   vap_handle;
@@ -1792,7 +1810,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    int    size    = frame->size;
    int    freq    = frame->freq;
    unsigned subtype = frame->subtype;
-@@ -8530,7 +8712,9 @@
+@@ -8530,7 +8714,9 @@
    sta_entry *sta;
    IEEE_ADDR *src_addr;
  
@@ -1803,7 +1821,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    vap_mng  = mtlk_vap_get_manager(nic->vap_handle);
    max_vaps = wave_radio_max_vaps_get(wave_vap_radio_get(nic->vap_handle));
-@@ -8615,14 +8799,13 @@
+@@ -8615,14 +8801,13 @@
      }
    } /* for (i = 0; i < max_vaps; i++) */
  
@@ -1819,7 +1837,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int
-@@ -8812,6 +8995,8 @@
+@@ -8812,6 +8997,8 @@
          BOOL reported = FALSE;
          if (fd.notify_hapd_supplicant)
          {
@@ -1828,7 +1846,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
            BOOL is_broadcast = FALSE;
            reported = TRUE;
  
-@@ -8819,23 +9004,26 @@
+@@ -8819,23 +9006,26 @@
                 data->buf, data->size, &is_broadcast))
            {
              if (is_broadcast) {
@@ -1869,7 +1887,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
                }
              } else {
                /* unicast frames can be send directly */
-@@ -8911,12 +9099,7 @@
+@@ -8911,12 +9101,7 @@
    struct mtlk_chan_def ccd;
    UMI_RADAR_DETECTION *radar_det;
    mtlk_scan_support_t *ss;
@@ -1882,7 +1900,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    BOOL radar_det_enabled;
    struct nic *nic = HANDLE_T_PTR(struct nic, core_object);
    wave_radio_t *radio = wave_vap_radio_get(nic->vap_handle);
-@@ -8925,14 +9108,7 @@
+@@ -8925,14 +9110,7 @@
  
    MTLK_ASSERT(nic == mtlk_core_get_master(nic));
  
@@ -1897,7 +1915,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    radar_det_enabled = WAVE_RADIO_PDB_GET_INT(radio, PARAM_DB_RADIO_DFS_RADAR_DETECTION);
  
    ccd = *__wave_core_chandef_get(nic);
-@@ -8962,7 +9138,6 @@
+@@ -8962,7 +9140,6 @@
    ILOG0_DDDD("RADAR detected on channel: %u, radar_type: %u, radar bit map 0x%02x, emulated %d",
               radar_det->channel, radar_det->radarType, rbm, emulating);
  
@@ -1905,7 +1923,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_hw_inc_radar_cntr(mtlk_vap_get_hw(nic->vap_handle));
  
    if (!radar_det_enabled) {
-@@ -9000,24 +9175,12 @@
+@@ -9000,24 +9177,12 @@
        ss->dfs_debug_params.switch_in_progress = TRUE;
    }
  
@@ -1931,7 +1949,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    return MTLK_ERR_OK;
  }
-@@ -9249,7 +9412,7 @@
+@@ -9249,7 +9414,7 @@
  
  static int
  _mtlk_core_ap_add_sta_req (struct nic *nic,
@@ -1940,7 +1958,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  {
    int               res = MTLK_ERR_OK;
    mtlk_txmm_msg_t   man_msg;
-@@ -9260,9 +9423,18 @@
+@@ -9260,9 +9425,18 @@
    unsigned          rssi_offs;
    int               rssi;
  
@@ -1959,7 +1977,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (info->supported_rates_len > MAX_NUM_SUPPORTED_RATES) {
      ELOG_DD("Rates length (%d) is longer than rates array size (%d).",
        info->supported_rates_len, MAX_NUM_SUPPORTED_RATES);
-@@ -9384,6 +9556,8 @@
+@@ -9384,6 +9558,8 @@
    mtlk_dump(1, psUmiStaAdd->u8HE_Mcs_Nss, sizeof(psUmiStaAdd->u8HE_Mcs_Nss), "dump of UMI_STA_ADD->u8HE_Mcs_Nss:");
    mtlk_dump(1, psUmiStaAdd->u8HE_Ppe_Th, sizeof(psUmiStaAdd->u8HE_Ppe_Th), "dump of UMI_STA_ADD->u8HE_Ppe_Th:");
  
@@ -1968,7 +1986,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
    if (res != MTLK_ERR_OK) {
      ELOG_DD("CID-%04x: Can't send UM_MAN_STA_ADD_REQ request to MAC (err=%d)",
-@@ -9391,6 +9565,8 @@
+@@ -9391,6 +9567,8 @@
      goto FINISH;
    }
  
@@ -1977,7 +1995,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (psUmiStaAdd->u8Status != UMI_OK) {
      WLOG_DYD("CID-%04x: Station %Y add failed in FW (status=%u)",
               mtlk_vap_get_oid(nic->vap_handle),
-@@ -9400,8 +9576,13 @@
+@@ -9400,8 +9578,13 @@
      goto FINISH;
    }
  
@@ -1992,7 +2010,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG1_DYD("CID-%04x: Station %Y connected (SID = %u)",
              mtlk_vap_get_oid(nic->vap_handle),
              &info->addr,
-@@ -9411,7 +9592,8 @@
+@@ -9411,7 +9594,8 @@
    if (man_entry) {
      mtlk_txmm_msg_cleanup(&man_msg);
    }
@@ -2002,7 +2020,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return res;
  }
  
-@@ -9458,6 +9640,7 @@
+@@ -9458,6 +9642,7 @@
    const IEEE_ADDR *addr = &info->addr;
    sta_entry *sta = NULL;
    BOOL is_ht_capable;
@@ -2010,7 +2028,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    uint32 four_addr_mode = MTLK_CORE_PDB_GET_INT(core, PARAM_DB_CORE_4ADDR_MODE);
  
    /* set WDS flag for peer AP */
-@@ -9500,11 +9683,24 @@
+@@ -9500,11 +9685,24 @@
    if (sta != NULL) {
      ELOG_DY("CID-%04x: ERROR:Try to add sta which already exist:%Y", mtlk_vap_get_oid(core->vap_handle), info->addr.au8Addr);
      mtlk_sta_decref(sta);
@@ -2037,7 +2055,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      goto FINISH;
    }
  
-@@ -9515,7 +9711,8 @@
+@@ -9515,7 +9713,8 @@
    sta = _mtlk_core_add_sta(core, addr, info);
  
    if (sta == NULL) {
@@ -2047,7 +2065,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      res = MTLK_ERR_UNKNOWN;
      goto FINISH;
    }
-@@ -9533,7 +9730,8 @@
+@@ -9533,7 +9732,8 @@
  
          core_ap_stop_traffic(core, &sta->info); /* Send Stop Traffic Request to FW */
  
@@ -2057,7 +2075,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
          mtlk_stadb_remove_sta(&core->slow_ctx->stadb, sta);
          res = MTLK_ERR_UNKNOWN;
          goto FINISH;
-@@ -9578,11 +9776,6 @@
+@@ -9578,11 +9778,6 @@
    /* notify Traffic Analyzer about new STA */
    mtlk_ta_on_connect(mtlk_vap_get_ta(core->vap_handle), sta);
  
@@ -2069,7 +2087,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (!mtlk_vap_is_ap(core->vap_handle)) {
      bss_data_t bss_found;
      if (mtlk_cache_find_bss_by_bssid(&core->slow_ctx->cache, addr, &bss_found, NULL) == 0) {
-@@ -9633,27 +9826,43 @@
+@@ -9633,27 +9828,43 @@
  
  static int _mtlk_core_ap_connect_sta (mtlk_handle_t hcore, const void* data, uint32 data_size)
  {
@@ -2128,7 +2146,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  int _mtlk_send_filter_req(mtlk_core_t *core, sta_entry *sta, BOOL authorizing)
-@@ -9684,8 +9893,17 @@
+@@ -9684,8 +9895,17 @@
    ILOG1_DD("CID-%04x: UM_MAN_SET_802_1X_FILTER_REQ u8IsFilterOpen:%d", mtlk_vap_get_oid(core->vap_handle),
             umi_filter->u8IsFilterOpen);
  
@@ -2146,7 +2164,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ELOG_DD("CID-%04x: mtlk_mm_send_blocked failed: %i", mtlk_vap_get_oid(core->vap_handle), res);
    }
  
-@@ -9745,7 +9963,14 @@
+@@ -9745,7 +9965,14 @@
    if (sta == NULL) {
      ILOG1_DY("CID-%04x: Station %Y not found during authorizing",
               mtlk_vap_get_oid(core->vap_handle), sStationID.au8Addr);
@@ -2162,7 +2180,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      goto FINISH;
    }
  
-@@ -9767,6 +9992,8 @@
+@@ -9767,6 +9994,8 @@
    }
  
    res = _mtlk_send_filter_req(core, sta, authorizing);
@@ -2171,7 +2189,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if(authorizing){
      mtlk_sta_set_packets_filter(sta, MTLK_PCKT_FLTR_ALLOW_ALL);
-@@ -9832,9 +10059,12 @@
+@@ -9832,9 +10061,12 @@
    */
  
    sta = mtlk_stadb_iterate_first(&core->slow_ctx->stadb, &iter);
@@ -2184,7 +2202,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        res = _mtlk_core_ap_disconnect_sta_blocked(core,
                                                   mtlk_sta_get_addr(sta),
                                                   FM_STATUSCODE_USER_REQUEST);
-@@ -9845,7 +10075,15 @@
+@@ -9845,7 +10077,15 @@
          break;
        }
  
@@ -2201,7 +2219,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        sta = mtlk_stadb_iterate_next(&iter);
      } while (sta);
      mtlk_stadb_iterate_done(&iter);
-@@ -10009,7 +10247,6 @@
+@@ -10009,7 +10249,6 @@
    MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, BEACON_DATA)
    MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, MGMT_FRAME_FILTER)
    MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, SCHED_SCAN_TIMER_INIT)
@@ -2209,7 +2227,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, CCA_TIMER_INIT)
    MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, SCHED_SCAN_REQ_INIT)
    MTLK_INIT_STEPS_LIST_ENTRY(core_slow_ctx, PROBE_RESP_LOCK)
-@@ -10043,8 +10280,6 @@
+@@ -10043,8 +10282,6 @@
                        mem_free_nullsafe, ((void **) &slow_ctx->sched_scan_req));
      MTLK_CLEANUP_STEP(core_slow_ctx, CCA_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
                        mtlk_osal_timer_cleanup, (&slow_ctx->cca_step_down_timer));
@@ -2218,7 +2236,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_CLEANUP_STEP(core_slow_ctx, SCHED_SCAN_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
                        mtlk_osal_timer_cleanup, (&slow_ctx->sched_scan_timer));
      MTLK_CLEANUP_STEP(core_slow_ctx, MGMT_FRAME_FILTER, MTLK_OBJ_PTR(slow_ctx),
-@@ -10129,8 +10364,6 @@
+@@ -10129,8 +10366,6 @@
      MTLK_INIT_STEP(core_slow_ctx, SCHED_SCAN_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
                     mtlk_osal_timer_init, (&slow_ctx->sched_scan_timer, sched_scan_timer_clb_func, HANDLE_T(nic)));
  
@@ -2227,7 +2245,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
      MTLK_INIT_STEP(core_slow_ctx, CCA_TIMER_INIT, MTLK_OBJ_PTR(slow_ctx),
                     mtlk_osal_timer_init, (&slow_ctx->cca_step_down_timer, cca_step_down_timer_clb_func, HANDLE_T(nic)));
-@@ -10158,40 +10391,14 @@
+@@ -10158,40 +10393,14 @@
  static int
  mtlk_core_crypto_cleanup (mtlk_core_t *core)
  {
@@ -2271,7 +2289,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return MTLK_ERR_OK;
  }
  
-@@ -10202,7 +10409,12 @@
+@@ -10202,7 +10411,12 @@
  uint8 rc4key[3 + MIB_WEP_KEY_WEP2_LENGTH];
  uint32 key_len;
  uint32 crc;
@@ -2285,7 +2303,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    /* check the cipher */
    if ((slow_ctx->keys[key_idx].key_len == 0) || ((slow_ctx->keys[key_idx].cipher != UMI_RSN_CIPHER_SUITE_WEP104) &&
-@@ -10221,10 +10433,9 @@
+@@ -10221,10 +10435,9 @@
    wave_memcpy(rc4key + IEEE80211_WEP_IV_WO_IDX_LEN, sizeof(rc4key) - IEEE80211_WEP_IV_WO_IDX_LEN,
        slow_ctx->keys[key_idx].key, slow_ctx->keys[key_idx].key_len);
  
@@ -2299,7 +2317,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    crc = cpu_to_le32(~crc32_le(~0, data, data_len));
    if (memcmp(&crc, data + data_len, IEEE80211_WEP_ICV_LEN) != 0) {
-@@ -10566,8 +10777,8 @@
+@@ -10566,8 +10779,8 @@
    MTLK_START_STEPS_LIST_ENTRY(core_slow_ctx, WDS_INIT)
    MTLK_START_STEPS_LIST_ENTRY(core_slow_ctx, SET_DEFAULT_BAND)
    MTLK_START_STEPS_LIST_ENTRY(core_slow_ctx, SET_DEFAULT_NET_MODE)
@@ -2309,7 +2327,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_START_STEPS_LIST_ENTRY(core_slow_ctx, CORE_STAT_REQ_HANDLER)
  MTLK_START_INNER_STEPS_BEGIN(core_slow_ctx)
  MTLK_START_STEPS_LIST_END(core_slow_ctx);
-@@ -10697,12 +10908,12 @@
+@@ -10697,12 +10910,12 @@
      MTLK_STOP_STEP(core_slow_ctx, CORE_STAT_REQ_HANDLER, MTLK_OBJ_PTR(slow_ctx),
                     mtlk_wssd_unregister_request_handler, (mtlk_vap_get_irbd(nic->vap_handle), slow_ctx->stat_irb_handle));
  
@@ -2325,7 +2343,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_STOP_STEP(core_slow_ctx, SET_DEFAULT_NET_MODE, MTLK_OBJ_PTR(slow_ctx),
                     MTLK_NOACTION, ())
  
-@@ -10802,14 +11013,14 @@
+@@ -10802,14 +11015,14 @@
      MTLK_START_STEP(core_slow_ctx, SET_DEFAULT_NET_MODE, MTLK_OBJ_PTR(slow_ctx),
                      mtlk_core_set_default_net_mode, (nic))
  
@@ -2343,7 +2361,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_START_STEP_EX(core_slow_ctx, CORE_STAT_REQ_HANDLER, MTLK_OBJ_PTR(slow_ctx),
                         mtlk_wssd_register_request_handler, (mtlk_vap_get_irbd(nic->vap_handle),
                                                              _mtlk_core_stat_handle_request, HANDLE_T(slow_ctx)),
-@@ -10824,7 +11035,6 @@
+@@ -10824,7 +11037,6 @@
    MTLK_START_STEPS_LIST_ENTRY(core, SLOW_CTX_START)
    MTLK_START_STEPS_LIST_ENTRY(core, DF_USER_SET_MAC_ADDR)
    MTLK_START_STEPS_LIST_ENTRY(core, RESET_STATS)
@@ -2351,7 +2369,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_START_STEPS_LIST_ENTRY(core, DUT_REGISTER)
    MTLK_START_STEPS_LIST_ENTRY(core, VAP_DB)
    MTLK_START_STEPS_LIST_ENTRY(core, CORE_ABILITIES_INIT)
-@@ -10871,9 +11081,6 @@
+@@ -10871,9 +11083,6 @@
      MTLK_STOP_STEP(core, DUT_REGISTER, MTLK_OBJ_PTR(nic),
                     mtlk_dut_core_unregister, (nic));
  
@@ -2361,7 +2379,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_STOP_STEP(core, RESET_STATS, MTLK_OBJ_PTR(nic),
                     MTLK_NOACTION, ())
  
-@@ -10923,9 +11130,6 @@
+@@ -10923,9 +11132,6 @@
      MTLK_START_STEP_VOID(core, RESET_STATS, MTLK_OBJ_PTR(nic),
                           _mtlk_core_reset_stats_internal, (nic))
  
@@ -2371,7 +2389,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_START_STEP(core, DUT_REGISTER, MTLK_OBJ_PTR(nic),
                      mtlk_dut_core_register, (nic));
  
-@@ -11013,7 +11217,26 @@
+@@ -11013,7 +11219,26 @@
  _mtlk_core_handle_rx_data (mtlk_vap_handle_t vap_handle, mtlk_core_handle_rx_data_t *data)
  {
    mtlk_nbuf_t *nbuf = data->nbuf;
@@ -2399,7 +2417,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return _handle_rx_ind(mtlk_vap_get_core(vap_handle), nbuf, data);
  }
  
-@@ -11244,8 +11467,6 @@
+@@ -11244,8 +11469,6 @@
          ILOG0_DDD("CID-%04x: Interference is detected on channel %d with Metric %d", mtlk_vap_get_oid(core->vap_handle),
                     interferer_ind->channel, interferer_ind->maximumValue);
  
@@ -2408,7 +2426,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
          res = fill_channel_data(core, &ch_data);
          if (res == MTLK_ERR_OK) mtlk_send_chan_data(core->vap_handle, &ch_data, sizeof(ch_data));
        }
-@@ -11397,34 +11618,6 @@
+@@ -11397,34 +11620,6 @@
    return MTLK_ERR_OK;
  }
  
@@ -2443,7 +2461,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  /* This function should be called from master serializer context */
  static int
-@@ -11448,25 +11641,28 @@
+@@ -11448,25 +11643,28 @@
        MTLK_CLPB_EXIT(MTLK_ERR_RETRY);
      }
  
@@ -2478,7 +2496,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
  
      if (bss_change_params->changed & BSS_CHANGED_BEACON_INT) {
-@@ -11480,41 +11676,19 @@
+@@ -11480,41 +11678,19 @@
         * in case we have low rate, many retries, lack of PDs, etc...
         */
  
@@ -2526,7 +2544,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_CLPB_FINALLY(res)
      return mtlk_clpb_push_res(clpb, res);
    MTLK_CLPB_END
-@@ -11643,8 +11817,9 @@
+@@ -11643,8 +11819,9 @@
        HANDLE_T(nic), payload, sizeof(UMI_Beacon_Block_t));
      break;
    case MC_MAN_RADAR_IND:
@@ -2538,7 +2556,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      break;
    case MC_MAN_BEACON_TEMPLATE_WAS_SET_IND:
      /* This has to be run in master VAP context */
-@@ -11652,9 +11827,7 @@
+@@ -11652,9 +11829,7 @@
        /* recovery case */
        wave_beacon_man_rcvry_template_ind_handle(master_nic);
      } else {
@@ -2549,7 +2567,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      }
      break;
    case MC_MAN_CLASS3_ERROR_IND:
-@@ -11702,6 +11875,8 @@
+@@ -11702,6 +11877,8 @@
         WAVE_CORE_REQ_GET_STATION   == req_id ||
         WAVE_CORE_REQ_CHANGE_BSS    == req_id ||
         WAVE_CORE_REQ_SET_WMM_PARAM == req_id ||
@@ -2558,7 +2576,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
         WAVE_RADIO_REQ_SET_CHAN      == req_id ||
         WAVE_RADIO_REQ_DO_SCAN       == req_id ||
         WAVE_RADIO_REQ_SCAN_TIMEOUT  == req_id)) {
-@@ -11711,6 +11886,47 @@
+@@ -11711,6 +11888,47 @@
    return TRUE;
  }
  
@@ -2606,7 +2624,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  void __MTLK_IFUNC
  mtlk_core_handle_tx_ctrl (mtlk_vap_handle_t    vap_handle,
                            mtlk_user_request_t *req,
-@@ -11725,6 +11941,12 @@
+@@ -11725,6 +11943,12 @@
      _mtlk_process_user_task(nic, req, SERIALIZABLE, req_id, func, HANDLE_T(nic), data); \
      break;
  
@@ -2619,7 +2637,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #define _MTLK_CORE_HANDLE_REQ_SYNCHRONOUS(req_id, func)                                 \
    case (req_id):                                                                        \
      _mtlk_process_user_task(nic, req, SYNCHRONOUS, req_id, func, HANDLE_T(nic), data);  \
-@@ -11757,7 +11979,7 @@
+@@ -11757,7 +11981,7 @@
  
    _WAVE_CORE_REQ_MAP_START(id)
      /* Radio requests */
@@ -2628,7 +2646,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_BEACON,                wave_beacon_man_beacon_set);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_BEACON_INTERVAL,       _mtlk_beacon_man_set_beacon_interval);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_REQUEST_SID,               core_cfg_request_sid);
-@@ -11769,12 +11991,16 @@
+@@ -11769,12 +11993,16 @@
      _MTLK_CORE_HANDLE_REQ_SYNCHRONOUS(WAVE_CORE_REQ_MGMT_TX,                    _mtlk_core_mgmt_tx);
      _MTLK_CORE_HANDLE_REQ_SYNCHRONOUS(WAVE_CORE_REQ_MGMT_RX,                    _mtlk_core_mgmt_rx);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_CONNECT_STA,               _mtlk_core_connect_sta);
@@ -2651,7 +2669,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_MAC_ADDR,              _mtlk_core_set_mac_addr_wrapper);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_MAC_ADDR,              _mtlk_core_get_mac_addr);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_STATUS,                _mtlk_core_get_status);
-@@ -11794,8 +12020,6 @@
+@@ -11794,8 +12022,6 @@
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GEN_DATA_EXCHANGE,         _mtlk_core_gen_data_exchange);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_EE_CAPS,               _mtlk_core_get_ee_caps);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_L2NAT_STATS,           _mtlk_core_get_l2nat_stats);
@@ -2660,7 +2678,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_RANGE_INFO,            _mtlk_core_range_info_get);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_STADB_STATUS,          _mtlk_core_get_stadb_sta_list);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_STADB_STA_BY_ITER_ID,  _mtlk_core_get_stadb_sta_by_iter_id);
-@@ -11804,13 +12028,13 @@
+@@ -11804,13 +12030,13 @@
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_WDS_WEP_ENC_CFG,       mtlk_core_cfg_get_wds_wep_enc_cfg);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_AUTH_CFG,              mtlk_core_cfg_set_auth_cfg);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_AUTH_CFG,              mtlk_core_cfg_get_auth_cfg);
@@ -2678,7 +2696,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_RX_TH,                 mtlk_core_cfg_get_rx_threshold);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_RX_TH,                 mtlk_core_cfg_set_rx_threshold);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_QOS_MAP,               _mtlk_core_set_qos_map);
-@@ -11822,15 +12046,9 @@
+@@ -11822,15 +12048,9 @@
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_STATION_MEASUREMENTS,  _mtlk_core_get_station_measurements);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_VAP_MEASUREMENTS,      _mtlk_core_get_vap_measurements);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_UNCONNECTED_STATION,   _mtlk_core_get_unconnected_station);
@@ -2694,7 +2712,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_WDS_WPA_LIST_ENTRIES,  mtlk_core_cfg_get_wds_wpa_entry);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_SET_DGAF_DISABLED,         mtlk_core_cfg_set_dgaf_disabled);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_TX_POWER,             _mtlk_core_get_tx_power);
-@@ -11838,6 +12056,8 @@
+@@ -11838,6 +12058,8 @@
  
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_RADIO_INFO,           _mtlk_core_get_radio_info);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_CHAN,                 core_cfg_set_chan_clpb);
@@ -2703,7 +2721,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_DO_SCAN,                  scan_do_scan);
      _MTLK_CORE_HANDLE_REQ_SYNCHRONOUS(WAVE_RADIO_REQ_START_SCHED_SCAN,          scan_start_sched_scan);
      _MTLK_CORE_HANDLE_REQ_SYNCHRONOUS(WAVE_RADIO_REQ_STOP_SCHED_SCAN,           scan_stop_sched_scan);
-@@ -11901,7 +12121,7 @@
+@@ -11901,7 +12123,7 @@
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_TX_POWER_LIMIT_OFFSET,  _mtlk_core_get_tx_power_limit_offset);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_TX_POWER_LIMIT_OFFSET,  _mtlk_core_set_tx_power_limit_offset);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_CORE_REQ_GET_HT_PROTECTION,         _mtlk_core_get_ht_protection)
@@ -2712,7 +2730,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_QAMPLUS_MODE,         _mtlk_core_set_qamplus_mode);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_QAMPLUS_MODE,         _mtlk_core_get_qamplus_mode);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_RADIO_MODE,           _mtlk_core_set_radio_mode);
-@@ -11931,10 +12151,11 @@
+@@ -11931,10 +12153,11 @@
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_FREQ_JUMP_MODE,       mtlk_core_cfg_set_freq_jump_mode);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_RESTRICTED_AC_MODE,    mtlk_core_cfg_set_restricted_ac_mode_cfg);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_RESTRICTED_AC_MODE,    mtlk_core_cfg_get_restricted_ac_mode_cfg);
@@ -2725,7 +2743,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_SET_CALIBRATION_MASK,      core_cfg_set_calibration_mask);
      _MTLK_CORE_HANDLE_REQ_SERIALIZABLE(WAVE_RADIO_REQ_GET_CALIBRATION_MASK,      core_cfg_get_calibration_mask);
  
-@@ -12037,51 +12258,6 @@
+@@ -12037,51 +12260,6 @@
    mtlk_fast_mem_free(core);
  }
  
@@ -2777,7 +2795,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static int
  _mtlk_core_get_hw_limits (mtlk_handle_t hcore, const void *data, uint32 data_size)
  {
-@@ -12159,6 +12335,7 @@
+@@ -12159,6 +12337,7 @@
    }
  }
  
@@ -2785,7 +2803,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static int
  _mtlk_core_get_tx_rate_power (mtlk_handle_t hcore, const void *data, uint32 data_size)
  {
-@@ -12274,48 +12451,6 @@
+@@ -12274,48 +12453,6 @@
  }
  
  static int
@@ -2834,7 +2852,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  _mtlk_core_get_stadb_sta_by_iter_id (mtlk_handle_t hcore, const void* data, uint32 data_size)
  {
    int res = MTLK_ERR_OK;
-@@ -12707,6 +12842,14 @@
+@@ -12707,6 +12844,14 @@
      return _mtlk_slave_core_range_info_get (core, data, data_size);
  }
  
@@ -2849,7 +2867,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static int
  _mtlk_core_get_enc_ext_cfg (mtlk_handle_t hcore, const void* data, uint32 data_size)
  {
-@@ -12724,6 +12867,9 @@
+@@ -12724,6 +12869,9 @@
  
    MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
  
@@ -2859,7 +2877,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(nic->vap_handle))) {
      ILOG1_D("CID-%04x: HOSTAPD STA database is not synced", mtlk_vap_get_oid(nic->vap_handle));
      res = MTLK_ERR_NOT_READY;
-@@ -12756,6 +12902,12 @@
+@@ -12756,6 +12904,12 @@
      goto FINISH;
    }
  
@@ -2872,7 +2890,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    umi_gpn = (UMI_GROUP_PN*)man_entry->payload;
    memset(umi_gpn, 0, sizeof(UMI_GROUP_PN));
  
-@@ -12828,6 +12980,9 @@
+@@ -12828,6 +12982,9 @@
  
    MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
  
@@ -2882,7 +2900,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if ((mtlk_core_get_net_state(core) & (NET_STATE_READY | NET_STATE_ACTIVATING | NET_STATE_CONNECTED)) == 0) {
      ILOG1_D("CID-%04x: Invalid card state - request rejected", mtlk_vap_get_oid(core->vap_handle));
      res = MTLK_ERR_NOT_READY;
-@@ -12847,6 +13002,14 @@
+@@ -12847,6 +13004,14 @@
      goto FINISH;
    }
  
@@ -2897,7 +2915,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* Prepare UMI message */
    man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, txmm, NULL);
    if (!man_entry) {
-@@ -12868,8 +13031,6 @@
+@@ -12868,8 +13033,6 @@
      goto FINISH;
    }
  
@@ -2906,7 +2924,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* Set Ciper Suite */
    alg_type = encext_cfg->alg_type;
    switch (alg_type) {
-@@ -12887,18 +13048,34 @@
+@@ -12887,18 +13050,34 @@
        }
        break;
      case IW_ENCODE_ALG_TKIP:
@@ -2943,7 +2961,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        umi_key->u16CipherSuite = HOST_TO_MAC16(UMI_RSN_CIPHER_SUITE_GCMP256);
        break;
      default:
-@@ -12910,10 +13087,6 @@
+@@ -12910,10 +13089,6 @@
    /* Set key type */
    if (mtlk_osal_eth_is_broadcast(encext_cfg->sta_addr.au8Addr)) {
      umi_key->u16KeyType = HOST_TO_MAC16(UMI_RSN_GROUP_KEY);
@@ -2954,7 +2972,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      umi_key->u16Sid = HOST_TO_MAC16(TMP_BCAST_DEST_ADDR);
    }
    else {
-@@ -12934,10 +13107,6 @@
+@@ -12934,10 +13109,6 @@
     * actually second part of key is copied into au8Tk2 array */
    wave_memcpy(umi_key->au8Tk, sizeof(umi_key->au8Tk), encext_cfg->key, key_len);
  
@@ -2965,7 +2983,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    /* set TX sequence number */
    umi_key->au8TxSeqNum[0] = 1;
    umi_key->u16KeyIndex = HOST_TO_MAC16(key_indx);
-@@ -12950,23 +13119,43 @@
+@@ -12950,23 +13121,43 @@
    ILOG1_D("UMI_SET_KEY        KeyIndex:%d", MAC_TO_HOST16(umi_key->u16KeyIndex));
    mtlk_dump(1, umi_key->au8RxSeqNum, sizeof(umi_key->au8RxSeqNum), "RxSeqNum");
    mtlk_dump(1, umi_key->au8TxSeqNum, sizeof(umi_key->au8TxSeqNum), "TxSeqNum");
@@ -3020,7 +3038,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  FINISH:
    if (NULL != sta) {
-@@ -12980,6 +13169,93 @@
+@@ -12980,6 +13171,93 @@
    return res;
  }
  
@@ -3114,7 +3132,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  static int
  _mtlk_core_set_default_key_cfg (mtlk_handle_t hcore, const void* data, uint32 data_size)
  {
-@@ -12997,6 +13273,9 @@
+@@ -12997,6 +13275,9 @@
  
    MTLK_ASSERT(sizeof(mtlk_clpb_t*) == data_size);
  
@@ -3124,7 +3142,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (!mtlk_mmb_is_sync_hostapd_done(mtlk_vap_get_hw(core->vap_handle))) {
      ILOG1_D("CID-%04x: HOSTAPD STA database is not synced", mtlk_vap_get_oid(core->vap_handle));
      res = MTLK_ERR_NOT_READY;
-@@ -13051,7 +13330,11 @@
+@@ -13051,7 +13332,11 @@
    ILOG2_D("UMI_SET_DEFAULT_KEY        KeyIndex:%d", MAC_TO_HOST16(umi_default_key->u16KeyIndex));
  
    res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
@@ -3136,7 +3154,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ELOG_DD("CID-%04x: mtlk_mm_send_blocked failed: %i", mtlk_vap_get_oid(core->vap_handle), res);
      goto FINISH;
    }
-@@ -13122,6 +13405,10 @@
+@@ -13122,6 +13407,10 @@
    ILOG2_D("UMI_SET_DEFAULT_KEY        KeyIndex:%d", MAC_TO_HOST16(umi_default_key->u16KeyIndex));
  
    res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
@@ -3147,7 +3165,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (MTLK_ERR_OK != res) {
      ELOG_DD("CID-%04x: mtlk_mm_send_blocked failed: %i", mtlk_vap_get_oid(core->vap_handle), res);
      goto FINISH;
-@@ -13137,39 +13424,24 @@
+@@ -13137,39 +13426,24 @@
  
  /* Aggregation configuration */
  static int
@@ -3202,7 +3220,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static int _mtlk_core_get_aggr_cfg (mtlk_handle_t hcore, const void* data, uint32 data_size)
-@@ -13519,11 +13791,7 @@
+@@ -13519,11 +13793,7 @@
  
  #ifdef MTLK_DEBUG
    (void)mtlk_hw_get_prop(hw_api, MTLK_HW_FW_CFM_IN_TASKLET,         &general_stats->tx_max_cfm_in_tasklet,      sizeof(general_stats->tx_max_cfm_in_tasklet));
@@ -3214,7 +3232,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #endif
  
    mtlk_txmm_get_stats(mtlk_vap_get_txmm(nic->vap_handle), &txm_stats);
-@@ -13554,9 +13822,9 @@
+@@ -13554,9 +13824,9 @@
      }
  
      /* Get MHI Statistics which is per HW card */
@@ -3227,7 +3245,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      /* Update all VAPs Statistics */
      if (MTLK_ERR_OK == res) {
        _mtlk_core_update_vaps_mhi_stats(nic, radio, hw);
-@@ -13569,8 +13837,8 @@
+@@ -13569,8 +13839,8 @@
        iwpriv_cca_adapt_t cca_adapt_params;
        mtlk_pdb_size_t cca_adapt_size = sizeof(cca_adapt_params);
  
@@ -3238,7 +3256,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
        /* if beacons were blocked due to CCA, need to poll CWI */
        if (nic->slow_ctx->cca_adapt.cwi_poll) {
          if (MTLK_ERR_OK != WAVE_RADIO_PDB_GET_BINARY(radio, PARAM_DB_RADIO_CCA_ADAPT, &cca_adapt_params, &cca_adapt_size))
-@@ -14286,7 +14554,10 @@
+@@ -14286,7 +14556,10 @@
  {
    uint8 mu_operation = WAVE_RADIO_PDB_GET_INT(wave_vap_radio_get(core->vap_handle), PARAM_DB_RADIO_MU_OPERATION);
  
@@ -3250,7 +3268,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      return MTLK_ERR_OK;
  
    return mtlk_core_set_mu_operation(core, mu_operation);
-@@ -14742,8 +15013,7 @@
+@@ -14742,8 +15015,7 @@
    /* net state is CONNECTED */
  
    RECOVERY_INFO("set wmm", core_oid);
@@ -3260,7 +3278,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (res != MTLK_ERR_OK) {goto ERR_END;}
  
    if (mtlk_vap_is_master(core->vap_handle)) {
-@@ -14882,6 +15152,8 @@
+@@ -14882,6 +15154,8 @@
    memset(umi_rem_sid, 0, sizeof(UMI_REMOVE_SID));
    umi_rem_sid->u16SID = HOST_TO_MAC16(sid);
  
@@ -3269,7 +3287,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_dump(2, umi_rem_sid, sizeof(UMI_REMOVE_SID), "dump of UMI_REMOVE_SID before submitting to FW:");
    res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
    mtlk_dump(2, umi_rem_sid, sizeof(UMI_REMOVE_SID), "dump of UMI_REMOVE_SID after submitting to FW:");
-@@ -14948,6 +15220,7 @@
+@@ -14948,6 +15222,7 @@
    psUmiStopTraffic->u8Status = UMI_OK;
    psUmiStopTraffic->u16SID = HOST_TO_MAC16(info->sid);
  
@@ -3277,7 +3295,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    mtlk_dump(2, psUmiStopTraffic, sizeof(UMI_STA_REMOVE), "dump of UMI_STOP_TRAFFIC:");
  
    res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
-@@ -14982,20 +15255,17 @@
+@@ -14982,20 +15257,17 @@
    man_entry = mtlk_txmm_msg_init_with_empty_data(&man_msg, mtlk_vap_get_txmm(vap_handle), &res);
    if (man_entry == NULL) {
      ELOG_D("CID-%04x: Can't send STA_REMOVE request to MAC: no MAN_MSG", mtlk_vap_get_oid(vap_handle));
@@ -3301,7 +3319,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG1_DY("UMI_STA_REMOVE->u16SID: %u, %Y", MAC_TO_HOST16(psUmiStaRemove->u16SID), &info->addr);
    res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
    if (res != MTLK_ERR_OK) {
-@@ -15015,6 +15285,14 @@
+@@ -15015,6 +15287,14 @@
  
  finish:
    mtlk_txmm_msg_cleanup(&man_msg);
@@ -3316,7 +3334,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    return res;
  }
  
-@@ -15076,82 +15354,6 @@
+@@ -15076,82 +15356,6 @@
    return mtlk_df_ui_mcast_is_registered(mtlk_vap_get_df(nic->vap_handle));
  }
  
@@ -3399,7 +3417,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  void
  mtlk_core_on_bss_drop_tx_que_full(mtlk_core_t *core)
  {
-@@ -15738,7 +15940,7 @@
+@@ -15738,7 +15942,7 @@
      MTLK_BFIELD_SET(info.flags, STA_FLAGS_IS_8021X_FILTER_OPEN, 1);
      /* RSSI in ADD STA should be set to MIN value */
      info.rssi_dbm = MIN_RSSI - _mtlk_core_get_rrsi_offs(caller_core);
@@ -3408,7 +3426,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (res != MTLK_ERR_OK)
        goto remove_sid;
  
-@@ -15786,9 +15988,9 @@
+@@ -15786,9 +15990,9 @@
      for(i = 0; i < ARRAY_SIZE(cpd.rssi); i++) {
        cpd.rssi[i] = mtlk_stadb_apply_rssi_offset(cpd.rssi[i], _mtlk_core_get_rrsi_offs(core));
      }
@@ -3420,7 +3438,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      _mtlk_core_mac_update_peers_stats(caller_core);
  
      sta_res_data.rx_bytes = mtlk_sta_get_stat_cntr_rx_bytes(sta);
-@@ -15814,7 +16016,7 @@
+@@ -15814,7 +16018,7 @@
      /* Send Stop Traffic Request to FW */
      if (sta)
        core_ap_stop_traffic(caller_core, &sta->info);
@@ -3429,7 +3447,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      if (sta)
        mtlk_stadb_remove_sta(&caller_core->slow_ctx->stadb, sta);
  remove_sid:
-@@ -15828,8 +16030,8 @@
+@@ -15828,8 +16032,8 @@
        mtlk_df_nbuf_free(nbuf_ndp);
      if (sta)
        mtlk_sta_decref(sta); /* De-reference by creator */
@@ -3440,7 +3458,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_CLPB_FINALLY(res)
      return res != MTLK_ERR_OK ? res : res2;
    MTLK_CLPB_END
-@@ -16182,6 +16384,19 @@
+@@ -16182,6 +16386,19 @@
      if (MTLK_ERR_OK != res) goto end;
  
      res = mtlk_core_cfg_init_cca_threshold(core);
@@ -3956,6 +3974,20 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  /* FIXME: currently mtidl_ini.pl just ignore any C preprocessor "#" lines */
  /* So these items (below) are always present in data struct */
+@@ -880,11 +932,11 @@
+ }
+ 
+ void __MTLK_IFUNC
+-mtlk_sta_on_rx_packet_forwarded(sta_entry *sta, mtlk_nbuf_t *nbuf)
++mtlk_sta_on_rx_packet_forwarded(sta_entry *sta, uint32 nbuf_len)
+ {
+   ASSERT(sta != NULL);
+   _mtlk_sta_inc_cnt(sta, MTLK_STAI_CNT_FWD_RX_PACKETS);
+-  _mtlk_sta_add_cnt(sta, MTLK_STAI_CNT_FWD_RX_BYTES, mtlk_df_nbuf_get_data_length(nbuf));
++  _mtlk_sta_add_cnt(sta, MTLK_STAI_CNT_FWD_RX_BYTES, nbuf_len);
+ }
+ 
+ int __MTLK_IFUNC
 @@ -1088,7 +1140,7 @@
  static void
  _mtlk_stadb_remove_sta_from_stadb_internal (sta_db* stadb, sta_entry *sta)
@@ -3973,7 +4005,68 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    if (mtlk_sta_is_4addr(sta))
      mtlk_osal_atomic_dec(&stadb->four_addr_sta_cnt);
-@@ -1516,6 +1567,50 @@
+@@ -1379,19 +1430,12 @@
+   mtlk_hash_enum_t              e;
+   MTLK_HASH_ENTRY_T(ieee_addr) *h;
+   sta_entry                    *sta;
+-  uint32                      sta_cnt;
+-  mtlk_stadb_iterator_t       iter;
+ 
+   MTLK_ASSERT(stadb != NULL);
+   MTLK_ASSERT(clb != NULL);
+ 
+-  /* Function _mtlk_sta_stop() cannot be called from a spinlock context, so following algo is used:
+-   * 1) enable data traffic filtering for all STA's under spinlock;
+-   * 2) create a temporal copy of STADB (internal list of STA's) under spinlock;
+-   * 3) call _mtlk_sta_stop() for each STA outside of spinlock;
+-   * 4) delete temporal STADB copy;
+-   * 5) remove all STA's from STADB under spinlock'.
+-   */
++  /* Block traffic first, then pin and remove each station outside the lock.
++   * Mandatory disconnect must not depend on an iterator allocation. */
+ 
+   mtlk_osal_lock_acquire(&stadb->lock);
+   h = mtlk_hash_enum_first_ieee_addr(&stadb->hash, &e);
+@@ -1404,34 +1448,11 @@
+ 
+   MTLK_UNREFERENCED_PARAM(wait_all_packets_confirmed);
+ 
+-  /* Make a copy of STADB and stop all STA's outside of spinlock context */
+-  sta = (sta_entry*)mtlk_stadb_iterate_first(stadb, &iter);
+-  if (sta) {
+-    do {
+-      clb(usr_ctx, sta);
+-      _mtlk_sta_stop(sta);
+-
+-      sta = (sta_entry*)mtlk_stadb_iterate_next(&iter);
+-    } while (sta);
+-    mtlk_stadb_iterate_done(&iter);
+-  }
+-
+-  /* Remove all STA's from STADB */
+-  sta_cnt = 0;
+-  mtlk_osal_lock_acquire(&stadb->lock);
+-  h = mtlk_hash_enum_first_ieee_addr(&stadb->hash, &e);
+-  while (h) {
+-    sta = MTLK_CONTAINER_OF(h, sta_entry, hentry);
+-
+-    _mtlk_stadb_remove_sta_from_stadb_internal(stadb, sta);
+-    sta_cnt++;
+-
+-    h = mtlk_hash_enum_next_ieee_addr(&stadb->hash, &e);
++  while ((sta = mtlk_stadb_get_first_sta(stadb)) != NULL) {
++    clb(usr_ctx, sta);
++    mtlk_stadb_remove_sta(stadb, sta);
++    mtlk_sta_decref(sta); /* Reference returned by get_first_sta. */
+   }
+-  mtlk_osal_lock_release(&stadb->lock);
+-
+-  /* Decrease global counter */
+-  mtlk_osal_atomic_sub(__mtlk_global_stadb_get_cntr(), sta_cnt);
+ }
+ 
+ int __MTLK_IFUNC
+@@ -1516,6 +1537,50 @@
    return res;
  }
  
@@ -4024,7 +4117,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  int __MTLK_IFUNC mtlk_stadb_get_sta_by_iter_id(sta_db *stadb, int iter_id, uint8 *mac, struct station_info* stinfo)
  {
    int                   res = MTLK_ERR_PARAMS;
-@@ -1529,78 +1624,8 @@
+@@ -1529,78 +1594,8 @@
        if (iter_id == 0) {
          ieee_addr_get(mac, mtlk_sta_get_addr(sta));
  
@@ -4105,7 +4198,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
          res = MTLK_ERR_OK;
          break;
-@@ -1854,13 +1879,14 @@
+@@ -1854,13 +1849,14 @@
  
    mtlk_osal_lock_acquire(&hstdb->lock);
    h = mtlk_hash_find_ieee_addr(&hstdb->hash, (IEEE_ADDR *)mac);
@@ -4185,6 +4278,15 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  }
  
  static __INLINE void
+@@ -676,7 +694,7 @@
+ mtlk_sta_on_tx_packet_discarded_802_1x(sta_entry *sta);
+ 
+ void __MTLK_IFUNC
+-mtlk_sta_on_rx_packet_forwarded(sta_entry *sta, mtlk_nbuf_t *nbuf) __MTLK_INT_HANDLER_SECTION;
++mtlk_sta_on_rx_packet_forwarded(sta_entry *sta, uint32 nbuf_len) __MTLK_INT_HANDLER_SECTION;
+ 
+ int __MTLK_IFUNC
+ mtlk_sta_update_beacon_interval(sta_entry *sta, uint16 beacon_interval);
 @@ -900,6 +918,17 @@
  
  int __MTLK_IFUNC
@@ -4203,6 +4305,15 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  int __MTLK_IFUNC
  mtlk_stadb_get_sta_by_iter_id(sta_db *stadb, int iter_id, uint8 *mac, struct station_info* stinfo);
  
+@@ -1055,7 +1084,7 @@
+ static __INLINE int locate_ms0bit_16 (uint16 i_x)
+ {
+   int i;
+-  for (i = 15; i > 0; i--)
++  for (i = 15; i >= 0; i--)
+     if (MTLK_BIT_GET(i_x, i) == 0)
+       return i;
+   return -1;
 --- a/wireless/driver/shared/wds.h
 +++ b/wireless/driver/shared/wds.h
 @@ -19,6 +19,9 @@
@@ -4224,3 +4335,17 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    unsigned  ht_cap_info_len;
    unsigned  vht_cap_info_len;
    unsigned  he_cap_info_len;
+--- a/wireless/driver/shared/ta.c
++++ b/wireless/driver/shared/ta.c
+@@ -438,8 +438,9 @@
+   /* Find wss sta */
+   sta_wss = _exclude_wss_sta(ta, sta);
+ 
+-  /* STA must be in the STA_WSS list */
+-  MTLK_ASSERT(sta_wss != NULL);
++  /* Optional accounting allocation may have failed at connect. */
++  if (!sta_wss)
++    return;
+ 
+   ILOG3_PY("Delete STA WSS entry (%p) for %Y", sta_wss, mtlk_sta_get_addr(sta));
+ 

@@ -4191,17 +4191,177 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    ILOG4_PD("PUMP: MSG=%p nU=%d", 
         pmsg, (int)obj->ques[MTLK_TXMMB_QUEUED].total);
  
-@@ -539,6 +552,9 @@
-   mtlk_txmm_base_t          *obj = HANDLE_T_PTR(mtlk_txmm_base_t, clb_usr_data);
-   mtlk_osal_msec_t now_time = mtlk_osal_timestamp_to_ms(mtlk_osal_timestamp());
+@@ -407,7 +420,8 @@
+   return res;
+ }
  
+-/* returns TRUE if block has been re-queued */
++/* Caller holds the base lock across selection, detachment and callback.
++ * Callbacks must not reenter TXMM; acquire the message lock second. */
+ static BOOL _mtlk_txmm_call_usr_clb_locked (mtlk_txmm_base_t*      obj, 
+                                             mtlk_txmm_block_t*     block,
+                                             mtlk_txmm_clb_reason_e reason)
+@@ -416,8 +430,6 @@
+   BOOL                   re_queued  = FALSE;
+   mtlk_txmm_msg_t       *msg        = NULL;
+ 
+-  mtlk_osal_lock_acquire(&obj->lock); /* for safe access to txmm object */
+-
+   MTLK_ASSERT(block->msg != NULL);
+   msg = block->msg;                   /* we have to store this pointer here, 
+                                        * since the block is zeroed on free 
+@@ -461,74 +473,60 @@
+ 
+ msg_cancelled:
+   mtlk_osal_lock_release(&msg->lock);
+-  mtlk_osal_lock_release(&obj->lock);
+ 
+   return re_queued;
+ }
+ 
+ 
+ static uint32 _mtlk_txmm_on_timer_que(mtlk_txmm_base_t*           obj, 
+-                                      mtlk_osal_msec_t       now_time, 
+                                       mtlk_txmm_block_e      que_idx, 
+                                       mtlk_txmm_clb_reason_e reason, 
+                                       int                    preserve_order)
+ {
+-  mtlk_txmm_que_t*   que      = NULL;
+-  mtlk_txmm_block_t* block    = NULL;  
+-  uint32             i        = 0;
+-  uint32             ptr_cnt  = 0;
++  mtlk_txmm_que_t *que = &obj->ques[que_idx];
++  uint32 ptr_cnt = 0;
+ 
+-  que = &obj->ques[que_idx];
++  for (;;) {
++    mtlk_txmm_block_t *block = NULL;
++    uint16 msg_id = 0;
++    uint32 i, n;
++    mtlk_osal_msec_t now_time;
+ 
+-  mtlk_osal_lock_acquire(&obj->lock);
+-  i = que->from;
+-  while (i != que->to)
+-  {
+-    block = que->ptr[i];
+-    if (block->timeout && block->clb)
+-    {
+-      mtlk_osal_ms_diff_t diff_time = mtlk_osal_ms_time_diff(now_time, block->send_time);
+-      if (diff_time >= block->timeout)
+-      {
+-        _mtlk_txmm_del_buf_from_que(obj, que_idx, block, preserve_order);
+-        _mtlk_txmm_put_buf(obj, MTLK_TXMMB_TIMED_OUT, block); 
+- 
+-         ++ptr_cnt;
+-      }
+-    }
+-    INC_WRAP_IDX(i, obj->cfg.max_msgs);
+-  }
+-  mtlk_osal_lock_release(&obj->lock);
+-
+-  que = &obj->ques[MTLK_TXMMB_TIMED_OUT];
+-  for (;;)
+-  {
+-    block = NULL;
+     mtlk_osal_lock_acquire(&obj->lock);
+-    if (que->total)
+-    {
+-      block = que->ptr[que->from];
+-      _mtlk_txmm_del_buf_from_que(obj, MTLK_TXMMB_TIMED_OUT, block, 0);
++    if (obj->flags & TXMM_FLAGS_QUIESCED) {
++      mtlk_osal_lock_release(&obj->lock);
++      break;
+     }
+-    mtlk_osal_lock_release(&obj->lock);
+-    if (!block)
+-    {
++    now_time = mtlk_osal_timestamp_to_ms(mtlk_osal_timestamp());
++    for (i = que->from, n = 0; n < que->total; n++) {
++      mtlk_txmm_block_t *candidate = que->ptr[i];
++
++      if (candidate->timeout && candidate->clb &&
++          mtlk_osal_ms_time_diff(now_time, candidate->send_time) >= candidate->timeout) {
++        block = candidate;
++        break;
++      }
++      INC_WRAP_IDX(i, obj->cfg.max_msgs);
++    }
++    if (!block) {
++      mtlk_osal_lock_release(&obj->lock);
+       break;
+     }
+ 
++    msg_id = block->data.id;
+     ELOG_DDDD("send: timeout (id=0x%04x). Res=%d (req=%u cfm=%u)",
+-          block->data.id,
+-          reason,
+-          obj->stats.nof_sent,
+-          obj->stats.nof_cfmed); 
+-
+-    obj->api.msg_timed_out(obj->api.usr_data, block->data.id);
++              msg_id, reason, obj->stats.nof_sent, obj->stats.nof_cfmed);
++    _mtlk_txmm_del_buf_from_que(obj, que_idx, block, preserve_order);
+     _mtlk_txmm_call_usr_clb_locked(obj, block, reason);
++    ++ptr_cnt;
++    mtlk_osal_lock_release(&obj->lock);
++
++    /* This notification may stop TXMM. No detached block survives the lock. */
++    obj->api.msg_timed_out(obj->api.usr_data, msg_id);
+   }
+ 
+-  if (ptr_cnt)  {
++  if (ptr_cnt)
+     _mtlk_txmm_err_print_err_sent_que(obj);
+-  }
+ 
+   return ptr_cnt;
+ }
+@@ -537,10 +535,11 @@
+                                                mtlk_handle_t     clb_usr_data)
+ {
+   mtlk_txmm_base_t          *obj = HANDLE_T_PTR(mtlk_txmm_base_t, clb_usr_data);
+-  mtlk_osal_msec_t now_time = mtlk_osal_timestamp_to_ms(mtlk_osal_timestamp());
 +  if (READ_ONCE(obj->flags) & TXMM_FLAGS_QUIESCED)
 +    return 0;
-+
-   _mtlk_txmm_on_timer_que(obj, now_time, MTLK_TXMMB_SENT, MTLK_TXMM_CLBR_TIMEOUT_SENT, 0);
-   _mtlk_txmm_on_timer_que(obj, now_time, MTLK_TXMMB_QUEUED, MTLK_TXMM_CLBR_TIMEOUT_UNSENT, 1);
  
-@@ -690,6 +706,7 @@
+-  _mtlk_txmm_on_timer_que(obj, now_time, MTLK_TXMMB_SENT, MTLK_TXMM_CLBR_TIMEOUT_SENT, 0);
+-  _mtlk_txmm_on_timer_que(obj, now_time, MTLK_TXMMB_QUEUED, MTLK_TXMM_CLBR_TIMEOUT_UNSENT, 1);
++  _mtlk_txmm_on_timer_que(obj, MTLK_TXMMB_SENT, MTLK_TXMM_CLBR_TIMEOUT_SENT, 0);
++  _mtlk_txmm_on_timer_que(obj, MTLK_TXMMB_QUEUED, MTLK_TXMM_CLBR_TIMEOUT_UNSENT, 1);
+ 
+   return obj->cfg.tmr_granularity;
+ }
+@@ -553,9 +552,8 @@
+   ILOG4_PD("OnCFM: MSG=%p nS=%d", 
+        pmsg, (int)obj->ques[MTLK_TXMMB_SENT].total);
+ 
+-  obj->stats.nof_cfmed++;
+-
+   mtlk_osal_lock_acquire(&obj->lock);
++  obj->stats.nof_cfmed++;
+   if (obj->ques[MTLK_TXMMB_SENT].total)
+   { /* there are sent messages */
+     mtlk_txmm_que_t*   que = &obj->ques[MTLK_TXMMB_SENT];
+@@ -575,8 +573,6 @@
+       INC_WRAP_IDX(i, obj->cfg.max_msgs);
+     } while (i != que->to);
+   }
+-  mtlk_osal_lock_release(&obj->lock);
+-
+   if (block)
+   {
+     void *payload = MSG_OBJ_PAYLOAD(pmsg);
+@@ -587,6 +583,8 @@
+     _mtlk_txmm_call_usr_clb_locked(obj, block, MTLK_TXMM_CLBR_CONFIRMED);
+   }
+ 
++  mtlk_osal_lock_release(&obj->lock);
++
+   return res;
+ }
+ 
+@@ -690,6 +688,7 @@
      }
  
      mtlk_rmlock_acquire(&obj->bsend.rmlock);
@@ -4209,7 +4369,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    MTLK_INIT_FINALLY(txmm, MTLK_OBJ_PTR(obj))
    MTLK_INIT_RETURN(txmm, MTLK_OBJ_PTR(obj), mtlk_txmm_cleanup, (obj))
-@@ -697,16 +714,32 @@
+@@ -697,16 +696,32 @@
  
  int __MTLK_IFUNC mtlk_txmm_start(mtlk_txmm_base_t *obj)
  {
@@ -4245,7 +4405,42 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_START_RETURN(txmm, MTLK_OBJ_PTR(obj), mtlk_txmm_stop, (obj))
  }
  
-@@ -754,7 +787,7 @@
+@@ -718,15 +733,26 @@
+ 
+   block_size = (uint32)sizeof(mtlk_txmm_block_t) + MTLK_TXMM_FGUARD_SIZE + obj->cfg.max_payload_size + MTLK_TXMM_BGUARD_SIZE;
+ 
++  mtlk_osal_lock_acquire(&obj->lock);
++
+   /* Move all TXMM message to FREE queue */
+   for (i = 0; i < obj->cfg.max_msgs; i++)
+   {
+     mtlk_txmm_block_t* block = (mtlk_txmm_block_t*)(obj->storage + (i * block_size));
+ 
+     if (block->que == MTLK_TXMMB_SENT || block->que == MTLK_TXMMB_QUEUED) {
++      _mtlk_txmm_del_buf_from_que(obj, block->que, block, 0);
+       _mtlk_txmm_call_usr_clb_locked(obj, block, MTLK_TXMM_CLBR_RCVRY_DISCARD);
+     }
+-    _mtlk_txmm_free_buf(obj, block, 1, 0);
++    if (block->que != MTLK_TXMMB_FREE) {
++      mtlk_txmm_msg_t *msg = block->msg;
++
++      mtlk_osal_lock_acquire(&msg->lock);
++      _mtlk_txmm_free_buf(obj, block, 1, 0);
++      msg->data = NULL;
++      msg->obj = NULL;
++      mtlk_osal_lock_release(&msg->lock);
++    }
+   }
+ 
+   for (i = 0; i < SIZEOF(obj->ques); i++)
+@@ -748,13 +774,14 @@
+       MTLK_ASSERT(obj->ques[i].total == obj->cfg.max_msgs);
+     }
+   }
++  mtlk_osal_lock_release(&obj->lock);
+ }
+ 
+ static void _mtlk_txmm_attach_data(mtlk_txmm_t *obj, mtlk_txmm_msg_t *msg)
  {
    mtlk_txmm_block_t* block = NULL;
  
@@ -4254,7 +4449,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      goto FINISH;
    }
  
-@@ -818,6 +851,10 @@
+@@ -818,6 +845,10 @@
      block->send_time = mtlk_osal_timestamp_to_ms(mtlk_osal_timestamp());
  
    mtlk_osal_lock_acquire(&obj->base->lock);
@@ -4265,7 +4460,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    pmsg  = obj->base->api.msg_get_from_pool(obj->base->api.usr_data); /* get message slot */
  
    if (!obj->base->ques[MTLK_TXMMB_QUEUED].total && pmsg)
-@@ -853,7 +890,8 @@
+@@ -853,7 +884,8 @@
    mtlk_vap_handle_t master_vap;
    BOOL is_pending = FALSE;
  
@@ -4275,7 +4470,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    res = mtlk_vap_manager_get_master_vap(mtlk_vap_get_manager(obj->vap_handle), &master_vap);
    if (res != MTLK_ERR_OK) {
-@@ -875,13 +913,18 @@
+@@ -875,13 +907,18 @@
    mtlk_rmlock_acquire(&obj->base->bsend.rmlock);
    mtlk_osal_mutex_acquire(&obj->base->bsend.mutex);
  
@@ -4295,7 +4490,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
    res = _mtlk_txmm_send_ex(obj,
                             data,
-@@ -900,6 +943,11 @@
+@@ -900,6 +937,11 @@
    
    _mtlk_txmm_block_history_blocked_finalize_and_commit(_mtlk_txmm_block_by_data(data), obj->base, res);
  
@@ -4307,7 +4502,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    if (res != MTLK_ERR_OK)
    {
      obj->base->api.msg_timed_out(obj->base->api.usr_data, data->id);
-@@ -913,6 +961,7 @@
+@@ -913,6 +955,7 @@
    }
    else if ((obj->base->flags & TXMM_FLAGS_ACTIVE) == 0) 
    {
@@ -4315,7 +4510,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      ILOG4_V("send (b): cancelled by cleanup");
      goto FINISH;
    }
-@@ -982,24 +1031,45 @@
+@@ -982,24 +1025,45 @@
  
  void __MTLK_IFUNC mtlk_txmm_stop(mtlk_txmm_base_t *obj)
  {
@@ -4365,7 +4560,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      mtlk_rmlock_release(&obj->bsend.rmlock); /* Release last reference to remove lock     */
    
      ILOG2_V("Wait until all the blocked sends are done...");
-@@ -1038,12 +1108,16 @@
+@@ -1038,12 +1102,16 @@
  
  void __MTLK_IFUNC mtlk_txmm_halt(mtlk_txmm_base_t* obj)
  {
@@ -4386,7 +4581,15 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  MTLK_INIT_STEPS_LIST_BEGIN(txmm_msg)
 --- a/wireless/driver/shared/txmm.h
 +++ b/wireless/driver/shared/txmm.h
-@@ -354,6 +354,10 @@
+@@ -53,7 +53,6 @@
+   MTLK_TXMMB_FREE,
+   MTLK_TXMMB_QUEUED,
+   MTLK_TXMMB_SENT,
+-  MTLK_TXMMB_TIMED_OUT,
+   MTLK_TXMMB_NONE
+ } mtlk_txmm_block_e;
+ 
+@@ -354,6 +353,10 @@
  void __MTLK_IFUNC
  mtlk_txmm_stop(mtlk_txmm_base_t *obj);
  
