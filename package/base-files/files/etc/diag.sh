@@ -16,11 +16,13 @@ set_led_state() {
 		status_led_blink_preinit
 		;;
 	failsafe)
-		status_led_off
-		[ -n "$running" ] && {
+		if [ -n "$status_led" ]; then
+			status_led_off || return $?
+		fi
+		if [ -n "$running" ]; then
 			status_led="$running"
-			status_led_off
-		}
+			status_led_off || return $?
+		fi
 		status_led="$failsafe"
 		status_led_blink_failsafe
 		;;
@@ -28,25 +30,39 @@ set_led_state() {
 		status_led_blink_preinit_regular
 		;;
 	upgrade)
-		[ -n "$running" ] && {
+		if [ -n "$running" ]; then
 			status_led="$running"
-			status_led_off
-		}
+			status_led_off || return $?
+		fi
 		status_led="$upgrade"
 		status_led_blink_preinit_regular
 		;;
 	done)
-		status_led_off
-		[ "$status_led" != "$running" ] && \
-			status_led_restore_trigger "boot"
-		[ -n "$running" ] && {
+		if [ -n "$status_led" ]; then
+			status_led_off || return $?
+		fi
+		if [ "$status_led" != "$running" ]; then
+			status_led_restore_trigger "boot" || return $?
+		fi
+		if [ -n "$running" ]; then
 			status_led="$running"
 			status_led_on
-		}
+		fi
 		;;
 	esac
 }
 
 set_state() {
-	[ -n "$boot" -o -n "$failsafe" -o -n "$running" -o -n "$upgrade" ] && set_led_state "$1"
+	local ret
+
+	[ -n "$boot" -o -n "$failsafe" -o -n "$running" -o -n "$upgrade" ] || return 0
+	if led_policy diag "$1"; then
+		return 0
+	else
+		ret=$?
+	fi
+	case "$ret" in
+		65) set_led_state "$1" ;;
+		*) return 1 ;;
+	esac
 }

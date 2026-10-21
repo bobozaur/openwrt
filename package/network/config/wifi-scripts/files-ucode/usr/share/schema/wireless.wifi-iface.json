@@ -1105,6 +1105,11 @@
 				"enum": [ "on", "off", "0", "1", "sae", "sae-pk", "wpa3", "owe" ]
 			}
 		},
+		"wmm": {
+			"description": "Wireless Multimedia QoS. Required for high-throughput modes.",
+			"type": "boolean",
+			"default": true
+		},
 		"uapsd": {
 			"type": "alias",
 			"default": "uapsd_advertisement_enabled"
@@ -1258,6 +1263,11 @@
 		"wps_pin": {
 			"type": "alias",
 			"default": "ap_pin"
+		},
+		"wps_state": {
+			"description": "WPS state: disabled, unconfigured, or configured",
+			"type": "number",
+			"enum": [ 0, 1, 2 ]
 		},
 		"wps_pushbutton": {
 			"description": "Support WPS pushbutton. Ignored in the 6 GHz band, which has no WPS",
