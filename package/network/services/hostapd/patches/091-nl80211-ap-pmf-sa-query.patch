@@ -1,0 +1,116 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] AP: handle unprotected PMF disconnect indications
+
+An unprotected disconnect indication must reach the AP PMF owner without
+being treated as an authenticated peer teardown. Use the existing SA Query
+path and retain native station, protection and driver event checks.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -115,6 +115,40 @@
+ #endif /* CONFIG_FILS */
+ 
+ 
++static void hostapd_event_unprot_disconnect(struct hostapd_data *hapd,
++					    const u8 *sa, const u8 *da,
++					    u16 reason)
++{
++	struct sta_info *sta;
++	struct os_reltime now;
++
++	if (!sa || !da || !ether_addr_equal(da, hapd->own_addr) ||
++	    (reason != WLAN_REASON_CLASS2_FRAME_FROM_NONAUTH_STA &&
++	     reason != WLAN_REASON_CLASS3_FRAME_FROM_NONASSOC_STA))
++		return;
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->conf->mld_ap)
++		return;
++#endif /* CONFIG_IEEE80211BE */
++	sta = ap_get_sta(hapd, sa);
++	if (!sta || (sta->flags &
++		     (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED)) !=
++		    (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED) ||
++	    sta->sa_query_count)
++		return;
++	os_get_reltime(&now);
++	if (sta->sa_query_start.sec &&
++	    !os_reltime_expired(&now, &sta->sa_query_start, 10))
++		return;
++
++	/* An unprotected disconnect cannot remove an established PMF peer.
++	 * Ask the existing SA Query owner to check for a state mismatch, with
++	 * the same frequency limit used by the station SME. */
++	ap_sta_set_sa_query_timeout(hapd, sta, 0);
++	ap_sta_start_sa_query(hapd, sta);
++}
++
++
+ static bool check_sa_query_need(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+ 	if ((sta->flags &
+@@ -2798,6 +2832,16 @@
+ 					   data->update_dh.link_addr);
+ 		break;
+ #endif /* CONFIG_OWE */
++	case EVENT_UNPROT_DEAUTH:
++		if (data)
++			hostapd_event_unprot_disconnect(hapd, data->unprot_deauth.sa,
++				data->unprot_deauth.da, data->unprot_deauth.reason_code);
++		break;
++	case EVENT_UNPROT_DISASSOC:
++		if (data)
++			hostapd_event_unprot_disconnect(hapd, data->unprot_disassoc.sa,
++				data->unprot_disassoc.da, data->unprot_disassoc.reason_code);
++		break;
+ 	case EVENT_DISASSOC:
+ 		if (data)
+ 			hostapd_notif_disassoc(hapd, data->disassoc_info.addr);
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -1713,7 +1713,7 @@
+ }
+ 
+ 
+-static void mlme_event_unprot_disconnect(struct wpa_driver_nl80211_data *drv,
++static void mlme_event_unprot_disconnect(struct i802_bss *bss,
+ 					 enum wpa_event_type type,
+ 					 const u8 *frame, size_t len)
+ {
+@@ -1730,6 +1730,10 @@
+ 		return;
+ 
+ 	mgmt = (const struct ieee80211_mgmt *) frame;
++	if (is_ap_interface(bss->drv->nlmode) &&
++	    (bss->valid_links || len < 26 ||
++	     !ether_addr_equal(mgmt->bssid, bss->addr)))
++		return;
+ 
+ 	os_memset(&event, 0, sizeof(event));
+ 	/* Note: Same offset for Reason Code in both frame subtypes */
+@@ -1746,7 +1750,7 @@
+ 		event.unprot_deauth.reason_code = reason_code;
+ 	}
+ 
+-	wpa_supplicant_event(drv->ctx, type, &event);
++	wpa_supplicant_event(bss->ctx, type, &event);
+ }
+ 
+ 
+@@ -1972,11 +1976,11 @@
+ 					  nla_len(frame), ack);
+ 		break;
+ 	case NL80211_CMD_UNPROT_DEAUTHENTICATE:
+-		mlme_event_unprot_disconnect(drv, EVENT_UNPROT_DEAUTH,
++		mlme_event_unprot_disconnect(bss, EVENT_UNPROT_DEAUTH,
+ 					     nla_data(frame), nla_len(frame));
+ 		break;
+ 	case NL80211_CMD_UNPROT_DISASSOCIATE:
+-		mlme_event_unprot_disconnect(drv, EVENT_UNPROT_DISASSOC,
++		mlme_event_unprot_disconnect(bss, EVENT_UNPROT_DISASSOC,
+ 					     nla_data(frame), nla_len(frame));
+ 		break;
+ 	case NL80211_CMD_UNPROT_BEACON:
