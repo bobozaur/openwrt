@@ -1,0 +1,40 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] net: dsa: avoid backlog requeue when GRO is disabled
+
+DSA receives packets in the network receive context, after the conduit
+has already applied RPS. When GRO is disabled on a user port,
+gro_cells_receive() calls netif_rx(), queuing the packet to a backlog a
+second time even when the user port has no RPS map. This adds queue
+admission and locking to every forwarded packet.
+
+Use netif_receive_skb() directly for an active user port that cannot use
+GRO. It retains user-port RPS and generic XDP processing. Keep the
+transport-header reset performed by gro_cells_receive(), and leave
+inactive ports and traffic eligible for GRO on the existing path. DSA
+switch timestamp deferral remains before this handoff; the direct receive
+path also performs the normal generic PHY timestamp check.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/net/dsa/tag.c
++++ b/net/dsa/tag.c
+@@ -120,7 +120,16 @@ static int dsa_switch_rcv(struct sk_buff *
+ 	if (dsa_skb_defer_rx_timestamp(p, skb))
+ 		return 0;
+ 
+-	gro_cells_receive(&p->gcells, skb);
++	if (netif_elide_gro(skb->dev) && netif_running(skb->dev) &&
++	    (skb->dev->flags & IFF_UP)) {
++		/* Already in the receive context; retain user-port RPS and XDP
++		 * without an unconditional second backlog admission.
++		 */
++		skb_unset_transport_header(skb);
++		netif_receive_skb(skb);
++	} else {
++		gro_cells_receive(&p->gcells, skb);
++	}
+ 
+ 	return 0;
+ }
