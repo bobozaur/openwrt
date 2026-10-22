@@ -296,7 +296,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    MTLK_INIT_STEPS_LIST_ENTRY(df_user, ALLOC_SLOW_CTX)
    MTLK_INIT_STEPS_LIST_ENTRY(df_user, DEBUG_BCL)
    MTLK_INIT_STEPS_LIST_ENTRY(df_user, NETDEV_INIT)
-+  MTLK_INIT_STEPS_LIST_ENTRY(df_user, STA_GRO)
++  MTLK_INIT_STEPS_LIST_ENTRY(df_user, RX_GRO)
    MTLK_INIT_STEPS_LIST_ENTRY(df_user, CREATE_CARD_DIR)
    MTLK_INIT_STEPS_LIST_ENTRY(df_user, CREATE_DEBUG_DIR)
    MTLK_INIT_STEPS_LIST_ENTRY(df_user, STAT_TIMER)
@@ -692,13 +692,14 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #ifdef MTCFG_LINUX_BACKPORT
    MTLK_START_STEPS_LIST_ENTRY(df_user, NETIF_CARRIER)
  #endif
-@@ -5303,36 +5393,34 @@
+@@ -5303,36 +5393,36 @@
  MTLK_START_INNER_STEPS_BEGIN(df_user)
  MTLK_START_STEPS_LIST_END(df_user);
  
 -static int
 -_mtlk_df_user_reg_netdev (mtlk_df_user_t *df_user)
 +static void _mtlk_netdev_destructor(struct net_device *ndev);
++static void _mtlk_df_user_gro_cleanup(mtlk_df_user_t *df_user);
 +
 +/* These control-owner entry points must never run in the serializer. */
 +int wave_df_register_netdev_locked(mtlk_df_user_t *df_user)
@@ -749,6 +750,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +  wave_df_notifications_stop_locked(df_user);
 +  if (df_user->ndev_registered) {
 +    df_user->ndev_registered = false;
++    _mtlk_df_user_gro_cleanup(df_user);
 +    cfg80211_unregister_netdevice(df_user->ndev);
    }
  }
@@ -798,13 +800,14 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  #if MTLK_USE_DIRECTCONNECT_DP_API
    if (__mtlk_df_user_litepath_is_registered(df_user)) {
-@@ -5503,8 +5580,23 @@
+@@ -5503,8 +5580,24 @@
  
    ILOG5_V("Send to Linux");
    nbuf->protocol        = eth_type_trans(nbuf, nbuf->dev);
 -  res                   = netif_rx(nbuf);
 -  df_user->ndev->last_rx = jiffies;
-+  if (mtlk_vap_is_ap(mtlk_df_get_vap_handle(df))) {
++  /* AP_VLAN delivery retains its child netdev/backlog lifetime. */
++  if (ndev != df_user->ndev) {
 +    res = netif_rx(nbuf);
 +  } else {
 +    /* gro_cells uses a per-CPU queue: the receive handoff and stop gate
@@ -884,18 +887,15 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #endif
  
    mtlk_aux_seq_printf(s, "\nBSS mgmt. related statistic\n\n");
-@@ -9096,16 +9193,31 @@
+@@ -9096,16 +9193,28 @@
    return _mtlk_df_mtlk_to_linux_error_code(res);
  }
  
 +static int
-+_mtlk_df_user_sta_gro_init(mtlk_df_user_t *df_user)
++_mtlk_df_user_gro_init(mtlk_df_user_t *df_user)
 +{
-+  if (mtlk_vap_is_ap(mtlk_df_get_vap_handle(df_user->df)))
-+    return MTLK_ERR_OK;
-+  /* STA borrows a registered mac80211 netdev. Its df_user is destroyed
-+   * during remove_interface, before mac80211 unregisters the netdev.
-+   * Keep AP's different netdev/destructor ownership unchanged.
++  /* AP cells retire before its netdev unregisters; STA cells retire in
++   * remove_interface before mac80211 unregisters the borrowed netdev.
 +   */
 +  if (gro_cells_init(&df_user->rx_gro, df_user->ndev))
 +    return MTLK_ERR_NO_MEM;
@@ -905,10 +905,10 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +
  static void
 -mtlk_df_user_uninit_prop_dfs_wq (mtlk_df_user_t *df_user)
-+_mtlk_df_user_sta_gro_cleanup(mtlk_df_user_t *df_user)
++_mtlk_df_user_gro_cleanup(mtlk_df_user_t *df_user)
  {
 -  if (!mtlk_vap_is_master(mtlk_df_get_vap_handle(df_user->df)))
-+  if (mtlk_vap_is_ap(mtlk_df_get_vap_handle(df_user->df)))
++  if (!df_user->rx_gro.cells)
      return;
 -
 -  ILOG2_V("Uninit of DFS propagate state");
@@ -953,8 +953,8 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
                        _mtlk_df_ui_delete_debug_dir, (df_user));
      MTLK_CLEANUP_STEP(df_user, CREATE_CARD_DIR, MTLK_OBJ_PTR(df_user),
                        _mtlk_df_ui_delete_card_dir, (df_user));
-+    MTLK_CLEANUP_STEP(df_user, STA_GRO, MTLK_OBJ_PTR(df_user),
-+                      _mtlk_df_user_sta_gro_cleanup, (df_user));
++    MTLK_CLEANUP_STEP(df_user, RX_GRO, MTLK_OBJ_PTR(df_user),
++                      _mtlk_df_user_gro_cleanup, (df_user));
      MTLK_CLEANUP_STEP(df_user, NETDEV_INIT, MTLK_OBJ_PTR(df_user),
                        MTLK_NOACTION, ());
      MTLK_CLEANUP_STEP(df_user, DEBUG_BCL, MTLK_OBJ_PTR(df_user),
@@ -1265,8 +1265,8 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      MTLK_INIT_STEP(df_user, NETDEV_INIT, MTLK_OBJ_PTR(df_user),
                     _mtlk_df_user_netdev_init, (df_user, ctx, name));
  
-+    MTLK_INIT_STEP(df_user, STA_GRO, MTLK_OBJ_PTR(df_user),
-+                   _mtlk_df_user_sta_gro_init, (df_user));
++    MTLK_INIT_STEP(df_user, RX_GRO, MTLK_OBJ_PTR(df_user),
++                   _mtlk_df_user_gro_init, (df_user));
 +
      MTLK_INIT_STEP(df_user, CREATE_CARD_DIR, MTLK_OBJ_PTR(df_user),
                     _mtlk_df_ui_create_card_dir, (df_user));
