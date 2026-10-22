@@ -1,0 +1,97 @@
+--- a/wireless/driver/shared/stadb.c
++++ b/wireless/driver/shared/stadb.c
+@@ -1542,13 +1542,78 @@
+   return res;
+ }
+ 
++/* Export one cached TX sample through cfg80211's native rate metadata.
++ * HE CP modes use the same GI grouping as bitrate.c's conversion table. */
++static BOOL
++_mtlk_sta_fill_tx_rate_info(mtlk_bitrate_params_t params, struct rate_info *rate)
++{
++  static const uint8 bandwidth[] = {
++    RATE_INFO_BW_20, RATE_INFO_BW_40, RATE_INFO_BW_80, RATE_INFO_BW_160
++  };
++  static const uint8 he_gi[] = {
++    NL80211_RATE_INFO_HE_GI_0_8, NL80211_RATE_INFO_HE_GI_1_6,
++    NL80211_RATE_INFO_HE_GI_0_8, NL80211_RATE_INFO_HE_GI_1_6,
++    NL80211_RATE_INFO_HE_GI_0_8, NL80211_RATE_INFO_HE_GI_3_2
++  };
++  uint32 mode, cbw, scp, mcs, nss, legacy;
++
++  if (params == MTLK_BITRATE_PARAMS_INVALID)
++    return FALSE;
++
++  mtlk_bitrate_params_get_hw_params(params, &mode, &cbw, &scp, &mcs, &nss);
++  if (mode == PHY_MODE_AG || mode == PHY_MODE_B) {
++    legacy = mtlk_bitrate_hw_params_to_rate(mode, 0, 0, mcs, 1);
++    if (legacy == MTLK_BITRATE_INVALID)
++      return FALSE;
++    memset(rate, 0, sizeof(*rate));
++    rate->legacy = legacy;
++    return TRUE;
++  }
++
++  /* Bound the table inputs before the existing supported-rate lookup. */
++  if (cbw >= ARRAY_SIZE(bandwidth) ||
++      (mode != PHY_MODE_AX && scp > 1) ||
++      !mtlk_bitrate_params_supported(mode, cbw, scp, mcs, nss))
++    return FALSE;
++
++  memset(rate, 0, sizeof(*rate));
++  rate->bw = bandwidth[cbw];
++  rate->mcs = mcs;
++  rate->nss = nss;
++  switch (mode) {
++  case PHY_MODE_N:
++    /* cfg80211's HT calculator cannot represent the duplicate MCS32.
++     * Retain its measured rate and width instead of reporting zero. */
++    if (mcs == BITRATE_MCS32) {
++      rate->legacy = mtlk_bitrate_hw_params_to_rate(mode, cbw, scp, mcs, nss);
++      return TRUE;
++    }
++    rate->flags = RATE_INFO_FLAGS_MCS;
++    if (scp)
++      rate->flags |= RATE_INFO_FLAGS_SHORT_GI;
++    break;
++  case PHY_MODE_AC:
++    rate->flags = RATE_INFO_FLAGS_VHT_MCS;
++    if (scp)
++      rate->flags |= RATE_INFO_FLAGS_SHORT_GI;
++    break;
++  case PHY_MODE_AX:
++    rate->flags = RATE_INFO_FLAGS_HE_MCS;
++    rate->he_gi = he_gi[scp];
++    break;
++  default:
++    return FALSE;
++  }
++  return TRUE;
++}
++
+ /* The caller holds a peer reference. TX counters and RX bytes use the
+  * existing firmware cache; accepted RX packets are counted by the host.
+  * Station queries do not issue a new firmware request. */
+ void __MTLK_IFUNC
+ mtlk_sta_fill_station_info(const sta_entry *sta, struct station_info *sinfo)
+ {
+-  uint32 tx_rate = _mtlk_sta_get_tx_data_rate(sta);
++  mtlk_bitrate_params_t tx_params = READ_ONCE(sta->info.stats.tx_data_rate_params);
+   uint32 rx_rate = _mtlk_sta_get_rx_data_rate(sta);
+ 
+   sinfo->signal = rx_rate == MTLK_BITRATE_INVALID ?
+@@ -1574,11 +1639,10 @@
+ 
+   /* cfg80211 and the firmware conversion both use 100 kbit/s. A missing
+    * rate must remain unfilled, not masquerade as a measured zero bitrate. */
+-  if (tx_rate != MTLK_BITRATE_INVALID && tx_rate <= U16_MAX) {
+-    memset(&sinfo->txrate, 0, sizeof(sinfo->txrate));
+-    sinfo->txrate.legacy = tx_rate;
++  if (_mtlk_sta_fill_tx_rate_info(tx_params, &sinfo->txrate))
+     sinfo->filled |= BIT_ULL(NL80211_STA_INFO_TX_BITRATE);
+-  }
++  /* The RX cache supplies only a scalar rate. Do not invent its PHY or
++   * bandwidth from the TX sample or the configured channel. */
+   if (rx_rate != MTLK_BITRATE_INVALID && rx_rate <= U16_MAX) {
+     memset(&sinfo->rxrate, 0, sizeof(sinfo->rxrate));
+     sinfo->rxrate.legacy = rx_rate;
