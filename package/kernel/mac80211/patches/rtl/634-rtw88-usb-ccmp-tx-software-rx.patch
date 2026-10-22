@@ -8,6 +8,10 @@ GTKs remain in software so they cannot replace an AP group CAM entry.
 Propagate USB security-transfer failures through the existing fail-closed
 TX boundary and confirm CAM programming/invalidation before slot reuse.
 
+USB PTK0 replacement requires the companion mac80211 prepared-key retirement
+patch (425). Together with the USB transport/MAC drain and software RX, it
+allows the existing CAN_REPLACE_PTK0 advertisement to cover USB as well.
+
 Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 ---
 --- a/drivers/net/wireless/realtek/rtw88/hci.h
@@ -528,7 +532,15 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  
  	rtwdev->lps_conf.deep_mode = rtw_update_lps_deep_mode(rtwdev, &rtwdev->fw);
  	rtwdev->lps_conf.wow_deep_mode = rtw_update_lps_deep_mode(rtwdev, &rtwdev->wow_fw);
-@@ -2336,7 +2340,7 @@
+@@ -2329,14 +2333,12 @@
+ 	}
+ 
+-	/* USB RX completion does not fence plaintext from the preceding key. */
+-	if (rtw_hci_type(rtwdev) != RTW_HCI_TYPE_USB)
+-		wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
++	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_CAN_REPLACE_PTK0);
+ 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_SCAN_RANDOM_SN);
+ 	wiphy_ext_feature_set(hw->wiphy, NL80211_EXT_FEATURE_SET_SCAN_DWELL);
  
  #ifdef CONFIG_PM
  	/* Firmware sleep offloads cannot own software-only keys. */
