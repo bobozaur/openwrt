@@ -709,7 +709,7 @@ export function owe_transition(config, band) {
 export function generate(interface, data, config, vlans, stas, phy_features) {
 	config.ctrl_interface = '/var/run/hostapd';
 
-	config.start_disabled = data.ap_start_disabled;
+	config.start_disabled = !!data.ap_start_disabled || !!config.start_disabled;
 	iface_setup(config);
 
 	config.sae_station_passwords = station_password_count(stas);
