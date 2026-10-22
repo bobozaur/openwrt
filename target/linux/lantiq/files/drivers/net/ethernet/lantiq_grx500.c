@@ -1758,12 +1758,17 @@ static netdev_tx_t grx500_transmit(struct sk_buff *skb, struct net_device *netde
 	/* As in the BSP, kick a stopped channel and leave a running fetch engine
 	 * alone. Channel configuration belongs to prepare, not every packet.
 	 */
-	grx500_dma_start(eth->tx_dma, 0);
+	if (!netdev_xmit_more() ||
+	    netif_xmit_stopped(netdev_get_tx_queue(netdev, 0)))
+		grx500_dma_start(eth->tx_dma, 0);
 	netif_trans_update(netdev);
 	spin_unlock_irqrestore(&eth->lock, flags);
 	return NETDEV_TX_OK;
 
 drop:
+	/* A rejected last skb may end a batch with accepted descriptors. */
+	if (eth->tx_pending)
+		grx500_dma_start(eth->tx_dma, 0);
 	eth->stats.tx_dropped++;
 	spin_unlock_irqrestore(&eth->lock, flags);
 	dev_kfree_skb_any(skb);
