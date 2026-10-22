@@ -257,3 +257,78 @@ relocated_default_end:
     .global keyslot_bad_index_assert
 keyslot_bad_index_assert:
     .incbin "ap_ram_gen6_wrx_600_real_phy.bin",0x4d2da,12
+
+
+    /* Recipient BA setup only. Native window values are 0/1 or the
+     * power-of-two table 2..256, so control bit16 identifies window1.
+     * Seed the original one-entry window before enlarging it: retain
+     * an equal requested boundary, otherwise use its 12-bit predecessor.
+     * Other native states retain their original command order/arguments.
+     */
+    .section .ba_owner,"ax",@progbits
+    .global ba_owner_entry
+ba_owner_entry:
+    /* Eight saved words retain the native call-stack alignment. */
+    enter_s [r13-r19,blink]
+    mov_s   r16,r3
+    mov_s   r17,r2
+    mov_s   r13,r1
+    bl.d    native_rxpp_halt
+    mov_s   r14,r0
+    mov_s   r0,0x72968
+    asl_s   r1,r14,7
+    ld_s    r0,[r0,0]
+    add_s   r0,r0,r1
+    asl_s   r15,r13,4
+    add_s   r15,r15,r0
+    bmsk.f  0,r15,1
+    beq_s   .Lba_aligned
+    mov_s   r0,60
+    mov_s   r1,1
+    bl.d    native_assert
+    mov     r2,816
+.Lba_aligned:
+    ld_s    r0,[r15,0]
+    /* Keep the original active bit across native commands; no new state. */
+    mov_s   r18,r0
+    bbit0   r0,29,.Lba_window
+    mov_s   r2,r16
+    bbit0   r0,16,.Lba_legacy_active
+    bmsk_s  r0,r0,11
+    breq    r0,r16,.Lba_pre_send
+    /* Unchanged writer masks requested zero minus one to 0xfff. */
+    sub_s   r2,r2,1
+    b_s     .Lba_pre_send
+.Lba_legacy_active:
+    breq    r16,0,.Lba_pre_send
+    mov_s   r18,0
+    /* The native SN writer masks to 12 bits, including wrap. */
+    add_s   r2,r0,1
+.Lba_pre_send:
+    mov_s   r0,r14
+    mov_s   r1,r13
+    bl.d    native_rxpp_sn
+    mov_s   r3,1
+.Lba_window:
+    mov_s   r0,r14
+    mov_s   r1,r13
+    bl.d    native_rxpp_window
+    mov_s   r2,r17
+    bbit1   r18,29,.Lba_shadow
+    mov_s   r0,r14
+    mov_s   r1,r13
+    mov_s   r2,r16
+    bl.d    native_rxpp_sn
+    mov_s   r3,1
+.Lba_shadow:
+    asl_s   r0,r14,4
+    ld_s    r1,[r15,0]
+    add1_s  r0,r0,r13
+    bmsk_s  r1,r1,11
+    add_s   r0,r0,0x93858
+    bl.d    native_rxpp_release
+    sth_s   r1,[r0,0]
+    leave_s [r13-r19,blink,pcl]
+    .global ba_owner_code_end
+ba_owner_code_end:
+    .org 140,0
