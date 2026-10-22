@@ -19,10 +19,10 @@ Subject: [PATCH] uci: support an explicit committed-only reader
 +				if (ucv_is_truish(value)) {
 +					struct uci_element *e, *tmp;
 +					uci_foreach_element_safe(&c->delta_path, tmp, e) {
-+						uci_list_del(&e->list);
 +						free(e->name);
 +						free(e);
 +					}
++					c->delta_path.next = c->delta_path.prev = &c->delta_path;
 +#ifdef HAVE_UCI_CONF2DIR
 +					rv = uci_set_conf2dir(c, NULL);
 +					if (rv)
