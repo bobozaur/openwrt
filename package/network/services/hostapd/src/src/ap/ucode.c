@@ -422,7 +422,7 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 	uc_value_t *files_only = uc_fn_arg(2);
 	unsigned int i, idx = 0;
 	int ret = -1;
-	bool started;
+	bool started, deferred;
 
 	if (!hapd || ucv_type(file) != UC_STRING)
 		goto out;
@@ -455,15 +455,15 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 	}
 
 	started = hapd->started;
+	deferred = hapd->conf->start_deferred;
 	__uc_hostapd_bss_stop(hapd);
 
 	/*
-	 * start_disabled is only meaningful for the initial apsta bring-up. When
-	 * re-applying config to a BSS that was already started, clear it so the
-	 * restart keeps beaconing instead of silently going quiet.
+	 * Release only the temporary AP+STA barrier. Explicit BSS disable is
+	 * persistent policy and must survive configuration and radio restarts.
 	 */
-	if (started)
-		conf->bss[idx]->start_disabled = 0;
+	if (started && !deferred)
+		conf->bss[idx]->start_deferred = 0;
 
 	old_bss = hapd->conf;
 	for (i = 0; i < iface->conf->num_bss; i++)
@@ -639,7 +639,11 @@ uc_hostapd_iface_add_bss(uc_vm_t *vm, size_t nargs)
 		goto free_hapd;
 
 	if (iface->state == HAPD_IFACE_ENABLED) {
-		hapd->conf->start_disabled = 0;
+		bool deferred = false;
+		for (int i = 0; i < iface->num_bss; i++)
+			deferred |= iface->bss[i]->conf->start_deferred;
+		if (!deferred)
+			hapd->conf->start_deferred = 0;
 		if (hostapd_setup_bss(hapd, false, true))
 			goto deinit_ctrl;
 	}
@@ -822,6 +826,7 @@ uc_hostapd_iface_stop(uc_vm_t *vm, size_t nargs)
 		hostapd_free_stas(hapd);
 		hostapd_drv_stop_ap(hapd);
 		hapd->beacon_set_done = 0;
+		hapd->conf->start_deferred = 1;
 	}
 	hostapd_ucode_iface_state_changed(iface);
 
@@ -878,7 +883,7 @@ uc_hostapd_iface_channel_status(uc_vm_t *vm, size_t nargs)
 	uc_value_t *info = uc_fn_arg(0), *ret;
 	struct hostapd_iface probe;
 	struct hostapd_config conf;
-	bool changed, beaconing;
+	bool changed, beaconing, ready;
 	int dfs, freq;
 
 	if (!iface || !iface->conf)
@@ -886,10 +891,25 @@ uc_hostapd_iface_channel_status(uc_vm_t *vm, size_t nargs)
 	ret = ucv_object_new(vm);
 	ucv_object_add(ret, "state", ucv_string_new(hostapd_state_text(iface->state)));
 	ucv_object_add(ret, "cac_time_ms", ucv_int64_new(iface->dfs_cac_ms));
-	beaconing = iface->state == HAPD_IFACE_ENABLED && iface->num_bss > 0;
-	for (int i = 0; i < iface->num_bss; i++)
-		beaconing &= !!iface->bss[i]->beacon_set_done;
+	beaconing = ready = iface->state == HAPD_IFACE_ENABLED && iface->num_bss > 0;
+	uc_value_t *bss_state = ucv_object_new(vm);
+	for (int i = 0; i < iface->num_bss; i++) {
+		struct hostapd_data *hapd = iface->bss[i];
+		bool active = hapd->started && !hapd->disabled &&
+			hapd->beacon_set_done && !hapd->conf->start_disabled &&
+			!hapd->conf->start_deferred;
+		uc_value_t *bss = ucv_object_new(vm);
+		ucv_object_add(bss, "beaconing", ucv_boolean_new(active));
+		ucv_object_add(bss, "disabled", ucv_boolean_new(hapd->conf->start_disabled));
+		ucv_object_add(bss, "deferred", ucv_boolean_new(hapd->conf->start_deferred));
+		ucv_object_add(bss_state, hapd->conf->iface, bss);
+		beaconing &= active;
+		ready &= !hapd->conf->start_deferred &&
+			(hapd->conf->start_disabled ? !hapd->beacon_set_done : active);
+	}
 	ucv_object_add(ret, "beaconing", ucv_boolean_new(beaconing));
+	ucv_object_add(ret, "ready", ucv_boolean_new(ready));
+	ucv_object_add(ret, "bss", bss_state);
 	if (!info)
 		return ret;
 	if (ucv_type(info) != UC_OBJECT)
@@ -944,7 +964,7 @@ uc_hostapd_iface_start(uc_vm_t *vm, size_t nargs)
 	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
 	uc_value_t *info = uc_fn_arg(0);
 	struct hostapd_config *conf;
-	bool changed;
+	bool changed, deferred = false, all_disabled = true;
 	uint64_t intval;
 	int i;
 
@@ -956,9 +976,14 @@ uc_hostapd_iface_start(uc_vm_t *vm, size_t nargs)
 	if (ucv_type(info) != UC_OBJECT)
 		return NULL;
 	changed = uc_hostapd_config_channel(conf, info);
+	for (i = 0; i < iface->num_bss; i++) {
+		deferred |= iface->bss[i]->conf->start_deferred;
+		all_disabled &= !!iface->bss[i]->conf->start_disabled;
+	}
 
-	if (!changed &&
-	    (iface->bss[0]->beacon_set_done ||
+	if (!changed && !deferred &&
+	    ((iface->state == HAPD_IFACE_ENABLED &&
+	      (iface->bss[0]->beacon_set_done || all_disabled)) ||
 	     iface->state == HAPD_IFACE_DFS))
 		return ucv_boolean_new(true);
 
@@ -986,7 +1011,7 @@ out:
 		iface->freq = hostapd_hw_get_freq(iface->bss[0], conf->channel);
 
 	for (i = 0; i < iface->num_bss; i++)
-		iface->bss[i]->conf->start_disabled = 0;
+		iface->bss[i]->conf->start_deferred = 0;
 
 	if (iface->state != HAPD_IFACE_ENABLED) {
 		return ucv_boolean_new(!hostapd_enable_iface(iface));
