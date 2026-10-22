@@ -9,10 +9,11 @@ from pathlib import Path
 
 IMAGE_SIZE = 0x180000
 ORIGINAL_SHA256 = "6801144d7d45d66ffdb867624d4906a6f215243cd00fa9d1611333ddf6477908"
-CORRECTED_SHA256 = "31bdd3e63ae344ec7c2a2b897ec449af72549b6b1cda42e39a14688d854c51ba"
+CORRECTED_SHA256 = "58f928980c996b10e334e0c35d582ce12c1a8423dbc8f57cd9815ed0c3d7d875"
 
 # Fixed output sections of rax40-wds.ld; not a general firmware patch format.
 SECTIONS = (
+    ("ba_owner", 0x4BB54, 140),
     ("default_owner", 0x4D0C8, 56),
     ("key_commit_hook", 0x4D25E, 4),
     ("keyslot_owner", 0x4D264, 130),
@@ -25,6 +26,7 @@ SECTIONS = (
 
 # Only changed code and the adjacent original bytes required by DWORD writes.
 SPANS = (
+    (0x4BB54, 140),
     (0x4D0C8, 56),
     (0x4D25C, 140),
     (0x5A8A0, 4),
@@ -73,7 +75,7 @@ def main():
         data = corrected[offset:offset + size]
         payload.extend(data)
         reconstructed[offset:offset + size] = data
-    if len(payload) != 576 or reconstructed != corrected:
+    if len(payload) != 716 or reconstructed != corrected:
         raise SystemExit("Native loader spans do not reproduce the complete reviewed image")
 
     header = f"""/* Firmware instruction data for the pinned NETGEAR RAX40 image.
@@ -93,7 +95,7 @@ static const uint8 wave_wds_ap_original_sha256[32] = {{
 }};
 
 /* Preserve byte order through the native swap=FALSE raw-DWORD writer. */
-static const uint8 wave_wds_ap_code[576] __aligned(4) = {{
+static const uint8 wave_wds_ap_code[716] __aligned(4) = {{
 {bytes_as_c(payload)}
 }};
 

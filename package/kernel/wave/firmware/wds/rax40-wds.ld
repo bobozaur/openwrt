@@ -3,6 +3,10 @@ OUTPUT_ARCH(arc)
 /* Native branch destinations must be linker symbols. ARC GAS treats a bare
  * numeric branch operand as a displacement, not a firmware address.
  */
+native_rxpp_halt = 0x65c2c;
+native_rxpp_release = 0x65c78;
+native_rxpp_window = 0x65d7c;
+native_rxpp_sn = 0x65db0;
 native_projection_tail = 0x4d154;
 native_plain_commit = 0x4d16c;
 native_keyslot_done = 0x4d2e6;
@@ -17,6 +21,7 @@ native_sta_resume_one = 0xfe25e;
 native_sta_resume_two = 0x14df12;
 SECTIONS
 {
+  .ba_owner 0x4bb54 : { *(.ba_owner) }
   .default_owner 0x4d0c8 : { *(.default_owner) }
   .key_commit_hook 0x4d25e : { *(.key_commit_hook) }
   .keyslot_owner 0x4d264 : { *(.keyslot_owner) }
@@ -46,3 +51,7 @@ ASSERT(relocated_default == 0x4d298, "Default-key relocated body")
 ASSERT(relocated_default_end == 0x4d2d6, "Default-key relocated body bound")
 ASSERT(keyslot_bad_index_assert == 0x4d2da, "Native invalid-key assertion PC")
 ASSERT(key_commit_wrapper == 0x5aaf8, "Word-aligned key commit wrapper in original HIF tail")
+
+ASSERT(SIZEOF(.ba_owner) == 140, "Native recipient BA setup extent")
+ASSERT(ba_owner_entry == 0x4bb54, "Native recipient BA setup ABI entry")
+ASSERT(ba_owner_code_end <= 0x4bbe0, "BA setup does not overlap the next function")
