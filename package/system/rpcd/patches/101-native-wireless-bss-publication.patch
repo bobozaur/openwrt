@@ -1,0 +1,651 @@
+Subject: [PATCH] uci: extend native wireless enrollment with bounded BSS publication
+
+--- a/uci.c
++++ b/uci.c
+@@ -1335,6 +1335,21 @@
+ 	free(pkg);
+ }
+ 
++/* Automatic credential publication reloads committed wireless only. Do not
++ * emit config.change here: normal Apply retains its full default reload.
++ * The caller releases its UCI context/lock before entering netifd. */
++static int rpc_uci_reload_wireless(struct ubus_context *ctx)
++{
++	struct blob_buf request = {};
++	uint32_t id;
++	int rv = ubus_lookup_id(ctx, "network.wireless", &id);
++	if (rv) return rv;
++	blob_buf_init(&request, 0);
++	rv = ubus_invoke(ctx, id, "reload", request.head, NULL, NULL, 2000);
++	blob_buf_free(&request);
++	return rv;
++}
++
+ /* WPS persists one selected native credential. This local-only operation owns
+  * the entire pending-edit/Apply/snapshot check and commit; callers must never
+  * emulate it with separate get/set/commit calls. */
+@@ -1629,7 +1644,7 @@
+ 	    !rpc_wps_section(c, device, tb[WPS_EXPECTED_DEVICE], NULL))
+ 		goto reply;
+ 	/* Exact desired state may follow a lost reply or post-rename sync failure.
+-	 * Rewrite it durably and notify the normal reload owner before saved. */
++	 * Re-sync durably and retry the committed wireless owner before saved. */
+ 	if (!rpc_wps_section(c, s, tb[WPS_EXPECTED], tb[WPS_VALUES]) &&
+ 	    !rpc_wps_section(c, s, tb[WPS_EXPECTED], NULL))
+ 		goto reply;
+@@ -1655,8 +1670,8 @@
+ 		uci_free_context(c);
+ 		c = NULL;
+ 	}
+-	if (saved)
+-		rpc_uci_trigger_event(bus, "wireless");
++	if (saved && rpc_uci_reload_wireless(bus))
++        status = "reload_failed";
+ 	blob_buf_init(&buf, 0);
+ 	blobmsg_add_string(&buf, "status", status);
+ 	ubus_send_reply(bus, req, buf.head);
+@@ -1666,6 +1681,596 @@
+ 		uci_free_context(c);
+ 	return rv;
+ }
++
++/* A native AP owner publishes one radio's complete BSS change atomically.
++ * This deliberately reuses enrollment admission/locking and is not a general
++ * UCI commit API. HTTP/session callers retain normal Apply semantics. */
++enum {
++	MESH_DEVICE, MESH_EXPECTED_DEVICE, MESH_UPDATES, MESH_SESSION, __MESH_MAX,
++};
++static const struct blobmsg_policy rpc_mesh_policy[__MESH_MAX] = {
++	[MESH_DEVICE] = { .name = "device", .type = BLOBMSG_TYPE_STRING },
++	[MESH_EXPECTED_DEVICE] = { .name = "expected_device", .type = BLOBMSG_TYPE_TABLE },
++	[MESH_UPDATES] = { .name = "updates", .type = BLOBMSG_TYPE_ARRAY },
++	[MESH_SESSION] = { .name = "ubus_rpc_session", .type = BLOBMSG_TYPE_STRING },
++};
++
++struct rpc_mesh_update {
++	const char *name;
++	struct blob_attr *expected, *values;
++	struct uci_section *section;
++	const char *type;
++};
++
++static bool rpc_mesh_clean(struct blob_attr *a)
++{
++	const unsigned char *s;
++	if (!rpc_wps_string(a))
++		return false;
++	for (s = (const unsigned char *)blobmsg_get_string(a); *s; s++)
++		if (*s < 32 || *s == 127)
++			return false;
++	return true;
++}
++
++static bool rpc_mesh_is(struct blob_attr *a, const char *value)
++{
++	return rpc_wps_string(a) && !strcmp(blobmsg_get_string(a), value);
++}
++
++static bool rpc_mesh_list(struct blob_attr *a)
++{
++	struct blob_attr *v;
++	int rem;
++	if (!a || blobmsg_type(a) != BLOBMSG_TYPE_ARRAY || !blobmsg_data_len(a))
++		return false;
++	blobmsg_for_each_attr(v, a, rem)
++		if (!rpc_mesh_clean(v))
++			return false;
++	return true;
++}
++
++/* Raw options may be preserved, never become an escape from the bounded
++ * owner. Only its provenance/profile/management directives can be introduced. */
++static bool rpc_mesh_raw_owned(const char *line)
++{
++	static const char * const names[] = {
++		"interface", "bss", "bssid", "ctrl_interface", "bridge", "ssid", "ssid2",
++		"auth_algs", "wpa", "wpa_key_mgmt", "wpa_pairwise", "rsn_pairwise", "wpa_group",
++		"wpa_passphrase", "wpa_psk", "wpa_psk_file", "wpa_psk_file_static",
++		"wpa_psk_radius", "sae_password", "sae_password_file", "ieee80211w",
++		"ieee8021x", "eap_server", "auth_server_addr", "auth_server_port",
++		"auth_server_shared_secret", "start_disabled", "start_deferred",
++		"ignore_broadcast_ssid", "wps_state", "wps_independent",
++		"notify_mgmt_frames", "config_id"
++	};
++	const char *end, *equal;
++	size_t len;
++	int i;
++	line += strspn(line, " \t\r");
++	equal = strchr(line, '=');
++	if (!equal) return false;
++	end = equal;
++	while (end > line && (end[-1] == ' ' || end[-1] == '\t')) end--;
++	len = end - line;
++	if ((len >= 8 && !strncmp(line, "multi_ap", 8)) ||
++		(len >= 12 && !strncmp(line, "rsn_override", 12))) return true;
++	for (i = 0; i < ARRAY_SIZE(names); i++)
++		if (strlen(names[i]) == len && !strncmp(line, names[i], len))
++			return true;
++	return false;
++}
++
++static struct blob_attr *rpc_mesh_raw_at(struct blob_attr *wanted, int index)
++{
++	struct blob_attr *a;
++	int rem;
++	blobmsg_for_each_attr(a, wanted, rem)
++		if (!rpc_mesh_raw_owned(blobmsg_get_string(a)) && !index--)
++			return a;
++	return NULL;
++}
++
++static bool rpc_mesh_raw_line(struct blob_attr *wanted, const char *text, int *index)
++{
++	char *copy = strdup(text), *tail = copy, *line;
++	struct blob_attr *a;
++	bool ok = true;
++	if (!copy) return false;
++	while ((line = strsep(&tail, "\n"))) {
++		if (!*line && !tail) break; /* std::getline excludes final empty row */
++		if (rpc_mesh_raw_owned(line)) continue;
++		a = rpc_mesh_raw_at(wanted, (*index)++);
++		if (!rpc_mesh_is(a, line)) { ok = false; break; }
++	}
++	free(copy);
++	return ok;
++}
++
++static bool rpc_mesh_raw(struct uci_context *c, struct rpc_mesh_update *u,
++						 struct blob_attr *wanted)
++{
++	struct uci_option *old = u->section ?
++		uci_lookup_option(c, u->section, "hostapd_bss_options") : NULL;
++	struct uci_element *e;
++	struct blob_attr *a;
++	const char *v;
++	int index = 0, rem, i;
++	bool token = false, notify = false, profile = false;
++	if (!rpc_mesh_list(wanted)) return false;
++	blobmsg_for_each_attr(a, wanted, rem) {
++		v = blobmsg_get_string(a);
++		if (!rpc_mesh_raw_owned(v)) continue;
++		if (!strcmp(v, "notify_mgmt_frames=1")) {
++			if (notify) return false;
++			notify = true;
++		} else if (!strncmp(v, "multi_ap_client_disallow=", 25) &&
++				   strlen(v + 25) == 1 && strchr("0123", v[25])) {
++			if (profile) return false;
++			profile = true;
++		} else if (!strncmp(v, "config_id=", 10) && strlen(v + 10) == 64) {
++			if (token) return false;
++			token = true;
++			for (i = 10; v[i]; i++)
++				if (!isxdigit((unsigned char)v[i])) return false;
++		} else {
++			return false;
++		}
++	}
++	if (!token || !notify ||
++		(!profile && !rpc_mesh_is(rpc_wps_field(u->values, "start_disabled"), "1")))
++		return false;
++	if (old && old->type == UCI_TYPE_STRING) {
++		if (!rpc_mesh_raw_line(wanted, old->v.string, &index)) return false;
++	} else if (old) {
++		uci_foreach_element(&old->v.list, e)
++			if (!rpc_mesh_raw_line(wanted, e->name, &index)) return false;
++	}
++	return !rpc_mesh_raw_at(wanted, index);
++}
++
++static bool rpc_mesh_choice(struct blob_attr *value, const char *choices)
++{
++	const char *v;
++	if (!rpc_wps_string(value)) return false;
++	v = blobmsg_get_string(value);
++	return strlen(v) == 1 && strchr(choices, *v);
++}
++
++static bool rpc_mesh_values(struct uci_context *c, struct rpc_mesh_update *u, const char *device)
++{
++	static const char * const ap[] = {
++		"ssid", "encryption", "key", "ieee80211w", "multi_ap",
++		"start_disabled", "wds", "hidden", "wps_pushbutton", "wps_state",
++		"multi_ap_backhaul_ssid", "multi_ap_backhaul_key", "hostapd_bss_options",
++		"device", "mode", "ifname", "network",
++	};
++	static const char * const remove_only[] = {
++		"sae_password", "sae_password_file", "wpa_psk_file", "ppsk", "dpp",
++		"auth_server", "auth_server_addr", "auth_server_shared_secret",
++		"wpa_psk", "wpa_passphrase", "wpa_psk_radius", "wpa_psk_file_static",
++		"wpa_key_mgmt", "ieee80211r", "sae_ext_key", "rsn_override_key_mgmt",
++		"rsn_override_pairwise", "rsn_override_mfp", "rsn_override_key_mgmt_2",
++		"rsn_override_pairwise_2", "rsn_override_mfp_2",
++	};
++	struct blob_attr *a, *v;
++	const char *name, *s;
++	int rem, i;
++	if (!u->values || blobmsg_type(u->values) != BLOBMSG_TYPE_TABLE)
++		return false;
++	blobmsg_for_each_attr(a, u->values, rem) {
++		name = blobmsg_name(a);
++		if (!strcmp(u->type, "wifi-device")) {
++			if (strcmp(name, "channel") && strcmp(name, "htmode"))
++				return false;
++		} else if (!strcmp(u->type, "wifi-station")) {
++			if (strcmp(name, "iface") && strcmp(name, "disabled"))
++				return false;
++		} else {
++			for (i = 0; i < ARRAY_SIZE(ap); i++)
++				if (!strcmp(name, ap[i]))
++					break;
++			if (i == ARRAY_SIZE(ap)) {
++				for (i = 0; i < ARRAY_SIZE(remove_only); i++)
++					if (!strcmp(name, remove_only[i])) break;
++				if (i == ARRAY_SIZE(remove_only) ||
++				    blobmsg_type(a) != BLOBMSG_TYPE_UNSPEC)
++					return false;
++			}
++		}
++		if (blobmsg_type(a) == BLOBMSG_TYPE_UNSPEC) {
++			if (!strcmp(name, "device") || !strcmp(name, "mode") ||
++			    !strcmp(name, "ifname") || !strcmp(name, "channel") ||
++			    !strcmp(name, "htmode"))
++				return false;
++			continue;
++		}
++		if (!strcmp(name, "network") || !strcmp(name, "hostapd_bss_options") ||
++		    !strcmp(name, "iface")) {
++			if (!rpc_mesh_list(a) &&
++			    (!strcmp(name, "hostapd_bss_options") || !rpc_mesh_clean(a)))
++				return false;
++		} else if (!rpc_mesh_clean(a)) {
++			return false;
++		}
++		if ((!strcmp(name, "start_disabled") || !strcmp(name, "wds") ||
++			 !strcmp(name, "hidden") || !strcmp(name, "wps_pushbutton") ||
++			 !strcmp(name, "disabled")) && !rpc_mesh_choice(a, "01"))
++			return false;
++		if ((!strcmp(name, "multi_ap") && !rpc_mesh_choice(a, "0123")) ||
++			(!strcmp(name, "ieee80211w") && !rpc_mesh_choice(a, "012")) ||
++			(!strcmp(name, "wps_state") && !rpc_mesh_choice(a, "012")))
++			return false;
++	}
++	if (!strcmp(u->type, "wifi-device")) {
++		a = rpc_wps_field(u->values, "channel");
++		if (a) {
++			char *end;
++			unsigned long channel = strtoul(blobmsg_get_string(a), &end, 10);
++			if (*end || !channel || channel > 233) return false;
++		}
++		a = rpc_wps_field(u->values, "htmode");
++		if (a) {
++			static const char * const modes[] = {
++				"HT20", "HT40", "VHT20", "VHT40", "VHT80", "VHT160",
++				"HE20", "HE40", "HE80", "HE160", "EHT20", "EHT40", "EHT80", "EHT160"
++			};
++			for (i = 0; i < ARRAY_SIZE(modes); i++)
++				if (!strcmp(blobmsg_get_string(a), modes[i])) break;
++			if (i == ARRAY_SIZE(modes)) return false;
++		}
++		return true;
++	}
++	if (strcmp(u->type, "wifi-iface"))
++		return true;
++	v = rpc_wps_field(u->values, "device");
++	if (v && !rpc_mesh_is(v, device))
++		return false;
++	a = rpc_wps_field(u->values, "ifname");
++	if (u->section && a) {
++		const char *old = uci_lookup_option_string(c, u->section, "ifname");
++		if (!old || !rpc_mesh_is(a, old)) return false;
++	}
++	v = rpc_wps_field(u->values, "mode");
++	if (v && !rpc_mesh_is(v, "ap"))
++		return false;
++	if (!u->section &&
++	    (!v || !rpc_wps_field(u->values, "device") ||
++	     !rpc_wps_string(rpc_wps_field(u->values, "ifname"))))
++		return false;
++	if (u->section && !blobmsg_data_len(u->values))
++		return true; /* Full-snapshot binding assertion, no mutation. */
++	if (!rpc_mesh_raw(c, u, rpc_wps_field(u->values, "hostapd_bss_options")))
++		return false;
++	if (rpc_mesh_is(rpc_wps_field(u->values, "start_disabled"), "1"))
++		return true;
++	a = rpc_wps_field(u->values, "ssid");
++	v = rpc_wps_field(u->values, "encryption");
++	if (!rpc_wps_string(a) || !strlen(blobmsg_get_string(a)) ||
++	    strlen(blobmsg_get_string(a)) > 32 || !rpc_wps_string(v) ||
++	    !rpc_wps_encryption(blobmsg_get_string(v)))
++		return false;
++	if (!strcmp(blobmsg_get_string(v), "none"))
++		return !rpc_wps_field(u->values, "key") ||
++		       blobmsg_type(rpc_wps_field(u->values, "key")) == BLOBMSG_TYPE_UNSPEC;
++	a = rpc_wps_field(u->values, "key");
++	if (!rpc_mesh_clean(a))
++		return false;
++	s = blobmsg_get_string(a);
++	if (strlen(s) < 8 || strlen(s) > 64)
++		return false;
++	if (strlen(s) == 64 && strncmp(blobmsg_get_string(v), "psk2", 4))
++		return false;
++	if (strlen(s) == 64)
++		for (i = 0; i < 64; i++)
++			if (!isxdigit((unsigned char)s[i]))
++				return false;
++	return true;
++}
++
++static bool rpc_mesh_new_matches(struct uci_context *c, struct uci_section *s,
++				struct blob_attr *values)
++{
++	struct uci_element *e;
++	struct blob_attr *a;
++	int rem;
++	if (!s || strcmp(s->type, "wifi-iface"))
++		return false;
++	uci_foreach_element(&s->options, e)
++		if (!rpc_wps_option(c, s, e->name, rpc_wps_field(values, e->name)))
++			return false;
++	blobmsg_for_each_attr(a, values, rem)
++		if (!rpc_wps_option(c, s, blobmsg_name(a), a))
++			return false;
++	return true;
++}
++
++static bool rpc_mesh_owner(struct rpc_mesh_update *updates, int count, const char *name)
++{
++	int i;
++	for (i = 0; i < count; i++)
++		if (!strcmp(updates[i].name, name) &&
++		    !strcmp(updates[i].type, "wifi-iface") &&
++		    rpc_mesh_is(rpc_wps_field(updates[i].values, "start_disabled"), "0"))
++			return true;
++	return false;
++}
++
++/* Only retire credential sources on APs whose credentials are replaced.
++ * Empty station bindings mean all APs. Never turn a last binding into global. */
++static bool rpc_mesh_station(struct uci_context *c, struct uci_package *p,
++							struct uci_section *s,
++							struct rpc_mesh_update *updates, int count)
++{
++	struct uci_option *o = uci_lookup_option(c, s, "iface");
++	struct blob_attr *wanted = NULL, *disable = NULL, *item;
++	struct uci_element *e;
++	const char *key = uci_lookup_option_string(c, s, "key");
++	const char *disabled = uci_lookup_option_string(c, s, "disabled");
++	char *copy = NULL, *name, *save = NULL;
++	int i, rem, remaining = 0, wanted_count = 0;
++	bool affected = false, ok = true, global = !o;
++	for (i = 0; i < count; i++)
++		if (!strcmp(updates[i].name, s->e.name)) {
++			wanted = rpc_wps_field(updates[i].values, "iface");
++			disable = rpc_wps_field(updates[i].values, "disabled");
++			if (rpc_wps_section(c, s, updates[i].expected, updates[i].values))
++				return true;
++		}
++	if (!key || !*key || (disabled && (!strcmp(disabled, "1") || !strcmp(disabled, "true"))))
++		return !wanted && !disable;
++	if (o && o->type == UCI_TYPE_STRING) {
++		copy = strdup(o->v.string);
++		if (!copy) return false;
++		global = false; /* Empty scalar is an inactive [ "" ] binding. */
++	} else if (o) {
++		global = uci_list_empty(&o->v.list);
++	}
++	if (wanted)
++		blobmsg_for_each_attr(item, wanted, rem)
++			wanted_count++;
++#define CHECK_BINDING(binding) do { \
++		const char *binding_name = (binding); \
++		if (rpc_mesh_owner(updates, count, binding_name)) { affected = true; break; } \
++		if (wanted && blobmsg_type(wanted) == BLOBMSG_TYPE_ARRAY) { \
++			bool found = false; int position = 0; \
++			blobmsg_for_each_attr(item, wanted, rem) { \
++				if ((global || position == remaining) && rpc_mesh_is(item, binding_name)) \
++					found = true; \
++				position++; \
++			} \
++			if (!found) ok = false; \
++		} else if (wanted) ok = false; \
++		remaining++; \
++	} while (0)
++	if (global) {
++		for (i = 0; i < count; i++)
++			if (rpc_mesh_owner(updates, count, updates[i].name))
++				affected = true;
++		uci_foreach_element(&p->sections, e) {
++			struct uci_section *ap = uci_to_section(e);
++			const char *mode = uci_lookup_option_string(c, ap, "mode");
++			if (!strcmp(ap->type, "wifi-iface") && mode && !strcmp(mode, "ap"))
++				CHECK_BINDING(ap->e.name);
++		}
++	} else if (copy) {
++		for (name = strtok_r(copy, " \t\r\n", &save); name;
++			 name = strtok_r(NULL, " \t\r\n", &save))
++			CHECK_BINDING(name);
++	} else {
++		uci_foreach_element(&o->v.list, e)
++			CHECK_BINDING(e->name);
++	}
++#undef CHECK_BINDING
++	free(copy);
++	if (!affected) return !wanted && !disable;
++	if (!remaining)
++		return !wanted && rpc_mesh_is(disable, "1");
++	return !disable && wanted && blobmsg_type(wanted) == BLOBMSG_TYPE_ARRAY &&
++		   ok && wanted_count == remaining;
++}
++
++static int rpc_uci_wireless_apply(struct ubus_context *bus, struct ubus_object *obj,
++		struct ubus_request_data *req, const char *method, struct blob_attr *msg)
++{
++	struct blob_attr *tb[__MESH_MAX], *a, *value;
++	struct rpc_mesh_update updates[64] = {};
++	struct uci_context *c = NULL;
++	struct uci_package *p = NULL;
++	struct uci_section *device, *s;
++	struct uci_element *e, *tmp;
++	const char *status = "conflict", *device_name;
++	int count = 0, i, j, rem, values_rem, err, rv = UBUS_STATUS_UNKNOWN_ERROR;
++	bool saved = false, changed = false;
++	struct blob_attr *device_values = NULL;
++
++	blobmsg_parse(rpc_mesh_policy, __MESH_MAX, tb, blob_data(msg), blob_len(msg));
++	if (tb[MESH_SESSION])
++		return UBUS_STATUS_PERMISSION_DENIED;
++	if (!rpc_wps_string(tb[MESH_DEVICE]) || !tb[MESH_EXPECTED_DEVICE] ||
++	    !tb[MESH_UPDATES])
++		return UBUS_STATUS_INVALID_ARGUMENT;
++	device_name = blobmsg_get_string(tb[MESH_DEVICE]);
++	if (apply_sid[0]) {
++		status = "busy";
++		goto reply;
++	}
++	c = uci_alloc_context();
++	if (!c)
++		goto out;
++	uci_foreach_element_safe(&c->delta_path, tmp, e) {
++		uci_list_del(&e->list);
++		free(e->name);
++		free(e);
++	}
++	if (uci_set_conf2dir(c, NULL))
++		goto out;
++	err = uci_trylock(c, "wireless");
++	if (err == UCI_ERR_BUSY) {
++		status = "busy";
++		goto reply;
++	}
++	if (err)
++		goto out;
++	if (rpc_wps_pending()) {
++		status = "busy";
++		goto reply;
++	}
++	if (uci_load(c, "wireless", &p))
++		goto out;
++	device = uci_lookup_section(c, p, device_name);
++	if (!device || strcmp(device->type, "wifi-device"))
++		goto reply;
++
++	blobmsg_for_each_attr(a, tb[MESH_UPDATES], rem) {
++		struct rpc_mesh_update *u;
++		if (count == ARRAY_SIZE(updates) || blobmsg_type(a) != BLOBMSG_TYPE_TABLE)
++			goto invalid;
++		u = &updates[count++];
++		value = rpc_wps_field(a, "section");
++		if (!rpc_wps_string(value) || !rpc_uci_verify_section(blobmsg_get_string(value)))
++			goto invalid;
++		u->name = blobmsg_get_string(value);
++		for (j = 0; j < count - 1; j++)
++			if (!strcmp(updates[j].name, u->name))
++				goto invalid;
++		u->expected = rpc_wps_field(a, "expected");
++		u->values = rpc_wps_field(a, "values");
++		u->section = uci_lookup_section(c, p, u->name);
++		if (!u->expected || !u->values ||
++			blobmsg_type(u->values) != BLOBMSG_TYPE_TABLE ||
++			(blobmsg_type(u->expected) != BLOBMSG_TYPE_TABLE &&
++			 blobmsg_type(u->expected) != BLOBMSG_TYPE_UNSPEC))
++			goto invalid;
++		if (blobmsg_type(u->expected) == BLOBMSG_TYPE_UNSPEC) {
++			u->type = "wifi-iface";
++			if (u->section && !rpc_mesh_new_matches(c, u->section, u->values))
++				goto reply;
++		} else {
++			value = rpc_wps_field(u->expected, ".type");
++			if (!rpc_wps_string(value))
++				goto invalid;
++			u->type = blobmsg_get_string(value);
++			if (!rpc_wps_section(c, u->section, u->expected, NULL) &&
++			    !rpc_wps_section(c, u->section, u->expected, u->values))
++				goto reply;
++		}
++		if (!strcmp(u->type, "wifi-device")) {
++			if (strcmp(u->name, device_name) || device_values)
++				goto invalid;
++			device_values = u->values;
++		} else if (!strcmp(u->type, "wifi-iface")) {
++			if (u->section &&
++			    ((!strcmp(uci_lookup_option_string(c, u->section, "disabled") ?: "", "1")) ||
++				 (!strcmp(uci_lookup_option_string(c, u->section, "disabled") ?: "", "true")) ||
++				 !rpc_wps_device(c, u->section, device_name) ||
++			     strcmp(uci_lookup_option_string(c, u->section, "mode") ?: "", "ap")))
++				goto reply;
++		} else if (strcmp(u->type, "wifi-station") || !u->section) {
++			goto invalid;
++		}
++		if (!rpc_mesh_values(c, u, device_name))
++			goto invalid;
++		value = rpc_wps_field(u->values, "ifname");
++		if (!strcmp(u->type, "wifi-iface") && value) {
++			uci_foreach_element(&p->sections, e) {
++				const char *ifname;
++				s = uci_to_section(e);
++				if (s == u->section) continue;
++				ifname = uci_lookup_option_string(c, s, "ifname");
++				if (ifname && rpc_mesh_is(value, ifname))
++					goto reply;
++			}
++			for (j = 0; j < count - 1; j++)
++				if (rpc_mesh_is(rpc_wps_field(updates[j].values, "ifname"),
++								blobmsg_get_string(value)))
++					goto invalid;
++		}
++	}
++	if (!count)
++		goto invalid;
++	if (!rpc_wps_section(c, device, tb[MESH_EXPECTED_DEVICE], NULL) &&
++	    !rpc_wps_section(c, device, tb[MESH_EXPECTED_DEVICE], device_values))
++		goto reply;
++	uci_foreach_element(&p->sections, e) {
++		s = uci_to_section(e);
++		if (!strcmp(s->type, "wifi-station") && !rpc_mesh_station(c, p, s, updates, count))
++			goto reply;
++	}
++
++	for (i = 0; i < count; i++) {
++		if (!updates[i].section) {
++			changed = true;
++			continue;
++		}
++		blobmsg_for_each_attr(value, updates[i].values, values_rem)
++			if (!rpc_wps_option(c, updates[i].section, blobmsg_name(value), value))
++				changed = true;
++	}
++	if (!changed) {
++		status = "saved";
++		saved = true;
++		goto reply;
++	}
++
++	p->has_delta = false;
++	for (i = 0; i < count; i++) {
++		struct rpc_mesh_update *u = &updates[i];
++		s = u->section;
++		if (!s) {
++			struct uci_ptr ptr = { .p = p, .package = p->e.name,
++				.section = u->name, .value = "wifi-iface" };
++			if (uci_set(c, &ptr))
++				goto out;
++			s = ptr.s;
++		}
++		blobmsg_for_each_attr(value, u->values, values_rem) {
++			struct uci_ptr ptr = { .p = p, .s = s, .package = p->e.name,
++				.section = s->e.name, .option = blobmsg_name(value) };
++			if (blobmsg_type(value) == BLOBMSG_TYPE_UNSPEC) {
++				if (uci_lookup_option(c, s, ptr.option) && uci_delete(c, &ptr))
++					goto out;
++			} else if (blobmsg_type(value) == BLOBMSG_TYPE_ARRAY) {
++				struct blob_attr *item;
++				int item_rem;
++				if (uci_lookup_option(c, s, ptr.option) && uci_delete(c, &ptr))
++					goto out;
++				blobmsg_for_each_attr(item, value, item_rem) {
++					ptr.value = blobmsg_get_string(item);
++					if (uci_add_list(c, &ptr))
++						goto out;
++				}
++			} else {
++				ptr.value = blobmsg_get_string(value);
++				if (uci_set(c, &ptr))
++					goto out;
++			}
++		}
++	}
++	if (uci_commit(c, &p, true))
++		goto out;
++	status = "saved";
++	saved = true;
++reply:
++	if (c) {
++		uci_free_context(c);
++		c = NULL;
++	}
++	if (saved && rpc_uci_reload_wireless(bus))
++		status = "reload_failed";
++	blob_buf_init(&buf, 0);
++	blobmsg_add_string(&buf, "status", status);
++	ubus_send_reply(bus, req, buf.head);
++	rv = 0;
++out:
++	if (c)
++		uci_free_context(c);
++	return rv;
++invalid:
++	rv = UBUS_STATUS_INVALID_ARGUMENT;
++	goto out;
++}
++
+ 
+ static int
+ rpc_uci_revert_commit(struct ubus_context *ctx, struct blob_attr *msg, bool commit)
+@@ -2136,6 +2741,7 @@
+ 		UBUS_METHOD("revert",   rpc_uci_revert,   rpc_uci_config_policy),
+ 		UBUS_METHOD("commit",   rpc_uci_commit,   rpc_uci_config_policy),
+ 		UBUS_METHOD("wireless_enroll", rpc_uci_wireless_enroll, rpc_wps_policy),
++		UBUS_METHOD("wireless_apply", rpc_uci_wireless_apply, rpc_mesh_policy),
+ 		UBUS_METHOD("apply",    rpc_uci_apply,    rpc_uci_apply_policy),
+ 		UBUS_METHOD("confirm",  rpc_uci_confirm,  rpc_uci_rollback_policy),
+ 		UBUS_METHOD("rollback", rpc_uci_rollback, rpc_uci_rollback_policy),
