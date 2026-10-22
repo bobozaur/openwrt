@@ -466,10 +466,10 @@ Subject: [PATCH] uci: extend native wireless enrollment with bounded BSS publica
 +	if (!c)
 +		goto out;
 +	uci_foreach_element_safe(&c->delta_path, tmp, e) {
-+		uci_list_del(&e->list);
 +		free(e->name);
 +		free(e);
 +	}
++	c->delta_path.next = c->delta_path.prev = &c->delta_path;
 +	if (uci_set_conf2dir(c, NULL))
 +		goto out;
 +	err = uci_trylock(c, "wireless");
