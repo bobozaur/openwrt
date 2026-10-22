@@ -1,0 +1,25 @@
+Subject: [PATCH] wifi: rtw88: usb: start TX work when a frame is queued
+
+The upper TX worker prepares its initial queue-depth snapshot before
+kicking the USB transport. With software encryption, USB submission can
+wait for that whole snapshot even though complete frames are queued.
+
+Queue the existing USB worker when admitting each complete frame, under
+the same lock and pause gate as the existing kick. Workqueue coalescing
+and the existing worker keep submission serialized and aggregate frames
+that are available. The final kick and drain/stop paths remain intact.
+
+Not submitted upstream.
+
+---
+--- a/drivers/net/wireless/realtek/rtw88/usb.c
++++ b/drivers/net/wireless/realtek/rtw88/usb.c
+@@ -815,6 +815,8 @@
+ 		return 0;
+ 	}
+ 	skb_queue_tail(&rtwusb->tx_queue[ep], skb);
++	/* Overlap USB submission with preparation of the next TX frames. */
++	queue_work(rtwusb->txwq, &rtwusb->tx_work);
+ 	spin_unlock_bh(&rtwusb->tx_lock);
+ 
+ 	return 0;
