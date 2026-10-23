@@ -67,6 +67,7 @@ define Build/grx500-sysupgrade
 endef
 
 define Device/tplink_archer-ax50-v1
+  PROFILES += AX50_FULL
   DEVICE_VENDOR := TP-Link
   DEVICE_MODEL := Archer AX50
   DEVICE_VARIANT := v1
