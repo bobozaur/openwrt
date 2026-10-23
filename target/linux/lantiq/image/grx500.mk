@@ -83,7 +83,7 @@ define Device/tplink_archer-ax50-v1
   SUPPORTED_DEVICES := tplink,archer-ax50-v1
   DEVICE_PACKAGES := kmod-gpio-button-hotplug kmod-leds-gpio kmod-ledtrig-network \
 	uboot-envtools ubi-utils ax50-caldata kmod-grx500-eth \
-	kmod-wave wave600-firmware-importer wave-scripts wpad-mbedtls ucode-mod-uci \
+	kmod-wave wave-scripts wpad-mbedtls ucode-mod-uci \
 	kmod-usb3 kmod-usb-dwc3-grx500 kmod-usb-ledtrig-usbport
   IMAGES := sysupgrade.bin
   IMAGE/sysupgrade.bin := grx500-sysupgrade | append-metadata

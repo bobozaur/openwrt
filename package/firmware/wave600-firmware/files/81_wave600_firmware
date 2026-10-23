@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+wave600_retire_importer() {
+	local hash file path
+
+	# 80_mount_root has restored any sysupgrade backup. Withdraw the former
+	# importer's search-path links before S09 services and S10 kmodloader run.
+	# The separate store remains intact for an older fallback image.
+	while read -r hash file; do
+		path="/lib/firmware/updates/$file"
+		[ ! -L "$path" ] ||
+			[ "$(readlink "$path")" != "/mnt/wave600_firmware/firmware/$file" ] ||
+			rm -f "$path"
+	done < /usr/share/wave600-firmware/SHA256SUMS
+
+	# A backup made with -c or explicit keep rules can restore old enable
+	# links. Disable that obsolete consumer even if its script was customized.
+	for path in /etc/rc.d/[SK][0-9][0-9]wave600-firmware; do
+		[ ! -L "$path" ] ||
+			[ "$(readlink "$path")" != ../init.d/wave600-firmware ] ||
+			rm -f "$path"
+	done
+
+	# Retire only the exact former package scripts; preserve local edits.
+	for path in /etc/init.d/wave600-firmware /usr/sbin/wave600-firmware-import; do
+		[ -f "$path" ] && [ ! -L "$path" ] || continue
+		hash=$(sha256sum < "$path") || continue
+		case "$path:${hash%% *}" in
+		/etc/init.d/wave600-firmware:fea731ab3f1ddd4f5d457422b19c705cd74c11b7606abb6ff424614ae0d26310|\
+		/usr/sbin/wave600-firmware-import:2910dc48fdf853b0f11fe5437f9cda6e1eb7dbf3abbabfb956c7009264408952)
+			rm -f "$path"
+			;;
+		esac
+	done
+}
+
+boot_hook_add preinit_main wave600_retire_importer

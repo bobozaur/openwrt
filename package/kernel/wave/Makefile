@@ -5,7 +5,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=wave
 PKG_VERSION:=6.0.8.87.7
-PKG_RELEASE:=17
+PKG_RELEASE:=18
 PKG_SOURCE_VERSION:=06.00.08.00.87.00.07.d24084bd3447
 WAVE_SOURCE_BASE:=lq-wave-300-$(PKG_SOURCE_VERSION)
 PKG_SOURCE:=ax50v1_GPL_3.tar.gz
@@ -32,7 +32,7 @@ include $(INCLUDE_DIR)/package.mk
 define KernelPackage/wave
   SUBMENU:=Wireless Drivers
   TITLE:=Intel WAVE600 wireless support
-  DEPENDS:=@TARGET_lantiq_grx500 +kmod-mac80211 +kmod-crypto-arc4 +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT
+  DEPENDS:=@TARGET_lantiq_grx500 +wave600-firmware +kmod-mac80211 +kmod-crypto-arc4 +@DRIVER_11AC_SUPPORT +@DRIVER_11AX_SUPPORT
   FILES:= \
 	$(PKG_BUILD_DIR)/build/tools/mtlkroot/mtlkroot.ko \
 	$(PKG_BUILD_DIR)/build/wireless/driver/mtlk.ko
@@ -44,8 +44,8 @@ define KernelPackage/wave/description
  Intel WAVE600 driver using the standard cfg80211/mac80211 backports API.
  Builds the driver and RF library from TP-Link's pinned Archer AX50 v1 source,
  adapted to the coherent WRX600 A0 interface used by NETGEAR RAX40 V1 1.0.6.106.
- Import that radio firmware with the AX50 PSD using wave600-firmware-importer
- before initializing the radios.
+ The wave600-firmware package supplies the original radio firmware and AX50 PSD
+ through the standard build and firmware loading paths.
 endef
 
 define Build/Prepare
