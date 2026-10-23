@@ -50,6 +50,9 @@ function enrollment_forget(ifname, status)
 	entry.expiry?.cancel();
 	entry.retry?.cancel();
 	delete wpas.data.enrollment[ifname];
+	// A native run gets one writer lifetime, even if credentials repeat.
+	entry.owner.retired_wps_iface = entry.iface;
+	entry.owner.retired_wps_run = entry.run;
 	if (entry.owner.active_wps_run == entry.run &&
 	    entry.owner.active_wps_iface == entry.iface) {
 		delete entry.owner.active_wps_run;
@@ -221,12 +224,44 @@ function enrollment_reconcile(old_if, new_if, generation)
 		result?.status == 'conflict' ? 'conflict' : 'unconfirmed');
 }
 
+// Teardown owns the stored native resource; it must not query a freed one.
+function enrollment_retire_iface(ifname, iface, owner)
+{
+	if (!iface || !owner)
+		return;
+	let entry = wpas.data.enrollment[ifname];
+	if (entry?.iface == iface && entry.owner == owner)
+		enrollment_forget(ifname, entry.publication_unconfirmed ?
+			'unconfirmed' : 'cancelled');
+	let run = owner.active_wps_run;
+	if (!run || owner.active_wps_iface != iface)
+		return;
+	delete owner.active_wps_run;
+	delete owner.active_wps_iface;
+	owner.cancelled_wps_run = run;
+	if (owner.retired_wps_iface == iface && owner.retired_wps_run == run)
+		return;
+	owner.retired_wps_iface = iface;
+	owner.retired_wps_run = run;
+	enrollment_result(owner, 'cancelled');
+}
+
+function enrollment_retain_fence(old_if, new_if, iface)
+{
+	if (!iface || old_if.retired_wps_iface != iface ||
+	    old_if.retired_wps_run != iface.status().wps_run)
+		return;
+	new_if.retired_wps_iface = iface;
+	new_if.retired_wps_run = old_if.retired_wps_run;
+}
+
 // Retain only native operation control across an identical STA incarnation.
 // Persistence candidates, retries and deadlines keep their original owner.
 function enrollment_retain_run(old_if, new_if, generation)
 {
 	let ifname = old_if.config.iface;
 	let iface = wpas.interfaces[ifname];
+	enrollment_retain_fence(old_if, new_if, iface);
 	let entry = wpas.data.enrollment[ifname];
 	let owned = entry && entry.iface == iface && entry.owner == old_if &&
 		entry.generation == generation;
@@ -236,7 +271,9 @@ function enrollment_retain_run(old_if, new_if, generation)
 	    (entry && !owned) || (!owned && old_if.active_wps_iface != iface))
 		return;
 	if (entry)
-		enrollment_forget(ifname);
+		enrollment_forget(ifname, entry.publication_unconfirmed ?
+			'unconfirmed' : 'cancelled');
+	enrollment_retain_fence(old_if, new_if, iface);
 	delete old_if.active_wps_run;
 	delete old_if.active_wps_iface;
 	new_if.active_wps_run = run;
@@ -249,7 +286,9 @@ function enrollment_candidate(ifname, iface, cred)
 		return;
 	let binding = enrollment_owner(ifname, iface);
 	if (!binding?.persistent || cred.wps_run != iface.status().wps_run ||
-	    binding.owner.cancelled_wps_run == cred.wps_run)
+	    binding.owner.cancelled_wps_run == cred.wps_run ||
+	    (binding.owner.retired_wps_iface == iface &&
+	     binding.owner.retired_wps_run == cred.wps_run))
 		return;
 	let entry = wpas.data.enrollment[ifname];
 	if (entry && (entry.iface != iface || entry.owner != binding.owner ||
@@ -294,8 +333,8 @@ function iface_stop(iface)
 	if (!iface.running)
 		return;
 
-	enrollment_forget(ifname, wpas.data.enrollment[ifname]?.publication_unconfirmed ?
-		'unconfirmed' : 'cancelled');
+	enrollment_retire_iface(ifname, wpas.interfaces[ifname] ??
+		iface.active_wps_iface, iface);
 	delete wpas.data.iface_phy[ifname];
 	wpas.remove_iface(ifname);
 	wdev_remove(ifname);
@@ -458,11 +497,18 @@ function iface_cb(new_if, old_if, generation)
 	}
 
 	if (old_if?.running && new_if && new_if.config.mode == "sta" &&
-	    config_equal_except(old_if.config, new_if.config, [ "config_data" ]) &&
-	    iface_network_apply(old_if.config.iface, old_if.config.config_data,
+	    config_equal_except(old_if.config, new_if.config, [ "config_data" ])) {
+		let ifname = old_if.config.iface;
+		let iface = wpas.interfaces[ifname];
+		// Network changes cannot inherit operation control or restart the old
+		// writer, even when native in-place update retains this interface.
+		enrollment_retire_iface(ifname, iface, old_if);
+		enrollment_retain_fence(old_if, new_if, iface);
+		if (iface_network_apply(ifname, old_if.config.config_data,
 				new_if.config.config_data)) {
-		new_if.running = true;
-		return;
+			new_if.running = true;
+			return;
+		}
 	}
 
 	if (new_if && old_if)
@@ -1779,6 +1825,8 @@ function iface_ubus_add(ifname)
 					binding.owner.cancelled_wps_run = state.wps_run;
 					delete binding.owner.active_wps_run;
 					delete binding.owner.active_wps_iface;
+					binding.owner.retired_wps_iface = iface;
+					binding.owner.retired_wps_run = state.wps_run;
 					enrollment_result(binding.owner, 'cancelled');
 				}
 				let result = iface.ctrl("WPS_CANCEL");
@@ -1828,8 +1876,11 @@ return {
 		iface_event("add", name);
 	},
 	iface_remove: function(name, obj) {
-		enrollment_forget(name, wpas.data.enrollment[name]?.publication_unconfirmed ?
-			'unconfirmed' : 'cancelled');
+		let entry = wpas.data.enrollment[name];
+		if (entry?.iface == obj)
+			enrollment_retire_iface(name, obj, entry.owner);
+		let phy = wpas.data.config[wpas.data.iface_phy[name]];
+		enrollment_retire_iface(name, obj, phy?.data[name]);
 		iface_event("remove", name);
 		iface_ubus_remove(name);
 		delete wpas.data.dpp_hooks[name];
@@ -1851,12 +1902,15 @@ return {
 			if (!owned && !active && !(starting != null && starting != run))
 				return;
 			binding.owner.cancelled_wps_run = run;
-			delete binding.owner.active_wps_run;
-			delete binding.owner.active_wps_iface;
-			if (owned)
-				enrollment_forget(name, 'cancelled');
-			else
+			enrollment_retire_iface(name, iface, binding.owner);
+			// A new run can terminate synchronously before WPS_PBC returns
+			// and publishes its active grant. The starting guard owns it.
+			if (binding.owner.retired_wps_iface != iface ||
+			    binding.owner.retired_wps_run != run) {
+				binding.owner.retired_wps_iface = iface;
+				binding.owner.retired_wps_run = run;
 				enrollment_result(binding.owner, 'cancelled');
+			}
 		}
 
 		// The set of links of an associated MLD can change without a state
