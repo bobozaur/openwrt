@@ -50,8 +50,11 @@ function enrollment_forget(ifname, status)
 	entry.expiry?.cancel();
 	entry.retry?.cancel();
 	delete wpas.data.enrollment[ifname];
-	if (entry.owner.active_wps_run == entry.run)
+	if (entry.owner.active_wps_run == entry.run &&
+	    entry.owner.active_wps_iface == entry.iface) {
 		delete entry.owner.active_wps_run;
+		delete entry.owner.active_wps_iface;
+	}
 	if (status) {
 		enrollment_result(entry.owner, status);
 		wpas.printf(`WPS persistence on ${ifname}: ${status}`);
@@ -216,6 +219,28 @@ function enrollment_reconcile(old_if, new_if, generation)
 		return;
 	enrollment_forget(ifname, result?.status == 'saved' ? 'saved' :
 		result?.status == 'conflict' ? 'conflict' : 'unconfirmed');
+}
+
+// Retain only native operation control across an identical STA incarnation.
+// Persistence candidates, retries and deadlines keep their original owner.
+function enrollment_retain_run(old_if, new_if, generation)
+{
+	let ifname = old_if.config.iface;
+	let iface = wpas.interfaces[ifname];
+	let entry = wpas.data.enrollment[ifname];
+	let owned = entry && entry.iface == iface && entry.owner == old_if &&
+		entry.generation == generation;
+	let run = owned ? entry.run : old_if.active_wps_run;
+	if (!old_if.running || old_if.config.mode != 'sta' || !run ||
+	    iface?.status().wps_run != run || old_if.cancelled_wps_run == run ||
+	    (entry && !owned) || (!owned && old_if.active_wps_iface != iface))
+		return;
+	if (entry)
+		enrollment_forget(ifname);
+	delete old_if.active_wps_run;
+	delete old_if.active_wps_iface;
+	new_if.active_wps_run = run;
+	new_if.active_wps_iface = iface;
 }
 
 function enrollment_candidate(ifname, iface, cred)
@@ -426,6 +451,7 @@ function iface_cb(new_if, old_if, generation)
 		new_if.macaddr = old_if.macaddr;
 
 	if (old_if && new_if && is_equal(old_if.config, new_if.config)) {
+		enrollment_retain_run(old_if, new_if, generation);
 		new_if.running = old_if.running;
 		new_if.macaddr = old_if.macaddr;
 		return;
@@ -1688,6 +1714,7 @@ function iface_ubus_add(ifname)
 				enrollment_forget(ifname);
 				if (binding) {
 					delete binding.owner.active_wps_run;
+					delete binding.owner.active_wps_iface;
 					// Starting a replacement can synchronously retire the old run.
 					binding.owner.starting_wps_run = iface.status().wps_run;
 				}
@@ -1699,6 +1726,7 @@ function iface_ubus_add(ifname)
 					if (result && match(result, /^OK\n?$/) &&
 					    binding.owner.cancelled_wps_run != run) {
 						binding.owner.active_wps_run = run;
+						binding.owner.active_wps_iface = iface;
 						enrollment_result(binding.owner, 'active');
 					}
 				}
@@ -1749,6 +1777,8 @@ function iface_ubus_add(ifname)
 				enrollment_forget(ifname);
 				if (binding) {
 					binding.owner.cancelled_wps_run = state.wps_run;
+					delete binding.owner.active_wps_run;
+					delete binding.owner.active_wps_iface;
 					enrollment_result(binding.owner, 'cancelled');
 				}
 				let result = iface.ctrl("WPS_CANCEL");
@@ -1816,11 +1846,13 @@ return {
 			if (entry && !owned)
 				return;
 			let starting = binding.owner.starting_wps_run;
-			if (!owned && binding.owner.active_wps_run != run &&
-			    !(starting != null && starting != run))
+			let active = binding.owner.active_wps_iface == iface &&
+				binding.owner.active_wps_run == run;
+			if (!owned && !active && !(starting != null && starting != run))
 				return;
 			binding.owner.cancelled_wps_run = run;
 			delete binding.owner.active_wps_run;
+			delete binding.owner.active_wps_iface;
 			if (owned)
 				enrollment_forget(name, 'cancelled');
 			else
