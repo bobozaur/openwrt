@@ -188,7 +188,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		nft_dev_path_info(&stack, &info, ha, &ft->data);
  
  	/* Keep neighbour output on its route device unless the resolved path
-@@ -248,9 +253,130 @@
+@@ -248,9 +253,131 @@
  		route->tuple[dir].out.bridge_vlan = info.bridge_vlan;
  		route->tuple[dir].out.port_vlans = info.port_vlans;
  		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
@@ -316,6 +316,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 +out:
 +	rcu_read_unlock();
 +	return valid;
++}
  
  int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
  		   struct nf_flow_route *route, enum ip_conntrack_dir dir,
