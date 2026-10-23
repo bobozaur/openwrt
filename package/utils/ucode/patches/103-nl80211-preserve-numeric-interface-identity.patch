@@ -1,0 +1,65 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: preserve numeric interface identity beside dev
+
+Expose the native interface index without requiring a racy name lookup.
+Retain the existing dev field and reject dual input properties, including
+null-valued ones, rather than encoding the same netlink attribute twice.
+This applies to replies and events.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/lib/nl80211.c
++++ b/lib/nl80211.c
+@@ -950,7 +950,7 @@
+ 
+ static const uc_nl_nested_spec_t nl80211_msg = {
+ 	.headsize = 0,
+-	.nattrs = 139,
++	.nattrs = 140,
+ 	.attrs = {
+ 		{ NL80211_ATTR_4ADDR, "4addr", DT_U8, 0, NULL },
+ 		{ NL80211_ATTR_AIRTIME_WEIGHT, "airtime_weight", DT_U16, 0, NULL },
+@@ -990,6 +990,7 @@
+ 		{ NL80211_ATTR_HT_CAPABILITY_MASK, "ht_capability_mask", DT_HT_CAP, 0, NULL },
+ 		{ NL80211_ATTR_IE, "ie", DT_IE, 0, NULL },
+ 		{ NL80211_ATTR_IFINDEX, "dev", DT_NETDEV, 0, NULL },
++		{ NL80211_ATTR_IFINDEX, "ifindex", DT_U32, 0, NULL },
+ 		{ NL80211_ATTR_IFNAME, "ifname", DT_STRING, 0, NULL },
+ 		{ NL80211_ATTR_IFTYPE, "iftype", DT_U32, 0, NULL },
+ 		{ NL80211_ATTR_INACTIVITY_TIMEOUT, "inactivity_timeout", DT_U16, 0, NULL },
+@@ -2961,6 +2962,20 @@
+ 	return n > 0;
+ }
+ 
++static bool
++uc_nl_interface_selector_valid(uc_value_t *payload)
++{
++	bool has_dev, has_ifindex;
++
++	ucv_object_get(payload, "dev", &has_dev);
++	ucv_object_get(payload, "ifindex", &has_ifindex);
++	if (!has_dev || !has_ifindex)
++		return true;
++
++	set_error(NLE_INVAL, "Specify either dev or ifindex");
++	return false;
++}
++
+ static uc_value_t *
+ uc_nl_request_common(struct nl_sock *sock, uc_vm_t *vm, size_t nargs)
+ {
+@@ -3020,6 +3035,13 @@
+ 		err_return(-id, NULL);
+ 
+ 	genlmsg_put(msg, 0, 0, id, 0, flagval, cid, 0);
++
++	/* Both selectors address the same netlink attribute. Never emit two
++	 * potentially conflicting interface identities in one request. */
++	if (st.spec == &nl80211_msg && !uc_nl_interface_selector_valid(payload)) {
++		nlmsg_free(msg);
++		return NULL;
++	}
+ 
+ 	if (!uc_nl_parse_attrs(msg, nlmsg_data(nlmsg_hdr(msg)), st.spec->attrs, st.spec->nattrs, vm, payload)) {
+ 		nlmsg_free(msg);

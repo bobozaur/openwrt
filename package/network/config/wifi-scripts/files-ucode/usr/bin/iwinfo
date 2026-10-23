@@ -162,13 +162,13 @@ if (ARGV[0] == 'nl80211' && ARGV[1] == 'phyname') {
 	let sec = uci.cursor(null, null, null, { strict: false }).get_all('wireless', sec_name);
 	if (!sec || sec['.type'] != 'wifi-device') {
 		warn(`Config section ${sec_name} not found\n`);
-		return 1;
+		exit(1);
 	}
 
 	let name = find_phy(sec);
 	if (!name) {
 		warn('Phy not found\n');
-		return 1;
+		exit(1);
 	}
 
 	print(name + '\n');
@@ -179,7 +179,9 @@ if (length(ARGV) == 2 && iwinfo.ifaces[ARGV[0]])
 	for (let cmd, cb in commands)
 		if (substr(cmd, 0, length(ARGV[1])) == ARGV[1]) {
 			let ret = cb[0](ARGV[0]);
-			
+			if (ret == null)
+				exit(1);
+
 			if (pretty)
 				cb[1](ret);
 			else
@@ -206,4 +208,4 @@ warn('Usage:\n' +
 	'\tiwinfo <device> countrylist\n' +
 	'\tiwinfo <device> htmodelist\n' +
 	'\tiwinfo nl80211 phyname <section>\n');
-return 1;
+exit(1);
