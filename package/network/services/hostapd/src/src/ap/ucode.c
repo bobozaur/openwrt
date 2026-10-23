@@ -842,17 +842,17 @@ uc_hostapd_iface_channel_status(uc_vm_t *vm, size_t nargs)
 	uc_value_t *bss_state = ucv_object_new(vm);
 	for (int i = 0; i < iface->num_bss; i++) {
 		struct hostapd_data *hapd = iface->bss[i];
+		bool held = hapd->conf->start_disabled && !hapd->beacon_started;
 		bool active = hapd->started && !hapd->disabled &&
-			hapd->beacon_set_done && !hapd->conf->start_disabled &&
-			!hapd->conf->start_deferred;
+			hapd->beacon_set_done && !held && !hapd->conf->start_deferred;
 		uc_value_t *bss = ucv_object_new(vm);
 		ucv_object_add(bss, "beaconing", ucv_boolean_new(active));
-		ucv_object_add(bss, "disabled", ucv_boolean_new(hapd->conf->start_disabled));
+		ucv_object_add(bss, "disabled", ucv_boolean_new(held));
 		ucv_object_add(bss, "deferred", ucv_boolean_new(hapd->conf->start_deferred));
 		ucv_object_add(bss_state, hapd->conf->iface, bss);
 		beaconing &= active;
 		ready &= !hapd->conf->start_deferred &&
-			(hapd->conf->start_disabled ? !hapd->beacon_set_done : active);
+			(held ? !hapd->beacon_set_done : active);
 	}
 	ucv_object_add(ret, "beaconing", ucv_boolean_new(beaconing));
 	ucv_object_add(ret, "ready", ucv_boolean_new(ready));
@@ -911,7 +911,7 @@ uc_hostapd_iface_start(uc_vm_t *vm, size_t nargs)
 	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
 	uc_value_t *info = uc_fn_arg(0);
 	struct hostapd_config *conf;
-	bool changed, deferred = false, all_disabled = true;
+	bool changed, deferred = false, all_held = true;
 	uint64_t intval;
 	int i;
 
@@ -925,12 +925,13 @@ uc_hostapd_iface_start(uc_vm_t *vm, size_t nargs)
 	changed = uc_hostapd_config_channel(conf, info);
 	for (i = 0; i < iface->num_bss; i++) {
 		deferred |= iface->bss[i]->conf->start_deferred;
-		all_disabled &= !!iface->bss[i]->conf->start_disabled;
+		all_held &= iface->bss[i]->conf->start_disabled &&
+			!iface->bss[i]->beacon_started;
 	}
 
 	if (!changed && !deferred &&
 	    ((iface->state == HAPD_IFACE_ENABLED &&
-	      (iface->bss[0]->beacon_set_done || all_disabled)) ||
+	      (iface->bss[0]->beacon_set_done || all_held)) ||
 	     iface->state == HAPD_IFACE_DFS))
 		return ucv_boolean_new(true);
 
