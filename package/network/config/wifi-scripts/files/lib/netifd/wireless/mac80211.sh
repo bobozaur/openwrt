@@ -577,7 +577,8 @@ mac80211_hostapd_setup_bss() {
 		append hostapd_cfg "wds_sta=1" "$N"
 		[ -n "$wds_bridge" ] && append hostapd_cfg "wds_bridge=$wds_bridge" "$N"
 	}
-	[ "$staidx" -gt 0 -o "$start_disabled" -eq 1 ] && append hostapd_cfg "start_disabled=1" "$N"
+	[ "$start_disabled" -eq 1 ] && append hostapd_cfg "start_disabled=1" "$N"
+	[ "$staidx" -gt 0 ] && append hostapd_cfg "start_deferred=1" "$N"
 
 	cat >> /var/run/hostapd-$phy$vif_phy_suffix.conf <<EOF
 $hostapd_cfg
@@ -1011,7 +1012,11 @@ wpa_supplicant_set_config() {
 	ret="$?"
 	[ "$ret" != 0 -o -z "$supplicant_res" ] && wireless_setup_vif_failed WPA_SUPPLICANT_FAILED
 
-	wireless_add_process "$(jsonfilter -s "$supplicant_res" -l 1 -e @.pid)" "/usr/sbin/wpa_supplicant" 1 1
+	# Empty configuration removes a previous STA without making an AP-only
+	# radio depend on the shared supplicant process.
+	if [ -n "$wpa_supp_init" ]; then
+		wireless_add_process "$(jsonfilter -s "$supplicant_res" -l 1 -e @.pid)" "/usr/sbin/wpa_supplicant" 1 1
+	fi
 
 }
 

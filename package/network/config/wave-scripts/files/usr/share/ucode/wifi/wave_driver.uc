@@ -30,7 +30,9 @@ function reset_phy(phy) {
 	return !!ap && !!sta;
 }
 
-// Reserve the persistent firmware master's address while the STA role is active.
+// A STA-only radio still has a persistent firmware AP master. Its address
+// belongs to a separate netifd group until both role configurations retire.
+// Mixed mode is covered by hostapd's actual AP-address mirror instead.
 function master_macaddr_sync(group, phy, address) {
 	let list = {};
 	if (address)
@@ -107,7 +109,7 @@ function setup(data) {
 	if (config.band != '2g' && config.band != '5g')
 		return fail('WAVE_BAND_UNSUPPORTED');
 
-	let modes = {};
+	let modes = {}, station_count = 0;
 	for (let _, v in data.interfaces) {
 		if (v.config.mode != 'ap' && v.config.mode != 'sta')
 			return fail('WAVE_MODE_UNSUPPORTED');
@@ -117,11 +119,19 @@ function setup(data) {
 		if (+v.config.dpp ||
 		    security.auth_type in [ 'eap2', 'eap192', 'eap-eap2', 'dpp' ])
 			return fail('WAVE_AUTH_UNSUPPORTED');
+		if (v.config.mode == 'ap') {
+			if (v.config.dynamic_vlan || v.config.per_sta_vif || length(v.vlans))
+				return fail('WAVE_DYNAMIC_VLAN_UNSUPPORTED');
+			if (v.config.wds)
+				return fail('WAVE_LATE_WDS_UNSUPPORTED');
+		}
 		modes[v.config.mode] = true;
+		station_count += v.config.mode == 'sta';
 	}
-	if (modes.ap && modes.sta)
-		return fail('WAVE_CONCURRENT_ROLES_UNSUPPORTED');
-	let mode = modes.sta ? 'sta' : 'ap';
+	let mixed = modes.ap && modes.sta;
+	if (mixed && station_count != 1)
+		return fail('WAVE_SINGLE_UPLINK_REQUIRED');
+	let mode = modes.ap ? 'ap' : 'sta';
 	data.phy = radio[mode].phy;
 	if (!wiphy_band(wiphy_info(data.phy), config.band))
 		return fail('WAVE_BAND_UNSUPPORTED');
@@ -136,11 +146,13 @@ function setup(data) {
 	    (data.data?.sta_phy != radio.sta.phy && !reset_phy(radio.sta.phy)))
 		return fail('WAVE_TEARDOWN_FAILED');
 	let owner = { wave: true, phy: data.phy, ap_phy: radio.ap.phy, sta_phy: radio.sta.phy,
-		macaddr_group: modes.sta ? `wave/${radio.sta.phy}` : null };
+		macaddr_group: modes.sta && !mixed ? `wave/${radio.sta.phy}` : null };
 	netifd.set_data(owner);
 	configure_radio(radio.ap.phy, config);
-	let ap_data = { ...data, phy: radio.ap.phy, config: { ...config } };
-	let sta_data = { ...data, phy: radio.sta.phy, config: { ...config } };
+	let ap_data = { ...data, phy: radio.ap.phy, config: { ...config },
+		station_phy: mixed ? radio.sta.phy : null, channel_follow: !!mixed };
+	let sta_data = { ...data, phy: radio.sta.phy, config: { ...config },
+		ap_phy: mixed ? radio.ap.phy : null };
 	let master_mac = trim(fs.readfile(`/sys/class/net/${radio.master}/address`) ?? '');
 	if (!master_mac)
 		return fail('WAVE_MASTER_MAC_UNAVAILABLE');
@@ -184,7 +196,9 @@ function setup(data) {
 				return fail('WAVE_MASTER_CONFIG_FAILED');
 			master_mac = lc(v.config.macaddr);
 		}
-		netifd.set_vif(name, v.config.ifname);
+		// The Linux bridge owns all bridged data forwarding for WAVE, including
+		// same-BSS traffic when multicast conversion is disabled.
+		netifd.set_vif(name, v.config.ifname, { bridge_forwarding: mode == 'ap' });
 		if (mode == 'sta' && type(supplicant.generate(supplicant_data, sta_data, v)) != 'object')
 			return 1;
 	}
@@ -193,12 +207,15 @@ function setup(data) {
 		if (owner.macaddr_group &&
 		    !master_macaddr_sync(owner.macaddr_group, sta_data.phy, master_mac))
 			return setup_failed(owner, 'WAVE_MAC_RESERVATION_FAILED');
-		supplicant.setup(supplicant_data, sta_data);
+		if (!supplicant.setup(supplicant_data, sta_data))
+			return setup_failed(owner, 'WAVE_SUPPLICANT_FAILED');
 	}
-	if (modes.ap)
-		hostapd.setup(ap_data);
-	if (modes.sta)
-		supplicant.start(sta_data);
+	// Native hostapd publishes every actual AP BSSID into the station scope
+	// before channel-follow callbacks can resume the deferred station.
+	if (modes.ap && !hostapd.setup(ap_data))
+		return setup_failed(owner, 'WAVE_HOSTAPD_FAILED');
+	if (modes.sta && !supplicant.start(sta_data))
+		return setup_failed(owner, 'WAVE_SUPPLICANT_FAILED');
 
 	netifd.set_up();
 	return 0;

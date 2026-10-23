@@ -5,7 +5,7 @@ include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=wave
 PKG_VERSION:=6.0.8.87.7
-PKG_RELEASE:=19
+PKG_RELEASE:=25
 PKG_SOURCE_VERSION:=06.00.08.00.87.00.07.d24084bd3447
 WAVE_SOURCE_BASE:=lq-wave-300-$(PKG_SOURCE_VERSION)
 PKG_SOURCE:=ax50v1_GPL_3.tar.gz
@@ -19,9 +19,9 @@ PKG_FIXUP:=autoreconf
 PKG_AUTOMAKE_PATHS:=.
 # The vendor log preprocessor updates shared generated files without locks.
 PKG_BUILD_PARALLEL:=0
-# The selected driver and RF C sources refer to the module-root dual license.
-# This describes the built module, not other contents of the vendor SDK.
-PKG_LICENSE:=GPL-2.0-only BSD-2-Clause
+# Driver/RF source licenses are below. The focused instruction overlay retains
+# unresolved original firmware terms; the LicenseRef marker grants no rights.
+PKG_LICENSE:=GPL-2.0-only BSD-2-Clause LicenseRef-NETGEAR-RAX40-Firmware
 PKG_LICENSE_FILES:=LICENSE wireless/driver/rflib/AGREEMENT \
 	wireless/shared_mbss_mac/Statistics/Wave600/LICENSE
 
