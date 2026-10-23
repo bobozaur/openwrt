@@ -1,0 +1,23 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] omcproxy: retain downlinks present in replacement configuration
+
+The replacement-config scan stops at the first different interface index
+instead of at a matching index. It can remove retained downlinks or keep
+an absent one according to list order. Search until a match is found and
+remove a downlink only when the complete replacement list lacks its index.
+Keep the existing querier/client/MRIB teardown and creation owners.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/src/proxy.c
++++ b/src/proxy.c
+@@ -162,7 +162,7 @@ int proxy_set(int uplink, const int down
+ 		struct querier_user_iface *iface = container_of(user, struct querier_user_iface, user);
+ 
+ 		size_t i;
+-		for (i = 0; i < downlinks_cnt && downlinks[i] == iface->iface->ifindex; ++i);
++		for (i = 0; i < downlinks_cnt && downlinks[i] != iface->iface->ifindex; ++i);
+ 		if (i == downlinks_cnt)
+ 			proxy_remove_downlink(container_of(iface, struct proxy_downlink, iface));
+ 	}

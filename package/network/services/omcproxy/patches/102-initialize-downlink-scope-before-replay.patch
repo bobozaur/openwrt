@@ -1,0 +1,27 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] omcproxy: initialize downlink scope before querier replay
+
+querier_attach() synchronously announces existing group state after linking
+the user to the querier. Its callback reads the downlink scope, which is
+still zero if flags are copied only after attachment. Copy the configured
+scope before invoking that producer; allocation, attachment and error
+cleanup retain their native owners.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/src/proxy.c
++++ b/src/proxy.c
+@@ -191,10 +191,10 @@ int proxy_set(int uplink, const int down
+ 		if (mrib_attach_user(&downlink->mrib, downlinks[i], NULL))
+ 			goto downlink_err2;
+ 
++		/* Attaching can immediately announce existing group state. */
++		downlink->flags = proxy->flags;
+ 		if (querier_attach(&downlink->iface, &proxy->querier, downlinks[i], proxy_trigger))
+ 			goto downlink_err1;
+-
+-		downlink->flags = proxy->flags;
+ 		continue;
+ 
+ downlink_err1:

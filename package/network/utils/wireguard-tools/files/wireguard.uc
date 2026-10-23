@@ -2,11 +2,22 @@
 'use strict';
 
 import * as fs from 'fs';
+import { error as ubus_error } from 'ubus';
 
 const WG = '/usr/bin/wg';
 
 function wg_exists() {
 	return fs.access(WG, fs.F_OK);
+}
+
+function notification_ok(proto, operation) {
+	let status = ubus_error(true);
+	if (!status)
+		return true;
+	warn('WireGuard ', operation, ' failed for ', proto.iface, ': ', status, '\n');
+	proto.error([ 'NOTIFY_FAILED', operation, '' + status ]);
+	proto.setup_failed();
+	return false;
 }
 
 function ensure_key_is_generated(cursor, section_name) {
@@ -18,13 +29,19 @@ function ensure_key_is_generated(cursor, section_name) {
 			return null;
 
 		let generated_key = rtrim(proc.read('all'));
-		proc.close();
+		if (proc.close() != 0 || !generated_key)
+			return null;
 
-		if (generated_key) {
-			cursor.set('network', section_name, 'private_key', generated_key);
-			cursor.commit('network');
-			return generated_key;
+		if (!cursor.set('network', section_name, 'private_key', generated_key) ||
+		    !cursor.commit('network')) {
+			warn('Unable to persist generated WireGuard key for ', section_name, '\n');
+			// A commit error can occur after publication. Discard the local
+			// delta and reload the native owner before any later config load.
+			cursor.unload('network');
+			cursor.load('network');
+			return null;
 		}
+		return generated_key;
 	}
 
 	return private_key;
@@ -90,6 +107,7 @@ function load_peers(cursor, iface) {
 function proto_setup(proto) {
 	if (!wg_exists()) {
 		warn('WireGuard tools not found at ', WG, '\n');
+		proto.error([ 'TOOLS_MISSING' ]);
 		proto.setup_failed();
 		return;
 	}
@@ -99,8 +117,11 @@ function proto_setup(proto) {
 
 	system(sprintf('ip link add dev %s type wireguard 2>/dev/null || true', iface));
 
-	if (config.mtu)
-		system(sprintf('ip link set mtu %d dev %s', int(config.mtu), iface));
+	if (config.mtu && system(sprintf('ip link set mtu %d dev %s', int(config.mtu), iface)) != 0) {
+		proto.error([ 'MTU_FAILED' ]);
+		proto.setup_failed();
+		return;
+	}
 
 	let wg_config = '[Interface]\n';
 	wg_config += sprintf('PrivateKey=%s\n', config.private_key);
@@ -155,20 +176,26 @@ function proto_setup(proto) {
 	let wg_proc = fs.popen(sprintf('%s syncconf %s /dev/stdin', WG, iface), 'w');
 	if (!wg_proc) {
 		warn('Failed to run wg syncconf for ', iface, '\n');
+		proto.error([ 'SYNC_FAILED' ]);
 		proto.setup_failed();
 		return;
 	}
 
-	wg_proc.write(wg_config);
+	let written = wg_proc.write(wg_config);
 	let wg_result = wg_proc.close();
 
-	if (wg_result != 0) {
+	if (written != length(wg_config) || wg_result != 0) {
 		warn('wg syncconf failed for ', iface, '\n');
+		proto.error([ 'SYNC_FAILED' ]);
 		proto.setup_failed();
 		return;
 	}
 
-	system(sprintf('ip link set up dev %s', iface));
+	if (system(sprintf('ip link set up dev %s', iface)) != 0) {
+		proto.error([ 'LINK_FAILED' ]);
+		proto.setup_failed();
+		return;
+	}
 
 	let ipv4_addrs = [];
 	let ipv6_addrs = [];
@@ -207,11 +234,16 @@ function proto_setup(proto) {
 			link_data.ip6prefix = prefix_list;
 	}
 
+	let dependencies = [];
 	if (config.nohostroute != '1') {
 		let endpoints_proc = fs.popen(sprintf('%s show %s endpoints', WG, iface));
 		if (endpoints_proc) {
 			let endpoints_data = endpoints_proc.read('all');
-			endpoints_proc.close();
+			if (endpoints_proc.close() != 0) {
+				proto.error([ 'ENDPOINTS_FAILED' ]);
+				proto.setup_failed();
+				return;
+			}
 
 			let endpoint_lines = split(endpoints_data, '\n');
 			for (let line in endpoint_lines) {
@@ -224,13 +256,28 @@ function proto_setup(proto) {
 
 				let endpoint = parts[1];
 				let addr_match = match(endpoint, regexp('\\[?([0-9.:a-f]+)\\]?:([0-9]+)'));
-				if (addr_match && length(addr_match) > 1)
-					proto.add_host_dependency(addr_match[1], config.tunlink);
+				if (addr_match && length(addr_match) > 1 && index(dependencies, addr_match[1]) < 0)
+					push(dependencies, addr_match[1]);
 			}
+		} else {
+			proto.error([ 'ENDPOINTS_FAILED' ]);
+			proto.setup_failed();
+			return;
 		}
 	}
 
+	proto.clear_host_dependencies();
+	if (!notification_ok(proto, 'clear dependencies'))
+		return;
+	for (let endpoint in dependencies) {
+		proto.add_host_dependency(endpoint, config.tunlink);
+		if (!notification_ok(proto, 'add dependency'))
+			return;
+	}
+
 	proto.update_link(true, link_data);
+	if (!notification_ok(proto, 'publish link'))
+		return;
 }
 
 function proto_teardown(proto) {
@@ -239,8 +286,18 @@ function proto_teardown(proto) {
 	proto.update_link(false);
 }
 
-function proto_renew(proto) {
-	proto_setup(proto);
+function config_update(old_json, new_json) {
+	let previous = json(old_json);
+	let next = json(new_json);
+	// Peer-only edits are applied by wg syncconf. Interface keys, addresses,
+	// MTU, underlay and other interface options retain the full reload path.
+	delete previous.peers;
+	delete next.peers;
+	for (let key in [ '.index', '.anonymous', '.name', '.type' ]) {
+		delete previous[key];
+		delete next[key];
+	}
+	return sprintf('%J', previous) == sprintf('%J', next);
 }
 
 netifd.add_proto({
@@ -259,5 +316,6 @@ netifd.add_proto({
 
 	setup: proto_setup,
 	teardown: proto_teardown,
-	renew: proto_renew
+	renew: proto_setup,
+	config_update,
 });
