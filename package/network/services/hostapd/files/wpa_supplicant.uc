@@ -1757,10 +1757,13 @@ function iface_ubus_add(ifname)
 					return libubus.STATUS_NOT_FOUND;
 				if (req.args.section != null && !binding?.persistent)
 					return libubus.STATUS_NOT_SUPPORTED;
-				enrollment_forget(ifname);
+				// Native replacement may clear the old WPS operation and fail
+				// before starting a new run, without emitting a terminal event.
+				let entry = wpas.data.enrollment[ifname];
+				if (entry?.iface == iface)
+					enrollment_retire_iface(ifname, iface, entry.owner);
 				if (binding) {
-					delete binding.owner.active_wps_run;
-					delete binding.owner.active_wps_iface;
+					enrollment_retire_iface(ifname, iface, binding.owner);
 					// Starting a replacement can synchronously retire the old run.
 					binding.owner.starting_wps_run = iface.status().wps_run;
 				}
