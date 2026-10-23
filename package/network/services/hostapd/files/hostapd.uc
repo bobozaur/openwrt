@@ -300,7 +300,8 @@ function apsta_follow(phy, config, iface, target, follow, csa_count)
 			if (ret < 0 || !tx.iface)
 				return apsta_fail(tx, 'AP creation rejected');
 		}
-		tx.iface.stop();
+		if (!tx.iface.stop())
+			return apsta_fail(tx, 'AP stop rejected');
 		tx.phase = 'starting';
 		if (!tx.iface.start(tx.target))
 			return apsta_fail(tx, 'AP start rejected');
@@ -2347,7 +2348,8 @@ let main_obj = {
 						delete hostapd.data.apsta_freq[phy];
 					if (req.args.station_state == 'AUTHENTICATING') {
 						apsta_cancel(phy, true);
-						iface.stop();
+						if (!iface.stop())
+							return libubus.STATUS_UNKNOWN_ERROR;
 					} else if (!iface.channel_status()?.ready) {
 						apsta_follow(phy, config, iface, null, false);
 					}
@@ -2367,8 +2369,7 @@ let main_obj = {
 			if (!req.args.up) {
 				delete hostapd.data.apsta_freq[phy];
 				hostapd.data.apsta_stopped[phy] = true;
-				iface.stop();
-				return 0;
+				return iface.stop() ? 0 : libubus.STATUS_UNKNOWN_ERROR;
 			}
 
 			if (req.args.frequency)
