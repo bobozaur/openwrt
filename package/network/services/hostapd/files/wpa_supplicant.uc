@@ -1,7 +1,7 @@
 let libubus = require("ubus");
 import * as uloop from "uloop";
 import { open, readfile } from "fs";
-import { wdev_create, wdev_set_mesh_params, wdev_remove, is_equal, wdev_set_up, vlist_new, phy_open, macaddr_keep, macaddr_sync_defer, macaddr_sync_entry, mld_prev_match } from "common";
+import { wdev_create, wdev_set_mesh_params, wdev_remove, is_equal, wdev_set_up, vlist_new, phy_open, macaddr_keep, macaddr_sync, macaddr_sync_defer, macaddr_sync_entry, mld_prev_match } from "common";
 
 let ubus = libubus.connect();
 
@@ -959,13 +959,28 @@ function set_config(config_name, phy_name, radio, num_global_macaddr, macaddr_ba
 	mld_update_phy(phy, mlo_ifaces);
 	phy.update(values, previous_generation);
 
-	macaddr_sync_defer(ubus, "wpa_supplicant", config_name, macaddr_keep(keys(phy.data)));
+	// A desired deferred interface does not yet own its previous address.
+	// Keep only actual native resources, including paused ones; pending names
+	// remain stale until iface_start() allocates around the AP reservations.
+	let keep = filter(keys(phy.data), (name) => phy.data[name].running && wpas.interfaces[name]);
+	let result = macaddr_sync(ubus, "wpa_supplicant", config_name, macaddr_keep(keep));
+	let error = ubus.error();
+	if (error || type(result) != "object" ||
+	    type(result.refused) != "array" || length(result.refused)) {
+		wpas.printf(`Could not synchronize MAC ownership for phy ${config_name}`);
+		return false;
+	}
+	// Acknowledge retirement before another owner can reserve the freed MAC.
+	return true;
 }
 
 function config_clear()
 {
+	let success = true;
 	for (let name, phy in wpas.data.config)
-		set_config(name, phy.name, phy.radio, phy.num_global_macaddr, phy.macaddr_base, []);
+		if (!set_config(name, phy.name, phy.radio, phy.num_global_macaddr, phy.macaddr_base, []))
+			success = false;
+	return success;
 }
 
 function iface_status_fill_radio_link(mld, radio, msg, link)
@@ -1381,9 +1396,9 @@ let main_obj = {
 	config_reset: {
 		args: {},
 		call: function(req) {
-			config_clear();
+			let success = config_clear();
 			mld_set_config({});
-			return 0;
+			return success ? 0 : libubus.STATUS_UNKNOWN_ERROR;
 		}
 	},
 	config_set: {
@@ -1402,8 +1417,9 @@ let main_obj = {
 				return libubus.STATUS_INVALID_ARGUMENT;
 
 			wpas.printf(`Set new config for phy ${phy}`);
-			if (req.args.config)
-				set_config(phy, req.args.phy, req.args.radio, req.args.num_global_macaddr, req.args.macaddr_base, req.args.config, req.args.ap_phy);
+			if (req.args.config &&
+			    !set_config(phy, req.args.phy, req.args.radio, req.args.num_global_macaddr, req.args.macaddr_base, req.args.config, req.args.ap_phy))
+				return libubus.STATUS_UNKNOWN_ERROR;
 
 			if (!req.args.defer) {
 				let owner = wpas.data.config[phy];
