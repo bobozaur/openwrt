@@ -1,0 +1,132 @@
+Subject: [PATCH] device: apply GRO settings without restarting devices
+
+A configuration-only restart removes dynamic wireless bridge members even
+when the interface remains associated. Apply GRO through the existing live
+settings path, including its first configuration and removal. Keep the
+existing owner when only live settings disappear, and honor the board GRO
+default before falling back to the original device value.
+
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/device.c
++++ b/device.c
+@@ -1255,9 +1255,19 @@
+ {
+ 	struct device_settings *s = &dev->settings;
+ 	struct device_settings *os = &dev->orig_settings;
+-	uint64_t added   = apply_mask &  s->flags;
+-	uint64_t removed = apply_mask & ~s->flags;
++	uint64_t added, removed;
+ 
++	if ((apply_mask & DEV_OPT_GRO) && !(s->flags & DEV_OPT_GRO)) {
++		int gro = config_get_default_gro(dev->ifname);
++
++		if (gro >= 0) {
++			s->gro = gro;
++			s->flags |= DEV_OPT_GRO;
++		}
++	}
++
++	added = apply_mask & s->flags;
++	removed = apply_mask & ~s->flags;
+ 	if (added)
+ 		system_if_apply_settings(dev, s, added);
+ 
+@@ -1330,20 +1340,12 @@
+ 	if (has_old)
+ 		blobmsg_parse_attr(dev_attrs, __DEV_ATTR_MAX, tb_old, dev->config);
+ 
+-	if (has_old)
+-		uci_blob_diff(tb, tb_old, &device_attr_list, diff);
++	uci_blob_diff(tb, tb_old, &device_attr_list, diff);
+ 
+ 	device_init_settings(dev, tb);
+ 
+-	if (has_old && !device_diff_live_apply(diff, &apply_mask))
+-		ret = DEV_CONFIG_RESTART;
+-	else if (!has_old && !dev->type->reload && cfg == &device_attr_list)
+-		/*
+-		 * Pre-refactor simple-device path returned RESTART whenever the
+-		 * blob equality check failed, including the first apply with
+-		 * dev->config == NULL. Match that so dev->present transitions
+-		 * stay bisect-identical.
+-		 */
++	if ((has_old || (!dev->type->reload && cfg == &device_attr_list)) &&
++	    !device_diff_live_apply(diff, &apply_mask))
+ 		ret = DEV_CONFIG_RESTART;
+ 
+ 	if (dev->type->reload) {
+@@ -1513,6 +1515,9 @@
+ device_reset_old(void)
+ {
+ 	struct device *dev, *tmp, *ndev;
++	struct blob_attr *tb[__DEV_ATTR_MAX], *empty[__DEV_ATTR_MAX] = {};
++	unsigned long diff[2];
++	uint64_t apply_mask;
+ 
+ 	avl_for_each_element_safe(&devices, dev, avl, tmp) {
+ 		if (dev->current_config || dev->default_config)
+@@ -1521,6 +1526,23 @@
+ 		if (dev->type != &simple_device_type)
+ 			continue;
+ 
++		/* Classify before mutating settings needed by the replacement path. */
++		memset(tb, 0, sizeof(tb));
++		if (dev->config)
++			blobmsg_parse_attr(dev_attrs, __DEV_ATTR_MAX, tb, dev->config);
++		memset(diff, 0, sizeof(diff));
++		uci_blob_diff(tb, empty, &device_attr_list, diff);
++		if (device_diff_live_apply(diff, &apply_mask)) {
++			/* Keep the owner and hotplug users for live-only removal. */
++			device_set_config(dev, dev->type, NULL);
++			free(dev->config);
++			dev->config = NULL;
++			dev->default_config = true;
++			dev->iface_config = false;
++			dev->config_iface = NULL;
++			continue;
++		}
++
+ 		ndev = device_create_default(dev->ifname, dev->external);
+ 		if (!ndev)
+ 			continue;
+--- a/device.h
++++ b/device.h
+@@ -33,7 +33,7 @@
+ 	 * Live-applicable: pure per-netdev sysctls. A diff limited to these
+ 	 * can be pushed via system_if_apply_settings() without tearing the
+ 	 * device down. Keep this group first so DEV_OPT_LIVE_APPLY_MASK
+-	 * stays a contiguous low-bit mask.
++	 * covers these contiguous low bits.
+ 	 */
+ 	DEV_ATTR_IPV6,
+ 	DEV_ATTR_IP6SEGMENTROUTING,
+@@ -75,7 +75,7 @@
+ 	DEV_ATTR_RXPAUSE,
+ 	DEV_ATTR_TXPAUSE,
+ 	DEV_ATTR_AUTONEG,
+-	DEV_ATTR_GRO,
++	DEV_ATTR_GRO, /* Also live-applicable via ethtool. */
+ 	DEV_ATTR_MASTER,
+ 	DEV_ATTR_EEE,
+ 	DEV_ATTR_PSE,
+@@ -181,7 +181,7 @@
+ };
+ 
+ #define DEV_OPT_LIVE_APPLY_MASK \
+-	(((uint64_t)1 << __DEV_ATTR_LIVE_APPLY_MAX) - 1)
++	((((uint64_t)1 << __DEV_ATTR_LIVE_APPLY_MAX) - 1) | DEV_OPT_GRO)
+ 
+ /* events broadcasted to all users of a device */
+ enum device_event {
+--- a/system-linux.c
++++ b/system-linux.c
+@@ -2849,6 +2849,8 @@
+ 		system_set_drop_unsolicited_na(dev, s->drop_unsolicited_na ? "1" : "0");
+ 	if (apply_mask & DEV_OPT_ARP_ACCEPT)
+ 		system_set_arp_accept(dev, s->arp_accept ? "1" : "0");
++	if (apply_mask & DEV_OPT_GRO)
++		system_set_ethtool_gro(dev, s);
+ 	if (apply_mask & (DEV_OPT_SPEED | DEV_OPT_DUPLEX |
+ 			  DEV_OPT_PAUSE | DEV_OPT_ASYM_PAUSE |
+ 			  DEV_OPT_RXPAUSE | DEV_OPT_TXPAUSE |
