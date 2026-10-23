@@ -220,37 +220,41 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
    hw->perform_isr_action = isr_action_init;
    MTLK_HW_INIT_EVT_RESET(hw);
    mtlk_ccr_enable_interrupts(hw->ccr, MTLK_IRQ_ALL);
-@@ -6156,6 +6157,37 @@
+@@ -6156,6 +6157,41 @@
  }
  
  int __MTLK_IFUNC
 +mtlk_hw_seq_write_mhi_stats_layout(mtlk_hw_t *hw, struct seq_file *s)
 +{
-+    const hw_mhi_stats_t *stats = &hw->hw_mhi_stats;
-+    const StatsEntryDecoded_t *entry;
-+    unsigned i, subtype = 0, last_type = ~0U;
-+
-+    /* Published only after parsing succeeds. The layout is immutable and
-+     * proc removal drains readers before freeing it, so no data lock is
-+     * needed. The binary data itself remains in firmware little-endian order. */
-+    mtlk_aux_seq_printf(s, "data_bytes %u\nentry_count %u\nbyte_order little\n",
-+                        stats->db_size, stats->tab_size);
-+    mtlk_aux_seq_printf(s, "type subtype offset unit_size dimensions dim1 dim2 next_index_offset stride\n");
-+    for (i = 0; i < stats->tab_size; i++) {
-+        entry = &stats->table[i];
-+        /* Firmware does not fill entry->subtype. The parser validates the
-+         * start of each contiguous type against the firmware type table. */
-+        if (entry->type != last_type) {
-+            last_type = entry->type;
-+            subtype = 0;
-+        }
-+        mtlk_aux_seq_printf(s, "%u %u %u %u %u %u %u %u %u\n",
-+                            (unsigned)entry->type, subtype++, (unsigned)entry->offset,
-+                            (unsigned)entry->unitSize, (unsigned)entry->numOfDimensions,
-+                            (unsigned)entry->dimension1, (unsigned)entry->dimension2,
-+                            (unsigned)entry->nextIdxOffset,
-+                            (unsigned)(entry->nextIdxOffset ? entry->nextIdxOffset : entry->unitSize));
-+    }
++    /* The matched A0 schema is fixed at build time. Proc readers drain before
++     * statistics cleanup; no snapshot data or firmware transaction is needed. */
++    mtlk_aux_seq_printf(s, "schema wave600_a0\ndata_bytes %u\nbyte_order little\n",
++                        hw->hw_mhi_stats.db_size);
++    mtlk_aux_seq_printf(s, "block offset bytes\n");
++#define WAVE600_STATS_LAYOUT(field) \
++    mtlk_aux_seq_printf(s, #field " %u %u\n", \
++        (unsigned)MTLK_OFFSET_OF(StatisticsDb_t_wave600, field), \
++        (unsigned)sizeof(((StatisticsDb_t_wave600 *)0)->field))
++    WAVE600_STATS_LAYOUT(hostIfCounters);
++    WAVE600_STATS_LAYOUT(rxCounters);
++    WAVE600_STATS_LAYOUT(baaCounters);
++    WAVE600_STATS_LAYOUT(tsManagerInitiatorTidGlobalStats);
++    WAVE600_STATS_LAYOUT(tsManagerInitiatorStationGlobalStats);
++    WAVE600_STATS_LAYOUT(tsManagerRecipientTidGlobalStats);
++    WAVE600_STATS_LAYOUT(tsManagerRecipientStationGlobalStats);
++    WAVE600_STATS_LAYOUT(linkAdaptationStats);
++    WAVE600_STATS_LAYOUT(multicastStats);
++    WAVE600_STATS_LAYOUT(trainingManagerStats);
++    WAVE600_STATS_LAYOUT(groupManagerStats);
++    WAVE600_STATS_LAYOUT(linkAdaptationMuStats);
++    WAVE600_STATS_LAYOUT(ptaStats);
++    WAVE600_STATS_LAYOUT(twtStats);
++    WAVE600_STATS_LAYOUT(perClientStats);
++    WAVE600_STATS_LAYOUT(generalStats);
++    WAVE600_STATS_LAYOUT(dynamicBwStats);
++    WAVE600_STATS_LAYOUT(phyStatistics);
++    WAVE600_STATS_LAYOUT(currentChannelStats);
++#undef WAVE600_STATS_LAYOUT
 +    return MTLK_ERR_OK;
 +}
 +
@@ -258,7 +262,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  mtlk_hw_mhi_copy_stats (mtlk_hw_t *hw, uint8 *buff, uint32 *size)
  {
      hw_mhi_stats_t          *mhi_stats;
-@@ -11083,6 +11115,8 @@
+@@ -11083,6 +11119,8 @@
      mapping->virt_addr = data->nbuf->data;
      mapping->dma_addr = data->dma_addr;
      mapping->size = data->size;
@@ -267,7 +271,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
      return true;
    }
    return false;
-@@ -11175,6 +11209,9 @@
+@@ -11175,6 +11213,9 @@
               lead, size, owner->size);
      goto critical_error;
    }
