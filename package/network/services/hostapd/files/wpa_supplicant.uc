@@ -50,6 +50,8 @@ function enrollment_forget(ifname, status)
 	entry.expiry?.cancel();
 	entry.retry?.cancel();
 	delete wpas.data.enrollment[ifname];
+	if (entry.owner.active_wps_run == entry.run)
+		delete entry.owner.active_wps_run;
 	if (status) {
 		enrollment_result(entry.owner, status);
 		wpas.printf(`WPS persistence on ${ifname}: ${status}`);
@@ -221,7 +223,8 @@ function enrollment_candidate(ifname, iface, cred)
 	if (!cred.processed || !cred.wps_run || cred.network_id == null)
 		return;
 	let binding = enrollment_owner(ifname, iface);
-	if (!binding?.persistent || binding.owner.cancelled_wps_run == cred.wps_run)
+	if (!binding?.persistent || cred.wps_run != iface.status().wps_run ||
+	    binding.owner.cancelled_wps_run == cred.wps_run)
 		return;
 	let entry = wpas.data.enrollment[ifname];
 	if (entry && (entry.iface != iface || entry.owner != binding.owner ||
@@ -1683,10 +1686,22 @@ function iface_ubus_add(ifname)
 				if (req.args.section != null && !binding?.persistent)
 					return libubus.STATUS_NOT_SUPPORTED;
 				enrollment_forget(ifname);
+				if (binding) {
+					delete binding.owner.active_wps_run;
+					// Starting a replacement can synchronously retire the old run.
+					binding.owner.starting_wps_run = iface.status().wps_run;
+				}
 				let multi_ap = req.args.multi_ap ?? binding?.owner.config.wps_multi_ap ?? false;
 				let result = iface.ctrl(`WPS_PBC multi_ap=${+multi_ap}`);
-				if (binding && result && match(result, /^OK\n?$/))
-					enrollment_result(binding.owner, 'active');
+				if (binding) {
+					delete binding.owner.starting_wps_run;
+					let run = iface.status().wps_run;
+					if (result && match(result, /^OK\n?$/) &&
+					    binding.owner.cancelled_wps_run != run) {
+						binding.owner.active_wps_run = run;
+						enrollment_result(binding.owner, 'active');
+					}
+				}
 				return result && match(result, /^OK\n?$/) ? 0 : libubus.STATUS_INVALID_ARGUMENT;
 			},
 		},
@@ -1789,17 +1804,27 @@ return {
 		iface_ubus_remove(name);
 		delete wpas.data.dpp_hooks[name];
 	},
-	ctrl_event: function(name, iface, ev) {
+	ctrl_event: function(name, iface, ev, run) {
 		iface_ubus_notify(name, ev);
-		if (match(ev, /^WPS-(CANCEL|FAIL|TIMEOUT|OVERLAP-DETECTED)/)) {
+		if (match(ev, /^WPS-(CANCEL|FAIL|TIMEOUT|OVERLAP-DETECTED)( |$)/)) {
 			let binding = enrollment_owner(name, iface);
-			if (binding) {
-				binding.owner.cancelled_wps_run = iface.status().wps_run;
-				let result = wpas.data.enrollment_results[binding.owner.config.uci.section];
-				if (wpas.data.enrollment[name] || result?.phase in [ 'active', 'connecting', 'waiting' ])
-					enrollment_result(binding.owner, 'cancelled');
-			}
-			enrollment_forget(name, 'cancelled');
+			let entry = wpas.data.enrollment[name];
+			if (!binding || !run || run != iface.status().wps_run)
+				return;
+			let owned = entry && entry.iface == iface && entry.owner == binding.owner &&
+				entry.generation == binding.phy.generation && entry.run == run;
+			if (entry && !owned)
+				return;
+			let starting = binding.owner.starting_wps_run;
+			if (!owned && binding.owner.active_wps_run != run &&
+			    !(starting != null && starting != run))
+				return;
+			binding.owner.cancelled_wps_run = run;
+			delete binding.owner.active_wps_run;
+			if (owned)
+				enrollment_forget(name, 'cancelled');
+			else
+				enrollment_result(binding.owner, 'cancelled');
 		}
 
 		// The set of links of an associated MLD can change without a state

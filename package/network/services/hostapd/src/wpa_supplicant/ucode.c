@@ -4,6 +4,7 @@
 #include "utils/base64.h"
 #include "drivers/driver.h"
 #include "common/ieee802_11_common.h"
+#include "common/wpa_ctrl.h"
 #include "ap/hostapd.h"
 #include "common/sae.h"
 #include "rsn_supp/wpa.h"
@@ -17,7 +18,6 @@
 #include "offchannel.h"
 #ifdef CONFIG_DPP
 #include "common/dpp.h"
-#include "common/wpa_ctrl.h"
 #include "common/gas.h"
 #endif /* CONFIG_DPP */
 
@@ -251,7 +251,11 @@ void wpas_ucode_ctrl_event(struct wpa_supplicant *wpa_s, const char *str, size_t
 	uc_value_t *val;
 
 #define _EV_PREFIX "CTRL-EVENT-"
-	if (strncmp(str, _EV_PREFIX, sizeof(_EV_PREFIX) - 1) != 0)
+	if (strncmp(str, _EV_PREFIX, sizeof(_EV_PREFIX) - 1) != 0 &&
+	    strncmp(str, WPS_EVENT_CANCEL, sizeof(WPS_EVENT_CANCEL) - 1) != 0 &&
+	    strncmp(str, WPS_EVENT_FAIL, sizeof(WPS_EVENT_FAIL) - 1) != 0 &&
+	    strncmp(str, WPS_EVENT_TIMEOUT, sizeof(WPS_EVENT_TIMEOUT) - 1) != 0 &&
+	    strncmp(str, WPS_EVENT_OVERLAP, sizeof(WPS_EVENT_OVERLAP) - 1) != 0)
 		return;
 
 	val = wpa_ucode_registry_get(iface_registry, wpa_s->ucode.idx);
@@ -264,7 +268,9 @@ void wpas_ucode_ctrl_event(struct wpa_supplicant *wpa_s, const char *str, size_t
 	uc_value_push(ucv_string_new(wpa_s->ifname));
 	uc_value_push(ucv_get(val));
 	uc_value_push(ucv_string_new_length(str, len));
-	ucv_put(wpa_ucode_call(3));
+	/* Capture the native run at emission, before a replacement can start. */
+	uc_value_push(ucv_int64_new(wpa_s->wps_run));
+	ucv_put(wpa_ucode_call(4));
 }
 
 void wpas_ucode_wps_complete(struct wpa_supplicant *wpa_s,
