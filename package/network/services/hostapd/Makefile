@@ -5,7 +5,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=hostapd
-PKG_RELEASE:=4
+PKG_RELEASE:=23
 
 PKG_SOURCE_URL:=https://w1.fi/hostap.git
 PKG_SOURCE_PROTO:=git
@@ -182,8 +182,8 @@ define Package/hostapd/Default
   SUBMENU:=WirelessAPD
   TITLE:=IEEE 802.1x Authenticator
   URL:=https://w1.fi/hostapd/
-  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
+  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd +wifi-scripts)
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r4)$(comma) wifi-scripts (>=1.0-r13))
   USERID:=network=101:network=101
   PROVIDES:=hostapd
   CONFLICTS:=$(HOSTAPD_PROVIDERS)
@@ -288,8 +288,8 @@ define Package/wpad/Default
   CATEGORY:=Network
   SUBMENU:=WirelessAPD
   TITLE:=IEEE 802.1x Auth/Supplicant
-  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
+  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd +wifi-scripts)
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r4)$(comma) wifi-scripts (>=1.0-r13))
   USERID:=network=101:network=101
   URL:=https://w1.fi/
   PROVIDES:=hostapd wpa-supplicant
@@ -433,8 +433,8 @@ define Package/wpa-supplicant/Default
   SUBMENU:=WirelessAPD
   TITLE:=WPA Supplicant
   URL:=https://w1.fi/wpa_supplicant/
-  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd)
-  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r2))
+  DEPENDS:=$(DRV_DEPENDS) +hostapd-common $(CORE_DEPENDS) $(if $(filter $(1),$(WPS_PROVIDERS)),+rpcd +wifi-scripts)
+  EXTRA_DEPENDS:=hostapd-common (=$(PKG_VERSION)-r$(PKG_RELEASE))$(if $(filter $(1),$(WPS_PROVIDERS)),$(comma) rpcd (>=2026.10.04~d99f703e-r4)$(comma) wifi-scripts (>=1.0-r13))
   USERID:=network=101:network=101
   PROVIDES:=wpa-supplicant
   CONFLICTS:=$(SUPPLICANT_PROVIDERS)
