@@ -1,0 +1,483 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: complete scans through the captured kernel interface
+
+Use the existing kernel scan path for every ordinary scan. The preferred
+WPA control path had a shorter wait and did not expose aborted completion.
+Subscribe before triggering, retain active wildcard discovery, and bind
+trigger, completion and result dump to the captured numeric interface.
+Use one finite monotonic event deadline; reject aborts or replaced interfaces.
+Native metadata/command transport and interface lifecycle queries are unchanged.
+This uses privileged nl80211 scanning; control-group-only callers now need
+the same CAP_NET_ADMIN permission as the native iwinfo CLI/RPC services.
+Keep ordinary WPA control queries and native interface lifecycle handling.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/iwinfo_nl80211.c
++++ b/iwinfo_nl80211.c
+@@ -670,17 +670,27 @@
+ 	return NL_OK;
+ }
+ 
+-static int nl80211_wait(struct nl_sock *sock, unsigned int ifindex)
++static int nl80211_scan_remaining(const struct timespec *deadline)
++{
++	struct timespec now;
++	int64_t remaining;
++
++	if (clock_gettime(CLOCK_MONOTONIC, &now))
++		return -errno;
++	remaining = (int64_t)(deadline->tv_sec - now.tv_sec) * 1000000000 +
++	            deadline->tv_nsec - now.tv_nsec;
++	if (remaining <= 0)
++		return -ETIMEDOUT;
++	return (remaining + 999999) / 1000000;
++}
++
++static int nl80211_wait(struct nl_sock *sock, unsigned int ifindex,
++                        const struct timespec *deadline)
+ {
+ 	struct nl80211_event_conveyor cv = { .ifindex = ifindex };
+ 	struct pollfd pfd = { .fd = nl_socket_get_fd(sock), .events = POLLIN };
+-	struct timespec deadline, now;
+ 	struct nl_cb *cb;
+ 	int err = 0, ret, timeout;
+-
+-	if (clock_gettime(CLOCK_MONOTONIC, &deadline))
+-		return -errno;
+-	deadline.tv_sec += 60;
+ 
+ 	cb = nl_cb_alloc(NL_CB_DEFAULT);
+ 	if (!cb)
+@@ -692,16 +702,10 @@
+ 
+ 	while (!cv.recv && !err)
+ 	{
+-		if (clock_gettime(CLOCK_MONOTONIC, &now))
+-		{
+-			err = -errno;
+-			break;
+-		}
+-		timeout = (deadline.tv_sec - now.tv_sec) * 1000 +
+-		          (deadline.tv_nsec - now.tv_nsec) / 1000000;
++		timeout = nl80211_scan_remaining(deadline);
+ 		if (timeout <= 0)
+ 		{
+-			err = -ETIMEDOUT;
++			err = timeout;
+ 			break;
+ 		}
+ 
+@@ -725,7 +729,7 @@
+ 	}
+ 
+ 	nl_cb_put(cb);
+-	return err;
++	return err ? err : (cv.recv == NL80211_CMD_NEW_SCAN_RESULTS ? 0 : -ECANCELED);
+ }
+ 
+ /* This is linux's ieee80211_freq_khz_to_channel() which is:
+@@ -2694,43 +2698,6 @@
+ 	return -1;
+ }
+ 
+-static void nl80211_get_scancrypto(char *spec, struct iwinfo_crypto_entry *c)
+-{
+-	int wpa_version = 0;
+-	char *p, *q, *proto, *suites;
+-
+-	c->enabled = 0;
+-
+-	for (p = strtok_r(spec, "[]", &q); p; p = strtok_r(NULL, "[]", &q)) {
+-		if (!strcmp(p, "WEP")) {
+-			c->enabled      = 1;
+-			c->auth_suites  = IWINFO_KMGMT_NONE;
+-			c->auth_algs    = IWINFO_AUTH_OPEN | IWINFO_AUTH_SHARED;
+-			c->pair_ciphers = IWINFO_CIPHER_WEP40 | IWINFO_CIPHER_WEP104;
+-			break;
+-		}
+-
+-		proto = strtok(p, "-");
+-		suites = strtok(NULL, "]");
+-
+-		if (!proto || !suites)
+-			continue;
+-
+-		if (!strcmp(proto, "WPA2") || !strcmp(proto, "RSN"))
+-			wpa_version = 2;
+-		else if (!strcmp(proto, "WPA"))
+-			wpa_version = 1;
+-		else
+-			continue;
+-
+-		c->enabled = 1;
+-
+-		parse_wpa_suites(suites, wpa_version, &c->wpa_version, &c->auth_suites);
+-		parse_wpa_ciphers(suites, &c->pair_ciphers);
+-	}
+-}
+-
+-
+ struct nl80211_scanlist {
+ 	struct iwinfo_scanlist_entry *e;
+ 	int len;
+@@ -2939,14 +2906,46 @@
+ 	return NL_SKIP;
+ }
+ 
+-static int nl80211_get_scanlist_nl(const char *ifname, char *buf, int *len)
++static int nl80211_scan_request(unsigned int ifindex, int cmd,
++                                 struct nl80211_scanlist *sl, bool ap)
++{
++	struct nl80211_msg_conveyor *cv;
++	struct nlattr *ssids;
++
++	cv = nl80211_new(nls->nl80211, cmd,
++	                 cmd == NL80211_CMD_GET_SCAN ? NLM_F_DUMP : 0);
++	if (!cv)
++		return -ENOMEM;
++	NLA_PUT_U32(cv->msg, NL80211_ATTR_IFINDEX, ifindex);
++	if (cmd == NL80211_CMD_TRIGGER_SCAN) {
++		/* Preserve active wildcard discovery. The AP permission is only
++		 * needed for an interface currently in AP mode. */
++		if (ap)
++			NLA_PUT_U32(cv->msg, NL80211_ATTR_SCAN_FLAGS, NL80211_SCAN_FLAG_AP);
++		ssids = nla_nest_start(cv->msg, NL80211_ATTR_SCAN_SSIDS);
++		if (!ssids || nla_put(cv->msg, 1, 0, ""))
++			goto nla_put_failure;
++		nla_nest_end(cv->msg, ssids);
++	}
++	return nl80211_send(cv, cmd == NL80211_CMD_GET_SCAN ?
++	                    nl80211_get_scanlist_cb : NULL, sl);
++
++nla_put_failure:
++	nl80211_free(cv);
++	return -ENOMEM;
++}
++
++static int nl80211_get_scanlist_nl(const char *ifname, char *buf, int *len,
++                                     const struct timespec *deadline)
+ {
+ 	struct nl80211_scanlist sl = { .e = (struct iwinfo_scanlist_entry *)buf };
+ 	struct nl_sock *sock = NULL;
+ 	unsigned int ifindex = if_nametoindex(ifname);
+-	int rv = -1;
+-
+-	if (!ifindex)
++	int mode, rv = -1;
++
++	if (!ifindex || nl80211_scan_remaining(deadline) <= 0 ||
++	    nl80211_get_mode(ifname, &mode) ||
++	    if_nametoindex(ifname) != ifindex)
+ 		goto out;
+ 
+ 	/* Listen before triggering, on a separate socket: the command socket's
+@@ -2960,14 +2959,19 @@
+ 	if (nl80211_subscribe(sock, "nl80211", "scan"))
+ 		goto out;
+ 
+-	if (nl80211_request(ifname, NL80211_CMD_TRIGGER_SCAN, 0, NULL, NULL))
++	if (nl80211_scan_remaining(deadline) <= 0 ||
++	    if_nametoindex(ifname) != ifindex ||
++	    nl80211_scan_request(ifindex, NL80211_CMD_TRIGGER_SCAN, NULL,
++	                         mode == IWINFO_OPMODE_MASTER))
+ 		goto out;
+ 
+-	if (nl80211_wait(sock, ifindex))
++	if (nl80211_wait(sock, ifindex, deadline))
+ 		goto out;
+ 
+-	if (nl80211_request(ifname, NL80211_CMD_GET_SCAN, NLM_F_DUMP,
+-	                    nl80211_get_scanlist_cb, &sl))
++	if (if_nametoindex(ifname) != ifindex ||
++	    nl80211_scan_remaining(deadline) <= 0 ||
++	    nl80211_scan_request(ifindex, NL80211_CMD_GET_SCAN, &sl, false) ||
++	    if_nametoindex(ifname) != ifindex)
+ 		goto out;
+ 
+ 	*len = sl.len * sizeof(struct iwinfo_scanlist_entry);
+@@ -2981,224 +2985,11 @@
+ 	return rv;
+ }
+ 
+-static int wpasupp_ssid_decode(const char *in, char *out, int outlen)
+-{
+-#define hex(x) \
+-	(((x) >= 'a') ? ((x) - 'a' + 10) : \
+-		(((x) >= 'A') ? ((x) - 'A' + 10) : ((x) - '0')))
+-
+-	int len = 0;
+-
+-	while (*in)
+-	{
+-		if (len + 1 >= outlen)
+-			break;
+-
+-		switch (*in)
+-		{
+-		case '\\':
+-			in++;
+-			switch (*in)
+-			{
+-			case 'n':
+-				out[len++] = '\n'; in++;
+-				break;
+-
+-			case 'r':
+-				out[len++] = '\r'; in++;
+-				break;
+-
+-			case 't':
+-				out[len++] = '\t'; in++;
+-				break;
+-
+-			case 'e':
+-				out[len++] = '\033'; in++;
+-				break;
+-
+-			case 'x':
+-				if (isxdigit(*(in+1)) && isxdigit(*(in+2)))
+-					out[len++] = hex(*(in+1)) * 16 + hex(*(in+2));
+-				in += 3;
+-				break;
+-
+-			default:
+-				out[len++] = *in++;
+-				break;
+-			}
+-			break;
+-
+-		default:
+-			out[len++] = *in++;
+-			break;
+-		}
+-	}
+-
+-	if (outlen > len)
+-		out[len] = '\0';
+-
+-	return len;
+-}
+-
+-static int nl80211_get_scanlist_wpactl(const char *ifname, char *buf, int *len)
+-{
+-	int sock, qmax, rssi, tries, count = -1, ready = 0;
+-	char *pos, *line, *bssid, *freq, *signal, *flags, *ssid, reply[4096];
+-	struct sockaddr_un local = { 0 };
+-	struct iwinfo_scanlist_entry *e = (struct iwinfo_scanlist_entry *)buf;
+-
+-	sock = nl80211_wpactl_connect(ifname, &local);
+-
+-	if (sock < 0)
+-		return sock;
+-
+-	send(sock, "ATTACH", 6, 0);
+-	send(sock, "SCAN", 4, 0);
+-
+-	/*
+-	 * wait for scan results:
+-	 *   nl80211_wpactl_recv() will use a timeout of 256ms and we need to scan
+-	 *   72 channels at most. We'll also receive two "OK" messages acknowledging
+-	 *   the "ATTACH" and "SCAN" commands and the driver might need a bit extra
+-	 *   time to process the results, so try 72 + 2 + 1 times.
+-	 */
+-	for (tries = 0; tries < 75; tries++)
+-	{
+-		if (nl80211_wpactl_recv(sock, reply, sizeof(reply)) <= 0)
+-			continue;
+-
+-		/* got an event notification */
+-		if (reply[0] == '<')
+-		{
+-			/* scan results are ready */
+-			if (strstr(reply, "CTRL-EVENT-SCAN-RESULTS"))
+-			{
+-				/* send "SCAN_RESULTS" command */
+-				ready = (send(sock, "SCAN_RESULTS", 12, 0) == 12);
+-				break;
+-			}
+-
+-			/* is another unrelated event, retry */
+-			tries--;
+-		}
+-
+-		/* scanning already in progress, keep awaiting results */
+-		else if (!strcmp(reply, "FAIL-BUSY\n"))
+-		{
+-			tries--;
+-		}
+-
+-		/* another failure, abort */
+-		else if (!strncmp(reply, "FAIL-", 5))
+-		{
+-			break;
+-		}
+-	}
+-
+-	/* receive and parse scan results if the wait above didn't time out */
+-	while (ready && nl80211_wpactl_recv(sock, reply, sizeof(reply)) > 0)
+-	{
+-		/* received an event notification, receive again */
+-		if (reply[0] == '<')
+-			continue;
+-
+-		nl80211_get_quality_max(ifname, &qmax);
+-
+-		for (line = strtok_r(reply, "\n", &pos);
+-		     line != NULL;
+-		     line = strtok_r(NULL, "\n", &pos))
+-		{
+-			/* skip header line */
+-			if (count < 0)
+-			{
+-				count++;
+-				continue;
+-			}
+-
+-			bssid  = strtok(line, "\t");
+-			freq   = strtok(NULL, "\t");
+-			signal = strtok(NULL, "\t");
+-			flags  = strtok(NULL, "\t");
+-			ssid   = strtok(NULL, "\n");
+-
+-			if (!bssid || !freq || !signal || !flags)
+-				continue;
+-
+-			memset(e, 0, sizeof(*e));
+-
+-			/* BSSID */
+-			e->mac[0] = strtol(&bssid[0],  NULL, 16);
+-			e->mac[1] = strtol(&bssid[3],  NULL, 16);
+-			e->mac[2] = strtol(&bssid[6],  NULL, 16);
+-			e->mac[3] = strtol(&bssid[9],  NULL, 16);
+-			e->mac[4] = strtol(&bssid[12], NULL, 16);
+-			e->mac[5] = strtol(&bssid[15], NULL, 16);
+-
+-			/* SSID */
+-			if (ssid)
+-				wpasupp_ssid_decode(ssid, e->ssid, sizeof(e->ssid));
+-			else
+-				e->ssid[0] = 0;
+-
+-			/* Mode */
+-			if (strstr(flags, "[MESH]"))
+-				e->mode = IWINFO_OPMODE_MESHPOINT;
+-			else if (strstr(flags, "[IBSS]"))
+-				e->mode = IWINFO_OPMODE_ADHOC;
+-			else
+-				e->mode = IWINFO_OPMODE_MASTER;
+-
+-			/* Channel */
+-			e->mhz = atoi(freq);
+-			e->band = nl80211_freq2band(e->mhz);
+-			e->channel = nl80211_freq2channel(e->mhz);
+-
+-			/* Signal */
+-			rssi = atoi(signal);
+-			e->signal = rssi;
+-
+-			/* Quality */
+-			if (rssi < 0)
+-			{
+-				/* The cfg80211 wext compat layer assumes a signal range
+-				 * of -110 dBm to -40 dBm, the quality value is derived
+-				 * by adding 110 to the signal level */
+-				if (rssi < -110)
+-					rssi = -110;
+-				else if (rssi > -40)
+-					rssi = -40;
+-
+-				e->quality = (rssi + 110);
+-			}
+-			else
+-			{
+-				e->quality = rssi;
+-			}
+-
+-			/* Max. Quality */
+-			e->quality_max = qmax;
+-
+-			/* Crypto */
+-			nl80211_get_scancrypto(flags, &e->crypto);
+-
+-			count++;
+-			e++;
+-		}
+-
+-		*len = count * sizeof(struct iwinfo_scanlist_entry);
+-		break;
+-	}
+-
+-	close(sock);
+-	unlink(local.sun_path);
+-
+-	return (count >= 0) ? 0 : -1;
+-}
+-
+ static int nl80211_get_scanlist(const char *ifname, char *buf, int *len)
+ {
+ 	char *res;
+ 	int rv, mode;
++	struct timespec deadline;
+ 
+ 	*len = 0;
+ 
+@@ -3220,21 +3011,21 @@
+ 		}
+ 	}
+ 
+-	/* WPA supplicant */
+-	if (!nl80211_get_scanlist_wpactl(ifname, buf, len))
+-	{
+-		return 0;
+-	}
+-
+-	/* station / ad-hoc / monitor scan */
+-	else if (!nl80211_get_mode(ifname, &mode) &&
++	if (clock_gettime(CLOCK_MONOTONIC, &deadline))
++		return -1;
++	deadline.tv_sec += 60;
++
++	/* Use kernel completion status for every scan: WPA control reports
++	 * partial results for aborted scans without exposing the abort. */
++	/* station / ad-hoc / monitor / AP scan */
++	if (!nl80211_get_mode(ifname, &mode) &&
+ 	         (mode == IWINFO_OPMODE_ADHOC ||
+ 	          mode == IWINFO_OPMODE_MASTER ||
+ 	          mode == IWINFO_OPMODE_CLIENT ||
+ 	          mode == IWINFO_OPMODE_MONITOR) &&
+ 	         iwinfo_ifup(ifname))
+ 	{
+-		return nl80211_get_scanlist_nl(ifname, buf, len);
++		return nl80211_get_scanlist_nl(ifname, buf, len, &deadline);
+ 	}
+ 
+ 	/* AP scan */
+@@ -3246,7 +3037,7 @@
+ 			if (!iwinfo_ifup(ifname))
+ 				return -1;
+ 
+-			rv = nl80211_get_scanlist_nl(ifname, buf, len);
++			rv = nl80211_get_scanlist_nl(ifname, buf, len, &deadline);
+ 			iwinfo_ifdown(ifname);
+ 			return rv;
+ 		}
+@@ -3263,7 +3054,7 @@
+ 			 * additional interface and there's no need to tear down the ap */
+ 			if (iwinfo_ifup(res))
+ 			{
+-				rv = nl80211_get_scanlist_nl(res, buf, len);
++				rv = nl80211_get_scanlist_nl(res, buf, len, &deadline);
+ 				iwinfo_ifdown(res);
+ 			}
+ 
+@@ -3271,7 +3062,7 @@
+ 			 * during scan */
+ 			else if (iwinfo_ifdown(ifname) && iwinfo_ifup(res))
+ 			{
+-				rv = nl80211_get_scanlist_nl(res, buf, len);
++				rv = nl80211_get_scanlist_nl(res, buf, len, &deadline);
+ 				iwinfo_ifdown(res);
+ 				iwinfo_ifup(ifname);
+ 				nl80211_hostapd_hup(ifname);
