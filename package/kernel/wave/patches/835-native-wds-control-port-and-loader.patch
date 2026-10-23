@@ -1,0 +1,404 @@
+Subject: [PATCH] wave: preserve station control-port framing and native WDS headers
+
+Use the canonical station control-port skb through the native BSS owner,
+with the matched raw-frame classifier and CCMP key context. Apply the
+fixed-cohort AP instruction overlay before firmware CPU release.
+
+--- a/wireless/driver/linux/mac80211.c
++++ b/wireless/driver/linux/mac80211.c
+@@ -497,9 +497,18 @@
+     goto drop;
+   }
+   in_chan = ieee80211_frequency_to_channel(channel->center_freq);
+-  extra_processing = (ieee80211_is_nullfunc(hdr->frame_control) ||
+-                      ieee80211_is_qos_nullfunc(hdr->frame_control)) ?
+-                     PROCESS_NULL_DATA_PACKET : PROCESS_MANAGEMENT;
++  if (vif->type == NL80211_IFTYPE_STATION &&
++      ieee80211_is_data(hdr->frame_control) &&
++      (info->control.flags & IEEE80211_TX_CTRL_PORT_CTRL_PROTO)) {
++    /* Keep legacy hardware ciphers on their existing Ethernet transport.
++     * Select while the stack's uploaded-key reference is still valid. */
++    extra_processing = info->control.hw_key &&
++                       info->control.hw_key->cipher != WLAN_CIPHER_SUITE_CCMP ?
++                       PROCESS_LEGACY_EAPOL : PROCESS_RAW_EAPOL;
++  } else
++    extra_processing = (ieee80211_is_nullfunc(hdr->frame_control) ||
++                        ieee80211_is_qos_nullfunc(hdr->frame_control)) ?
++                       PROCESS_NULL_DATA_PACKET : PROCESS_MANAGEMENT;
+ 
+   /* The core dispatch for this request was synchronous. Submit directly so
+    * a failed clipboard/result allocation cannot obscure skb ownership. */
+@@ -2436,13 +2445,11 @@
+   hw->wiphy->features |= NL80211_FEATURE_SK_TX_STATUS |
+                           NL80211_FEATURE_SCAN_FLUSH;
+ 
+-  /* This hybrid driver delivers Ethernet EAPOL through AF_PACKET. mac80211
+-   * alloc_hw advertises its own control-port path by default, but that path
+-   * bypasses our Ethernet ndo and lacks retained-firmware TX status support.
+-   * Let unmodified supplicant select the implemented standard transport. */
++  /* Station control-port TX uses mac80211's canonical three-address header.
++   * Keep AF_PACKET RX and the existing AP transport policy; neither RX nor
++   * control-port TX-status capabilities are selected by this path. */
+   {
+     static const unsigned int unsupported[] = {
+-      NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211,
+       NL80211_EXT_FEATURE_CONTROL_PORT_NO_PREAUTH,
+       NL80211_EXT_FEATURE_CONTROL_PORT_OVER_NL80211_TX_STATUS,
+     };
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -11398,6 +11398,12 @@
+ #define  MTLK_HOST_TO_MAC_PAYLOAD(dma) CPU_TO_LE32(dma & ~7);
+ #endif
+ 
++/* Matched experimental raw-EAPOL classifier metadata in HOST_DSC DW1.
++ * The vendor path consumes only class/EP here; these bits require the paired
++ * firmware classifier and do not alter the supplied 802.11 header. */
++#define WAVE_BSS_RAW_EAPOL       BIT(31)
++#define WAVE_BSS_ENCRYPT_INTENT  BIT(30)
++
+ static int
+ _mtlk_mmb_bss_mgmt_tx(mtlk_hw_t *hw,
+                       struct mtlk_hw_bss_req_mirror *bss_req, mtlk_vap_handle_t vap_handle)
+@@ -11432,6 +11438,7 @@
+   mtlk_dump(3, bss_req->virt_addr, bss_req->size, "BSS Mgmt TX frame:");
+ 
+   switch (bss_req->extra_processing) {
++    case PROCESS_RAW_EAPOL:
+     case PROCESS_MANAGEMENT:
+         /* 1. dst address mc bit */
+         dst_addr = WLAN_GET_ADDR1(bss_req->virt_addr);
+@@ -11441,10 +11448,12 @@
+         sid = bss_req->sid;
+ 
+         /* 3. type, subtype, priority, frame type */
++        /* The native raw-frame consumer uses the management descriptor type;
++         * the supplied control-port DATA header and subtype remain unchanged. */
+         type = IEEE80211_FTYPE_MGMT >> 2;
+         frame_ctl = mtlk_wlan_pkt_get_frame_ctl(bss_req->virt_addr);
+-        /* Check tods and from ds for managment packets must be 0 */
+-        if (frame_ctl & TMP_FRAME_FROMDSTODS_MASK) {
++        if (bss_req->extra_processing == PROCESS_MANAGEMENT &&
++            (frame_ctl & TMP_FRAME_FROMDSTODS_MASK)) {
+             ELOG_D("CID-%02x: ToDS and FromDS not null in managment packet", hw->card_idx);
+             MTLK_ASSERT(NULL);
+             return MTLK_ERR_PKT_DROPPED;
+@@ -11493,6 +11502,7 @@
+           wave_vap_increment_ndp_counter(vap_handle);
+         }
+         break;
++    case PROCESS_LEGACY_EAPOL:
+     case PROCESS_EAPOL:
+         /* 1. dst address mc bit */
+         dst_addr = ((struct ethhdr *) bss_req->virt_addr)->h_dest;
+@@ -11554,6 +11564,16 @@
+ 
+   bss_hd.u32frameInfo1 = CPU_TO_LE32(MTLK_BFIELD_VALUE(TX_DATA_INFO_CLASS, ntid, uint32)
+                           | MTLK_BFIELD_VALUE(TX_DATA_INFO_EP, wave_vap_ep_bit_get(vap_handle), uint32));
++  if (bss_req->extra_processing == PROCESS_RAW_EAPOL) {
++    const struct ieee80211_tx_info *info = IEEE80211_SKB_CB(bss_req->skb);
++    uint32 intent = WAVE_BSS_RAW_EAPOL;
++
++    /* mac80211 already applied no_encrypt and selected the hardware key.
++     * Compare the retained pointer only; firmware owns key lookup and PN. */
++    if (info->control.hw_key)
++      intent |= WAVE_BSS_ENCRYPT_INTENT;
++    bss_hd.u32frameInfo1 |= CPU_TO_LE32(intent);
++  }
+ 
+   bss_hd.u32frameInfo3      = CPU_TO_LE32(MTLK_BFIELD_VALUE(TX_DATA_INFO_SOP_EOP, NO_FRAG, uint32) |
+                               MTLK_BFIELD_VALUE(TX_DATA_INFO_OFFSET,
+@@ -11821,7 +11841,15 @@
+   }
+ 
+ 
+-  if (extra_processing == PROCESS_EAPOL && sid == DB_UNKNOWN_SID)
++  if (extra_processing == PROCESS_RAW_EAPOL) {
++    uint16 frame_ctrl = mtlk_wlan_pkt_get_frame_ctl(buf);
++
++    subtype = (frame_ctrl & FRAME_SUBTYPE_MASK) >> FRAME_SUBTYPE_SHIFT;
++  }
++
++  if ((extra_processing == PROCESS_EAPOL ||
++       extra_processing == PROCESS_RAW_EAPOL ||
++       extra_processing == PROCESS_LEGACY_EAPOL) && sid == DB_UNKNOWN_SID)
+     return MTLK_ERR_NOT_HANDLED;
+ 
+   mtlk_osal_lock_acquire(&bss_mgmt->tx_bdr.lock);
+@@ -11874,7 +11902,47 @@
+   bss_req->vap_id = mtlk_vap_get_id(vap_handle);
+   bss_req->radio_id = radio_id;
+   bss_req->cookie = local_cookie;
+-  wave_memcpy(bss_req->virt_addr, BSS_MGMT_FRAME_SIZE, buf, len);
++  if (extra_processing == PROCESS_LEGACY_EAPOL) {
++    struct sk_buff *view = skb_clone(skb, GFP_ATOMIC);
++    struct ethhdr eth;
++
++    if (!view) {
++      res = MTLK_ERR_NO_MEM;
++      goto release_entry;
++    }
++    /* The helper's iftype is the receiver of this canonical ToDS frame.
++     * An external Ethernet header leaves the original skb bytes untouched.
++     * WAVE rejects fragmentation and requests no software MIC/IV generation;
++     * uploaded WEP/TKIP frames still contain the original EAPOL payload. */
++    res = ieee80211_data_to_8023_exthdr(view, &eth, skb->dev->dev_addr,
++                                       NL80211_IFTYPE_AP, 0, false);
++    if (!res) {
++      wave_memcpy(bss_req->virt_addr, BSS_MGMT_FRAME_SIZE, &eth, ETH_HLEN);
++      res = skb_copy_bits(view, 0, (uint8 *)bss_req->virt_addr + ETH_HLEN, view->len);
++      len = ETH_HLEN + view->len;
++    }
++    kfree_skb(view);
++    if (res) {
++      res = MTLK_ERR_PARAMS;
++      goto release_entry;
++    }
++  } else if (extra_processing == PROCESS_RAW_EAPOL &&
++             ieee80211_is_data_qos(((const struct ieee80211_hdr *)buf)->frame_control)) {
++    const unsigned int hdrlen = sizeof(struct ieee80211_hdr_3addr);
++    struct ieee80211_hdr *raw = (struct ieee80211_hdr *)bss_req->virt_addr;
++
++    /* Native raw CCMP inserts its IV after a 24-byte header. Normalize only
++     * this wire copy; the original skb and its control-port status stay intact. */
++    wave_memcpy(raw, BSS_MGMT_FRAME_SIZE, buf, hdrlen);
++    wave_memcpy((uint8 *)raw + hdrlen, BSS_MGMT_FRAME_SIZE - hdrlen,
++                buf + hdrlen + IEEE80211_QOS_CTL_LEN,
++                len - hdrlen - IEEE80211_QOS_CTL_LEN);
++    raw->frame_control &= ~cpu_to_le16(IEEE80211_STYPE_QOS_DATA);
++    len -= IEEE80211_QOS_CTL_LEN;
++    subtype = IEEE80211_STYPE_DATA >> 4;
++  } else {
++    wave_memcpy(bss_req->virt_addr, BSS_MGMT_FRAME_SIZE, buf, len);
++  }
+   bss_req->size = len;
+   bss_req->extra_processing = extra_processing;
+   bss_req->action_code      = action_code;
+@@ -11913,6 +11981,20 @@
+ 
+   *cookie = local_cookie;
+   return MTLK_ERR_OK;
++
++release_entry:
++  /* No skb ownership or DMA mapping was transferred on conversion failure. */
++  mtlk_osal_lock_acquire(&bss_mgmt->tx_bdr.lock);
++  if (transmit_now) {
++    mtlk_dlist_remove(&bss_mgmt->tx_bdr.used_list, entry);
++    mtlk_dlist_push_back(&bss_mgmt->tx_bdr.free_list, entry);
++  } else {
++    mtlk_dlist_push_back(&bss_mgmt->tx_res_bdr.free_list, entry);
++  }
++  mtlk_osal_lock_release(&bss_mgmt->tx_bdr.lock);
++  if (!transmit_now)
++    mtlk_core_on_bss_res_freed(cur_core);
++  return res;
+ 
+ frame_drop:
+   ILOG0_V("Frame dropped");
+@@ -12057,7 +12139,9 @@
+   mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr), bss_req->dma_addr, bss_req->size, MTLK_DATA_TO_DEVICE);
+   bss_req->dma_addr = 0;
+ 
+-  if (PROCESS_MANAGEMENT == bss_req->extra_processing)
++  if (PROCESS_MANAGEMENT == bss_req->extra_processing ||
++      PROCESS_RAW_EAPOL == bss_req->extra_processing ||
++      PROCESS_LEGACY_EAPOL == bss_req->extra_processing)
+   {
+     if (bss_req->cookie)
+     {
+--- a/wireless/driver/shared/hw_mmb.h
++++ b/wireless/driver/shared/hw_mmb.h
+@@ -383,6 +383,8 @@
+   PROCESS_MANAGEMENT = 0,
+   PROCESS_EAPOL,
+   PROCESS_NULL_DATA_PACKET,
++  PROCESS_RAW_EAPOL,
++  PROCESS_LEGACY_EAPOL,
+ };
+ 
+ uint8 __MTLK_IFUNC
+
+diff --git a/wireless/driver/shared/hw_mmb.c b/wireless/driver/shared/hw_mmb.c
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -44,6 +44,8 @@
+ 
+ #include "linux/netdevice.h"
+ #include <linux/unaligned.h>
++#include <crypto/sha2.h>
++#include "wave_wds_ap.h"
+ #include <net/ieee80211_radiotap.h>
+ #ifdef MTCFG_SET_PM_QOS
+ #include "linux/pm_qos.h"
+@@ -3667,6 +3669,54 @@
+   return MTLK_ERR_OK;
+ }
+ 
++/* This WDS branch pairs the raw-control-port host contract with one AP
++ * image. Admission happens before upload; both cold start and recovery keep
++ * the CPUs reset until the entire firmware load succeeds.
++ */
++static int
++_mtlk_mmb_load_wds_ap(mtlk_cpu_mem_t *mem, mtlk_df_fw_file_buf_t *buf)
++{
++  uint8 digest[SHA256_DIGEST_SIZE];
++  mtlk_cpu_mem_t patch_mem[2] = { { 0 } };
++  mtlk_df_fw_file_buf_t patch_fb = { 0 };
++  unsigned int i;
++  int res;
++
++  if (buf->size != WAVE_WDS_AP_SIZE ||
++      mem[0].length != (int)WAVE_WDS_AP_SIZE || mem[0].swap) {
++    ELOG_V("WDS AP firmware size or IRAM mapping does not match");
++    return MTLK_ERR_FW;
++  }
++  sha256(buf->buffer, buf->size, digest);
++  if (memcmp(digest, wave_wds_ap_original_sha256, sizeof(digest))) {
++    ELOG_V("WDS AP firmware SHA256 does not match the original NETGEAR image");
++    return MTLK_ERR_FW;
++  }
++
++  res = _mtlk_mmb_load_fw2mem(mem, buf);
++  if (res != MTLK_ERR_OK)
++    return res;
++
++  /* The kernel firmware object stays const. Only the existing device IRAM
++   * destination is changed, using the same DWORD writer and error path.
++   * patch_fb borrows static bytes; it owns no request_firmware reference.
++   */
++  for (i = 0; i < ARRAY_SIZE(wave_wds_ap_spans); i++) {
++    const struct wave_wds_ap_span *span = &wave_wds_ap_spans[i];
++
++    patch_mem[0].start = (uint8 *)mem[0].start + span->offset;
++    patch_mem[0].length = span->size;
++    patch_fb.buffer = wave_wds_ap_code + span->data_offset;
++    patch_fb.size = span->size;
++    res = _mtlk_mmb_load_fw2mem(patch_mem, &patch_fb);
++    if (res != MTLK_ERR_OK)
++      return res;
++  }
++
++  ILOG0_V("Applied NETGEAR WDS AP correction 31bdd3e6");
++  return MTLK_ERR_OK;
++}
++
+ /*--- Start of Platform Specific ---*/
+ void __MTLK_IFUNC   mtlk_psdb_data_cleanup (hw_psdb_t *psdb);
+ int  __MTLK_IFUNC   mtlk_psdb_file_read_and_parse(mtlk_hw_api_t *hw_api, hw_psdb_t *psdb,
+@@ -4098,7 +4148,10 @@
+ 
+     ILOG1_SD("Loading '%s' of %d bytes", fw_info.fname, fb.size);
+ 
+-    res = _mtlk_mmb_load_fw2mem(fw_info.mem, &fb);
++    if (cpu == CHI_CPU_NUM_UM)
++      res = _mtlk_mmb_load_wds_ap(fw_info.mem, &fb);
++    else
++      res = _mtlk_mmb_load_fw2mem(fw_info.mem, &fb);
+ 
+     if (MTLK_ERR_OK == res) {
+       _mtlk_mmb_notify_firmware(hw, cpu, fw_info.fname, &fb);
+diff --git a/wireless/driver/shared/wave_wds_ap.h b/wireless/driver/shared/wave_wds_ap.h
+new file mode 100644
+--- /dev/null
++++ b/wireless/driver/shared/wave_wds_ap.h
+@@ -0,0 +1,100 @@
++/* Firmware instruction data for the pinned NETGEAR RAX40 image.
++ * Original firmware licensing applies; no additional permission is granted here.
++ */
++/* Generated by firmware/generate-loader-data.py; do not edit.
++ * Original AP SHA256: 6801144d7d45d66ffdb867624d4906a6f215243cd00fa9d1611333ddf6477908
++ * Reviewed corrected AP SHA256: f4c8d064aaf4e175d8c12f13c013277a69ea8eed446e312e77a7840052e51de6
++ */
++#ifndef WAVE_WDS_AP_IMAGE_H
++#define WAVE_WDS_AP_IMAGE_H
++
++#define WAVE_WDS_AP_SIZE 0x00180000u
++
++static const uint8 wave_wds_ap_original_sha256[32] = {
++  0x68, 0x01, 0x14, 0x4d, 0x7d, 0x45, 0xd6, 0x6f, 0xfd, 0xb8, 0x67, 0x62,
++  0x4d, 0x49, 0x06, 0xa6, 0xf2, 0x15, 0x24, 0x3c, 0xd0, 0x0f, 0xa9, 0xd1,
++  0x61, 0x13, 0x33, 0xdd, 0xf6, 0x47, 0x79, 0x08,
++};
++
++/* Preserve byte order through the native swap=FALSE raw-DWORD writer. */
++static const uint8 wave_wds_ap_code[716] __aligned(4) = {
++  0xee, 0xc2, 0x70, 0x40, 0x50, 0x41, 0x28, 0x45, 0xd2, 0x08, 0x20, 0x0d,
++  0x08, 0x46, 0xc3, 0x40, 0x07, 0x00, 0x68, 0x29, 0x37, 0x6e, 0x04, 0x40,
++  0x38, 0x60, 0xf4, 0x6d, 0x1f, 0x67, 0x53, 0x27, 0x7e, 0x90, 0x08, 0xf2,
++  0x3c, 0xd8, 0x2c, 0x71, 0xd6, 0x08, 0x6f, 0xfc, 0x8a, 0x22, 0x0c, 0x0c,
++  0xe5, 0x40, 0x10, 0x42, 0x27, 0x08, 0x56, 0x07, 0x02, 0x42, 0x11, 0x08,
++  0x16, 0x04, 0xcb, 0xb8, 0x11, 0x08, 0x00, 0x04, 0x49, 0x6a, 0x06, 0xf0,
++  0x09, 0x08, 0x10, 0x20, 0x4e, 0x70, 0x41, 0x68, 0xc1, 0x40, 0xa1, 0x41,
++  0x0a, 0x0a, 0x20, 0x0d, 0x6c, 0x71, 0xc1, 0x40, 0xa1, 0x41, 0xce, 0x09,
++  0x20, 0x0d, 0x22, 0x42, 0x11, 0x0a, 0x57, 0x27, 0xc1, 0x40, 0xa1, 0x41,
++  0x02, 0x42, 0xf2, 0x09, 0x20, 0x0d, 0x6c, 0x71, 0x14, 0x6e, 0xe5, 0x41,
++  0xb4, 0x78, 0xcb, 0xb9, 0xc3, 0x70, 0x09, 0x00, 0x58, 0x38, 0xa6, 0x08,
++  0x20, 0x0d, 0x20, 0xb0, 0xce, 0xc6, 0x00, 0x00, 0xd1, 0x01, 0x00, 0x00,
++  0x31, 0x08, 0x96, 0x06, 0x41, 0x28, 0x03, 0x05, 0xc2, 0xbb, 0x29, 0x0b,
++  0x91, 0x00, 0x5f, 0x21, 0x03, 0x03, 0x32, 0x23, 0x83, 0x0f, 0x0b, 0x00,
++  0x41, 0x38, 0x9f, 0x23, 0x06, 0x00, 0x00, 0x16, 0x01, 0x70, 0x0b, 0x00,
++  0x4c, 0x35, 0x3b, 0x63, 0x7f, 0x8b, 0xe0, 0xbb, 0x5c, 0x00, 0x02, 0x00,
++  0x71, 0x00, 0x00, 0x00, 0x25, 0x78, 0x9e, 0x08, 0xc0, 0x06, 0x15, 0x20,
++  0xc0, 0x23, 0x55, 0x20, 0x13, 0x08, 0x73, 0x08, 0x15, 0x21, 0x41, 0x28,
++  0x41, 0x20, 0x15, 0x25, 0x43, 0x10, 0x44, 0x20, 0x41, 0x20, 0x34, 0x69,
++  0xc3, 0x40, 0x00, 0x00, 0xff, 0x0f, 0x64, 0x42, 0x00, 0x28, 0x40, 0x00,
++  0x06, 0x22, 0x02, 0x00, 0x00, 0x2b, 0x40, 0x20, 0x45, 0x78, 0x00, 0xa3,
++  0x53, 0x00, 0x00, 0x00, 0x08, 0x44, 0xc3, 0x43, 0x09, 0x00, 0x68, 0x6c,
++  0x9f, 0x20, 0x03, 0x07, 0x64, 0x43, 0x19, 0x0a, 0x70, 0x00, 0x1b, 0x63,
++  0x7c, 0x44, 0x04, 0x20, 0x80, 0x0f, 0x00, 0x01, 0x00, 0x02, 0x8c, 0x20,
++  0x08, 0x80, 0xe0, 0x7c, 0x74, 0x44, 0x04, 0x20, 0x82, 0x0f, 0xff, 0xcf,
++  0xff, 0xff, 0x53, 0x21, 0x40, 0x00, 0x1c, 0xb8, 0x45, 0x78, 0x81, 0x41,
++  0x60, 0x42, 0xfd, 0x05, 0xcf, 0xff, 0x00, 0x00, 0x00, 0x00, 0x41, 0xd8,
++  0x2c, 0x70, 0x76, 0x09, 0xaf, 0xfb, 0x8a, 0x22, 0x0b, 0x05, 0x2f, 0x20,
++  0x4c, 0x02, 0x26, 0x00, 0x04, 0xa5, 0x69, 0xf0, 0x3e, 0xf0, 0x8f, 0x40,
++  0x0b, 0x08, 0xd6, 0x07, 0x37, 0x08, 0x96, 0x07, 0x17, 0xf0, 0x0b, 0x23,
++  0x80, 0x8f, 0x00, 0x00, 0x00, 0x60, 0x15, 0xf4, 0xa2, 0x0b, 0x60, 0x00,
++  0x6f, 0x78, 0x11, 0xe8, 0xaa, 0x0b, 0x60, 0x00, 0x20, 0xc0, 0x0d, 0xe8,
++  0x87, 0x40, 0x00, 0x41, 0xad, 0x20, 0x81, 0x0e, 0x5e, 0x0b, 0x60, 0x00,
++  0xad, 0x21, 0x43, 0x04, 0x03, 0xe8, 0x0b, 0xd8, 0x02, 0xf0, 0x09, 0xd8,
++  0xbd, 0x41, 0x04, 0x21, 0x81, 0x0f, 0xff, 0xe0, 0xff, 0xff, 0x18, 0xb8,
++  0x25, 0x78, 0x00, 0x45, 0x03, 0xa5, 0x53, 0x25, 0xc0, 0x00, 0x13, 0x08,
++  0xf0, 0x03, 0x20, 0xd8, 0x2c, 0x76, 0x8e, 0x09, 0xef, 0xf4, 0x8a, 0x22,
++  0x06, 0x05, 0x87, 0x40, 0x6d, 0x20, 0x41, 0x03, 0x1e, 0xb9, 0xb5, 0x40,
++  0xbe, 0xb8, 0x25, 0x78, 0x02, 0xa5, 0xd2, 0x08, 0x6f, 0xfb, 0xa1, 0x40,
++  0x06, 0x71, 0xb7, 0x05, 0xef, 0xff, 0x14, 0xe6, 0x8f, 0x45, 0xe0, 0xc9,
++  0x30, 0x70, 0x50, 0x08, 0x82, 0xfc, 0xca, 0xc7, 0x9a, 0xb8, 0xe1, 0x41,
++  0xa1, 0x42, 0xd1, 0x05, 0x0f, 0xf9, 0x00, 0x00, 0xc3, 0x42, 0x94, 0xa0,
++  0x3c, 0x78, 0x44, 0x43, 0x10, 0x23, 0x03, 0x00, 0x03, 0xe9, 0x0f, 0x23,
++  0x03, 0x00, 0xe0, 0x7f, 0x60, 0xa2, 0x02, 0x11, 0x80, 0x20, 0x1f, 0x20,
++  0x81, 0x0f, 0x00, 0x00, 0x80, 0x01, 0x32, 0x21, 0x81, 0x0f, 0x33, 0xa0,
++  0xff, 0xbe, 0x2d, 0x09, 0x16, 0x00, 0x7a, 0x11, 0x81, 0x20, 0x34, 0x71,
++  0x2c, 0x71, 0xca, 0x21, 0x21, 0x00, 0xca, 0x0f, 0xcf, 0xff, 0x0c, 0xf0,
++  0xc3, 0x40, 0x94, 0xa0, 0x44, 0x78, 0x1d, 0xd9, 0x20, 0xa0, 0xc3, 0x41,
++  0x7f, 0x00, 0x00, 0x03, 0xe0, 0x7f, 0x23, 0xa0, 0x97, 0x41, 0x59, 0xc8,
++  0x8b, 0x02, 0x40, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0xc2, 0x40, 0x3b, 0x05, 0x8f, 0xfa, 0x30, 0x70, 0xc3, 0x42, 0x94, 0xa0,
++  0x3c, 0x78, 0x44, 0x43, 0x10, 0x23, 0x03, 0x00, 0x03, 0xe9, 0x0f, 0x23,
++  0x03, 0x00, 0xe0, 0x7f, 0x60, 0xa2, 0x02, 0x11, 0x80, 0x20, 0x1f, 0x20,
++  0x81, 0x0f, 0x00, 0x00, 0x80, 0x01, 0x32, 0x21, 0x81, 0x0f, 0x33, 0xa0,
++  0xff, 0xbe, 0x2d, 0x09, 0x16, 0x00, 0x7a, 0x11, 0x81, 0x20, 0x34, 0x71,
++  0x2c, 0x71, 0xca, 0x21, 0x21, 0x00, 0xca, 0x0f, 0xcf, 0xff, 0x0c, 0xf0,
++  0xc3, 0x40, 0x94, 0xa0, 0x44, 0x78, 0x1d, 0xd9, 0x20, 0xa0, 0xc3, 0x41,
++  0x7f, 0x00, 0x00, 0x03, 0xe0, 0x7f, 0x23, 0xa0, 0x97, 0x41, 0x59, 0xc8,
++  0x97, 0x02, 0x40, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++  0xc2, 0x40, 0x2f, 0x05, 0x8f, 0xfa, 0x30, 0x70,
++};
++
++static const struct wave_wds_ap_span {
++  uint32 offset;
++  uint16 data_offset;
++  uint16 size;
++} wave_wds_ap_spans[] = {
++  { 0x0004bb54, 0, 140 },
++  { 0x0004d0c8, 140, 56 },
++  { 0x0004d25c, 196, 140 },
++  { 0x0005a8a0, 336, 4 },
++  { 0x0005a9e8, 340, 4 },
++  { 0x0005aa68, 344, 156 },
++  { 0x000f377c, 500, 100 },
++  { 0x000fe258, 600, 8 },
++  { 0x00143424, 608, 100 },
++  { 0x0014df0c, 708, 8 },
++};
++
++#endif /* WAVE_WDS_AP_IMAGE_H */
