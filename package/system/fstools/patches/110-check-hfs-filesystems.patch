@@ -1,0 +1,33 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] block: dispatch HFS filesystem checks to hfsprogs
+
+HFS and HFS+ volumes have no checker dispatch even when filesystem checking
+is enabled and hfsprogs is installed. Select its fsck.hfsplus binary for both
+probe types and use the existing noninteractive -p invocation.
+
+Keep checker absence and failure handling unchanged. This dispatch neither
+enables filesystem checking nor installs the optional checker.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/block.c
++++ b/block.c
+@@ -775,6 +775,7 @@
+ 	const char *fatfsck = "/usr/sbin/fsck.fat";
+ 	const char *btrfsck = "/usr/bin/btrfsck";
+ 	const char *ntfsck = "/usr/bin/ntfsfix";
++	const char *hfsck = "/usr/sbin/fsck.hfsplus";
+ 	const char *ckfs;
+ 
+ 	/* UBIFS does not need stuff like fsck */
+@@ -791,6 +792,8 @@
+ 		ckfs = btrfsck;
+ 	} else if (!strncmp(pr->type, "ntfs", 4)) {
+ 		ckfs = ntfsck;
++	} else if (!strcmp(pr->type, "hfs") || !strcmp(pr->type, "hfsplus")) {
++		ckfs = hfsck;
+ 	} else {
+ 		ULOG_ERR("check_filesystem: %s is not supported\n", pr->type);
+ 		return;
