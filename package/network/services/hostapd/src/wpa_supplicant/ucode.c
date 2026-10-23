@@ -269,7 +269,11 @@ void wpas_ucode_ctrl_event(struct wpa_supplicant *wpa_s, const char *str, size_t
 	uc_value_push(ucv_get(val));
 	uc_value_push(ucv_string_new_length(str, len));
 	/* Capture the native run at emission, before a replacement can start. */
+#ifdef CONFIG_WPS
 	uc_value_push(ucv_int64_new(wpa_s->wps_run));
+#else
+	uc_value_push(ucv_int64_new(0));
+#endif
 	ucv_put(wpa_ucode_call(4));
 }
 

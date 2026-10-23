@@ -435,7 +435,7 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 	if (!conf)
 		goto out;
 
-	if (idx > conf->num_bss || !conf->bss[idx])
+	if (idx >= conf->num_bss || !conf->bss[idx])
 		goto free;
 
 	if (ucv_boolean_get(files_only)) {
