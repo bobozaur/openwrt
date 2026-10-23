@@ -607,7 +607,7 @@ export function scan(dev) {
 		// Keep the first owned result even when another radio reports later
 		// in the same received batch.
 		listener = nl80211.listener((event) => {
-			if (res || event.msg?.ifindex != ifindex)
+			if (res || err || event.msg?.ifindex != ifindex)
 				return;
 			res = event;
 			// A deferred event may run before the loop's poll phase. A
@@ -622,6 +622,10 @@ export function scan(dev) {
 			err = "Unable to subscribe to scan events: " + nl80211.error();
 		} else {
 			listener.set_overrun_handler(() => {
+				// A later loss notification does not invalidate a complete
+				// owned result already delivered in this dispatch snapshot.
+				if (res || err)
+					return;
 				err = "Scan event buffer overrun";
 				wake ??= uloop.timer(1, () => {});
 			});
