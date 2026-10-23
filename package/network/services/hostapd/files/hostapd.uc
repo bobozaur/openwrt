@@ -102,7 +102,7 @@ nas_identifier=${nasid}
 `;
 		if (start_disabled)
 			str += `
-start_disabled=1
+start_deferred=1
 `;
 	}
 
@@ -217,7 +217,7 @@ function apsta_check(tx)
 	if (!status)
 		return apsta_fail(tx, 'AP state unavailable');
 	if (tx.phase == 'resuming') {
-		if (!status.beaconing || (tx.target && !status.matches))
+		if (!status.ready || (tx.target && !status.matches))
 			apsta_fail(tx, 'AP permission changed during STA resume');
 		return;
 	}
@@ -230,7 +230,7 @@ function apsta_check(tx)
 	}
 	if (status.state == 'DISABLED' || status.state == 'NO_IR')
 		return apsta_fail(tx, `AP entered ${status.state}`);
-	if (!status.beaconing)
+	if (!status.ready)
 		return;
 	if (tx.target && !status.matches)
 		return apsta_fail(tx, 'AP selected a different channel');
@@ -261,7 +261,7 @@ function apsta_follow(phy, config, iface, target, follow, csa_count)
 	if (previous && previous.follow == follow && is_equal(previous.target, target))
 		return true;
 	apsta_cancel(phy, true);
-	if (!previous && target && status.beaconing &&
+	if (!previous && target && status.ready &&
 	    status.needs_cac === false && !(csa_count != null && status.radar)) {
 		if (csa_count != null) {
 			// The native STA callback submits the single physical firmware
@@ -660,6 +660,7 @@ function csa_timer_cancel(name)
 function iface_restart(phydev, config, old_config)
 {
 	let phy = phydev.name;
+	apsta_cancel(phy, true);
 	let pending = hostapd.data.pending_config[phy];
 
 	csa_timer_cancel(phy);
@@ -1307,6 +1308,14 @@ function iface_reload_config(name, phydev, config, old_config)
 	if (!old_config || old_config.station_phy != config.station_phy)
 		return false;
 
+	// A paused/authenticating AP+STA must retain its start barrier. Use the
+	// existing restart/setup owner to arbitrate again; never incrementally
+	// start BSSs or cancel a pending transition as an unchanged-config side effect.
+	if (config.station_phy &&
+	    (hostapd.data.apsta_pending[name] ||
+	     !hostapd.interfaces[name]?.channel_status()?.ready))
+		return false;
+
 	switch (radio_reload_class(old_config.radio, config.radio)) {
 	case "restart":
 		return false;
@@ -1754,7 +1763,6 @@ function mld_link_bss_remove(phy, name)
 function iface_set_config(name, config)
 {
 	let old_config = hostapd.data.config[name];
-	apsta_cancel(name, true);
 
 	if (!config) {
 		delete hostapd.data.config[name];
@@ -2356,7 +2364,7 @@ let main_obj = {
 					if (req.args.station_state == 'AUTHENTICATING') {
 						apsta_cancel(phy, true);
 						iface.stop();
-					} else if (!iface.channel_status()?.beaconing) {
+					} else if (!iface.channel_status()?.ready) {
 						apsta_follow(phy, config, iface, null, false);
 					}
 					return 0;
@@ -2637,9 +2645,10 @@ let main_obj = {
 					!!hostapd.data.apsta_pending[phy_name];
 				let iface = hostapd.interfaces[phy_name];
 				let state = iface?.state();
-				let is_running = iface && iface.channel_status()?.beaconing && !is_pending;
+				let bss_state = iface?.channel_status()?.bss;
 
 				for (let bss in config.bss) {
+					let is_running = !!bss_state?.[bss.ifname]?.beaconing && !is_pending;
 					let ifname = bss.ifname;
 					let entry = interfaces[ifname];
 
@@ -2777,8 +2786,8 @@ return {
 
 		// This is the same registered ubus context that owns config_set.
 		// A synchronous call queues nested INVOKE messages until the current
-		// native WPS/SOAP callback unwinds. Commit precedes protocol success;
-		// normal netifd reload applies it afterwards.
+		// native WPS/SOAP callback unwinds. Commit and committed-wireless
+		// reload acceptance precede protocol success.
 		let result = ubus.call('uci', 'wireless_enroll', { ...owner, mode: 'ap', values });
 		if (result?.status != 'saved') {
 			hostapd.printf('WPS AP settings on ' + ifname + ': ' +
@@ -2793,7 +2802,7 @@ return {
 	iface_state: function(phy, iface, state, channel_changed) {
 		let tx = hostapd.data.apsta_pending[phy];
 		if (channel_changed && hostapd.data.config[phy]?.station_phy &&
-		    hostapd.interfaces[phy] == iface && iface.channel_status()?.beaconing &&
+		    hostapd.interfaces[phy] == iface && iface.channel_status()?.ready &&
 		    !iface.update_beacons()) {
 			hostapd.printf(`Failed to refresh AP beacons after shared channel switch on ${phy}`);
 			apsta_cancel(phy, true);

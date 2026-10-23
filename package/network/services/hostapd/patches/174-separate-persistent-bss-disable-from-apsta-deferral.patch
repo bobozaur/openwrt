@@ -1,0 +1,55 @@
+Subject: [PATCH] ap: distinguish persistent disable from native AP+STA deferral
+
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -2481,6 +2481,8 @@
+ 		bss->wds_sta = atoi(pos);
+ 	} else if (os_strcmp(buf, "start_disabled") == 0) {
+ 		bss->start_disabled = atoi(pos);
++	} else if (os_strcmp(buf, "start_deferred") == 0) {
++		bss->start_deferred = atoi(pos) != 0;
+ 	} else if (os_strcmp(buf, "ap_isolate") == 0) {
+ 		bss->isolate = atoi(pos);
+ 	} else if (os_strcmp(buf, "ap_max_inactivity") == 0) {
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -364,6 +364,8 @@
+ 	int wds_sta;
+ 	int isolate;
+ 	int start_disabled;
++	/* OpenWrt defers initial beacons until its co-located STA is ready. */
++	bool start_deferred;
+ 
+ 	int auth_algs; /* bitfield of allowed IEEE 802.11 authentication
+ 			* algorithms, WPA_AUTH_ALG_{OPEN,SHARED,LEAP} */
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2774,6 +2774,10 @@
+ 	int res, ret = -1, i;
+ 	struct hostapd_hw_modes *mode;
+ 
++	/* The temporary AP+STA barrier is released only by its native owner. */
++	if (hapd->conf->start_deferred)
++		return 0;
++
+ 	if (!hapd->drv_priv) {
+ 		wpa_printf(MSG_ERROR, "Interface is disabled");
+ 		return -1;
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1698,10 +1698,11 @@
+ {
+ 	struct hostapd_bss_config *conf = hapd->conf;
+ 
+-	if (!conf->start_disabled && ieee802_11_set_beacon(hapd) < 0)
+-		return -1;
+-
+-	if (flush_old_stations && !conf->start_disabled &&
++	if (!conf->start_disabled && !conf->start_deferred &&
++	    ieee802_11_set_beacon(hapd) < 0)
++		return -1;
++
++	if (flush_old_stations && !conf->start_disabled && !conf->start_deferred &&
+ 	    conf->broadcast_deauth) {
+ 		u8 addr[ETH_ALEN];
+ 
