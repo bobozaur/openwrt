@@ -1,0 +1,162 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netfilter: flowtable: keep direct output tied to its route
+
+A direct flow keeps its L2 output and MTU after dropping the route reference.
+After hardware withdrawal, the software path can therefore continue using
+those cached values across a FIB replacement or device MTU change. Retain the
+native route reference for direct output as for neighbor output, check its
+cookie, and retire a tuple whose current forwarding MTU changed. The existing
+teardown and slow path then select current routing policy before any rewrite.
+
+Keep the validated direct output in the existing per-hook context, under the
+same RCU lifetime, rather than looking it up again before transmission.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -141,12 +141,11 @@
+ 					port_vlans:2,
+ 					in_vlan_ingress:2;
+ 	u16				mtu;
++	/* Direct L2 output still depends on the route which admitted it. */
++	struct dst_entry		*dst_cache;
++	u32				dst_cookie;
+ 	union {
+-		struct {
+-			struct dst_entry *dst_cache;
+-			u32		ifidx;
+-			u32		dst_cookie;
+-		};
++		u32			ifidx;
+ 		struct {
+ 			u32		ifidx;
+ 			u32		hw_ifidx;
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -132,18 +132,17 @@
+ 		flow_tuple->bridge_vlan = route->tuple[dir].out.bridge_vlan;
+ 		flow_tuple->port_vlans = route->tuple[dir].out.port_vlans;
+ 		flow_tuple->out.hw_ifidx = route->tuple[dir].out.hw_ifindex;
+-		dst_release(dst);
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_XFRM:
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+ 		flow_tuple->ifidx = route->tuple[dir].out.ifindex;
+-		flow_tuple->dst_cache = dst;
+-		flow_tuple->dst_cookie = flow_offload_dst_cookie(flow_tuple);
+ 		break;
+ 	default:
+ 		WARN_ON_ONCE(1);
+ 		break;
+ 	}
++	flow_tuple->dst_cache = dst;
++	flow_tuple->dst_cookie = flow_offload_dst_cookie(flow_tuple);
+ 	flow_tuple->xmit_type = route->tuple[dir].xmit_type;
+ 
+ 	return 0;
+@@ -153,7 +152,8 @@
+ 				 enum flow_offload_tuple_dir dir)
+ {
+ 	if (flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
+-	    flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_XFRM)
++	    flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_XFRM ||
++	    flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
+ 		dst_release(flow->tuplehash[dir].tuple.dst_cache);
+ }
+ 
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -170,6 +170,8 @@
+ 
+ struct nf_flowtable_ctx {
+ 	const struct net_device	*in;
++	/* Validated DIRECT output, borrowed for this hook under RCU. */
++	struct net_device	*out;
+ 	u32			offset;
+ 	u32			hdrsize;
+ };
+@@ -258,13 +260,41 @@
+ 	return true;
+ }
+ 
+-static inline bool nf_flow_dst_check(struct flow_offload_tuple *tuple)
+-{
++static inline bool nf_flow_dst_check(struct nf_flowtable *flow_table,
++				     struct flow_offload_tuple *tuple,
++				     struct nf_flowtable_ctx *ctx)
++{
++	struct net_device *outdev;
++	unsigned int mtu;
++
+ 	if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH &&
+-	    tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM)
++	    tuple->xmit_type != FLOW_OFFLOAD_XMIT_XFRM &&
++	    tuple->xmit_type != FLOW_OFFLOAD_XMIT_DIRECT)
+ 		return true;
+ 
+-	return dst_check(tuple->dst_cache, tuple->dst_cookie);
++	if (!dst_check(tuple->dst_cache, tuple->dst_cookie))
++		return false;
++
++	/* A current route may still have changed its device/forwarding MTU.
++	 * Retire the old tuple before either family rewrites or transmits it.
++	 */
++	if (tuple->l3proto == NFPROTO_IPV4)
++		mtu = ip_dst_mtu_maybe_forward(tuple->dst_cache, true);
++	else
++		mtu = ip6_dst_mtu_maybe_forward(tuple->dst_cache, true);
++
++	if (tuple->xmit_type == FLOW_OFFLOAD_XMIT_DIRECT) {
++		/* Bridge path resolution can select a lower device whose MTU
++		 * is smaller than the retained L3 route's device.
++		 */
++		outdev = dev_get_by_index_rcu(read_pnet(&flow_table->net),
++					     tuple->out.ifidx);
++		if (!outdev || READ_ONCE(outdev->mtu) < tuple->mtu)
++			return false;
++		ctx->out = outdev;
++	}
++
++	return mtu == tuple->mtu;
+ }
+ 
+ static unsigned int nf_flow_xmit_xfrm(struct sk_buff *skb,
+@@ -398,7 +428,7 @@
+ 	if (nf_flow_state_check(flow, iph->protocol, skb, thoff))
+ 		return 0;
+ 
+-	if (!nf_flow_dst_check(&tuplehash->tuple)) {
++	if (!nf_flow_dst_check(flow_table, &tuplehash->tuple, ctx)) {
+ 		flow_offload_teardown(flow);
+ 		return 0;
+ 	}
+@@ -478,7 +508,7 @@
+ 		skb_dst_set_noref(skb, &rt->dst);
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+-		xmit.outdev = dev_get_by_index_rcu(state->net, tuplehash->tuple.out.ifidx);
++		xmit.outdev = ctx.out;
+ 		if (!xmit.outdev) {
+ 			flow_offload_teardown(flow);
+ 			return NF_DROP;
+@@ -687,7 +717,7 @@
+ 	if (nf_flow_state_check(flow, ip6h->nexthdr, skb, thoff))
+ 		return 0;
+ 
+-	if (!nf_flow_dst_check(&tuplehash->tuple)) {
++	if (!nf_flow_dst_check(flow_table, &tuplehash->tuple, ctx)) {
+ 		flow_offload_teardown(flow);
+ 		return 0;
+ 	}
+@@ -783,7 +813,7 @@
+ 		skb_dst_set_noref(skb, &rt->dst);
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_DIRECT:
+-		xmit.outdev = dev_get_by_index_rcu(state->net, tuplehash->tuple.out.ifidx);
++		xmit.outdev = ctx.out;
+ 		if (!xmit.outdev) {
+ 			flow_offload_teardown(flow);
+ 			return NF_DROP;

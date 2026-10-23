@@ -1,0 +1,396 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] netfilter: flowtable: validate cached L2 output before reuse
+
+DIRECT software output bypasses neighbor and root-bridge forwarding
+after initial admission. Retain its native neighbor and bridge path
+signature so a changed neighbor, FDB destination or bridge VLAN policy
+tears down the old flow before rewriting another packet. VLAN and
+PPPoE upper devices retain their normal lower forwarding ownership.
+
+Delayed hardware REPLACE also needs current source authority: DIRECT
+rules copy cached Ethernet addresses and NEIGH rules sample them while
+building actions. Validate those identities again through a borrowed
+synchronous callback; the provider owns ordinary teardown on mismatch.
+Drivers can place the check inside their notifier admission interval
+without retaining flowtable objects or interpreting private cookies.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/include/net/netfilter/nf_flow_table.h
++++ b/include/net/netfilter/nf_flow_table.h
+@@ -47,6 +47,8 @@
+ struct nf_flow_rule {
+ 	struct nf_flow_match	match;
+ 	struct flow_rule	*rule;
++	u8			h_source[ETH_ALEN];
++	u8			h_dest[ETH_ALEN];
+ };
+ 
+ struct nf_flowtable_type {
+@@ -106,6 +108,13 @@
+ };
+ 
+ #define NF_FLOW_TABLE_ENCAP_MAX		2
++
++/* Root bridge state captured by the native forwarding-path resolver. */
++struct flow_offload_bridge {
++	u16 vlan_id;
++	__be16 vlan_proto;
++	u8 vlan_mode;
++};
+ 
+ struct flow_offload_tuple {
+ 	union {
+@@ -151,6 +160,8 @@
+ 			u32		hw_ifidx;
+ 			u8		h_source[ETH_ALEN];
+ 			u8		h_dest[ETH_ALEN];
++			struct neighbour *neigh;
++			struct flow_offload_bridge bridge;
+ 		} out;
+ 		struct {
+ 			u32		iifidx;
+@@ -217,6 +228,7 @@
+ 			u32			hw_ifindex;
+ 			u8			h_source[ETH_ALEN];
+ 			u8			h_dest[ETH_ALEN];
++			struct flow_offload_bridge bridge;
+ 			u8			bridge_path:1,
+ 						bridge_vlan:1,
+ 						port_vlans:2;
+@@ -230,6 +242,12 @@
+ 
+ struct nft_flowtable;
+ struct nft_pktinfo;
++bool nf_flow_direct_valid(const struct flow_offload_tuple *tuple,
++			  const struct net_device *outdev);
++bool nf_flow_route_valid(struct nf_flowtable *table, const struct flow_offload *flow,
++			 enum flow_offload_tuple_dir rule_dir,
++			 const struct nf_flow_rule *rule);
++
+ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
+ 		   struct nf_flow_route *route, enum ip_conntrack_dir dir,
+ 		   struct nft_flowtable *ft);
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -697,6 +697,13 @@
+ 	bool use_act_stats;
+ 	unsigned long cookie;
+ 	struct flow_rule *rule;
++	/* Optional source admission check for this synchronous REPLACE call.
++	 * Neither callback nor borrowed context may be retained by a driver.
++	 */
++	bool (*validate)(void *priv);
++	void *validate_priv;
++	/* Optional route, borrowed only for this synchronous REPLACE call. */
++	struct dst_entry *dst;
+ 	struct flow_stats stats;
+ 	u32 classid;
+ };
+--- a/net/netfilter/nf_flow_table_core.c
++++ b/net/netfilter/nf_flow_table_core.c
+@@ -14,6 +14,7 @@
+ #include <net/netfilter/nf_conntrack_core.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_tuple.h>
++#include <net/neighbour.h>
+ 
+ static DEFINE_MUTEX(flowtable_lock);
+ static LIST_HEAD(flowtables);
+@@ -132,6 +133,11 @@
+ 		flow_tuple->bridge_vlan = route->tuple[dir].out.bridge_vlan;
+ 		flow_tuple->port_vlans = route->tuple[dir].out.port_vlans;
+ 		flow_tuple->out.hw_ifidx = route->tuple[dir].out.hw_ifindex;
++		flow_tuple->out.bridge = route->tuple[dir].out.bridge;
++		/* One native neighbour reference, never another hash lookup per packet. */
++		if (dst->dev->type == ARPHRD_ETHER && dst->dev->addr_len == ETH_ALEN)
++			flow_tuple->out.neigh =
++				dst_neigh_lookup(dst, &flow->tuplehash[!dir].tuple.src_v4);
+ 		break;
+ 	case FLOW_OFFLOAD_XMIT_XFRM:
+ 	case FLOW_OFFLOAD_XMIT_NEIGH:
+@@ -151,6 +157,9 @@
+ static void nft_flow_dst_release(struct flow_offload *flow,
+ 				 enum flow_offload_tuple_dir dir)
+ {
++	if (flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT &&
++	    flow->tuplehash[dir].tuple.out.neigh)
++		neigh_release(flow->tuplehash[dir].tuple.out.neigh);
+ 	if (flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
+ 	    flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_XFRM ||
+ 	    flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_DIRECT)
+--- a/net/netfilter/nf_flow_table_ip.c
++++ b/net/netfilter/nf_flow_table_ip.c
+@@ -312,6 +312,8 @@
+ 		    outdev != tuple->dst_cache->dev &&
+ 		    netdev_master_upper_dev_get_rcu(outdev) != tuple->dst_cache->dev)
+ 			return false;
++		if (!nf_flow_direct_valid(tuple, outdev))
++			return false;
+ 		ctx->out = outdev;
+ 	}
+ 
+--- a/net/netfilter/nf_flow_table_path.c
++++ b/net/netfilter/nf_flow_table_path.c
+@@ -8,6 +8,8 @@
+ #include <linux/netfilter/nf_conntrack_common.h>
+ #include <linux/netfilter/nf_tables.h>
+ #include <net/ip.h>
++#include <net/ip6_route.h>
++#include <net/neighbour.h>
+ #include <net/inet_dscp.h>
+ #include <net/netfilter/nf_tables.h>
+ #include <net/netfilter/nf_tables_core.h>
+@@ -41,13 +43,10 @@
+ 	return true;
+ }
+ 
+-static int nft_dev_fill_forward_path(const struct nf_flow_route *route,
+-				     const struct dst_entry *dst_cache,
+-				     const struct nf_conn *ct,
+-				     enum ip_conntrack_dir dir, u8 *ha,
++static int nft_dev_fill_forward_path(const struct dst_entry *dst_cache,
++				     const void *daddr, u8 *ha,
+ 				     struct net_device_path_stack *stack)
+ {
+-	const void *daddr = &ct->tuplehash[!dir].tuple.src.u3;
+ 	struct net_device *dev = dst_cache->dev;
+ 	struct net_device_path_ctx ctx = {
+ 		.dev = dev,
+@@ -92,6 +91,7 @@
+ 	u8 ingress_vlans;
+ 	u8 h_source[ETH_ALEN];
+ 	u8 h_dest[ETH_ALEN];
++	struct flow_offload_bridge bridge;
+ 	u8 bridge_path:1,
+ 	   bridge_vlan:1,
+ 	   port_vlans:2;
+@@ -143,6 +143,11 @@
+ 				memcpy(info->h_dest, path->encap.h_dest, ETH_ALEN);
+ 			break;
+ 		case DEV_PATH_BRIDGE:
++			if (!i) {
++				info->bridge.vlan_id = path->bridge.vlan_id;
++				info->bridge.vlan_proto = path->bridge.vlan_proto;
++				info->bridge.vlan_mode = path->bridge.vlan_mode;
++			}
+ 			if (is_zero_ether_addr(info->h_source))
+ 				memcpy(info->h_source, path->dev->dev_addr, ETH_ALEN);
+ 
+@@ -220,7 +225,7 @@
+ 	unsigned char ha[ETH_ALEN];
+ 	int i;
+ 
+-	if (nft_dev_fill_forward_path(route, dst, ct, dir, ha, &stack) >= 0)
++	if (nft_dev_fill_forward_path(dst, &ct->tuplehash[!dir].tuple.src.u3, ha, &stack) >= 0)
+ 		nft_dev_path_info(&stack, &info, ha, &ft->data);
+ 
+ 	/* Keep neighbour output on its route device unless the resolved path
+@@ -248,9 +253,131 @@
+ 		route->tuple[dir].out.bridge_vlan = info.bridge_vlan;
+ 		route->tuple[dir].out.port_vlans = info.port_vlans;
+ 		route->tuple[dir].out.hw_ifindex = info.hw_outdev->ifindex;
++		route->tuple[dir].out.bridge = info.bridge;
+ 		route->tuple[dir].xmit_type = info.xmit_type;
+ 	}
+ }
++
++/* The packet hook already holds RCU. VLAN/PPPoE upper owners still perform
++ * lower-device forwarding; a root bridge DIRECT path bypasses that owner.
++ */
++bool nf_flow_direct_valid(const struct flow_offload_tuple *tuple,
++			  const struct net_device *outdev)
++{
++	const struct net_device *dev = tuple->dst_cache->dev;
++	struct net_device_path_ctx ctx;
++	struct net_device_path path;
++	struct neighbour *n = tuple->out.neigh;
++	u8 ha[ETH_ALEN];
++
++	if (dev->type == ARPHRD_ETHER && dev->addr_len == ETH_ALEN) {
++		if (!n || READ_ONCE(n->dead) || !(READ_ONCE(n->nud_state) & NUD_VALID))
++			return false;
++		neigh_ha_snapshot(ha, n, dev);
++		if (!ether_addr_equal(ha, tuple->out.h_dest) ||
++		    !ether_addr_equal(dev->dev_addr, tuple->out.h_source))
++			return false;
++	}
++	if (!netif_is_bridge_master(dev))
++		return true;
++	if (!dev->netdev_ops->ndo_fill_forward_path)
++		return false;
++	memset(&ctx, 0, sizeof(ctx));
++	memset(&path, 0, sizeof(path));
++	ctx.dev = dev;
++	ether_addr_copy(ctx.daddr, tuple->out.h_dest);
++	if (dev->netdev_ops->ndo_fill_forward_path(&ctx, &path))
++		return false;
++	return path.type == DEV_PATH_BRIDGE && path.dev == dev && ctx.dev == outdev &&
++		path.bridge.vlan_id == tuple->out.bridge.vlan_id &&
++		path.bridge.vlan_proto == tuple->out.bridge.vlan_proto &&
++		path.bridge.vlan_mode == tuple->out.bridge.vlan_mode;
++}
++
++/* Cold publication/replay validates the original native resolver's complete
++ * output and ingress/encapsulation identity, without changing a live hash key.
++ * No RCU/neighbor lock survives this function, and RTNL is never acquired.
++ */
++bool nf_flow_route_valid(struct nf_flowtable *table, const struct flow_offload *flow,
++			 enum flow_offload_tuple_dir rule_dir,
++			 const struct nf_flow_rule *rule)
++{
++	const struct flow_offload_tuple *tuple, *other;
++	struct net_device_path_stack stack;
++	struct nft_forward_info info;
++	struct net_device *outdev;
++	struct neighbour *n;
++	u8 ha[MAX_ADDR_LEN];
++	unsigned int mtu;
++	int dir, i, j;
++	bool valid = false;
++
++	rcu_read_lock();
++	for (dir = 0; dir < FLOW_OFFLOAD_DIR_MAX; dir++) {
++		tuple = &flow->tuplehash[dir].tuple;
++		if (tuple->xmit_type != FLOW_OFFLOAD_XMIT_DIRECT &&
++		    (tuple->xmit_type != FLOW_OFFLOAD_XMIT_NEIGH || dir != rule_dir))
++			continue;
++		other = &flow->tuplehash[!dir].tuple;
++		if (!dst_check(tuple->dst_cache, tuple->dst_cookie))
++			goto out;
++		mtu = tuple->l3proto == NFPROTO_IPV4 ?
++			ip_dst_mtu_maybe_forward(tuple->dst_cache, true) :
++			ip6_dst_mtu_maybe_forward(tuple->dst_cache, true);
++		if (tuple->mtu != mtu)
++			goto out;
++		if (tuple->xmit_type == FLOW_OFFLOAD_XMIT_NEIGH) {
++			/* The native Ethernet builders sampled these exact rule bytes.
++			 * Software NEIGH output itself continues to resolve normally.
++			 */
++			outdev = dev_get_by_index_rcu(read_pnet(&table->net), other->iifidx);
++			if (!outdev || READ_ONCE(outdev->mtu) < tuple->mtu ||
++			    !ether_addr_equal(outdev->dev_addr, rule->h_source))
++				goto out;
++			n = dst_neigh_lookup(tuple->dst_cache, &other->src_v4);
++			if (!n)
++				goto out;
++			valid = !READ_ONCE(n->dead) && (READ_ONCE(n->nud_state) & NUD_VALID);
++			neigh_ha_snapshot(ha, n, tuple->dst_cache->dev);
++			neigh_release(n);
++			if (!valid || !ether_addr_equal(ha, rule->h_dest)) {
++				valid = false;
++				goto out;
++			}
++			valid = false;
++			continue;
++		}
++		outdev = dev_get_by_index_rcu(read_pnet(&table->net), tuple->out.ifidx);
++		if (!outdev || READ_ONCE(outdev->mtu) < tuple->mtu ||
++		    !nf_flow_direct_valid(tuple, outdev))
++			goto out;
++		memset(&info, 0, sizeof(info));
++		if (nft_dev_fill_forward_path(tuple->dst_cache, &other->src_v4, ha, &stack) < 0)
++			goto out;
++		nft_dev_path_info(&stack, &info, ha, table);
++		if (!info.indev || !info.outdev || !info.hw_outdev ||
++		    info.xmit_type != FLOW_OFFLOAD_XMIT_DIRECT ||
++		    info.outdev->ifindex != tuple->out.ifidx ||
++		    info.hw_outdev->ifindex != tuple->out.hw_ifidx ||
++		    info.indev->ifindex != other->iifidx ||
++		    !ether_addr_equal(info.h_source, tuple->out.h_source) ||
++		    !ether_addr_equal(info.h_dest, tuple->out.h_dest) ||
++		    info.num_encaps != other->encap_num)
++			goto out;
++		for (i = 0; i < info.num_encaps; i++) {
++			j = info.num_encaps - i - 1;
++			if (info.encap[i].id != other->encap[j].id ||
++			    info.encap[i].proto != other->encap[j].proto ||
++			    !!(info.ingress_vlans & BIT(i)) !=
++			    !!(other->in_vlan_ingress & BIT(j)))
++				goto out;
++		}
++	}
++	valid = true;
++out:
++	rcu_read_unlock();
++	return valid;
++}
+ 
+ int nft_flow_route(const struct nft_pktinfo *pkt, const struct nf_conn *ct,
+ 		   struct nf_flow_route *route, enum ip_conntrack_dir dir,
+--- a/net/netfilter/nf_flow_table_offload.c
++++ b/net/netfilter/nf_flow_table_offload.c
+@@ -261,6 +261,9 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	ether_addr_copy(flow_rule->h_source, addr);
++	addr = flow_rule->h_source;
++
+ 	mask = ~0xffff0000;
+ 	memcpy(&val16, addr, 2);
+ 	val = val16 << 16;
+@@ -322,6 +325,8 @@
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
++
++	ether_addr_copy(flow_rule->h_dest, ha);
+ 
+ 	mask = ~0xffffffff;
+ 	memcpy(&val, ha, 4);
+@@ -896,6 +901,24 @@
+ 	cls_flow->cookie = (unsigned long)tuple;
+ }
+ 
++struct nf_flow_offload_validity {
++	struct nf_flowtable *table;
++	struct flow_offload *flow;
++	const struct nf_flow_rule *rule;
++	enum flow_offload_tuple_dir dir;
++};
++
++static bool nf_flow_offload_validate(void *priv)
++{
++	struct nf_flow_offload_validity *source = priv;
++
++	if (!test_bit(NF_FLOW_TEARDOWN, &source->flow->flags) &&
++	    nf_flow_route_valid(source->table, source->flow, source->dir, source->rule))
++		return true;
++	flow_offload_teardown(source->flow);
++	return false;
++}
++
+ static int nf_flow_offload_tuple(struct nf_flowtable *flowtable,
+ 				 struct flow_offload *flow,
+ 				 struct nf_flow_rule *flow_rule,
+@@ -904,6 +927,9 @@
+ 				 struct flow_stats *stats,
+ 				 struct list_head *block_cb_list)
+ {
++	struct nf_flow_offload_validity validity = {
++		.table = flowtable, .flow = flow, .rule = flow_rule, .dir = dir,
++	};
+ 	struct flow_cls_offload cls_flow = {};
+ 	struct netlink_ext_ack extack = {};
+ 	struct flow_block_cb *block_cb;
+@@ -912,8 +938,16 @@
+ 
+ 	nf_flow_offload_init(&cls_flow, proto, priority, cmd,
+ 			     &flow->tuplehash[dir].tuple, &extack);
+-	if (cmd == FLOW_CLS_REPLACE)
++	if (cmd == FLOW_CLS_REPLACE) {
+ 		cls_flow.rule = flow_rule->rule;
++		if (flow->type == NF_FLOW_OFFLOAD_ROUTE) {
++			cls_flow.dst = flow->tuplehash[dir].tuple.dst_cache;
++			cls_flow.validate = nf_flow_offload_validate;
++			cls_flow.validate_priv = &validity;
++			if (!cls_flow.validate(cls_flow.validate_priv))
++				return 0;
++		}
++	}
+ 
+ 	down_read(&flowtable->flow_block_lock);
+ 	list_for_each_entry(block_cb, block_cb_list, list) {
