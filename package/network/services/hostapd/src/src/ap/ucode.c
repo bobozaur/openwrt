@@ -1023,7 +1023,8 @@ out:
 		wpa_printf(MSG_INFO, "DFS CAC required on new channel, restart interface");
 		/* fallthrough */
 	default:
-		uc_hostapd_disable_iface(iface);
+		if (uc_hostapd_disable_iface(iface))
+			return ucv_boolean_new(false);
 		break;
 	}
 
@@ -1036,8 +1037,11 @@ out:
 	if (iface->state != HAPD_IFACE_ENABLED) {
 		int ret = hostapd_enable_iface(iface);
 
-		if (ret < 0)
+		if (ret < 0) {
+			for (i = 0; i < iface->num_bss; i++)
+				iface->bss[i]->conf->start_deferred = 1;
 			uc_hostapd_disable_iface(iface);
+		}
 		hostapd_ucode_update_interfaces();
 		hostapd_ucode_iface_state_changed(iface);
 		return ucv_boolean_new(ret == 0);
