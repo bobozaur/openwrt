@@ -76,10 +76,15 @@ documents the serial header and 115200 8N1 console; it does not provide an
 installation method for this port. OEM web recovery has not been established
 as a way to load these OpenWrt images.
 
-Keep the full `sysupgrade.bin` from the preceding build. In ordinary
-`menuconfig`, select the smaller **TP-Link Archer AX50 v1** device profile and
-an embedded ramdisk under **Target Images** (`CONFIG_TARGET_ROOTFS_INITRAMFS=y`,
-with separate initramfs disabled). Build its
+Save the full `.config` and copy the full `sysupgrade.bin` outside the build
+output directory before rebuilding. Move the saved configuration aside so
+`.config` is absent when starting ordinary `make menuconfig`. From that fresh
+selection, choose **Lantiq**, **GRX500**, the smaller **TP-Link Archer AX50 v1**
+device profile, and an embedded ramdisk under **Target Images**
+(`CONFIG_TARGET_ROOTFS_INITRAMFS=y`,
+`CONFIG_TARGET_ROOTFS_INITRAMFS_SEPARATE=n`). Switching profiles in the full
+configuration retains explicit package selections and does not produce the
+smaller recovery image. Build the freshly selected profile's
 `openwrt-lantiq-grx500-tplink_archer-ax50-v1-initramfs-uImage`. Both compressed
 and expanded size bounds are enforced; the full services profile is not a
 recovery ramdisk. Use a 3.3 V TTL UART with TX/RX/GND and no VCC connection.
