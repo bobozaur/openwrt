@@ -584,9 +584,12 @@ export function scan(dev) {
 		scan_ssids: [ '' ],
 	};
 
+	// Module errors are sticky; claim only this request's reply error.
+	nl80211.error();
 	let iface = nl80211.request(nl80211.const.NL80211_CMD_GET_INTERFACE, 0, { dev });
-	if (!iface?.ifindex) {
-		warn("Unable to resolve scan interface " + dev + ": " + nl80211.error() + "\n");
+	let iface_error = nl80211.error();
+	if (iface_error || !iface?.ifindex) {
+		warn("Unable to resolve scan interface " + dev + ": " + (iface_error ?? "Interface not found") + "\n");
 		return null;
 	}
 	let ifindex = iface.ifindex;
@@ -629,6 +632,7 @@ export function scan(dev) {
 				// Match the native iwinfo observer budget, including home-
 				// channel service between background scan channel visits.
 				let deadline = now[0] * 1000 + int(now[1] / 1000000) + 60000;
+				nl80211.error();
 				nl80211.request(nl80211.const.NL80211_CMD_TRIGGER_SCAN, 0, params);
 				err = nl80211.error();
 				while (!err && !res) {
@@ -662,7 +666,14 @@ export function scan(dev) {
 		return null;
 	}
 
+	// Other event callbacks may have used the shared module while waiting.
+	nl80211.error();
 	let scan = nl80211.request(nl80211.const.NL80211_CMD_GET_SCAN, nl80211.const.NLM_F_DUMP, { ifindex });
+	let scan_error = nl80211.error();
+	if (scan_error) {
+		warn("Unable to read scan results on " + dev + ": " + scan_error + "\n");
+		return null;
+	}
 
 	let cells = [];
 	for (let k, bss in scan) {
