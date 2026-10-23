@@ -19,9 +19,9 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  #include "common/ieee802_11_common.h"
 +#include "common/wpa_common.h"
  #include "ap/hostapd.h"
- #include "wpa_supplicant_i.h"
- #include "driver_i.h"
-@@ -334,6 +335,8 @@
+ #include "common/sae.h"
+ #include "rsn_supp/wpa.h"
+@@ -337,6 +338,8 @@
  	ucv_object_add(val, "processed", ucv_boolean_new(network != NULL));
  	if (network) {
  		ucv_object_add(val, "network_id", ucv_int64_new(network->id));
@@ -30,7 +30,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  		for (i = 0; i < ARRAY_SIZE(fields); i++) {
  			char *value = wpa_config_get_no_key(network, fields[i]);
  
-@@ -723,6 +726,19 @@
+@@ -772,6 +775,19 @@
  	ret = ucv_object_new(vm);
  
  	ucv_object_add(ret, "state", ucv_string_new(wpa_supplicant_state_txt(wpa_s->wpa_state)));
