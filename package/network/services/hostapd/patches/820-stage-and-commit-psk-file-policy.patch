@@ -1,0 +1,274 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] ap: stage PSK files before publishing the accepted policy
+
+Prepare both file inputs with the accepted inline key, without modifying the
+live list or SAE PT ownership. Commit only after the complete pair succeeds;
+share post-commit WPS policy and associated-PSK reconciliation with native reload.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -469,6 +469,8 @@
+ 		ssid->wpa_psk = psk;
+ 	}
+ 
++	if (ferror(f))
++		ret = -1;
+ 	fclose(f);
+ 
+ 	return ret;
+@@ -555,31 +557,52 @@
+ }
+ 
+ 
++int hostapd_prepare_wpa_psk(struct hostapd_bss_config *conf,
++			    const char *file, const char *supplemental,
++			    struct hostapd_wpa_psk **result)
++{
++	struct hostapd_ssid ssid = conf->ssid;
++	struct hostapd_wpa_psk *raw = ssid.wpa_psk;
++
++	*result = NULL;
++	ssid.wpa_psk = NULL;
++	/* The inline raw key is the original tail; file readers prepend rows. */
++	if (ssid.wpa_psk_set && !ssid.wpa_passphrase && raw) {
++		for (; raw->next; raw = raw->next)
++			;
++		ssid.wpa_psk = os_memdup(raw, sizeof(*raw));
++		if (!ssid.wpa_psk)
++			return -1;
++		ssid.wpa_psk->next = NULL;
++	} else if (ssid.wpa_passphrase) {
++		if (hostapd_derive_psk(&ssid) < 0)
++			goto fail;
++		ssid.wpa_psk->group = 1;
++	}
++
++	if (hostapd_config_read_wpa_psk(file, &ssid) < 0 ||
++	    hostapd_config_read_wpa_psk(supplemental, &ssid) < 0)
++		goto fail;
++	*result = ssid.wpa_psk;
++	return 0;
++fail:
++	hostapd_config_clear_wpa_psk(&ssid.wpa_psk);
++	return -1;
++}
++
++
+ int hostapd_setup_wpa_psk(struct hostapd_bss_config *conf)
+ {
+-	struct hostapd_ssid *ssid = &conf->ssid;
+-
+-	if (hostapd_setup_sae_pt(conf) < 0)
+-		return -1;
+-
+-	if (ssid->wpa_passphrase != NULL) {
+-		if (ssid->wpa_psk != NULL) {
+-			wpa_printf(MSG_DEBUG, "Using pre-configured WPA PSK "
+-				   "instead of passphrase");
+-		} else {
+-			wpa_printf(MSG_DEBUG, "Deriving WPA PSK based on "
+-				   "passphrase");
+-			if (hostapd_derive_psk(ssid) < 0)
+-				return -1;
+-			ssid->wpa_psk->group = 1;
+-		}
+-	}
+-
+-	if (hostapd_config_read_wpa_psk(ssid->wpa_psk_file, ssid) < 0)
+-		return -1;
+-	return hostapd_config_read_wpa_psk(ssid->wpa_psk_file_static, ssid);
+-}
+-
++	struct hostapd_wpa_psk *psk;
++
++	if (hostapd_setup_sae_pt(conf) < 0 ||
++	    hostapd_prepare_wpa_psk(conf, conf->ssid.wpa_psk_file,
++				  conf->ssid.wpa_psk_file_static, &psk) < 0)
++		return -1;
++	hostapd_config_clear_wpa_psk(&conf->ssid.wpa_psk);
++	conf->ssid.wpa_psk = psk;
++	return 0;
++}
+ 
+ static void hostapd_config_free_radius(struct hostapd_radius_server *servers,
+ 				       int num_servers)
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1504,6 +1504,11 @@
+ const u8 * hostapd_get_psk(const struct hostapd_bss_config *conf,
+ 			   const u8 *addr, const u8 *p2p_dev_addr,
+ 			   const u8 *prev_psk, int *vlan_id);
++/* Prepare a replacement PSK list without changing accepted policy or SAE PTs.
++ * The caller owns the list until commit or hostapd_config_clear_wpa_psk(). */
++int hostapd_prepare_wpa_psk(struct hostapd_bss_config *conf,
++			    const char *file, const char *supplemental,
++			    struct hostapd_wpa_psk **result);
+ int hostapd_setup_wpa_psk(struct hostapd_bss_config *conf);
+ int hostapd_vlan_valid(struct hostapd_vlan *vlan,
+ 		       struct vlan_description *vlan_desc);
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -4255,6 +4255,56 @@
+ }
+ 
+ 
++static int
++hostapd_kick_mismatch_psk_sta_iter(struct hostapd_data *hapd,
++					      struct sta_info *sta, void *ctx)
++{
++	struct hostapd_wpa_psk *psk;
++	const u8 *pmk;
++	int pmk_len;
++	int pmk_match;
++	int sta_match;
++	int bss_match;
++	int reason;
++
++	if (!sta->wpa_sm ||
++	    !wpa_key_mgmt_wpa_psk(wpa_auth_sta_key_mgmt(sta->wpa_sm)))
++		return 0;
++
++	pmk = wpa_auth_get_pmk(sta->wpa_sm, &pmk_len);
++
++	for (psk = hapd->conf->ssid.wpa_psk; pmk && psk; psk = psk->next) {
++		pmk_match = PMK_LEN == pmk_len &&
++			os_memcmp(psk->psk, pmk, pmk_len) == 0;
++		sta_match = psk->group == 0 &&
++			ether_addr_equal(sta->addr, psk->addr);
++		bss_match = psk->group == 1;
++
++		if (pmk_match && (sta_match || bss_match))
++			return 0;
++	}
++
++	wpa_printf(MSG_INFO, "STA " MACSTR
++		   " PSK/passphrase no longer valid - disconnect",
++		   MAC2STR(sta->addr));
++	reason = WLAN_REASON_PREV_AUTH_NOT_VALID;
++	hostapd_drv_sta_deauth(hapd, sta->addr, reason);
++	ap_sta_deauthenticate(hapd, sta, reason);
++
++	return 0;
++}
++
++
++void hostapd_commit_wpa_psk(struct hostapd_data *hapd,
++			   struct hostapd_wpa_psk *psk)
++{
++	hostapd_config_clear_wpa_psk(&hapd->conf->ssid.wpa_psk);
++	hapd->conf->ssid.wpa_psk = psk;
++	hostapd_update_wps(hapd);
++	ap_for_each_sta(hapd, hostapd_kick_mismatch_psk_sta_iter, NULL);
++}
++
++
+ int hostapd_reload_iface(struct hostapd_iface *hapd_iface)
+ {
+ 	size_t j;
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -875,6 +875,10 @@
+ void hostapd_interface_deinit_free(struct hostapd_iface *iface);
+ void hostapd_cleanup_unused_mlds(struct hapd_interfaces *interfaces);
+ int hostapd_enable_iface(struct hostapd_iface *hapd_iface);
++struct hostapd_wpa_psk;
++/* Commit one fully prepared list after its file paths have been accepted. */
++void hostapd_commit_wpa_psk(struct hostapd_data *hapd,
++			   struct hostapd_wpa_psk *psk);
+ int hostapd_reload_iface(struct hostapd_iface *hapd_iface);
+ int hostapd_reload_bss_only(struct hostapd_data *bss);
+ int hostapd_disable_iface(struct hostapd_iface *hapd_iface);
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1431,77 +1431,19 @@
+ }
+ 
+ 
+-static int
+-hostapd_ctrl_iface_kick_mismatch_psk_sta_iter(struct hostapd_data *hapd,
+-					      struct sta_info *sta, void *ctx)
+-{
++static int hostapd_ctrl_iface_reload_wpa_psk(struct hostapd_data *hapd)
++{
++	struct hostapd_bss_config *conf = hapd->conf;
+ 	struct hostapd_wpa_psk *psk;
+-	const u8 *pmk;
+-	int pmk_len;
+-	int pmk_match;
+-	int sta_match;
+-	int bss_match;
+-	int reason;
+-
+-	pmk = wpa_auth_get_pmk(sta->wpa_sm, &pmk_len);
+-
+-	for (psk = hapd->conf->ssid.wpa_psk; pmk && psk; psk = psk->next) {
+-		pmk_match = PMK_LEN == pmk_len &&
+-			os_memcmp(psk->psk, pmk, pmk_len) == 0;
+-		sta_match = psk->group == 0 &&
+-			ether_addr_equal(sta->addr, psk->addr);
+-		bss_match = psk->group == 1;
+-
+-		if (pmk_match && (sta_match || bss_match))
+-			return 0;
+-	}
+-
+-	wpa_printf(MSG_INFO, "STA " MACSTR
+-		   " PSK/passphrase no longer valid - disconnect",
+-		   MAC2STR(sta->addr));
+-	reason = WLAN_REASON_PREV_AUTH_NOT_VALID;
+-	hostapd_drv_sta_deauth(hapd, sta->addr, reason);
+-	ap_sta_deauthenticate(hapd, sta, reason);
+-
++
++	if (hostapd_prepare_wpa_psk(conf, conf->ssid.wpa_psk_file,
++				  conf->ssid.wpa_psk_file_static, &psk) < 0) {
++		wpa_printf(MSG_ERROR, "Reloading WPA-PSK passwords failed");
++		return -1;
++	}
++	hostapd_commit_wpa_psk(hapd, psk);
+ 	return 0;
+ }
+-
+-
+-static int hostapd_ctrl_iface_reload_wpa_psk(struct hostapd_data *hapd)
+-{
+-	struct hostapd_bss_config *conf = hapd->conf;
+-	struct hostapd_wpa_psk *old_psk = conf->ssid.wpa_psk;
+-	struct hostapd_wpa_psk *raw_psk = NULL;
+-	int err;
+-
+-	/* File readers prepend rows. An explicitly configured raw PSK remains
+-	 * the original tail node and must survive a file-only reload too. */
+-	if (conf->ssid.wpa_psk_set && !conf->ssid.wpa_passphrase && old_psk) {
+-		for (raw_psk = old_psk; raw_psk->next; raw_psk = raw_psk->next)
+-			;
+-		raw_psk = os_memdup(raw_psk, sizeof(*raw_psk));
+-		if (!raw_psk)
+-			return -1;
+-		raw_psk->next = NULL;
+-	}
+-	conf->ssid.wpa_psk = raw_psk;
+-	err = hostapd_setup_wpa_psk(conf);
+-	if (err < 0) {
+-		hostapd_config_clear_wpa_psk(&conf->ssid.wpa_psk);
+-		conf->ssid.wpa_psk = old_psk;
+-		wpa_printf(MSG_ERROR, "Reloading WPA-PSK passwords failed: %d",
+-			   err);
+-		return -1;
+-	}
+-	hostapd_config_clear_wpa_psk(&old_psk);
+-	hostapd_update_wps(hapd);
+-
+-	ap_for_each_sta(hapd, hostapd_ctrl_iface_kick_mismatch_psk_sta_iter,
+-			NULL);
+-
+-	return 0;
+-}
+-
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+ 

@@ -130,16 +130,6 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	struct sae_pt *pt;
  
  #ifdef CONFIG_WEP
---- a/src/ap/ucode.c
-+++ b/src/ap/ucode.c
-@@ -449,6 +449,7 @@
- 	} while (0)
- 
- 		swap_field(ssid.wpa_psk_file);
-+		swap_field(ssid.wpa_psk_file_static);
- 		ret = bss_reload_vlans(hapd, bss);
- 		goto free;
- 	}
 --- a/src/ap/wps_hostapd.c
 +++ b/src/ap/wps_hostapd.c
 @@ -7,8 +7,10 @@

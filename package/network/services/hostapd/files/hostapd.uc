@@ -737,21 +737,38 @@ function find_array_idx(arr, key, val)
 	return -1;
 }
 
-function bss_reload_psk(bss, config, old_config)
+function bss_reload_psk(bss, config, old_config, inline, idx)
 {
 	if (is_equal(old_config.hash.wpa_psk_file, config.hash.wpa_psk_file) &&
 	    is_equal(old_config.hash.wpa_psk_file_static, config.hash.wpa_psk_file_static))
-		return;
+		return 0;
 
-	old_config.hash.wpa_psk_file = config.hash.wpa_psk_file;
-	old_config.hash.wpa_psk_file_static = config.hash.wpa_psk_file_static;
-	if (!is_equal(old_config, config))
-		return;
+	let hash = { ...old_config.hash };
+	for (let field in [ 'wpa_psk_file', 'wpa_psk_file_static' ])
+		if (config.hash[field] == null)
+			delete hash[field];
+		else
+			hash[field] = config.hash[field];
+	if (!is_equal({ ...old_config, hash }, config))
+		return 0;
 
-	let ret = bss.ctrl("RELOAD_WPA_PSK");
-	ret ??= "failed";
+	let ret = bss.set_config(inline, idx, true);
+	if (ret < 0)
+		return ret;
+	old_config.hash = hash;
+	return 0;
+}
 
-	hostapd.printf(`Reload WPA PSK file for bss ${config.ifname}: ${ret}`);
+// Earlier BSS operations have already completed. Keep their accepted state,
+// and retain the unchanged policy of the rejected/unprocessed BSSes for retry.
+function bss_file_reload_failed(config, accepted, idx, current)
+{
+	config.bss[idx] = current;
+	for (let i = idx + 1; i < length(config.bss); i++)
+		if (accepted[i])
+			config.bss[i] = accepted[i];
+	config.orig_bss = [ ...config.bss ];
+	return -1;
 }
 
 function normalize_rxkhs(txt)
@@ -1607,16 +1624,21 @@ function iface_reload_config(name, phydev, config, old_config)
 		if (is_equal(bss_remove_file_fields(config.bss[i]),
 		             bss_remove_file_fields(prev_cfg))) {
 			hostapd.printf(`Update config data files for bss ${ifname}`);
-			if (bss.set_config(config_inline, i, true) < 0) {
-				hostapd.printf(`Could not update config data files for bss ${ifname}`);
-				return false;
-			} else {
-				bss.ctrl("RELOAD_WPA_PSK");
-				continue;
+			let ret = bss.set_config(config_inline, i, true);
+			if (ret == -2) {
+				hostapd.printf(`Could not accept PSK files for bss ${ifname}`);
+				return bss_file_reload_failed(config, bss_list_cfg, i, prev_cfg);
 			}
+			if (ret < 0)
+				return false;
+			continue;
 		}
 
-		bss_reload_psk(bss, config.bss[i], prev_cfg);
+		let psk_ret = bss_reload_psk(bss, config.bss[i], prev_cfg, config_inline, i);
+		if (psk_ret == -2)
+			return bss_file_reload_failed(config, bss_list_cfg, i, prev_cfg);
+		if (psk_ret < 0)
+			return false;
 		bss_reload_rxkhs(bss, config.bss[i], prev_cfg);
 		if (is_equal(config.bss[i], prev_cfg))
 			continue;
@@ -1791,6 +1813,8 @@ function iface_set_config(name, config)
 
 	try {
 		let ret = iface_reload_config(name, phydev, config, old_config);
+		if (ret === -1)
+			return false;
 		if (ret) {
 			hostapd.printf(`Reloaded settings for phy ${name}`);
 			return 0;
@@ -2305,6 +2329,7 @@ let main_obj = {
 		},
 		call: function(req) {
 			let phy_list = req.args.phy ? [ phy_name(req.args.phy, req.args.radio) ] : keys(hostapd.data.config);
+			let error = 0;
 			for (let phy_name in phy_list) {
 				let phy = hostapd.data.config[phy_name];
 				let config = iface_load_config(phy.phy, phy.radio_idx, phy.orig_file);
@@ -2312,10 +2337,11 @@ let main_obj = {
 				for (let bss in config.bss)
 					if (previous[bss.ifname]?.uci != null)
 						bss.uci = previous[bss.ifname].uci;
-				iface_set_config(phy_name, config);
+				if (iface_set_config(phy_name, config) === false)
+					error = libubus.STATUS_UNKNOWN_ERROR;
 			}
 
-			return 0;
+			return error;
 		}
 	},
 	apsta_state: {
@@ -2519,7 +2545,8 @@ let main_obj = {
 				bss.uci = req.args.uci ? req.args.uci[bss.ifname] : null;
 
 			hostapd.printf(`Set new config for phy ${name}: ${file}`);
-			iface_set_config(name, config);
+			if (iface_set_config(name, config) === false)
+				return libubus.STATUS_UNKNOWN_ERROR;
 
 			if (hostapd.data.auth_obj)
 				hostapd.data.auth_obj.notify("reload", { phy, radio });

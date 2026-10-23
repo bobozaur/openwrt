@@ -420,7 +420,8 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 	uc_value_t *index = uc_fn_arg(1);
 	uc_value_t *files_only = uc_fn_arg(2);
 	unsigned int i, idx = 0;
-	int ret = -1;
+	/* -2 rejects a files-only policy without requesting a BSS restart. */
+	int ret = ucv_boolean_get(files_only) ? -2 : -1;
 	bool started, deferred;
 
 	if (!hapd || ucv_type(file) != UC_STRING)
@@ -440,16 +441,29 @@ uc_hostapd_bss_set_config(uc_vm_t *vm, size_t nargs)
 	if (ucv_boolean_get(files_only)) {
 		struct hostapd_bss_config *bss = conf->bss[idx];
 		struct hostapd_bss_config *old_bss = hapd->conf;
+		struct hostapd_wpa_psk *psk;
 
-#define swap_field(name)				\
-	do {								\
+		/* Keep paths, accepted keys and SAE state until both inputs parse. */
+		if (hostapd_prepare_wpa_psk(old_bss, bss->ssid.wpa_psk_file,
+					  bss->ssid.wpa_psk_file_static, &psk) < 0)
+			goto free;
+		ret = bss_reload_vlans(hapd, bss);
+		if (ret < 0) {
+			hostapd_config_clear_wpa_psk(&psk);
+			goto free;
+		}
+
+#define swap_field(name)					\
+	do {							\
 		void *ptr = old_bss->name;		\
 		old_bss->name = bss->name;		\
 		bss->name = ptr;				\
 	} while (0)
 
 		swap_field(ssid.wpa_psk_file);
-		ret = bss_reload_vlans(hapd, bss);
+		swap_field(ssid.wpa_psk_file_static);
+#undef swap_field
+		hostapd_commit_wpa_psk(hapd, psk);
 		goto free;
 	}
 
