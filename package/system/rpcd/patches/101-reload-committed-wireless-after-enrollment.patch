@@ -1,0 +1,46 @@
+Subject: [PATCH] uci: reload committed wireless after credential enrollment
+
+--- a/uci.c
++++ b/uci.c
+@@ -1335,6 +1335,21 @@
+ 	free(pkg);
+ }
+ 
++/* Automatic credential publication reloads committed wireless only. Do not
++ * emit config.change here: normal Apply retains its full default reload.
++ * The caller releases its UCI context/lock before entering netifd. */
++static int rpc_uci_reload_wireless(struct ubus_context *ctx)
++{
++	struct blob_buf request = {};
++	uint32_t id;
++	int rv = ubus_lookup_id(ctx, "network.wireless", &id);
++	if (rv) return rv;
++	blob_buf_init(&request, 0);
++	rv = ubus_invoke(ctx, id, "reload", request.head, NULL, NULL, 2000);
++	blob_buf_free(&request);
++	return rv;
++}
++
+ /* WPS persists one selected native credential. This local-only operation owns
+  * the entire pending-edit/Apply/snapshot check and commit; callers must never
+  * emulate it with separate get/set/commit calls. */
+@@ -1629,7 +1644,7 @@
+ 	    !rpc_wps_section(c, device, tb[WPS_EXPECTED_DEVICE], NULL))
+ 		goto reply;
+ 	/* Exact desired state may follow a lost reply or post-rename sync failure.
+-	 * Rewrite it durably and notify the normal reload owner before saved. */
++	 * Re-sync durably and retry the committed wireless owner before saved. */
+ 	if (!rpc_wps_section(c, s, tb[WPS_EXPECTED], tb[WPS_VALUES]) &&
+ 	    !rpc_wps_section(c, s, tb[WPS_EXPECTED], NULL))
+ 		goto reply;
+@@ -1655,8 +1670,8 @@
+ 		uci_free_context(c);
+ 		c = NULL;
+ 	}
+-	if (saved)
+-		rpc_uci_trigger_event(bus, "wireless");
++	if (saved && rpc_uci_reload_wireless(bus))
++		status = "reload_failed";
+ 	blob_buf_init(&buf, 0);
+ 	blobmsg_add_string(&buf, "status", status);
+ 	ubus_send_reply(bus, req, buf.head);
