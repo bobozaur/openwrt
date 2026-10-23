@@ -69,6 +69,7 @@ hostapd.data.bss_info_fields = {
 hostapd.data.mld = {};
 hostapd.data.dpp_hooks = {};
 hostapd.data.station_macaddr = {};
+let iface_config_remove;
 
 function iface_remove(cfg)
 {
@@ -1727,7 +1728,7 @@ function iface_check_mld(phydev, name, config)
 	}
 }
 
-function iface_config_remove(name, old_config)
+iface_config_remove = function(name, old_config)
 {
 	let pending = hostapd.data.pending_config[name];
 
@@ -1742,7 +1743,7 @@ function iface_config_remove(name, old_config)
 	if (hostapd.data.station_macaddr[name] &&
 	    (hostapd.interfaces[name] || !iface_station_macaddr_sync(name, null)))
 		die(`Could not retire station MAC addresses on phy ${name}\n`);
-}
+};
 
 // No fallback to a PHY restart, which would take the other BSSes down.
 function mld_link_bss_remove(phy, name)
