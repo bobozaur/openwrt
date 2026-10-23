@@ -793,54 +793,49 @@ uc_hostapd_bss_link_remove(uc_vm_t *vm, size_t nargs)
 }
 #endif /* CONFIG_IEEE80211BE */
 
-static void
+static int
 uc_hostapd_disable_iface(struct hostapd_iface *iface)
 {
-	switch (iface->state) {
-	case HAPD_IFACE_DISABLED:
-		break;
 #ifdef CONFIG_ACS
-	case HAPD_IFACE_ACS:
+	if (iface->state == HAPD_IFACE_ACS) {
 		acs_cleanup(iface);
 		iface->scan_cb = NULL;
-		/* fallthrough */
-#endif
-	default:
-		hostapd_disable_iface(iface);
-		break;
 	}
+#endif
+	if (!iface->bss[0]->drv_priv)
+		return 0;
+
+	return hostapd_disable_iface(iface);
 }
 
 static uc_value_t *
 uc_hostapd_iface_stop(uc_vm_t *vm, size_t nargs)
 {
 	struct hostapd_iface *iface = uc_fn_thisval("hostapd.iface");
-	int i;
+	int i, ret;
 
 	if (!iface)
-		return NULL;
-
-	if (iface->state != HAPD_IFACE_ENABLED)
-		uc_hostapd_disable_iface(iface);
+		return ucv_boolean_new(false);
 
 	for (i = 0; i < iface->num_bss; i++) {
 		struct hostapd_data *hapd = iface->bss[i];
 		struct sta_info *sta;
 
-		/* STOP_AP retires driver peers and keys. Request each native
-		 * protected disconnect while that station still exists, then
-		 * retire the matching hostapd state before stopping the BSS. */
+		/* Protect disconnects with the still-installed native key context. */
 		for (sta = hapd->sta_list; sta; sta = sta->next)
 			ap_sta_disconnect(hapd, sta, sta->addr,
 					  WLAN_REASON_DEAUTH_LEAVING);
-		hostapd_free_stas(hapd);
-		hostapd_drv_stop_ap(hapd);
-		hapd->beacon_set_done = 0;
 		hapd->conf->start_deferred = 1;
 	}
+
+	/* Driver STOP_AP also retires group keys. Retire the matching BSS
+	 * authenticators and timers through the native interface owner so the
+	 * next enable creates fresh WPA/EAP/WPS and group-key state. */
+	ret = uc_hostapd_disable_iface(iface);
+	hostapd_ucode_update_interfaces();
 	hostapd_ucode_iface_state_changed(iface);
 
-	return NULL;
+	return ucv_boolean_new(ret == 0);
 }
 
 static bool
@@ -1025,7 +1020,13 @@ out:
 		iface->bss[i]->conf->start_deferred = 0;
 
 	if (iface->state != HAPD_IFACE_ENABLED) {
-		return ucv_boolean_new(!hostapd_enable_iface(iface));
+		int ret = hostapd_enable_iface(iface);
+
+		if (ret < 0)
+			uc_hostapd_disable_iface(iface);
+		hostapd_ucode_update_interfaces();
+		hostapd_ucode_iface_state_changed(iface);
+		return ucv_boolean_new(ret == 0);
 	}
 
 	for (i = 0; i < iface->num_bss; i++) {
