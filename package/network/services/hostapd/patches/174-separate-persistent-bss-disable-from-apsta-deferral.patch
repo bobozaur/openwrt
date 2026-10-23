@@ -2,7 +2,7 @@ Subject: [PATCH] ap: distinguish persistent disable from native AP+STA deferral
 
 --- a/hostapd/config_file.c
 +++ b/hostapd/config_file.c
-@@ -2481,6 +2481,8 @@
+@@ -2477,6 +2477,8 @@
  		bss->wds_sta = atoi(pos);
  	} else if (os_strcmp(buf, "start_disabled") == 0) {
  		bss->start_disabled = atoi(pos);
@@ -13,7 +13,7 @@ Subject: [PATCH] ap: distinguish persistent disable from native AP+STA deferral
  	} else if (os_strcmp(buf, "ap_max_inactivity") == 0) {
 --- a/src/ap/ap_config.h
 +++ b/src/ap/ap_config.h
-@@ -364,6 +364,8 @@
+@@ -359,6 +359,8 @@
  	int wds_sta;
  	int isolate;
  	int start_disabled;
@@ -24,9 +24,9 @@ Subject: [PATCH] ap: distinguish persistent disable from native AP+STA deferral
  			* algorithms, WPA_AUTH_ALG_{OPEN,SHARED,LEAP} */
 --- a/src/ap/beacon.c
 +++ b/src/ap/beacon.c
-@@ -2774,6 +2774,10 @@
- 	int res, ret = -1, i;
- 	struct hostapd_hw_modes *mode;
+@@ -2764,6 +2764,10 @@
+ 	if (hostapd_beacon_held(hapd))
+ 		return 0;
  
 +	/* The temporary AP+STA barrier is released only by its native owner. */
 +	if (hapd->conf->start_deferred)
@@ -37,7 +37,7 @@ Subject: [PATCH] ap: distinguish persistent disable from native AP+STA deferral
  		return -1;
 --- a/src/ap/hostapd.c
 +++ b/src/ap/hostapd.c
-@@ -1698,10 +1698,11 @@
+@@ -1370,10 +1370,11 @@
  {
  	struct hostapd_bss_config *conf = hapd->conf;
  
