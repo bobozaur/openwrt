@@ -14,6 +14,7 @@
 #include "ieee802_11_auth.h"
 #include "neighbor_db.h"
 #include "gas_serv.h"
+#include "wps/wps.h"
 #ifdef CONFIG_DPP
 #include "common/dpp.h"
 #include "common/wpa_ctrl.h"
@@ -98,6 +99,68 @@ hostapd_ucode_update_interfaces(void)
 	ucv_object_add(ucv_prototype_get(global), "interfaces", ifs);
 	ucv_object_add(ucv_prototype_get(global), "bss", if_bss);
 }
+
+static uc_value_t *
+uc_hostapd_wps_state(uc_vm_t *vm, size_t nargs)
+{
+	uc_value_t *result = ucv_object_new(vm);
+	uc_value_t *bss = ucv_array_new(vm);
+#ifdef CONFIG_WPS
+	struct os_reltime now, age;
+	bool have_time = os_get_reltime(&now) == 0;
+	int i, j;
+
+	for (i = 0; i < interfaces->count; i++) {
+		struct hostapd_iface *iface = interfaces->iface[i];
+
+		if (!iface->bss || iface->state != HAPD_IFACE_ENABLED)
+			continue;
+		for (j = 0; j < iface->num_bss; j++) {
+			struct hostapd_data *hapd = iface->bss[j];
+			uc_value_t *entry;
+
+			if (!hapd->wps || !hapd->started || hapd->disabled ||
+			    !hapd->beacon_set_done)
+				continue;
+			entry = ucv_object_new(vm);
+			ucv_object_add(entry, "ifname",
+				       ucv_string_new(hapd->conf->iface));
+			ucv_object_add(entry, "active", ucv_boolean_new(
+				wps_registrar_is_selected(hapd->wps->registrar)));
+			if (hapd->wps_status_event && have_time &&
+			    !os_reltime_before(&now, &hapd->wps_status_time)) {
+				os_reltime_sub(&now, &hapd->wps_status_time, &age);
+				ucv_object_add(entry, "event",
+					ucv_string_new(hapd->wps_status_event));
+				ucv_object_add(entry, "age_ms", ucv_int64_new(
+					(int64_t) age.sec * 1000 + age.usec / 1000));
+			}
+			ucv_array_push(bss, entry);
+		}
+	}
+#endif /* CONFIG_WPS */
+	ucv_object_add(result, "bss", bss);
+	return result;
+}
+
+
+static void hostapd_ucode_wps_state_notify(void *eloop_ctx, void *timeout_ctx)
+{
+	if (!wpa_ucode_call_prepare("wps_state_changed"))
+		ucv_put(wpa_ucode_call(0));
+}
+
+
+void hostapd_ucode_wps_state_changed(void)
+{
+	if (!vm)
+		return;
+	/* Do not reenter ucode from its synchronous WPS/start/stop calls.
+	 * No BSS pointer is retained across teardown. */
+	eloop_cancel_timeout(hostapd_ucode_wps_state_notify, NULL, NULL);
+	eloop_register_timeout(0, 0, hostapd_ucode_wps_state_notify, NULL, NULL);
+}
+
 
 static uc_value_t *
 uc_hostapd_add_iface(uc_vm_t *vm, size_t nargs)
@@ -1613,6 +1676,7 @@ int hostapd_ucode_init(struct hapd_interfaces *ifaces)
 		{ "add_iface", uc_hostapd_add_iface },
 		{ "remove_iface", uc_hostapd_remove_iface },
 		{ "udebug_set", uc_wpa_udebug_set },
+		{ "wps_state", uc_hostapd_wps_state },
 	};
 	static const uc_function_list_t bss_fns[] = {
 		{ "ctrl", uc_hostapd_bss_ctrl },
@@ -1662,6 +1726,7 @@ int hostapd_ucode_init(struct hapd_interfaces *ifaces)
 	return 0;
 
 free_vm:
+	eloop_cancel_timeout(hostapd_ucode_wps_state_notify, NULL, NULL);
 	hostapd_ucode_free_vm();
 	return -1;
 }
@@ -1670,6 +1735,7 @@ void hostapd_ucode_free(void)
 {
 	if (wpa_ucode_call_prepare("shutdown") == 0)
 		ucv_put(wpa_ucode_call(0));
+	eloop_cancel_timeout(hostapd_ucode_wps_state_notify, NULL, NULL);
 	hostapd_ucode_free_vm();
 }
 
@@ -1692,6 +1758,7 @@ static void hostapd_ucode_iface_state_notify(void *eloop_ctx, void *timeout_ctx)
 
 void hostapd_ucode_iface_state_changed(struct hostapd_iface *iface)
 {
+	hostapd_ucode_wps_state_changed();
 	if (!iface_registry)
 		return;
 	/* Run outside a ucode-initiated start/stop call. The callback reads current

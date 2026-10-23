@@ -1,0 +1,511 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] AP: keep static station PSKs separate from the WPS file owner
+
+A generated union of a configured PSK file and static station rows is not the
+persistent owner of WPS appends: regeneration and reboot discard learned keys.
+Keep the configured primary as the native read/append owner and accept static
+station rows through one supplemental read-only input. Read primary then static
+to preserve existing row precedence, and swap both inputs for files-only reload.
+
+Reload both inputs transactionally and retain configured raw shared keys.
+Common WPS exports select a group key instead of another station's list head;
+static-only authentication remains valid without inventing a shared credential.
+Synchronize the canonical primary parent before success since setup may create
+its target through a symlink. Keep live WPS capability changes synchronized with
+native EAP-WSC consumers, shared authentication owners and beacon publication.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3106,6 +3106,13 @@
+ 		if (!bss->ssid.wpa_psk_file) {
+ 			wpa_printf(MSG_ERROR, "Line %d: allocation failed",
+ 				   line);
++			return 1;
++		}
++	} else if (os_strcmp(buf, "wpa_psk_file_static") == 0) {
++		os_free(bss->ssid.wpa_psk_file_static);
++		bss->ssid.wpa_psk_file_static = os_strdup(pos);
++		if (!bss->ssid.wpa_psk_file_static) {
++			wpa_printf(MSG_ERROR, "Line %d: allocation failed", line);
+ 			return 1;
+ 		}
+ 	} else if (os_strcmp(buf, "wpa_key_mgmt") == 0) {
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1470,16 +1470,31 @@
+ static int hostapd_ctrl_iface_reload_wpa_psk(struct hostapd_data *hapd)
+ {
+ 	struct hostapd_bss_config *conf = hapd->conf;
++	struct hostapd_wpa_psk *old_psk = conf->ssid.wpa_psk;
++	struct hostapd_wpa_psk *raw_psk = NULL;
+ 	int err;
+ 
+-	hostapd_config_clear_wpa_psk(&conf->ssid.wpa_psk);
+-
++	/* File readers prepend rows. An explicitly configured raw PSK remains
++	 * the original tail node and must survive a file-only reload too. */
++	if (conf->ssid.wpa_psk_set && !conf->ssid.wpa_passphrase && old_psk) {
++		for (raw_psk = old_psk; raw_psk->next; raw_psk = raw_psk->next)
++			;
++		raw_psk = os_memdup(raw_psk, sizeof(*raw_psk));
++		if (!raw_psk)
++			return -1;
++		raw_psk->next = NULL;
++	}
++	conf->ssid.wpa_psk = raw_psk;
+ 	err = hostapd_setup_wpa_psk(conf);
+ 	if (err < 0) {
++		hostapd_config_clear_wpa_psk(&conf->ssid.wpa_psk);
++		conf->ssid.wpa_psk = old_psk;
+ 		wpa_printf(MSG_ERROR, "Reloading WPA-PSK passwords failed: %d",
+ 			   err);
+ 		return -1;
+ 	}
++	hostapd_config_clear_wpa_psk(&old_psk);
++	hostapd_update_wps(hapd);
+ 
+ 	ap_for_each_sta(hapd, hostapd_ctrl_iface_kick_mismatch_psk_sta_iter,
+ 			NULL);
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -1925,6 +1925,11 @@
+ # Use absolute path name to make sure that the files can be read on SIGHUP
+ # configuration reloads.
+ #wpa_psk_file=/etc/hostapd.wpa_psk
++# Supplemental static station PSKs use the same format, read after the primary
++# file. This input is read-only for WPS; only wpa_psk_file owns per-device writes.
++# Without a primary, WPS requires a shared passphrase or a group PSK.
++# Primary writes need a writable file and a readable, fsync-capable target parent.
++#wpa_psk_file_static=/run/hostapd-static.psk
+ 
+ # Optionally, WPA passphrase can be received from RADIUS authentication server
+ # This requires macaddr_acl to be set to 2 (RADIUS) for wpa_psk_radius values
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -571,11 +571,13 @@
+ 				   "passphrase");
+ 			if (hostapd_derive_psk(ssid) < 0)
+ 				return -1;
+-		}
+-		ssid->wpa_psk->group = 1;
+-	}
+-
+-	return hostapd_config_read_wpa_psk(ssid->wpa_psk_file, &conf->ssid);
++			ssid->wpa_psk->group = 1;
++		}
++	}
++
++	if (hostapd_config_read_wpa_psk(ssid->wpa_psk_file, ssid) < 0)
++		return -1;
++	return hostapd_config_read_wpa_psk(ssid->wpa_psk_file_static, ssid);
+ }
+ 
+ 
+@@ -840,6 +842,7 @@
+ 
+ 	str_clear_free(conf->ssid.wpa_passphrase);
+ 	os_free(conf->ssid.wpa_psk_file);
++	os_free(conf->ssid.wpa_psk_file_static);
+ #ifdef CONFIG_WEP
+ 	hostapd_config_free_wep(&conf->ssid.wep);
+ #endif /* CONFIG_WEP */
+@@ -1327,6 +1330,7 @@
+ 	    wpa_key_mgmt_wpa_psk_no_sae(bss->wpa_key_mgmt) &&
+ 	    bss->ssid.wpa_psk == NULL && bss->ssid.wpa_passphrase == NULL &&
+ 	    bss->ssid.wpa_psk_file == NULL &&
++	    bss->ssid.wpa_psk_file_static == NULL &&
+ 	    bss->wpa_psk_radius != PSK_RADIUS_DURING_4WAY_HS &&
+ 	    (bss->wpa_psk_radius != PSK_RADIUS_REQUIRED ||
+ 	     bss->macaddr_acl != USE_EXTERNAL_RADIUS_AUTH)) {
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -110,6 +110,7 @@
+ 	struct hostapd_wpa_psk *wpa_psk;
+ 	char *wpa_passphrase;
+ 	char *wpa_psk_file;
++	char *wpa_psk_file_static; /* supplemental input, never a WPS append owner */
+ 	struct sae_pt *pt;
+ 
+ #ifdef CONFIG_WEP
+--- a/src/ap/ucode.c
++++ b/src/ap/ucode.c
+@@ -449,6 +449,7 @@
+ 	} while (0)
+ 
+ 		swap_field(ssid.wpa_psk_file);
++		swap_field(ssid.wpa_psk_file_static);
+ 		ret = bss_reload_vlans(hapd, bss);
+ 		goto free;
+ 	}
+--- a/src/ap/wps_hostapd.c
++++ b/src/ap/wps_hostapd.c
+@@ -7,8 +7,10 @@
+  */
+ 
+ #include "utils/includes.h"
++#include <fcntl.h>
+ #include <sys/file.h>
+ #include <sys/stat.h>
++#include <limits.h>
+ 
+ #include "utils/common.h"
+ #include "utils/eloop.h"
+@@ -16,6 +18,10 @@
+ #include "common/wpa_ctrl.h"
+ #include "common/ieee802_11_defs.h"
+ #include "common/ieee802_11_common.h"
++#include "eap_server/eap.h"
++#ifdef RADIUS_SERVER
++#include "radius/radius_server.h"
++#endif /* RADIUS_SERVER */
+ #include "eapol_auth/eapol_auth_sm.h"
+ #include "eapol_auth/eapol_auth_sm_i.h"
+ #include "wps/wps.h"
+@@ -28,6 +34,7 @@
+ #include "ap_drv_ops.h"
+ #include "beacon.h"
+ #include "sta_info.h"
++#include "ieee802_1x.h"
+ #include "wps_hostapd.h"
+ #include "ucode.h"
+ 
+@@ -107,6 +114,30 @@
+ 		return -1;
+ 	}
+ 	return 0;
++}
++
++
++static int hostapd_wps_sync_psk_parent(const char *path, const struct stat *opened)
++{
++	char target[PATH_MAX], *slash;
++	int fd, ret, saved_errno;
++
++	if (!realpath(path, target) ||
++	    hostapd_wps_psk_file_matches(target, opened))
++		return -1;
++	slash = os_strrchr(target, '/');
++	if (slash == target)
++		slash++;
++	*slash = '\0';
++	fd = open(target, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	ret = fsync(fd);
++	saved_errno = errno;
++	if (close(fd) < 0 && !ret)
++		return -1;
++	errno = saved_errno;
++	return ret;
+ }
+ 
+ 
+@@ -169,6 +200,14 @@
+ 		goto out;
+ 	operation = "sync";
+ 	if (os_fdatasync(f))
++		goto out;
++	/* Setup may create the primary, including through a final symlink.
++	 * Synchronize the actual target name, not the symlink's directory.
++	 * The target parent must be readable and support fsync for this process.
++	 * Pre-existing ancestors/symlinks remain the configured provider's owner.
++	 */
++	operation = "directory sync";
++	if (hostapd_wps_sync_psk_parent(path, &st))
+ 		goto out;
+ 	operation = "owner check";
+ 	if (hostapd_wps_psk_file_matches(path, &st))
+@@ -1264,14 +1303,41 @@
+ }
+ 
+ 
++static const u8 * hostapd_wps_group_psk(const struct hostapd_bss_config *conf)
++{
++	struct hostapd_wpa_psk *psk;
++
++	for (psk = conf->ssid.wpa_psk; psk; psk = psk->next)
++		if (psk->group)
++			return psk->psk;
++	return NULL;
++}
++
++
++static bool hostapd_wps_static_only(const struct hostapd_bss_config *conf,
++				  const u8 *group_psk)
++{
++	if (conf->ssid.security_policy != SECURITY_WPA_PSK ||
++	    !conf->ssid.wpa_psk_file_static || conf->ssid.wpa_psk_file ||
++	    conf->ssid.wpa_passphrase || group_psk)
++		return false;
++
++	wpa_printf(MSG_WARNING,
++		   "WPS: Static station PSKs require a shared key or a primary PSK file for new enrolment");
++	return true;
++}
++
++
+ int hostapd_init_wps(struct hostapd_data *hapd,
+ 		     struct hostapd_bss_config *conf)
+ {
+ 	struct wps_context *wps;
+ 	struct wps_registrar_config cfg;
+ 	u8 *multi_ap_netw_key = NULL;
+-
+-	if (conf->wps_state == 0) {
++	const u8 *group_psk = hostapd_wps_group_psk(conf);
++	size_t i;
++
++	if (conf->wps_state == 0 || hostapd_wps_static_only(conf, group_psk)) {
+ 		hostapd_wps_clear_ies(hapd, 0);
+ 		return 0;
+ 	}
+@@ -1413,12 +1479,12 @@
+ 	} else if (conf->ssid.wpa_passphrase) {
+ 		wps->network_key = (u8 *) os_strdup(conf->ssid.wpa_passphrase);
+ 		wps->network_key_len = os_strlen(conf->ssid.wpa_passphrase);
+-	} else if (conf->ssid.wpa_psk) {
++	} else if (group_psk) {
+ 		wps->network_key = os_malloc(2 * PMK_LEN + 1);
+ 		if (wps->network_key == NULL)
+ 			goto fail;
+ 		wpa_snprintf_hex((char *) wps->network_key, 2 * PMK_LEN + 1,
+-				 conf->ssid.wpa_psk->psk, PMK_LEN);
++				 group_psk, PMK_LEN);
+ 		wps->network_key_len = 2 * PMK_LEN;
+ #ifdef CONFIG_WEP
+ 	} else if (conf->ssid.wep.keys_set && conf->ssid.wep.key[0]) {
+@@ -1431,8 +1497,8 @@
+ #endif /* CONFIG_WEP */
+ 	}
+ 
+-	if (conf->ssid.wpa_psk) {
+-		os_memcpy(wps->psk, conf->ssid.wpa_psk->psk, PMK_LEN);
++	if (group_psk) {
++		os_memcpy(wps->psk, group_psk, PMK_LEN);
+ 		wps->psk_set = 1;
+ 	}
+ 
+@@ -1522,7 +1588,13 @@
+ 	wps->upc = hapd->conf->upc;
+ #endif /* CONFIG_WPS_UPNP */
+ 
+-	hostapd_register_probereq_cb(hapd, hostapd_wps_probe_req_rx, hapd);
++	/* The callback belongs to this BSS, surviving WPS capability changes. */
++	for (i = 0; i < hapd->num_probereq_cb; i++)
++		if (hapd->probereq_cb[i].cb == hostapd_wps_probe_req_rx &&
++		    hapd->probereq_cb[i].ctx == hapd)
++			break;
++	if (i == hapd->num_probereq_cb)
++		hostapd_register_probereq_cb(hapd, hostapd_wps_probe_req_rx, hapd);
+ 
+ #ifdef CONFIG_P2P
+ 	if ((hapd->conf->p2p & P2P_ENABLED) &&
+@@ -1641,13 +1713,67 @@
+ }
+ 
+ 
++/* Live PSK reload can change WPS capability without replacing the BSS. */
++static void hostapd_wps_reload_sta(struct hostapd_data *hapd)
++{
++	struct sta_info *sta;
++
++	for (sta = hapd->sta_list; sta; sta = sta->next)
++		if ((sta->flags & (WLAN_STA_WPS | WLAN_STA_MAYBE_WPS)) ||
++		    (sta->eapol_sm && eap_server_uses_wps(sta->eapol_sm->eap)))
++			ieee802_1x_free_station(hapd, sta);
++}
++
++
++static void hostapd_wps_reload_disable(struct hostapd_data *hapd)
++{
++	/* Each link's EAP sessions retain that link's WPS context. */
++	hostapd_wps_reload_sta(hapd);
++	/* External RADIUS sessions use the optional shared configuration. */
++	if (hapd->eap_cfg && hapd->eap_cfg->wps == hapd->wps) {
++#ifdef RADIUS_SERVER
++		radius_server_wps_cancel(hapd->radius_srv);
++#endif /* RADIUS_SERVER */
++		hapd->eap_cfg->wps = NULL;
++	}
++	hostapd_deinit_wps(hapd);
++	if (hapd->beacon_set_done)
++		ieee802_11_set_beacon(hapd);
++}
++
++
+ void hostapd_update_wps(struct hostapd_data *hapd)
+ {
+ 	struct wps_context *wps = hapd->wps;
+ 	struct hostapd_bss_config *conf = hapd->conf;
+-
+-	if (!wps)
++	const u8 *group_psk = hostapd_wps_group_psk(conf);
++
++	if (!wps) {
++		/* Disabled BSS setup owns initialization when it is enabled again. */
++		if (!hapd->started || !conf->wps_state ||
++		    hostapd_wps_static_only(conf, group_psk))
++			return;
++		if (hostapd_init_wps(hapd, conf) < 0 ||
++		    hostapd_init_wps_complete(hapd) < 0) {
++			wpa_printf(MSG_WARNING, "WPS: Cannot initialize updated common key");
++			hostapd_wps_reload_disable(hapd);
++			return;
++		}
++		/* Non-first MLD BSSes share the first BSS authentication owner. */
++		if (hapd->eap_cfg && !hapd->eap_cfg->wps
++#ifdef CONFIG_IEEE80211BE
++		    && hostapd_mld_is_first_bss(hapd)
++#endif /* CONFIG_IEEE80211BE */
++		    )
++			hapd->eap_cfg->wps = hapd->wps;
++		if (hapd->beacon_set_done)
++			ieee802_11_set_beacon(hapd);
+ 		return;
++	}
++	if (hostapd_wps_static_only(conf, group_psk)) {
++		hostapd_wps_reload_disable(hapd);
++		return;
++	}
+ 
+ 	wps_registrar_update_psk_policy(wps->registrar,
+ 		conf->ssid.wpa_psk_file != NULL,
+@@ -1676,12 +1802,12 @@
+ 		if (!wps->network_key)
+ 			return;
+ 		wps->network_key_len = os_strlen(conf->ssid.wpa_passphrase);
+-	} else if (conf->ssid.wpa_psk) {
++	} else if (group_psk) {
+ 		wps->network_key = os_malloc(2 * PMK_LEN + 1);
+ 		if (!wps->network_key)
+ 			return;
+ 		wpa_snprintf_hex((char *) wps->network_key, 2 * PMK_LEN + 1,
+-				 conf->ssid.wpa_psk->psk, PMK_LEN);
++				 group_psk, PMK_LEN);
+ 		wps->network_key_len = 2 * PMK_LEN;
+ #ifdef CONFIG_WEP
+ 	} else if (conf->ssid.wep.keys_set && conf->ssid.wep.key[0]) {
+@@ -1694,8 +1820,8 @@
+ #endif /* CONFIG_WEP */
+ 	}
+ 
+-	if (conf->ssid.wpa_psk) {
+-		os_memcpy(wps->psk, conf->ssid.wpa_psk->psk, PMK_LEN);
++	if (group_psk) {
++		os_memcpy(wps->psk, group_psk, PMK_LEN);
+ 		wps->psk_set = 1;
+ 	}
+ 
+--- a/src/eap_server/eap.h
++++ b/src/eap_server/eap.h
+@@ -298,6 +298,7 @@
+ const u8 * eap_get_identity(struct eap_sm *sm, size_t *len);
+ const char * eap_get_serial_num(struct eap_sm *sm);
+ const char * eap_get_method(struct eap_sm *sm);
++bool eap_server_uses_wps(struct eap_sm *sm);
+ const char * eap_get_imsi(struct eap_sm *sm);
+ struct eap_eapol_interface * eap_get_interface(struct eap_sm *sm);
+ void eap_server_clear_identity(struct eap_sm *sm);
+--- a/src/eap_server/eap_i.h
++++ b/src/eap_server/eap_i.h
+@@ -196,6 +196,9 @@
+ 
+ 	u8 peer_addr[ETH_ALEN];
+ 
++	/* WSC may be the inner method while m still names a tunnel. */
++	bool wps_active;
++
+ 	bool initiate_reauth_start_sent;
+ 	bool try_initiate_reauth;
+ 
+--- a/src/eap_server/eap_server.c
++++ b/src/eap_server/eap_server.c
+@@ -1983,6 +1983,12 @@
+ }
+ 
+ 
++bool eap_server_uses_wps(struct eap_sm *sm)
++{
++	return sm && sm->wps_active;
++}
++
++
+ /**
+  * eap_get_method - Get the used EAP method
+  * @sm: Pointer to EAP state machine allocated with eap_server_sm_init()
+--- a/src/eap_server/eap_server_wsc.c
++++ b/src/eap_server/eap_server_wsc.c
+@@ -82,6 +82,9 @@
+ 	int registrar;
+ 	struct wps_config cfg;
+ 
++	if (!sm->wps)
++		return NULL;
++
+ 	if (sm->identity && sm->identity_len == WSC_ID_REGISTRAR_LEN &&
+ 	    os_memcmp(sm->identity, WSC_ID_REGISTRAR, WSC_ID_REGISTRAR_LEN) ==
+ 	    0)
+@@ -106,7 +109,7 @@
+ 	cfg.wps = sm->wps;
+ 	cfg.registrar = registrar;
+ 	if (registrar) {
+-		if (!cfg.wps || !cfg.wps->registrar) {
++		if (!cfg.wps->registrar) {
+ 			wpa_printf(MSG_INFO, "EAP-WSC: WPS Registrar not "
+ 				   "initialized");
+ 			os_free(data);
+@@ -146,6 +149,7 @@
+ 		os_free(data);
+ 		return NULL;
+ 	}
++	sm->wps_active = true;
+ 	data->fragment_size = sm->cfg->fragment_size > 0 ?
+ 		sm->cfg->fragment_size : WSC_FRAGMENT_SIZE;
+ 
+@@ -160,6 +164,7 @@
+ 	wpabuf_free(data->in_buf);
+ 	wpabuf_free(data->out_buf);
+ 	wps_deinit(data->wps);
++	sm->wps_active = false;
+ 	os_free(data);
+ }
+ 
+--- a/src/radius/radius_server.c
++++ b/src/radius/radius_server.c
+@@ -409,6 +409,23 @@
+ 		prev = session;
+ 		session = session->next;
+ 	}
++}
++
++
++/* Retire only sessions retaining a WPS context before its live replacement. */
++void radius_server_wps_cancel(struct radius_server_data *data)
++{
++	struct radius_client *client;
++	struct radius_session *sess, *next;
++
++	if (!data)
++		return;
++	for (client = data->clients; client; client = client->next)
++		for (sess = client->sessions; sess; sess = next) {
++			next = sess->next;
++			if (eap_server_uses_wps(sess->eap))
++				radius_server_session_remove(data, sess);
++		}
+ }
+ 
+ 
+--- a/src/radius/radius_server.h
++++ b/src/radius/radius_server.h
+@@ -128,6 +128,7 @@
+ struct radius_server_data *
+ radius_server_init(struct radius_server_conf *conf);
+ 
++void radius_server_wps_cancel(struct radius_server_data *data);
+ void radius_server_erp_flush(struct radius_server_data *data);
+ void radius_server_set_conf_ctx(struct radius_server_data *data, void *conf_ctx);
+ void radius_server_deinit(struct radius_server_data *data);
