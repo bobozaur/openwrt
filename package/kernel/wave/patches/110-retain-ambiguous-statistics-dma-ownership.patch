@@ -1,0 +1,208 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] wave: retain statistics DMA ownership after ambiguous sends
+
+Queue admission does not prove completion on timeout or cancellation. Keep
+that mapping and buffer quarantined until the existing hardware reset/drain
+owner fences DMA and pending TXMM work. Preserve normal confirmed completion
+and proven pre-admission cleanup through an optional admission result.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/wireless/driver/shared/hw_mmb.c
++++ b/wireless/driver/shared/hw_mmb.c
+@@ -233,6 +233,8 @@
+   uint8                *db_data;    /* data block received from FW, in DMA area */
+   uint8                *db_copy;    /* copy of db_data, in non-DMA area */
+   uint32                db_size;    /* Fixed matched A0 statistics image. */
++  uint32                dma_addr;
++  BOOL                  dma_mapped; /* In flight, or quarantined until reset/drain. */
+   uint64                sta_generation; /* Last confirmed snapshot incarnation. */
+   uint64                sample_serial; /* Successful MAC snapshots only. */
+   mtlk_osal_timestamp_t  sample_time; /* Request time, not cache-consumption time. */
+@@ -6034,6 +6036,36 @@
+     hw->phy_rx_status.valid = TRUE;
+ }
+ 
++/* Caller owns phy_rx_status.mutex. */
++static void
++_mtlk_hw_mhi_stats_dma_unmap (mtlk_hw_t *hw)
++{
++    hw_mhi_stats_t *mhi_stats = &hw->hw_mhi_stats;
++
++    if (!mhi_stats->dma_mapped)
++        return;
++    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
++                              mhi_stats->dma_addr, mhi_stats->db_size,
++                              MTLK_DATA_FROM_DEVICE);
++    WRITE_ONCE(mhi_stats->dma_mapped, FALSE);
++}
++
++/* Hardware reset/drain has stopped DMA and TXMM admits no old requests.
++ * A mapping can exist only after PHY initialization, so this guard also
++ * covers probe failures before phy_rx_status.mutex has been initialized.
++ * Wait for any woken sender to finish recording its result before retiring
++ * the mapping. A late firmware confirmation cannot release it itself.
++ */
++static void
++_mtlk_hw_mhi_stats_dma_reset (mtlk_hw_t *hw)
++{
++    if (!READ_ONCE(hw->hw_mhi_stats.dma_mapped))
++        return;
++    mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
++    _mtlk_hw_mhi_stats_dma_unmap(hw);
++    mtlk_osal_mutex_release(&hw->phy_rx_status.mutex);
++}
++
+ /* Get MHI Statistics Data using the same UMI req as for the Statistics Data */
+ int __MTLK_IFUNC
+ mtlk_hw_mhi_get_stats (mtlk_hw_t *hw)
+@@ -6043,6 +6075,7 @@
+     UMI_GET_STATISTICS_DATA *req;
+     hw_mhi_stats_t          *mhi_stats;
+     uint32                   dma_addr;
++    BOOL                     accepted = FALSE;
+     mtlk_osal_timestamp_t     sample_time;
+     int                      res = MTLK_ERR_UNKNOWN;
+ 
+@@ -6055,6 +6088,12 @@
+     mhi_stats = &hw->hw_mhi_stats;
+     /* Serialize the shared DMA buffer and peer incarnation publication. */
+     mtlk_osal_mutex_acquire(&hw->phy_rx_status.mutex);
++    /* A timeout/cancellation does not return DMA ownership. Only the
++     * hardware reset/drain owner may retire that ambiguous request. */
++    if (mhi_stats->dma_mapped || !wave_hw_mmb_ready(hw)) {
++        res = MTLK_ERR_NOT_READY;
++        goto finish;
++    }
+     sample_time = mtlk_osal_timestamp();
+     hw->phy_rx_status.valid = FALSE;
+ 
+@@ -6067,6 +6106,8 @@
+         res = MTLK_ERR_NO_RESOURCES;
+         goto finish;
+     }
++    mhi_stats->dma_addr = dma_addr;
++    WRITE_ONCE(mhi_stats->dma_mapped, TRUE);
+ 
+     man_entry->id = UM_MAN_GET_STATISTICS_REQ;
+     man_entry->payload_size = sizeof(*req);
+@@ -6075,11 +6116,14 @@
+     req->length           = HOST_TO_MAC32(mhi_stats->db_size);
+     req->status           = UMI_OK;
+ 
+-    res = mtlk_txmm_msg_send_blocked(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT);
+-
+-    mtlk_osal_unmap_phys_addr(mtlk_ccr_get_dev_ctx(hw->ccr),
+-                              dma_addr, mhi_stats->db_size,
+-                              MTLK_DATA_FROM_DEVICE);
++    res = mtlk_txmm_msg_send_blocked_ex(&man_msg, MTLK_MM_BLOCKED_SEND_TIMEOUT,
++                                       &accepted);
++
++    /* A confirmation completes this transfer. A proven admission failure
++     * never published its address. All other errors quarantine the mapping
++     * and the unchanged buffer until the hardware owner has stopped DMA. */
++    if (!accepted || res == MTLK_ERR_OK)
++        _mtlk_hw_mhi_stats_dma_unmap(hw);
+ 
+     if (res != MTLK_ERR_OK) {
+         ELOG_DD("card_idx %d: Sending failed, err=%i", hw->card_idx, res);
+@@ -6324,6 +6368,7 @@
+             mtlk_df_ui_mhi_stats_delete(mtlk_df_get_user(mtlk_vap_manager_get_master_df(wave_radio_descr_vap_manager_get(hw->radio_descr, i))));
+     }
+ 
++    MTLK_ASSERT(!mhi_stats->dma_mapped); /* Hardware fence retires it first. */
+     if (mhi_stats->db_data) mtlk_osal_mem_free(mhi_stats->db_data);
+     if (mhi_stats->db_copy) mtlk_osal_mem_free(mhi_stats->db_copy);
+ 
+@@ -7117,6 +7162,7 @@
+   wave_mmb_drv_drain_dma(mtlk_ccr_get_device(hw->ccr));
+   _mtlk_mmb_cleanup_reset_mac(hw);
+   mtlk_ccr_reset_mac(hw->ccr);
++  _mtlk_hw_mhi_stats_dma_reset(hw);
+ }
+ 
+ void wave_hw_mmb_quiesce(mtlk_hw_t *hw)
+@@ -8108,6 +8154,7 @@
+   /* Don't control on FPGA */
+   if (!__hw_mmb_card_is_fpga(hw)) {
+     mtlk_ccr_reset_mac(hw->ccr);
++    _mtlk_hw_mhi_stats_dma_reset(hw);
+   }
+ 
+   return MTLK_ERR_OK;
+--- a/wireless/driver/shared/txmm.c
++++ b/wireless/driver/shared/txmm.c
+@@ -877,11 +877,15 @@
+ 
+ static int _mtlk_txmm_send_blocked(mtlk_txmm_t*      obj, 
+                                    mtlk_txmm_data_t* data,
+-                                   uint32            timeout_ms)
++                                   uint32            timeout_ms,
++                                   BOOL             *accepted)
+ {
+   int res = MTLK_ERR_UNKNOWN;
+   mtlk_vap_handle_t master_vap;
+   BOOL is_pending = FALSE;
++
++  if (accepted)
++    *accepted = FALSE;
+ 
+   if (!mtlk_txmm_is_running(obj->base))
+     return MTLK_ERR_NOT_READY;
+@@ -930,6 +934,11 @@
+     ELOG_D("send (b): send failed. Err#%d", res);
+     goto FINISH;
+   }
++
++  /* Queueing is admission too: timeout/cancellation does not establish
++   * whether firmware has already consumed a queued request's payload. */
++  if (accepted)
++    *accepted = TRUE;
+ 
+   ILOG4_D("send (b): wait event (%d ms)", (int)timeout_ms);
+   res = mtlk_osal_event_wait(&obj->base->bsend.evt, timeout_ms);
+@@ -1255,13 +1264,22 @@
+ mtlk_txmm_msg_send_blocked (mtlk_txmm_msg_t  *msg, 
+                             uint32            timeout_ms)
+ {
++  return mtlk_txmm_msg_send_blocked_ex(msg, timeout_ms, NULL);
++}
++
++int __MTLK_IFUNC
++mtlk_txmm_msg_send_blocked_ex (mtlk_txmm_msg_t *msg,
++                              uint32           timeout_ms,
++                              BOOL            *accepted)
++{
+   MTLK_ASSERT(msg != NULL);
+   MTLK_ASSERT(msg->data != NULL);
+   MTLK_ASSERT(msg->obj != NULL);
+   
+   return _mtlk_txmm_send_blocked(msg->obj,
+                                  msg->data,
+-                                 timeout_ms);
++                                 timeout_ms,
++                                 accepted);
+ }
+ 
+ mtlk_txmm_data_t* __MTLK_IFUNC
+--- a/wireless/driver/shared/txmm.h
++++ b/wireless/driver/shared/txmm.h
+@@ -515,6 +515,16 @@
+ mtlk_txmm_msg_send_blocked(mtlk_txmm_msg_t  *msg, 
+                            uint32            timeout_ms);
+ 
++/* The optional result reports TXMM admission, not firmware completion.
++ * FALSE guarantees that this call neither queued nor sent the request.
++ * TRUE includes queueing and remains true on timeout/cancellation, when
++ * external resources named in the payload may still belong to firmware.
++ */
++int __MTLK_IFUNC
++mtlk_txmm_msg_send_blocked_ex(mtlk_txmm_msg_t *msg,
++                             uint32           timeout_ms,
++                             BOOL            *accepted);
++
+ /*! \fn       mtlk_txmm_data_t* mtlk_txmm_msg_init_with_empty_data(mtlk_txmm_msg_t *msg, 
+                                                                    mtlk_txmm_t     *obj,
+                                                                    int             *err)
