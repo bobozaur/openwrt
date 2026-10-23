@@ -33,7 +33,7 @@ platform_check_image() {
 	if ax50_is_initial_install; then
 		ax50_check_initial_layout && ax50_check_initial_bootenv
 	else
-		ax50_check_ubi && ax50_check_bootenv
+		ax50_check_layout && ax50_check_bootenv
 	fi
 }
 
@@ -49,7 +49,7 @@ platform_pre_upgrade() {
 	local bank expected
 	bank=$(ax50_running_bank) || exit 1
 	case "$bank" in A) expected=0 ;; B) expected=2 ;; esac
-	ax50_check_lower_root "$bank" && ax50_check_bootenv &&
+	ax50_check_lower_root && ax50_check_bootenv &&
 		[ "$(fw_printenv -n update_chk)" = "$expected" ] || exit 1
 }
 
@@ -70,7 +70,7 @@ ax50_volume_unmounted() {
 ax50_initial_remove_overlay() {
 	local id="$1" name="$2" dev="$3"
 	# Only a successful creation in this invocation grants removal ownership.
-	[ -n "$dev" ] && ax50_check_ubi &&
+	[ -n "$dev" ] && ax50_check_core_layout &&
 		ax50_check_volume "$id" "$name" 128 &&
 		[ "$(cat "/sys/class/ubi/ubi0_$id/dev")" = "$dev" ] &&
 		ax50_volume_unmounted "$id" || return 1
@@ -133,9 +133,11 @@ ax50_initial_install() {
 		ubimkvol /dev/ubi0 -n 6 -N ax50_overlayA -t dynamic -s 16252928
 		created_a=1
 		dev_a=$(cat /sys/class/ubi/ubi0_6/dev)
+		ax50_check_volume 6 ax50_overlayA 128
 		ubimkvol /dev/ubi0 -n 7 -N ax50_overlayB -t dynamic -s 16252928
 		created_b=1
 		dev_b=$(cat /sys/class/ubi/ubi0_7/dev)
+		ax50_check_layout
 		if [ -e /sys/class/block/ubiblock0_3 ]; then
 			ubiblock -r /dev/ubi0_3
 		fi
@@ -147,6 +149,8 @@ ax50_initial_install() {
 		mount -t ubifs ubi0:ax50_overlayB "$dir/overlay"
 		sync
 		umount "$dir/overlay"
+		ax50_check_layout
+		ax50_check_initial_bootenv
 		# A lost acknowledgement may still have selected B. Retain both new
 		# overlays after this point, even when fw_setenv/readback fails.
 		selection_attempted=1
@@ -171,11 +175,8 @@ platform_do_upgrade() {
 	B) target=A; kernel=0; root=1; overlay=6; expected=2 ;;
 	*) return 1 ;;
 	esac
-	ax50_check_ubi && ax50_check_bootenv &&
+	ax50_check_layout && ax50_check_bootenv &&
 		[ "$(fw_printenv -n update_chk)" = "$expected" ] &&
-		ax50_check_volume "$kernel" "kernel$target" &&
-		ax50_check_volume "$root" "rootfs$target" &&
-		ax50_check_volume "$overlay" "ax50_overlay$target" &&
 		ax50_volume_unmounted "$kernel" && ax50_volume_unmounted "$root" &&
 		ax50_volume_unmounted "$overlay" || return 1
 	dir=$(mktemp -d /tmp/ax50-upgrade.XXXXXX) || return 1
