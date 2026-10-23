@@ -17,8 +17,8 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- a/include/net/netfilter/nf_flow_table.h
 +++ b/include/net/netfilter/nf_flow_table.h
-@@ -138,12 +138,11 @@
- 					encap_num:2,
+@@ -141,12 +141,11 @@
+ 					port_vlans:2,
  					in_vlan_ingress:2;
  	u16				mtu;
 +	/* Direct L2 output still depends on the route which admitted it. */
@@ -36,9 +36,9 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  			u32		hw_ifidx;
 --- a/net/netfilter/nf_flow_table_core.c
 +++ b/net/netfilter/nf_flow_table_core.c
-@@ -127,18 +127,17 @@
- 		       ETH_ALEN);
- 		flow_tuple->out.ifidx = route->tuple[dir].out.ifindex;
+@@ -132,18 +132,17 @@
+ 		flow_tuple->bridge_vlan = route->tuple[dir].out.bridge_vlan;
+ 		flow_tuple->port_vlans = route->tuple[dir].out.port_vlans;
  		flow_tuple->out.hw_ifidx = route->tuple[dir].out.hw_ifindex;
 -		dst_release(dst);
  		break;
@@ -57,7 +57,7 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  	flow_tuple->xmit_type = route->tuple[dir].xmit_type;
  
  	return 0;
-@@ -148,7 +147,8 @@
+@@ -153,7 +152,8 @@
  				 enum flow_offload_tuple_dir dir)
  {
  	if (flow->tuplehash[dir].tuple.xmit_type == FLOW_OFFLOAD_XMIT_NEIGH ||
