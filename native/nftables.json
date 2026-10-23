@@ -1,21 +1,24 @@
 {
   "component": "nftables",
   "upstream": "https://git.netfilter.org/nftables.git",
-  "base": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
+  "base": "824778066c2f84e7207cba7d1048a0def8bd98fd",
+  "base_ref": "master",
   "bundle": "native/nftables.bundle",
-  "sha256": "b32cb83bae7762c9e343991eb44afe2f9b7f3b328cd5bcfdd860fc5c7cb122f6",
-  "bytes": 5151,
+  "sha256": "a001868f68d12438cdf5f864ae1fb37401a9933d70f83c61881801c5a6a1b770",
+  "bytes": 5995,
   "retained_branch": "contribution",
   "refs": {
-    "refs/heads/contribution": "37b9c8c08630fbe4cfdc428729ea400585d23978",
-    "refs/heads/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
-    "refs/heads/topic/scalar-map-operands": "d27e4087d978bd8479e2125b475e39afbaa93f4f",
+    "refs/heads/contribution": "71a1a4e583f9a9fdc47eaaacb77a494299b0408e",
+    "refs/heads/master": "824778066c2f84e7207cba7d1048a0def8bd98fd",
     "refs/tags/archive/20261020-consolidation/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
-    "refs/tags/archive/20261020-consolidation/topic/scalar-map-operands": "d27e4087d978bd8479e2125b475e39afbaa93f4f"
+    "refs/tags/archive/20261020-consolidation/topic/scalar-map-operands": "d27e4087d978bd8479e2125b475e39afbaa93f4f",
+    "refs/tags/archive/20261023-reconstruction/contribution": "37b9c8c08630fbe4cfdc428729ea400585d23978",
+    "refs/tags/archive/20261023-reconstruction/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd"
   },
   "public_base_refs": {
-    "refs/heads/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
-    "refs/tags/archive/20261020-consolidation/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd"
+    "refs/heads/master": "824778066c2f84e7207cba7d1048a0def8bd98fd",
+    "refs/tags/archive/20261020-consolidation/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd",
+    "refs/tags/archive/20261023-reconstruction/master": "91373de3ec389004c30ae5465d1bb34dcaf690dd"
   },
   "bundle_refs_exact": true,
   "verify_exit": 0

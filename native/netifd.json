@@ -1,23 +1,15 @@
 {
   "component": "netifd",
   "upstream": "https://git.openwrt.org/project/netifd.git",
-  "base": "2fec6e82409b029c36be6eb3c07938d77c52263a",
+  "base": "06fc904585606ed5a1dfca233ecaa6be9a5ca599",
+  "base_ref": "master",
   "bundle": "native/netifd.bundle",
-  "sha256": "33c4ee76e13f2ab18de30a8019e50933d30557a240a1b0784138e84619c58f8b",
-  "bytes": 27295,
+  "sha256": "547e79708510d8385b2ce23fe4d9fe3b1834e7a95c9ac5c49af6b317b4e7ed7a",
+  "bytes": 33215,
   "retained_branch": "contribution",
   "refs": {
-    "refs/heads/contribution": "fca46e178b7dff1f5908aefaa14401c876790c84",
-    "refs/heads/master": "2fec6e82409b029c36be6eb3c07938d77c52263a",
-    "refs/heads/topic/bridge-forwarding": "3edc0475599e326eb170f45112cc1a781bd9dc25",
-    "refs/heads/topic/dynamic-children": "5976cb4fd35a2be97e45144f6bafddf52dacdcb8",
-    "refs/heads/topic/hotplug-replace": "2fec6e82409b029c36be6eb3c07938d77c52263a",
-    "refs/heads/topic/ipv6-ownership": "ee4f637f6e21e9e61527dfd6a7076799c004cfe1",
-    "refs/heads/topic/lifecycle-status": "30a2bd85728376197344c172cb247eb73b4ba421",
-    "refs/heads/topic/protocol-generations": "374cb3d9c0376844a8e98c55a3cb69d8c4bf081f",
-    "refs/heads/topic/protocol-live-updates": "58ceb9afb7e0f590776a4f2133927ae839db3708",
-    "refs/heads/topic/protocol-mtu": "d7b7276e6d032aa07be157a8df280e511c816098",
-    "refs/heads/topic/vlan-reclaim": "89957f4e0a171793119e96c96c40b9b4de1c3834",
+    "refs/heads/contribution": "c40962818ffa19016747ebcea02e207285942a03",
+    "refs/heads/master": "06fc904585606ed5a1dfca233ecaa6be9a5ca599",
     "refs/tags/archive/20261020-consolidation/master": "2fec6e82409b029c36be6eb3c07938d77c52263a",
     "refs/tags/archive/20261020-consolidation/topic/bridge-forwarding": "3edc0475599e326eb170f45112cc1a781bd9dc25",
     "refs/tags/archive/20261020-consolidation/topic/dynamic-children": "5976cb4fd35a2be97e45144f6bafddf52dacdcb8",
@@ -27,13 +19,15 @@
     "refs/tags/archive/20261020-consolidation/topic/protocol-generations": "374cb3d9c0376844a8e98c55a3cb69d8c4bf081f",
     "refs/tags/archive/20261020-consolidation/topic/protocol-live-updates": "58ceb9afb7e0f590776a4f2133927ae839db3708",
     "refs/tags/archive/20261020-consolidation/topic/protocol-mtu": "d7b7276e6d032aa07be157a8df280e511c816098",
-    "refs/tags/archive/20261020-consolidation/topic/vlan-reclaim": "89957f4e0a171793119e96c96c40b9b4de1c3834"
+    "refs/tags/archive/20261020-consolidation/topic/vlan-reclaim": "89957f4e0a171793119e96c96c40b9b4de1c3834",
+    "refs/tags/archive/20261023-reconstruction/contribution": "b00d2c089cf7e74107aa66eee11500f33aae2712",
+    "refs/tags/archive/20261023-reconstruction/master": "2fec6e82409b029c36be6eb3c07938d77c52263a"
   },
   "public_base_refs": {
-    "refs/heads/master": "2fec6e82409b029c36be6eb3c07938d77c52263a",
-    "refs/heads/topic/hotplug-replace": "2fec6e82409b029c36be6eb3c07938d77c52263a",
+    "refs/heads/master": "06fc904585606ed5a1dfca233ecaa6be9a5ca599",
     "refs/tags/archive/20261020-consolidation/master": "2fec6e82409b029c36be6eb3c07938d77c52263a",
-    "refs/tags/archive/20261020-consolidation/topic/hotplug-replace": "2fec6e82409b029c36be6eb3c07938d77c52263a"
+    "refs/tags/archive/20261020-consolidation/topic/hotplug-replace": "2fec6e82409b029c36be6eb3c07938d77c52263a",
+    "refs/tags/archive/20261023-reconstruction/master": "2fec6e82409b029c36be6eb3c07938d77c52263a"
   },
   "bundle_refs_exact": true,
   "verify_exit": 0

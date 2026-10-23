@@ -2,25 +2,23 @@
   "component": "linux",
   "upstream": "https://github.com/gregkh/linux.git",
   "base": "725bd2f3c81d54edccb66fead01d4c0c222e2231",
+  "base_ref": "v6.18.55",
   "bundle": "native/linux.bundle",
-  "sha256": "2a8cd91e7b6e5db2ccdad5efc416d3763a0badb52210be14199b12d6c7c23f4f",
-  "bytes": 21955,
+  "sha256": "7f9f568a9b7b0239aec6052438fc7f5a7fd4db7ea52a89f2a0bbcb12c1b0120a",
+  "bytes": 24043,
   "retained_branch": "topic/ax50-kernel-fixes",
   "refs": {
     "refs/heads/topic/ax50-kernel-fixes": "01dbe7ddc4bd3a95fbd3d74ba1428dce64cda84b",
-    "refs/heads/topic/kernel-bridge-multicast": "fa44957693c0c95140fdfc8e5478b25e64014c27",
-    "refs/heads/topic/kernel-dsa-ageing": "a4ed577dfadcf2bd086c0edc9ed1115d18b65746",
-    "refs/heads/topic/kernel-flowtable": "d927594a5711e7551cc9cd5c6af5b18c9c115150",
-    "refs/heads/topic/kernel-threaded-backlog": "dac29e6a2f590198e28046c6b6dcde87621eb418",
-    "refs/heads/topic/lantiq-console": "de5fd91d1f48bb42d316a0682131e6c2128e6185",
-    "refs/heads/topic/mips-eva": "fa4617bd88161b80e57ae79ed212c9f9eed04a7b",
     "refs/tags/archive/20261020-consolidation/topic/kernel-bridge-multicast": "fa44957693c0c95140fdfc8e5478b25e64014c27",
     "refs/tags/archive/20261020-consolidation/topic/kernel-dsa-ageing": "a4ed577dfadcf2bd086c0edc9ed1115d18b65746",
     "refs/tags/archive/20261020-consolidation/topic/kernel-flowtable": "d927594a5711e7551cc9cd5c6af5b18c9c115150",
     "refs/tags/archive/20261020-consolidation/topic/kernel-threaded-backlog": "dac29e6a2f590198e28046c6b6dcde87621eb418",
     "refs/tags/archive/20261020-consolidation/topic/lantiq-console": "de5fd91d1f48bb42d316a0682131e6c2128e6185",
-    "refs/tags/archive/20261020-consolidation/topic/mips-eva": "fa4617bd88161b80e57ae79ed212c9f9eed04a7b"
+    "refs/tags/archive/20261020-consolidation/topic/mips-eva": "fa4617bd88161b80e57ae79ed212c9f9eed04a7b",
+    "refs/tags/archive/20261023-reconstruction/topic/ax50-kernel-fixes": "14da8edefbfa304255cce7bd55541eef8568802c",
+    "refs/tags/archive/ax50/dsa-gro-fallback-20261022": "6606ecd7958d47c34ba76c3c7898a026eebc3a58"
   },
+  "public_base_refs": {},
   "bundle_refs_exact": true,
   "verify_exit": 0
 }

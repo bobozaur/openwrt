@@ -2,20 +2,23 @@
   "component": "uci",
   "upstream": "https://git.openwrt.org/project/uci.git",
   "base": "74f6277aabffc943d026f406df57c22595134c42",
+  "base_ref": "master",
   "bundle": "native/uci.bundle",
-  "sha256": "867bc5efb26d0a3979ad971d97a2155ac27284fed671b39db7bbfef0357a77da",
-  "bytes": 6556,
+  "sha256": "254b54758bfb68c9881ff81ddcabceb3d43e000bf8f3122304f10c5eb79932a7",
+  "bytes": 6570,
   "retained_branch": "contribution",
   "refs": {
     "refs/heads/contribution": "6de6c3d6bf60daac4c3816e0c78e7e05478a585c",
     "refs/heads/master": "74f6277aabffc943d026f406df57c22595134c42",
-    "refs/heads/topic/conditional-publication": "08d999773f2988ba899d707d172f04ac0fc8225b",
     "refs/tags/archive/20261020-consolidation/master": "74f6277aabffc943d026f406df57c22595134c42",
-    "refs/tags/archive/20261020-consolidation/topic/conditional-publication": "08d999773f2988ba899d707d172f04ac0fc8225b"
+    "refs/tags/archive/20261020-consolidation/topic/conditional-publication": "08d999773f2988ba899d707d172f04ac0fc8225b",
+    "refs/tags/archive/20261023-reconstruction/contribution": "6de6c3d6bf60daac4c3816e0c78e7e05478a585c",
+    "refs/tags/archive/20261023-reconstruction/master": "74f6277aabffc943d026f406df57c22595134c42"
   },
   "public_base_refs": {
     "refs/heads/master": "74f6277aabffc943d026f406df57c22595134c42",
-    "refs/tags/archive/20261020-consolidation/master": "74f6277aabffc943d026f406df57c22595134c42"
+    "refs/tags/archive/20261020-consolidation/master": "74f6277aabffc943d026f406df57c22595134c42",
+    "refs/tags/archive/20261023-reconstruction/master": "74f6277aabffc943d026f406df57c22595134c42"
   },
   "bundle_refs_exact": true,
   "verify_exit": 0

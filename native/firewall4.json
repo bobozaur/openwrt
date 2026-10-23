@@ -2,26 +2,26 @@
   "component": "firewall4",
   "upstream": "https://git.openwrt.org/project/firewall4.git",
   "base": "c2ae8c8940a89407da32fbd662d4010ee2c9bbe6",
+  "base_ref": "master",
   "bundle": "native/firewall4.bundle",
-  "sha256": "8b1cf994693f8e7f74907a8f04b164d34894cabe37299f2a05a4cb86b08f037c",
-  "bytes": 8478,
+  "sha256": "c44313e333907e039c7ca7cabcce9660937c9dca5124a0c29abd3d9425f22e7a",
+  "bytes": 8283,
   "retained_branch": "contribution",
   "refs": {
     "refs/heads/contribution": "6c12d171f4240d355692a182b2e400774874ed67",
     "refs/heads/master": "c2ae8c8940a89407da32fbd662d4010ee2c9bbe6",
-    "refs/heads/topic/dhcp-slowpath": "6484037584cbd7921611e37f66138b518e039fd8",
-    "refs/heads/topic/offload-chain": "23bbeb8e275cf2111e2d7bb02e16e0a3b2f0fc07",
-    "refs/heads/topic/offload-includes": "2207f85415bce5483ca726818e2f8650bd31ce0d",
-    "refs/heads/topic/port-triggers": "dbeefb2f41230b202db84c199e500c89a3d40cb3",
     "refs/tags/archive/20261020-consolidation/master": "c2ae8c8940a89407da32fbd662d4010ee2c9bbe6",
     "refs/tags/archive/20261020-consolidation/topic/dhcp-slowpath": "6484037584cbd7921611e37f66138b518e039fd8",
     "refs/tags/archive/20261020-consolidation/topic/offload-chain": "23bbeb8e275cf2111e2d7bb02e16e0a3b2f0fc07",
     "refs/tags/archive/20261020-consolidation/topic/offload-includes": "2207f85415bce5483ca726818e2f8650bd31ce0d",
-    "refs/tags/archive/20261020-consolidation/topic/port-triggers": "dbeefb2f41230b202db84c199e500c89a3d40cb3"
+    "refs/tags/archive/20261020-consolidation/topic/port-triggers": "dbeefb2f41230b202db84c199e500c89a3d40cb3",
+    "refs/tags/archive/20261023-reconstruction/contribution": "6c12d171f4240d355692a182b2e400774874ed67",
+    "refs/tags/archive/20261023-reconstruction/master": "c2ae8c8940a89407da32fbd662d4010ee2c9bbe6"
   },
   "public_base_refs": {
     "refs/heads/master": "c2ae8c8940a89407da32fbd662d4010ee2c9bbe6",
-    "refs/tags/archive/20261020-consolidation/master": "c2ae8c8940a89407da32fbd662d4010ee2c9bbe6"
+    "refs/tags/archive/20261020-consolidation/master": "c2ae8c8940a89407da32fbd662d4010ee2c9bbe6",
+    "refs/tags/archive/20261023-reconstruction/master": "c2ae8c8940a89407da32fbd662d4010ee2c9bbe6"
   },
   "bundle_refs_exact": true,
   "verify_exit": 0

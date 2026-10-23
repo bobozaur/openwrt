@@ -2,22 +2,24 @@
   "component": "rpcd",
   "upstream": "https://git.openwrt.org/project/rpcd.git",
   "base": "d99f703e4035d03fbcfbada3cb697db346c2b984",
+  "base_ref": "master",
   "bundle": "native/rpcd.bundle",
-  "sha256": "123a5703d27643a204fbf9a52900baeb40e43fe55ad35f3ea5122b44dbd30059",
-  "bytes": 6040,
+  "sha256": "c80366ae7800ec97b35872f665e398b694551414c531f034ca9283684f3269c4",
+  "bytes": 12583,
   "retained_branch": "contribution",
   "refs": {
-    "refs/heads/contribution": "15fb1344f35ab92e49752737c68d2fa9ed7eb982",
+    "refs/heads/contribution": "8e97b32837748ad7b4a7bc3f52fc22d2bb8e4e8c",
     "refs/heads/master": "d99f703e4035d03fbcfbada3cb697db346c2b984",
-    "refs/heads/topic/conditional-enrollment": "b55f088774663906c6a4cb59203437a90daf1463",
-    "refs/heads/topic/session-freeze": "3c4def5b70a23967a4475f7bb3a2830440e10768",
     "refs/tags/archive/20261020-consolidation/master": "d99f703e4035d03fbcfbada3cb697db346c2b984",
     "refs/tags/archive/20261020-consolidation/topic/conditional-enrollment": "b55f088774663906c6a4cb59203437a90daf1463",
-    "refs/tags/archive/20261020-consolidation/topic/session-freeze": "3c4def5b70a23967a4475f7bb3a2830440e10768"
+    "refs/tags/archive/20261020-consolidation/topic/session-freeze": "3c4def5b70a23967a4475f7bb3a2830440e10768",
+    "refs/tags/archive/20261023-reconstruction/contribution": "487da1ee011cc27b82f0f777861f07c7e6fd4583",
+    "refs/tags/archive/20261023-reconstruction/master": "d99f703e4035d03fbcfbada3cb697db346c2b984"
   },
   "public_base_refs": {
     "refs/heads/master": "d99f703e4035d03fbcfbada3cb697db346c2b984",
-    "refs/tags/archive/20261020-consolidation/master": "d99f703e4035d03fbcfbada3cb697db346c2b984"
+    "refs/tags/archive/20261020-consolidation/master": "d99f703e4035d03fbcfbada3cb697db346c2b984",
+    "refs/tags/archive/20261023-reconstruction/master": "d99f703e4035d03fbcfbada3cb697db346c2b984"
   },
   "bundle_refs_exact": true,
   "verify_exit": 0

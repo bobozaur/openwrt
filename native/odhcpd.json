@@ -2,28 +2,27 @@
   "component": "odhcpd",
   "upstream": "https://git.openwrt.org/project/odhcpd.git",
   "base": "68f382690bfaec56d5b1f31c3c31c48bcb642e3a",
+  "base_ref": "master",
   "bundle": "native/odhcpd.bundle",
-  "sha256": "b3f8eca1bfd6cd1c0726e6c420b5c060361a5eae3a2cc94cdb1961eb07d4644d",
-  "bytes": 12541,
+  "sha256": "c437307f53ed19afd83bcb9a46e42d1062b2a9af3c833594591c47cbcb887e1e",
+  "bytes": 12277,
   "retained_branch": "contribution",
   "refs": {
     "refs/heads/contribution": "ef6db0fe032e076cc3466e22531bc95d12c781e3",
     "refs/heads/master": "68f382690bfaec56d5b1f31c3c31c48bcb642e3a",
-    "refs/heads/topic/auth-option-length": "5ae713510254b3e687c5d1e106f9124e302037ee",
-    "refs/heads/topic/live-ra-mtu": "947fef57c22b0ab6f684f27e7e0852191da1e123",
-    "refs/heads/topic/ndp-ownership": "a118768f3cd35b2dd4b7f634396ea9b442d371a4",
-    "refs/heads/topic/stale-reply": "267560af47b5fd6781afe45f7301c5fbd44f8e51",
-    "refs/heads/topic/withdrawn-pd": "5ce722bc886f2fcc64c73fae1bfa4b3bebfd5cd1",
     "refs/tags/archive/20261020-consolidation/master": "68f382690bfaec56d5b1f31c3c31c48bcb642e3a",
     "refs/tags/archive/20261020-consolidation/topic/auth-option-length": "5ae713510254b3e687c5d1e106f9124e302037ee",
     "refs/tags/archive/20261020-consolidation/topic/live-ra-mtu": "947fef57c22b0ab6f684f27e7e0852191da1e123",
     "refs/tags/archive/20261020-consolidation/topic/ndp-ownership": "a118768f3cd35b2dd4b7f634396ea9b442d371a4",
     "refs/tags/archive/20261020-consolidation/topic/stale-reply": "267560af47b5fd6781afe45f7301c5fbd44f8e51",
-    "refs/tags/archive/20261020-consolidation/topic/withdrawn-pd": "5ce722bc886f2fcc64c73fae1bfa4b3bebfd5cd1"
+    "refs/tags/archive/20261020-consolidation/topic/withdrawn-pd": "5ce722bc886f2fcc64c73fae1bfa4b3bebfd5cd1",
+    "refs/tags/archive/20261023-reconstruction/contribution": "ef6db0fe032e076cc3466e22531bc95d12c781e3",
+    "refs/tags/archive/20261023-reconstruction/master": "68f382690bfaec56d5b1f31c3c31c48bcb642e3a"
   },
   "public_base_refs": {
     "refs/heads/master": "68f382690bfaec56d5b1f31c3c31c48bcb642e3a",
-    "refs/tags/archive/20261020-consolidation/master": "68f382690bfaec56d5b1f31c3c31c48bcb642e3a"
+    "refs/tags/archive/20261020-consolidation/master": "68f382690bfaec56d5b1f31c3c31c48bcb642e3a",
+    "refs/tags/archive/20261023-reconstruction/master": "68f382690bfaec56d5b1f31c3c31c48bcb642e3a"
   },
   "bundle_refs_exact": true,
   "verify_exit": 0

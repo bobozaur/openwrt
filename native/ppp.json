@@ -1,27 +1,27 @@
 {
   "component": "ppp",
   "upstream": "https://github.com/ppp-project/ppp.git",
-  "base": "4ff45106fba3c27c9dbedc03a751b77517597572",
+  "base": "2aef1a81dbe093d8de75396296ea233d2f42ae8a",
+  "base_ref": "master",
   "bundle": "native/ppp.bundle",
-  "sha256": "4a3ab550a27245302b49039752d3f7df96e1263ecff184bf39e8b93edef11e9e",
-  "bytes": 8800,
+  "sha256": "6fc9345afad2ed167c211cb4a815ebf26a57dd11afb429d5662fea6e4d01b820",
+  "bytes": 7735,
   "retained_branch": "contribution",
   "refs": {
-    "refs/heads/contribution": "fd2914a9f7808d4ce49ca1a4c646598cfd99b82b",
-    "refs/heads/master": "4ff45106fba3c27c9dbedc03a751b77517597572",
-    "refs/heads/topic/ccp-receive-state": "32b527ea6ec4f1982d70f44655b8bbb58cabaa5a",
-    "refs/heads/topic/mppe-lifetime": "00fbc797bd31aaab3ab4f79a6b132afc46e7463b",
-    "refs/heads/topic/mppe-mtu": "d44e9f5922fac1aa7755efee1434d4a5266328ce",
-    "refs/heads/topic/mppe-option-mask": "325c4c169739cf139e507d1e4ca1ac6a99605c15",
+    "refs/heads/contribution": "9b5fd243726fc612f223ee7b3d112011c504193a",
+    "refs/heads/master": "2aef1a81dbe093d8de75396296ea233d2f42ae8a",
     "refs/tags/archive/20261020-consolidation/master": "4ff45106fba3c27c9dbedc03a751b77517597572",
     "refs/tags/archive/20261020-consolidation/topic/ccp-receive-state": "32b527ea6ec4f1982d70f44655b8bbb58cabaa5a",
     "refs/tags/archive/20261020-consolidation/topic/mppe-lifetime": "00fbc797bd31aaab3ab4f79a6b132afc46e7463b",
     "refs/tags/archive/20261020-consolidation/topic/mppe-mtu": "d44e9f5922fac1aa7755efee1434d4a5266328ce",
-    "refs/tags/archive/20261020-consolidation/topic/mppe-option-mask": "325c4c169739cf139e507d1e4ca1ac6a99605c15"
+    "refs/tags/archive/20261020-consolidation/topic/mppe-option-mask": "325c4c169739cf139e507d1e4ca1ac6a99605c15",
+    "refs/tags/archive/20261023-reconstruction/contribution": "fd2914a9f7808d4ce49ca1a4c646598cfd99b82b",
+    "refs/tags/archive/20261023-reconstruction/master": "4ff45106fba3c27c9dbedc03a751b77517597572"
   },
   "public_base_refs": {
-    "refs/heads/master": "4ff45106fba3c27c9dbedc03a751b77517597572",
-    "refs/tags/archive/20261020-consolidation/master": "4ff45106fba3c27c9dbedc03a751b77517597572"
+    "refs/heads/master": "2aef1a81dbe093d8de75396296ea233d2f42ae8a",
+    "refs/tags/archive/20261020-consolidation/master": "4ff45106fba3c27c9dbedc03a751b77517597572",
+    "refs/tags/archive/20261023-reconstruction/master": "4ff45106fba3c27c9dbedc03a751b77517597572"
   },
   "bundle_refs_exact": true,
   "verify_exit": 0

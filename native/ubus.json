@@ -2,20 +2,23 @@
   "component": "ubus",
   "upstream": "https://git.openwrt.org/project/ubus.git",
   "base": "414c60a2e29e72c2c4f573bc50ad54aef076d169",
+  "base_ref": "master",
   "bundle": "native/ubus.bundle",
-  "sha256": "0190813e37da09dcc119d87fe107a6ad0695224c908d6054a334f47a3a1ef65a",
-  "bytes": 5361,
+  "sha256": "b0b9372eb8ea88edbf96e64e5e5aff0a46f5888ae6dde4079961c06caf588645",
+  "bytes": 5383,
   "retained_branch": "contribution",
   "refs": {
     "refs/heads/contribution": "f52ec31c08e2788d9277b2500bc55969e46db45f",
     "refs/heads/master": "414c60a2e29e72c2c4f573bc50ad54aef076d169",
-    "refs/heads/topic/invoke-envelope": "0b54e048a3e557e81f6171f1793bce353d326701",
     "refs/tags/archive/20261020-consolidation/master": "414c60a2e29e72c2c4f573bc50ad54aef076d169",
-    "refs/tags/archive/20261020-consolidation/topic/invoke-envelope": "0b54e048a3e557e81f6171f1793bce353d326701"
+    "refs/tags/archive/20261020-consolidation/topic/invoke-envelope": "0b54e048a3e557e81f6171f1793bce353d326701",
+    "refs/tags/archive/20261023-reconstruction/contribution": "f52ec31c08e2788d9277b2500bc55969e46db45f",
+    "refs/tags/archive/20261023-reconstruction/master": "414c60a2e29e72c2c4f573bc50ad54aef076d169"
   },
   "public_base_refs": {
     "refs/heads/master": "414c60a2e29e72c2c4f573bc50ad54aef076d169",
-    "refs/tags/archive/20261020-consolidation/master": "414c60a2e29e72c2c4f573bc50ad54aef076d169"
+    "refs/tags/archive/20261020-consolidation/master": "414c60a2e29e72c2c4f573bc50ad54aef076d169",
+    "refs/tags/archive/20261023-reconstruction/master": "414c60a2e29e72c2c4f573bc50ad54aef076d169"
   },
   "bundle_refs_exact": true,
   "verify_exit": 0
