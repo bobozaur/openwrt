@@ -13,10 +13,10 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
 
 --- a/wpa_supplicant/ucode.c
 +++ b/wpa_supplicant/ucode.c
-@@ -4,6 +4,7 @@
- #include "utils/base64.h"
+@@ -5,6 +5,7 @@
  #include "drivers/driver.h"
  #include "common/ieee802_11_common.h"
+ #include "common/wpa_ctrl.h"
 +#include "common/wpa_common.h"
  #include "ap/hostapd.h"
  #include "common/sae.h"
