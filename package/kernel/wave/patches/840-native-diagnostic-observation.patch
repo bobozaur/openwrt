@@ -187,13 +187,14 @@ Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
  /* Terminal for this probe. Only a fresh PCI probe may restart the card. */
  static void wave_hw_mmb_quiesce_locked(mtlk_hw_t *hw)
  {
-@@ -7229,6 +7246,7 @@
+@@ -7229,7 +7246,8 @@
    mtlk_osal_timer_cancel_sync(&hw->recover_timer);
  #endif
    wave_mmb_drv_drain_dma(mtlk_ccr_get_device(hw->ccr));
 +  wave_rcvry_dump_before_reset(hw);
    _mtlk_mmb_cleanup_reset_mac(hw);
    mtlk_ccr_reset_mac(hw->ccr);
+   _mtlk_hw_mhi_stats_dma_reset(hw);
  }
 --- a/wireless/driver/shared/hw_mmb.h
 +++ b/wireless/driver/shared/hw_mmb.h
