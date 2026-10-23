@@ -190,7 +190,7 @@ function iface_setup(config) {
 		'wds_sta', 'wds_bridge', 'snoop_iface', 'vendor_elements', 'nas_identifier', 'radius_acct_interim_interval',
 		'spp_amsdu', 'multicast_to_unicast', 'preamble', 'proxy_arp', 'per_sta_vif', 'mbo',
 		'bss_transition', 'wnm_sleep_mode', 'wnm_sleep_mode_no_keys', 'qos_map_set', 'max_listen_int',
-		'dtim_period', 'wmm_enabled', 'start_disabled', 'na_mcast_to_ucast', 'no_probe_resp_if_max_sta',
+		'dtim_period', 'wmm_enabled', 'start_disabled', 'start_deferred', 'na_mcast_to_ucast', 'no_probe_resp_if_max_sta',
 	]);
 }
 
@@ -707,7 +707,8 @@ export function owe_transition(config, band) {
 export function generate(interface, data, config, vlans, stas, phy_features) {
 	config.ctrl_interface = '/var/run/hostapd';
 
-	config.start_disabled = data.ap_start_disabled;
+	config.start_disabled = !!config.start_disabled;
+	config.start_deferred = !!data.ap_start_disabled;
 	iface_setup(config);
 
 	config.sae_station_passwords = station_password_count(stas);

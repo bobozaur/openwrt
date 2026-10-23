@@ -9,7 +9,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=wifi-scripts
 PKG_VERSION:=1.0
-PKG_RELEASE:=5
+PKG_RELEASE:=9
 PKG_LICENSE:=GPL-2.0
 
 PKG_MAINTAINER:=Felix Fietkau <nbd@nbd.name>
@@ -21,7 +21,7 @@ define Package/wifi-scripts
   SECTION:=utils
   CATEGORY:=Base system
   DEPENDS:=+netifd +ucode +ucode-mod-nl80211 +ucode-mod-rtnl +ucode-mod-ubus +ucode-mod-uci +ucode-mod-digest +WIFI_SCRIPTS_UCODE:hostapd-common
-  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)$(if $(CONFIG_WIFI_SCRIPTS_UCODE),$(comma) hostapd-common (>=2026.08.07~831364bf-r9))
+  EXTRA_DEPENDS:=netifd (>=2026.09.11~06d06c86-r2)$(if $(CONFIG_WIFI_SCRIPTS_UCODE),$(comma) hostapd-common (>=2026.08.07~831364bf-r10))
   TITLE:=Wi-Fi configuration scripts
   PKGARCH:=all
 endef
