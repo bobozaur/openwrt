@@ -1,0 +1,24 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] ap: complete native teardown after interface setup failure
+
+Setup may already have allocated per-BSS authenticators, timers and driver BSSes.
+Disable those owners before dropping the driver so an explicit enable retry
+starts with fresh security state while retaining the interface configuration.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -4243,9 +4243,7 @@ int hostapd_enable_iface(struct hostapd_if
+ 	}
+ 
+ 	if (hostapd_setup_interface(hapd_iface)) {
+-		hostapd_deinit_driver(hapd_iface->bss[0]->driver,
+-				      hapd_iface->bss[0]->drv_priv,
+-				      hapd_iface);
++		hostapd_disable_iface(hapd_iface);
+ 		return -1;
+ 	}
+ 
