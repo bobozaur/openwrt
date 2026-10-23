@@ -2,6 +2,7 @@
 
 import * as nl80211 from 'nl80211';
 import * as libubus from 'ubus';
+import * as uloop from 'uloop';
 import { readfile, stat } from "fs";
 
 let wifi_devices = json(readfile('/usr/share/wifi_devices.json'));
@@ -583,27 +584,85 @@ export function scan(dev) {
 		scan_ssids: [ '' ],
 	};
 
-	nl80211.request(nl80211.const.NL80211_CMD_TRIGGER_SCAN, 0, params);
-	let err = nl80211.error();
-	if (err) {
-		warn("Unable to trigger scan on " + dev + ": " + err + "\n");
+	let iface = nl80211.request(nl80211.const.NL80211_CMD_GET_INTERFACE, 0, { dev });
+	if (!iface?.ifindex) {
+		warn("Unable to resolve scan interface " + dev + ": " + nl80211.error() + "\n");
+		return null;
+	}
+	let ifindex = iface.ifindex;
+	delete params.dev;
+	params.ifindex = ifindex;
+
+	if (uloop.cancelling() || !uloop.init()) {
+		warn("Unable to initialize scan event handling on " + dev + "\n");
 		return null;
 	}
 
-	let res = nl80211.waitfor([
-		nl80211.const.NL80211_CMD_NEW_SCAN_RESULTS,
-		nl80211.const.NL80211_CMD_SCAN_ABORTED
-	], 5000);
+	let listener, wake, res, err;
+	try {
+		// Subscribe before the separate command socket submits the request.
+		// Keep the first owned result even when another radio reports later
+		// in the same received batch.
+		listener = nl80211.listener((event) => {
+			if (res || event.msg?.ifindex != ifindex)
+				return;
+			res = event;
+			// A deferred event may run before the loop's poll phase. A
+			// positive wake survives that phase's expired-timer snapshot;
+			// never stop a caller's event loop to finish this request.
+			wake ??= uloop.timer(1, () => {});
+		}, [
+			nl80211.const.NL80211_CMD_NEW_SCAN_RESULTS,
+			nl80211.const.NL80211_CMD_SCAN_ABORTED,
+		]);
+		if (!listener) {
+			err = "Unable to subscribe to scan events: " + nl80211.error();
+		} else {
+			listener.set_overrun_handler(() => {
+				err = "Scan event buffer overrun";
+				wake ??= uloop.timer(1, () => {});
+			});
+			let now = clock(true);
+			if (!now) {
+				err = "Unable to read the monotonic scan clock";
+			} else {
+				// Match the native iwinfo observer budget, including home-
+				// channel service between background scan channel visits.
+				let deadline = now[0] * 1000 + int(now[1] / 1000000) + 60000;
+				nl80211.request(nl80211.const.NL80211_CMD_TRIGGER_SCAN, 0, params);
+				err = nl80211.error();
+				while (!err && !res) {
+					now = clock(true);
+					if (!now) {
+						err = "Unable to read the monotonic scan clock";
+						break;
+					}
+					let remaining = deadline - now[0] * 1000 - int(now[1] / 1000000);
+					if (remaining <= 0) {
+						err = "Scan result deadline expired";
+						break;
+					}
+					let status = uloop.run(remaining);
+					if (status == null || status != 0 || uloop.cancelling())
+						err = "Scan event handling interrupted";
+				}
+			}
+		}
+	} catch (e) {
+		err = "Scan event handling failed: " + e;
+	}
+	wake?.cancel();
+	listener?.close();
 
-	if (!res) {
-		warn("Netlink error while awaiting scan results on " + dev + ": " + nl80211.error() + "\n");
+	if (err) {
+		warn("Unable to complete scan on " + dev + ": " + err + "\n");
 		return null;
 	} else if (res.cmd == nl80211.const.NL80211_CMD_SCAN_ABORTED) {
 		warn("Scan aborted by kernel on " + dev + "\n");
 		return null;
 	}
 
-	let scan = nl80211.request(nl80211.const.NL80211_CMD_GET_SCAN, nl80211.const.NLM_F_DUMP, { dev });
+	let scan = nl80211.request(nl80211.const.NL80211_CMD_GET_SCAN, nl80211.const.NLM_F_DUMP, { ifindex });
 
 	let cells = [];
 	for (let k, bss in scan) {

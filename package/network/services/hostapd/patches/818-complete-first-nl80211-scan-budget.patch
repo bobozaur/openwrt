@@ -1,0 +1,41 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] nl80211: give the first scan the full completion budget
+
+Background scanning may alternate short channel visits with home-channel
+service. A short initial watchdog can abort every valid long scan before a
+successful completion grants the longer timeout. Use the existing bounded
+30-second completion budget from the first accepted request. Completion and
+abort events still cancel it immediately; no-event fallback stays finite.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/src/drivers/driver_nl80211_scan.c
++++ b/src/drivers/driver_nl80211_scan.c
+@@ -455,19 +455,12 @@
+ 	}
+ 
+ 	drv->scan_state = SCAN_REQUESTED;
+-	/* Not all drivers generate "scan completed" wireless event, so try to
+-	 * read results after a timeout. */
+-	timeout = drv->uses_6ghz ? 20 : 10;
+-	if (drv->uses_s1g)
+-		timeout += 5;
+-	if (drv->scan_complete_events) {
+-		/*
+-		 * The driver seems to deliver events to notify when scan is
+-		 * complete, so use longer timeout to avoid race conditions
+-		 * with scanning and following association request.
+-		 */
+-		timeout = 30;
+-	}
++	/* Background scans can spend most of their time servicing the home
++	 * channel. Give the first scan the same bounded completion budget as
++	 * later event-completed scans; a short initial watchdog can abort every
++	 * valid long scan before the driver ever reports its first completion.
++	 * Drivers without completion events still have a finite fallback. */
++	timeout = 30;
+ 	wpa_printf(MSG_DEBUG, "Scan requested (ret=%d) - scan timeout %d "
+ 		   "seconds", ret, timeout);
+ 	eloop_cancel_timeout(wpa_driver_nl80211_scan_timeout, drv, bss->ctx);
