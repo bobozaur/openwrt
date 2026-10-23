@@ -1,6 +1,7 @@
 'use strict';
 
 import * as ubus from "ubus";
+import * as uci from "uci";
 import { realpath, lsdir } from "fs";
 import {
 	handler_load, handler_attributes,
@@ -254,6 +255,14 @@ function config_init(uci)
 			let vif = {
 				name, config,
 				device: dev_name,
+				// Preserve raw option presence/types before driver normalization.
+				// Service-provided VIFs intentionally have no persistent UCI owner.
+				uci: {
+					section: name,
+					device: dev_name,
+					expected: json(sprintf('%J', data)),
+					expected_device: json(sprintf('%J', sections.device[dev_name])),
+				},
 
 				vlan: [],
 				sta: [],
@@ -523,6 +532,22 @@ function get_validate_info(ret, handler)
 }
 
 const ubus_obj = {
+	reload: {
+		args: {},
+		call: function(req) {
+			// Automatic wireless publication must not activate CLI edits or
+			// reload unrelated network settings. Explicit manual network/wifi
+			// reload retains its normal default-cursor behavior.
+			let ctx = uci.cursor(netifd.config_path, null, null, {
+				strict: false, committed_only: true
+			});
+			if (!ctx || !ctx.load("wireless"))
+				return ubus.STATUS_UNKNOWN_ERROR;
+			config_init(ctx);
+			config_start();
+			return 0;
+		}
+	},
 	up: {
 		args: wdev_args,
 		call: function(req) {

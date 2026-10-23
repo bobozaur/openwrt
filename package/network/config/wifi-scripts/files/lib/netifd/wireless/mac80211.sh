@@ -580,6 +580,13 @@ mac80211_hostapd_setup_bss() {
 	[ "$start_disabled" -eq 1 ] && append hostapd_cfg "start_disabled=1" "$N"
 	[ "$staidx" -gt 0 ] && append hostapd_cfg "start_deferred=1" "$N"
 
+	local previous_namespace
+	json_select ..
+	json_set_namespace hostapd_uci previous_namespace
+	json_set_namespace "$previous_namespace"
+	mac80211_copy_wps_owner "$previous_namespace" uci "$ifname" hostapd_uci
+	json_select config
+
 	cat >> /var/run/hostapd-$phy$vif_phy_suffix.conf <<EOF
 $hostapd_cfg
 ${macaddr:+bssid=$macaddr}
@@ -959,10 +966,47 @@ wpa_supplicant_init_config() {
 	json_set_namespace "$prev"
 }
 
+# Copy the handler's immutable UCI binding between jshn namespaces. Preserve
+# strings, lists and absent options instead of interpolating credential JSON.
+mac80211_copy_wps_owner() {
+	local source="$1" source_key="$2" target_key="$3"
+	local destination="${4:-wpa_supp}"
+	local kind value keys key original table
+	json_set_namespace "$source"
+	json_get_type kind "$source_key" || return 0
+	json_get_var value "$source_key"
+	case "$kind" in
+		object|array)
+			json_select "$source_key"
+			_json_get_var table JSON_CUR
+			json_get_keys keys
+			json_set_namespace "$destination"
+			json_add_"$kind" "$target_key"
+			for key in $keys; do
+				json_set_namespace "$source"
+				_json_get_var original "N_${table}_${key}"
+				mac80211_copy_wps_owner "$source" "$key" "${original:-$key}" "$destination"
+			done
+			json_set_namespace "$destination"
+			json_close_"$kind"
+			json_set_namespace "$source"
+			json_select ..
+			;;
+		string|int|boolean|double|null)
+			json_set_namespace "$destination"
+			json_add_"$kind" "$target_key" "$value"
+			;;
+	esac
+	json_set_namespace "$source"
+}
+
 wpa_supplicant_add_interface() {
 	local ifname="$1"
 	local mode="$2"
 	local prev
+	local wps_multi_ap
+	json_get_var wps_multi_ap multi_ap
+	json_select ..
 
 	_wpa_supplicant_common "$ifname"
 
@@ -973,6 +1017,9 @@ wpa_supplicant_add_interface() {
 	json_add_string iface "$ifname"
 	json_add_string mode "$mode"
 	json_add_string config "$_config"
+	json_add_boolean wps_multi_ap "${wps_multi_ap:-0}"
+	mac80211_copy_wps_owner "$prev" uci uci
+	json_set_namespace wpa_supp
 	[ -n "$default_macaddr" ] || json_add_string macaddr "$macaddr"
 	[ -n "$network_bridge" ] && json_add_string bridge "$network_bridge"
 	[ -n "$wds" ] && json_add_boolean 4addr "$wds"
@@ -981,6 +1028,7 @@ wpa_supplicant_add_interface() {
 	json_close_object
 
 	json_set_namespace "$prev"
+	json_select config
 
 	wpa_supp_init=1
 }
@@ -1030,7 +1078,11 @@ hostapd_set_config() {
 	}
 
 	ubus wait_for hostapd
-	local hostapd_res="$(ubus_call hostapd config_set "{ \"phy\": \"$phy\", \"radio\": $radio, \"config\":\"${hostapd_conf_file}\", \"prev_config\": \"${hostapd_conf_file}.prev\"}")"
+	local previous_namespace owners
+	json_set_namespace hostapd_uci previous_namespace
+	owners="$(json_dump)"
+	json_set_namespace "$previous_namespace"
+	local hostapd_res="$(ubus_call hostapd config_set "{ \"phy\": \"$phy\", \"radio\": $radio, \"config\":\"${hostapd_conf_file}\", \"prev_config\": \"${hostapd_conf_file}.prev\", \"uci\": $owners }")"
 	ret="$?"
 	[ "$ret" != 0 -o -z "$hostapd_res" ] && {
 		wireless_setup_failed HOSTAPD_START_FAILED
@@ -1252,6 +1304,9 @@ drv_mac80211_setup() {
 	json_set_namespace "$prev"
 
 	wpa_supplicant_init_config
+	json_set_namespace hostapd_uci prev
+	json_init
+	json_set_namespace "$prev"
 
 	mac80211_prepare_iw_htmode
 	active_ifnames=

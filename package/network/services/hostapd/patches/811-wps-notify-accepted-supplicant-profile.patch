@@ -1,0 +1,125 @@
+From: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+Subject: [PATCH] ucode: notify accepted WPS profiles with their native owner
+
+Notify only after native credential validation, security adjustments and any
+enabled configuration-file write have succeeded. Preserve the old SSID on
+allocation failure. Include the accepted network, WPS run and effective PMF
+so consumers can select the connection that actually succeeds; external
+credential handlers remain explicitly unprocessed.
+
+Upstream-Status: Pending
+Signed-off-by: Bogdan Mircea <mirceapetrebogdan@gmail.com>
+---
+
+--- a/wpa_supplicant/ucode.c
++++ b/wpa_supplicant/ucode.c
+@@ -5,6 +5,7 @@
+ #include "drivers/driver.h"
+ #include "common/ieee802_11_common.h"
+ #include "common/wpa_ctrl.h"
++#include "common/wpa_common.h"
+ #include "ap/hostapd.h"
+ #include "common/sae.h"
+ #include "rsn_supp/wpa.h"
+@@ -337,6 +338,8 @@
+ 	ucv_object_add(val, "processed", ucv_boolean_new(network != NULL));
+ 	if (network) {
+ 		ucv_object_add(val, "network_id", ucv_int64_new(network->id));
++		ucv_object_add(val, "wps_run", ucv_int64_new(network->wps_run));
++		ucv_object_add(val, "ieee80211w", ucv_int64_new(wpas_get_ssid_pmf(wpa_s, network)));
+ 		for (i = 0; i < ARRAY_SIZE(fields); i++) {
+ 			char *value = wpa_config_get_no_key(network, fields[i]);
+ 
+@@ -772,6 +775,19 @@
+ 	ret = ucv_object_new(vm);
+ 
+ 	ucv_object_add(ret, "state", ucv_string_new(wpa_supplicant_state_txt(wpa_s->wpa_state)));
++	ucv_object_add(ret, "pairwise_cipher", ucv_string_new(wpa_cipher_txt(wpa_s->pairwise_cipher)));
++#ifdef CONFIG_WPS
++	/* Protocol success precedes reassociation and may supply several profiles.
++	 * The persistence owner must select the network that actually connected. */
++	ucv_object_add(ret, "wps_run", ucv_int64_new(wpa_s->wps_run));
++	ucv_object_add(ret, "wps_success", ucv_boolean_new(wpa_s->wps_success));
++	if (wpa_s->current_ssid) {
++		ucv_object_add(ret, "network_id", ucv_int64_new(wpa_s->current_ssid->id));
++		ucv_object_add(ret, "network_wps_run", ucv_int64_new(wpa_s->current_ssid->wps_run));
++		ucv_object_add(ret, "wps_selected", ucv_boolean_new(!(wpa_s->current_ssid->key_mgmt & WPA_KEY_MGMT_WPS)));
++	}
++#endif
++
+ 
+ 	bss = wpa_s->current_bss;
+ 	if (bss)
+--- a/wpa_supplicant/wps_supplicant.c
++++ b/wpa_supplicant/wps_supplicant.c
+@@ -386,6 +386,7 @@
+ 	struct wpa_supplicant *wpa_s = ctx;
+ 	struct wpa_ssid *ssid = wpa_s->current_ssid;
+ 	u16 auth_type;
++	u8 *wps_ssid;
+ #ifdef CONFIG_WPS_REG_DISABLE_OPEN
+ 	int registrar = 0;
+ #endif /* CONFIG_WPS_REG_DISABLE_OPEN */
+@@ -410,10 +411,10 @@
+ 	wpa_hexdump_key(MSG_DEBUG, "WPS: Received Credential attribute",
+ 			cred->cred_attr, cred->cred_attr_len);
+ 
+-	wpas_ucode_wps_complete(wpa_s, cred);
+-
+-	if (wpa_s->conf->wps_cred_processing == 1)
++	if (wpa_s->conf->wps_cred_processing == 1) {
++		wpas_ucode_wps_complete(wpa_s, cred, NULL);
+ 		return 0;
++	}
+ 
+ 	wpa_hexdump_ascii(MSG_DEBUG, "WPS: SSID", cred->ssid, cred->ssid_len);
+ 	wpa_printf(MSG_DEBUG, "WPS: Authentication Type 0x%x",
+@@ -449,6 +450,12 @@
+ 			return -1;
+ 		}
+ 	}
++
++	/* Allocate before replacing the WPS profile, so an allocation failure
++	 * cannot leave a stale length pointing at a missing SSID. */
++	wps_ssid = cred->ssid_len ? os_memdup(cred->ssid, cred->ssid_len) : NULL;
++	if (cred->ssid_len && !wps_ssid)
++		return -1;
+ 
+ 	if (ssid && (ssid->key_mgmt & WPA_KEY_MGMT_WPS)) {
+ 		wpa_printf(MSG_DEBUG, "WPS: Replace WPS network block based "
+@@ -478,8 +485,10 @@
+ 		wpa_printf(MSG_DEBUG, "WPS: Create a new network based on the "
+ 			   "received credential");
+ 		ssid = wpa_config_add_network(wpa_s->conf);
+-		if (ssid == NULL)
++		if (ssid == NULL) {
++			os_free(wps_ssid);
+ 			return -1;
++		}
+ 		if (wpa_s->current_ssid) {
+ 			/*
+ 			 * Should the GO issue multiple credentials for some
+@@ -498,11 +507,8 @@
+ 	ssid->wps_run = wpa_s->wps_run;
+ 
+ 	os_free(ssid->ssid);
+-	ssid->ssid = os_malloc(cred->ssid_len);
+-	if (ssid->ssid) {
+-		os_memcpy(ssid->ssid, cred->ssid, cred->ssid_len);
+-		ssid->ssid_len = cred->ssid_len;
+-	}
++	ssid->ssid = wps_ssid;
++	ssid->ssid_len = cred->ssid_len;
+ 
+ 	switch (cred->encr_type) {
+ 	case WPS_ENCR_NONE:
+@@ -618,6 +624,9 @@
+ 	wpa_s->after_wps = 5;
+ 	wpa_s->wps_freq = wpa_s->assoc_freq;
+ 
++	/* Only publish after native validation, security adjustments and any
++	 * requested configuration write have succeeded. */
++	wpas_ucode_wps_complete(wpa_s, cred, ssid);
+ 	return 0;
+ }
+ 
