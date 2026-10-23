@@ -1,0 +1,36 @@
+Subject: [PATCH] uci: support an explicit committed-only reader
+
+--- a/lib/uci.c
++++ b/lib/uci.c
+@@ -169,6 +169,8 @@
+  *
+  * @param {module:uci.cursor.ParserFlags}
+  * Parser flags to change.
++ * The boolean committed_only flag excludes saved delta paths and runtime
++ * config overrides from reads. It does not consume or remove those inputs.
+  *
+  * @returns {?module:uci.cursor}
+  */
+@@ -227,6 +229,22 @@
+ 		};
+ 
+ 		ucv_object_foreach(flags, key, value) {
++			if (!strcmp(key, "committed_only")) {
++				if (ucv_is_truish(value)) {
++					struct uci_element *e, *tmp;
++					uci_foreach_element_safe(&c->delta_path, tmp, e) {
++						free(e->name);
++						free(e);
++					}
++					c->delta_path.next = c->delta_path.prev = &c->delta_path;
++#ifdef HAVE_UCI_CONF2DIR
++					rv = uci_set_conf2dir(c, NULL);
++					if (rv)
++						goto error;
++#endif
++				}
++				continue;
++			}
+ 			for (i = 0; i < ARRAY_SIZE(flag_spec); i++)
+ 				if (!strcmp(flag_spec[i].name, key))
+ 					break;
