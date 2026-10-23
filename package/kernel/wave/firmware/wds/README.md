@@ -1,6 +1,6 @@
 # WRX600 A0 station WDS and receive BlockAck corrections
 
-This layer pairs the station control-port transport with one fixed NETGEAR RAX40 V1 1.0.6.106 AP-firmware correction. The ordinary cohort importer continues to import all original firmware bytes. No full radio image is included here. The instruction overlay is applied by the existing native firmware writer while the CPUs remain in reset.
+This layer pairs the station control-port transport with one fixed NETGEAR RAX40 V1 1.0.6.106 AP-firmware correction. The ordinary `wave600-firmware` package supplies the pinned original firmware bytes in the image. No full radio image is included here. The instruction overlay is applied by the existing native firmware writer while the CPUs remain in reset.
 
 The typed UMAC loader accepts only original image size 0x180000 and SHA256 6801144d7d45d66ffdb867624d4906a6f215243cd00fa9d1611333ddf6477908, one aligned native IRAM region and swap-disabled upload. Ten aligned spans totaling 716 bytes reconstruct corrected SHA256 `f4c8d064aaf4e175d8c12f13c013277a69ea8eed446e312e77a7840052e51de6`, pinned in the generator. Other CPU images retain their ordinary loader path.
 
