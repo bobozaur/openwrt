@@ -1,5 +1,5 @@
 src-git packages https://github.com/bobozaur/packages.git^55cd4e40203949b8efc214c4fb9434793b8d2a59
-src-git luci https://github.com/bobozaur/luci.git^7d08b2c23749129bd1a20e5dc912d956c4e79926
+src-git luci https://github.com/bobozaur/luci.git^41ed352b007bb8f8a07553000edfa39c1134c9b2
 src-git routing https://git.openwrt.org/feed/routing.git^4b9891b9136259f93294a424507ed24c5e8c1cbd
 src-git telephony https://git.openwrt.org/feed/telephony.git^5d68d53c160a325ea9d03fce393e051573bcc736
 src-git video https://github.com/openwrt/video.git^6917907d4d6c670cf85be525d23216595655061d
