@@ -1,0 +1,19 @@
+Subject: [PATCH] iwinfo: omit unavailable station rate widths
+
+A zero iwinfo width means that the backend did not identify a channel width.
+Keep the bitrate and mode fields, but do not publish zero as a measured width.
+
+Upstream-Status: Pending
+
+--- a/iwinfo.c
++++ b/iwinfo.c
+@@ -481,7 +481,8 @@
+ 	blobmsg_add_u8(&buf, "vht", r->is_vht);
+ 	blobmsg_add_u8(&buf, "he", r->is_he);
+ 	blobmsg_add_u8(&buf, "eht", r->is_eht);
+-	blobmsg_add_u32(&buf, "mhz", r->mhz_hi * 256 + r->mhz);
++	if (r->mhz || r->mhz_hi)
++		blobmsg_add_u32(&buf, "mhz", r->mhz_hi * 256 + r->mhz);
+ 	blobmsg_add_u32(&buf, "rate", r->rate);
+ 
+ 	if (r->is_ht) {
