@@ -256,10 +256,15 @@ function assoc_flags(data) {
 		width_5: 5
 	};
 
-	let mhz = 'unknown';
+	let mhz = null;
 	for (let k, v in assoc_mhz)
 		if (data[k])
-			mhz = v; 
+			mhz = v;
+
+	/* nl80211 has no explicit width flag for non-OFDMA 20 MHz MCS rates. */
+	if (mhz == null && data.he_ru_alloc == null && data.eht_ru_alloc == null &&
+	    (data.mcs != null || data.vht_mcs != null || data.he_mcs != null || data.eht_mcs != null))
+		mhz = 20;
 
 	const assoc_flags = {
 		mcs: {
@@ -284,7 +289,7 @@ function assoc_flags(data) {
 
 	let flags = [];
 	for (let k, v in assoc_flags) {
-		if (!data[k])
+		if (data[k] == null)
 			continue;
 
 		let first = 0;
@@ -292,10 +297,13 @@ function assoc_flags(data) {
 			if (data[name] == null)
 				continue;
 			push(flags, `${flag} ${data[name]}`);
-			if (!first++)
+			if (!first++ && mhz != null)
 				push(flags, `${mhz}MHz`);
 		}
 	}
+
+	if (!length(flags) && mhz != null)
+		push(flags, `${mhz}MHz`);
 
 	return flags;
 }

@@ -1,0 +1,98 @@
+Subject: [PATCH] nl80211: preserve unknown station rate widths
+
+Only typed non-OFDMA MCS rates imply 20 MHz when no width flag is present.
+Scalar-only driver rates do not identify a width. Preserve their bitrate,
+keep zero as the existing unknown-width value, and omit unknown widths from
+CLI and Lua output. Retain explicit widths and the implicit 20 MHz MCS case.
+
+Upstream-Status: Pending
+
+--- a/iwinfo_nl80211.c
++++ b/iwinfo_nl80211.c
+@@ -2282,8 +2282,14 @@
+ 		re->mhz = 160;
+ 	else if (ri[NL80211_RATE_INFO_320_MHZ_WIDTH])
+ 		re->mhz_hi = 320 / 256, re->mhz = 320 % 256;
++	else if ((re->is_ht || re->is_vht || re->is_he || re->is_eht) &&
++	         !ri[NL80211_RATE_INFO_HE_RU_ALLOC] &&
++	         !ri[NL80211_RATE_INFO_EHT_RU_ALLOC])
++		/* nl80211 omits the width flag for non-OFDMA 20 MHz MCS rates. */
++		re->mhz = 20;
+ 	else
+-		re->mhz = 20;
++		/* A scalar bitrate alone does not identify its channel width. */
++		re->mhz = 0;
+ 
+ 	if (ri[NL80211_RATE_INFO_SHORT_GI])
+ 		re->is_short_gi = 1;
+--- a/iwinfo_cli.c
++++ b/iwinfo_cli.c
+@@ -299,12 +299,12 @@
+ 
+ 		if (r->is_ht)
+ 		{
+-			p += snprintf(p, l, ", MCS %d, %dMHz", r->mcs, r->mhz);
++			p += snprintf(p, l, ", MCS %d", r->mcs);
+ 			l = sizeof(buf) - (p - buf);
+ 		}
+ 		else if (r->is_vht)
+ 		{
+-			p += snprintf(p, l, ", VHT-MCS %d, %dMHz", r->mcs, r->mhz);
++			p += snprintf(p, l, ", VHT-MCS %d", r->mcs);
+ 			l = sizeof(buf) - (p - buf);
+ 
+ 			if (r->nss)
+@@ -315,7 +315,7 @@
+ 		}
+ 		else if (r->is_he)
+ 		{
+-			p += snprintf(p, l, ", HE-MCS %d, %dMHz", r->mcs, r->mhz);
++			p += snprintf(p, l, ", HE-MCS %d", r->mcs);
+ 			l = sizeof(buf) - (p - buf);
+ 
+ 			p += snprintf(p, l, ", HE-NSS %d", r->nss);
+@@ -329,7 +329,7 @@
+ 		}
+ 		else if (r->is_eht)
+ 		{
+-			p += snprintf(p, l, ", EHT-MCS %d, %dMHz", r->mcs, r->mhz_hi * 256 + r->mhz);
++			p += snprintf(p, l, ", EHT-MCS %d", r->mcs);
+ 			l = sizeof(buf) - (p - buf);
+ 
+ 			p += snprintf(p, l, ", EHT-NSS %d", r->nss);
+@@ -338,6 +338,9 @@
+ 			p += snprintf(p, l, ", EHT-GI %d", r->eht_gi);
+ 			l = sizeof(buf) - (p - buf);
+ 		}
++
++		if (r->mhz || r->mhz_hi)
++			snprintf(p, l, ", %dMHz", r->mhz_hi * 256 + r->mhz);
+ 	}
+ 
+ 	return buf;
+--- a/iwinfo_lua.c
++++ b/iwinfo_lua.c
+@@ -282,8 +282,11 @@
+ 	lua_pushboolean(L, r->is_eht);
+ 	lua_setfield(L, -2, rx ? "rx_eht" : "tx_eht");
+ 
+-	lua_pushnumber(L, r->mhz_hi * 256 + r->mhz);
+-	lua_setfield(L, -2, rx ? "rx_mhz" : "tx_mhz");
++	if (r->mhz || r->mhz_hi)
++	{
++		lua_pushnumber(L, r->mhz_hi * 256 + r->mhz);
++		lua_setfield(L, -2, rx ? "rx_mhz" : "tx_mhz");
++	}
+ 
+ 	if (r->is_ht)
+ 	{
+--- a/include/iwinfo.h
++++ b/include/iwinfo.h
+@@ -239,6 +239,7 @@
+ 	uint8_t is_eht:1;
+ 	uint8_t he_gi;
+ 	uint8_t he_dcm;
++	/* Width is mhz_hi * 256 + mhz; zero means unavailable. */
+ 	uint8_t mhz;
+ 	uint8_t nss;
+ 	uint8_t mhz_hi;
